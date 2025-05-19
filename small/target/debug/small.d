@@ -1,0 +1,1 @@
+/Users/sdreussi/project/copper5/small/target/debug/small: /Users/sdreussi/project/copper5/ast_macro/src/lib.rs /Users/sdreussi/project/copper5/small/src/lib.rs /Users/sdreussi/project/copper5/small/src/main.rs /Users/sdreussi/project/copper5/small/src/reg_design.rs /Users/sdreussi/project/copper5/small/src/register.rs

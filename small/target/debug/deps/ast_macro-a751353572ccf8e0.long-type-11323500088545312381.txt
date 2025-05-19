@@ -1,0 +1,2 @@
+Map<Zip<core::slice::iter::Iter<'_, proc_macro2::TokenStream>, core::slice::iter::Iter<'_, proc_macro2::TokenStream>>, {closure@/Users/sdreussi/project/copper5/ast_macro/src/lib.rs:36:73: 36:85}>
+Map<Zip<std::slice::Iter<'_, proc_macro2::TokenStream>, std::slice::Iter<'_, proc_macro2::TokenStream>>, {closure@/Users/sdreussi/project/copper5/ast_macro/src/lib.rs:36:73: 36:85}>
