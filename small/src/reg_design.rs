@@ -1,5 +1,5 @@
 use crate::register::Register;
-use crate::wire::Wire;
+// use crate::wire::Wire;
 use ast_macro::{DescribeModule, analyze_impl};
 
 #[derive(Debug, DescribeModule)]
