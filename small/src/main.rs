@@ -1,11 +1,11 @@
-mod register;
-mod reg_design;
+mod counter;
+use crate::counter::Counter;
+use rust_type::{to_verilog, New};
 
-use reg_design::RegDesign;
 
 fn main() {
-    RegDesign::to_verilog();
-    RegDesign::to_verilog_assignments();
-    let mut design = RegDesign::new();
-    design.update();
+    let mut counter = Counter::<4>::new();
+    counter.design();
+    let verilog = to_verilog(&counter);
+    println!("Counter Verilog:\n{}", verilog);
 }

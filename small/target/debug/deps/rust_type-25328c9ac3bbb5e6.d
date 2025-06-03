@@ -1,0 +1,8 @@
+/Users/sdreussi/project/copper5/small/target/debug/deps/librust_type-25328c9ac3bbb5e6.rmeta: /Users/sdreussi/project/copper5/rust_type/src/lib.rs /Users/sdreussi/project/copper5/rust_type/src/register.rs /Users/sdreussi/project/copper5/rust_type/src/wire.rs /Users/sdreussi/project/copper5/rust_type/src/logic.rs
+
+/Users/sdreussi/project/copper5/small/target/debug/deps/rust_type-25328c9ac3bbb5e6.d: /Users/sdreussi/project/copper5/rust_type/src/lib.rs /Users/sdreussi/project/copper5/rust_type/src/register.rs /Users/sdreussi/project/copper5/rust_type/src/wire.rs /Users/sdreussi/project/copper5/rust_type/src/logic.rs
+
+/Users/sdreussi/project/copper5/rust_type/src/lib.rs:
+/Users/sdreussi/project/copper5/rust_type/src/register.rs:
+/Users/sdreussi/project/copper5/rust_type/src/wire.rs:
+/Users/sdreussi/project/copper5/rust_type/src/logic.rs:

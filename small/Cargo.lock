@@ -30,10 +30,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust_logic"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "rust_type"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "small"
 version = "0.1.0"
 dependencies = [
  "ast_macro",
+ "rust_logic",
+ "rust_type",
 ]
 
 [[package]]

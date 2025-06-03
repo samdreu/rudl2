@@ -7,3 +7,5 @@ edition = "2024"
 
 [dependencies]
 ast_macro = { path = "../ast_macro" }
+rust_type = { path = "../rust_type" }
+rust_logic = { path = "../rust_logic" }
