@@ -1,0 +1,11 @@
+/Users/sdreussi/project/final_copper/target/debug/deps/quote-249d5b349745599e.d: /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/lib.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/ext.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/format.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/ident_fragment.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/to_tokens.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/runtime.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/spanned.rs
+
+/Users/sdreussi/project/final_copper/target/debug/deps/libquote-249d5b349745599e.rmeta: /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/lib.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/ext.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/format.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/ident_fragment.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/to_tokens.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/runtime.rs /Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/spanned.rs
+
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/lib.rs:
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/ext.rs:
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/format.rs:
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/ident_fragment.rs:
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/to_tokens.rs:
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/runtime.rs:
+/Users/sdreussi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.44/src/spanned.rs:

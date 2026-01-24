@@ -1,0 +1,1 @@
+/Users/sdreussi/project/final_copper/target/debug/examples/counter: /Users/sdreussi/project/final_copper/copper-codegen/src/lib.rs /Users/sdreussi/project/final_copper/copper-core/src/lib.rs /Users/sdreussi/project/final_copper/copper-macros/src/lib.rs /Users/sdreussi/project/final_copper/copper-sim/src/lib.rs /Users/sdreussi/project/final_copper/examples/counter.rs

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["copper-core", "copper-macros", "copper-codegen", "copper-sim"]
+
+[package]
+name = "copper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+copper-core = { path = "copper-core" }
+copper-macros = { path = "copper-macros" }
+copper-codegen = { path = "copper-codegen" }
+copper-sim = { path = "copper-sim" }

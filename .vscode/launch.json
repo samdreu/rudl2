@@ -1,0 +1,43 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug inverter example",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=inverter",
+                    "--package=copper"
+                ],
+                "filter": {
+                    "name": "inverter",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug tests",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=copper",
+                    "--lib",
+                    "--",
+                    "--nocapture"
+                ],
+                "filter": {
+                    "name": "inverter",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
