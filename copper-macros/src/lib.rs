@@ -7,6 +7,7 @@ pub fn module_struct(_args: TokenStream, input: TokenStream) -> TokenStream {
     let input_struct = parse_macro_input!(input as ItemStruct);
     let struct_name = &input_struct.ident;
     let generics = &input_struct.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let mut port_entries = Vec::new();
 
@@ -43,7 +44,7 @@ pub fn module_struct(_args: TokenStream, input: TokenStream) -> TokenStream {
     quote! {
         #input_struct
         
-        impl #generics #struct_name #generics {
+        impl #impl_generics #struct_name #ty_generics #where_clause {
             pub fn __get_ports(&self) -> Vec<copper_core::Port> {
                 vec![
                     #(#port_entries),*
