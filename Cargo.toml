@@ -12,3 +12,5 @@ copper-core = { path = "copper-core" }
 copper-macros = { path = "copper-macros" }
 copper-codegen = { path = "copper-codegen" }
 copper-sim = { path = "copper-sim" }
+env_logger = "0.11.8"
+log = "0.4.29"

@@ -4,6 +4,7 @@ use syn::{parse_macro_input, ItemStruct, ItemImpl, ImplItem, Fields, Type};
 
 #[proc_macro_attribute]
 pub fn module_struct(_args: TokenStream, input: TokenStream) -> TokenStream {
+    eprintln!("Processing module_struct macro");
     let input_struct = parse_macro_input!(input as ItemStruct);
     let struct_name = &input_struct.ident;
     let generics = &input_struct.generics;
@@ -19,21 +20,38 @@ pub fn module_struct(_args: TokenStream, input: TokenStream) -> TokenStream {
             // Parse type to extract Wire/Register and width
             if let Type::Path(type_path) = &field.ty {
                 let type_name = &type_path.path.segments.last().unwrap().ident;
-                
+                eprint!("Found field: {} of type {}\n", field_name, type_name);
                 // Check if it's Wire or Register
                 if type_name == "Wire" || type_name == "Register" {
+                    eprint!("  It's a port of type {}\n", type_name);
                     // Extract const generic (the width)
                     if let syn::PathArguments::AngleBracketed(args) = 
                         &type_path.path.segments.last().unwrap().arguments {
-                        if let Some(syn::GenericArgument::Const(width_expr)) = args.args.first() {
-                            port_entries.push(quote! {
-                                copper_core::Port {
-                                    name: stringify!(#field_name).to_string(),
-                                    width: #width_expr,
-                                    direction: self.#field_name.get_direction(),
-                                }
-                            });
-                        }
+                        eprintln!("  Has {} angle bracketed args", args.args.len());
+
+                        // Try both Type and Const variants
+                        let width_expr = match args.args.first() {
+                            Some(syn::GenericArgument::Const(expr)) => {
+                                eprintln!("  Found Const width: {}", quote!(#expr));
+                                quote!(#expr)
+                            }
+                            Some(syn::GenericArgument::Type(ty)) => {
+                                eprintln!("  Found Type width: {}", quote!(#ty));
+                                quote!(#ty)
+                            }
+                            _ => {
+                                eprintln!("  Unexpected generic argument type");
+                                continue;
+                            }
+                        };
+                        
+                        port_entries.push(quote! {
+                            copper_core::Port {
+                                name: stringify!(#field_name).to_string(),
+                                width: #width_expr,
+                                direction: self.#field_name.get_direction(),
+                            }
+                        });
                     }
                 }
             }

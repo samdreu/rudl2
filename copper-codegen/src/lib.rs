@@ -69,11 +69,13 @@ pub fn to_verilog<M: Module>(module: &M) -> String {
     let ast_data = module.get_design_ast();
     let ports = module.get_ports();
     
-    // Parse AST → IR
     let design_fn = parse_str(&ast_data.ast).expect("Failed to parse AST");
-    let mut ir = IRBuilder::from_ast(&design_fn, ports);
-    ir.name = ast_data.name;
     
-    // Generate Verilog from IR
-    VerilogGenerator::generate(&ir)
+    match IRBuilder::from_ast(&design_fn, ports) {
+        Ok(mut ir) => {
+            ir.name = ast_data.name;
+            VerilogGenerator::generate(&ir)
+        }
+        Err(e) => format!("// Error: {}\n", e),
+    }
 }

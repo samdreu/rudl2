@@ -1,6 +1,9 @@
 use copper_core::Module;
 use std::collections::HashMap;
 
+pub mod verification;
+pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
+
 pub struct Simulator<M: Module> {
     module: M,
     cycle: u64,

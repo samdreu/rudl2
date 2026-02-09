@@ -72,6 +72,16 @@ pub enum Expression {
     Index(Box<Expression>, Box<Expression>),
     Slice(Box<Expression>, Box<Expression>, Box<Expression>),
     Concat(Vec<Expression>),
+    Case {
+        selector: Box<Expression>,
+        arms: Vec<CaseExprArm>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseExprArm {
+    pub pattern: Pattern,
+    pub value: Box<Expression>,
 }
 
 #[derive(Debug, Clone)]
