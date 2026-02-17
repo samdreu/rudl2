@@ -1,7 +1,10 @@
 pub mod ir;
-pub use ir::{ModuleIR};
+pub mod types;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub use ir::{ModuleIR};
+pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Logic {
     Zero = 0,
     One = 1,
