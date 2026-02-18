@@ -5,11 +5,6 @@ pub use ir::{ModuleIR};
 pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Logic {
-    Zero = 0,
-    One = 1,
-    X, // unknown
-}
 
 pub struct Wire<const N: usize> {
     name: String,

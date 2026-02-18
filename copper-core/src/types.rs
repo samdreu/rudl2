@@ -10,8 +10,14 @@
 use std::marker::PhantomData;
 use std::fmt;
 
-// Re-export Logic from parent module for now
-pub use super::Logic;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+// primitive logic values (0, 1, X)
+pub enum Logic {
+    Zero = 0,
+    One = 1,
+    X, // unknown
+}
 
 /// A single hardware bit with 4-state logic (0, 1, X, Z)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
