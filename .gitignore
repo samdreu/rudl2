@@ -1,0 +1,12 @@
+# Verilator build artifacts
+obj_dir/
+*.v
+tb_*.cpp
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Generated files
+*.d
