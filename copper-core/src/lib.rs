@@ -3,8 +3,9 @@ pub mod types;
 
 pub use ir::{ModuleIR};
 pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain};
+use crate::types::Logic;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 
 pub struct Wire<const N: usize> {
     name: String,
@@ -67,7 +68,7 @@ impl<const N: usize> Register<N> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Input,
     Output,

@@ -1,4 +1,5 @@
-use crate::{Port, Logic};
+use crate::{Port};
+use crate::types::{Logic};
 
 #[derive(Debug, Clone)]
 pub enum HardwareIR {
