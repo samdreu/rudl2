@@ -2,8 +2,7 @@ pub mod ir;
 pub mod types;
 
 pub use ir::{ModuleIR};
-pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain};
-use crate::types::Logic;
+pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain, Logic};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 

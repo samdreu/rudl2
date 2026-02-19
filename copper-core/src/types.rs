@@ -9,6 +9,8 @@
 
 use std::marker::PhantomData;
 use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::task::Waker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 
@@ -387,13 +389,19 @@ impl<Domain: ClockDomain, T: fmt::Debug> fmt::Debug for Signal<Domain, T> {
     }
 }
 
+#[derive(Debug)]
+struct ClockState {
+    cycle: u64,
+    wakers: Vec<Waker>,
+}
+
 /// Clock source for synchronous logic
 /// 
 /// Represents a clock signal that can be awaited in async state machines.
 /// Each clock has an associated domain type for safety.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Clock<Domain: ClockDomain> {
-    cycle: u64,
+    state: Arc<Mutex<ClockState>>,
     _domain: PhantomData<Domain>,
 }
 
@@ -401,19 +409,29 @@ impl<Domain: ClockDomain> Clock<Domain> {
     /// Create a new clock starting at cycle 0
     pub fn new() -> Self {
         Self {
-            cycle: 0,
+            state: Arc::new(Mutex::new(ClockState {
+                cycle: 0,
+                wakers: Vec::new(),
+            })),
             _domain: PhantomData,
         }
     }
     
     /// Get the current cycle number
     pub fn cycle(&self) -> u64 {
-        self.cycle
+        self.state.lock().unwrap().cycle
     }
     
     /// Advance the clock by one cycle (for simulation)
     pub fn advance(&mut self) {
-        self.cycle += 1;
+        let mut state = self.state.lock().unwrap();
+        state.cycle += 1;
+        // wake any tasks waiting on this clock tick
+        let wakers = std::mem::take(&mut state.wakers);
+        drop(state); // release lock before waking ?????
+        for w in wakers {
+            w.wake();
+        }
     }
     
     /// Create a future that completes on the next clock edge
@@ -428,7 +446,10 @@ impl<Domain: ClockDomain> Clock<Domain> {
     /// }
     /// ```
     pub fn tick(&self) -> ClockTick<Domain> {
+        let target = self.cycle().wrapping_add(1); 
         ClockTick {
+            state: Arc::clone(&self.state),
+            target_cycle: target,
             _domain: PhantomData,
         }
     }
@@ -440,10 +461,22 @@ impl<Domain: ClockDomain> Default for Clock<Domain> {
     }
 }
 
+impl<Domain: ClockDomain> Clone for Clock<Domain> {
+    fn clone(&self) -> Self {
+        Self {
+            state: std::sync::Arc::clone(&self.state),
+            _domain: std::marker::PhantomData,
+        }
+    }
+}
+
+
 /// Future representing a clock tick
 /// 
 /// This is returned by `Clock::tick()` and should be awaited in async functions.
 pub struct ClockTick<Domain: ClockDomain> {
+    state: Arc<Mutex<ClockState>>,
+    target_cycle: u64,
     _domain: PhantomData<Domain>,
 }
 
@@ -452,10 +485,15 @@ impl<Domain: ClockDomain> std::future::Future for ClockTick<Domain> {
     
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // This is a placeholder - actual async execution will be custom
-        std::task::Poll::Ready(())
+        let mut state = self.state.lock().unwrap();
+        if state.cycle >= self.target_cycle {
+            std::task::Poll::Ready(())
+        } else {
+            state.wakers.push(cx.waker().clone());
+            std::task::Poll::Pending
+        }
     }
 }
 
