@@ -1,16 +1,18 @@
 use copper_core::{Clock, ClockDomain, Bits};
 use copper_sim::HardwareExecutor;
+use copper_macros::hardware;
+use std::sync::{Arc, Mutex};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-// For now, without macro - just async fn
-async fn counter(clk: Clock<MainClk>) {
-    let mut count = Bits::<8>::from_u128(0);
+#[hardware]
+async fn counter(clk: Clock<MainClk>, output: Arc<Mutex<Bits<8>>>) {
+    let mut count = Bits::from_u128(0);
     loop {
-        println!("count = {}", count.as_u128());
+        output.lock().unwrap().clone_from(&count);
         clk.tick().await;
-        count = count + Bits::<8>::from_u128(1);
+        count = count + Bits::from_u128(1);
     }
 }
 
@@ -18,9 +20,13 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
     
-    exec.spawn(counter(clk.clone()));
+    let output = Arc::new(Mutex::new(Bits::<8>::from_u128(0)));
+    
+    exec.spawn(counter(clk.clone(), Arc::clone(&output)));
     
     for _ in 0..5 {
         exec.tick_clock(&mut clk);
+        let val = output.lock().unwrap().as_u128();
+        println!("cycle {} count {}", clk.cycle(), val);
     }
 }
