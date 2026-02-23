@@ -1,11 +1,10 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
-use copper_core::{Clock, ClockDomain};
+use copper_core::{Clock, ClockDomain, State};
 
-// what is this used for?
-// explain every part of this function - why do we need a noop waker? what is the VTABLE doing? why are the functions empty?
 fn noop_waker() -> Waker {
     fn clone(_: *const ()) -> RawWaker { RawWaker::new(std::ptr::null(), &VTABLE) }
     fn wake(_: *const ()) {}
@@ -15,53 +14,76 @@ fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
-
 pub struct HardwareExecutor {
-    tasks: Vec<Pin<Box<dyn Future<Output = ()>>>>, // why is this the appropriate type here?
-    cycle: u64 // the global cycle count - independent of the tasks cycles
+    tasks: Vec<Pin<Box<dyn Future<Output = ()>>>>,
+    /// Closures that advance each state
+    state_commits: Arc<Mutex<Vec<Box<dyn Fn() + Send>>>>,
+    cycle: u64,
 }
 
 impl HardwareExecutor {
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
+            state_commits: Arc::new(Mutex::new(Vec::new())),
             cycle: 0,
         }
     }
-
-    pub fn spawn(&mut self, task: impl Future<Output = ()> + 'static) {
-        self.tasks.push(Box::pin(task)); // what is the Box::pin(task) doing here?
+    
+    pub fn state_factory(&self) -> StateFactory {
+        StateFactory {
+            commits: Arc::clone(&self.state_commits),
+        }
     }
+    
+    pub fn spawn(&mut self, task: impl Future<Output = ()> + 'static) {
+        self.tasks.push(Box::pin(task));
+    }
+    
+    pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
+        // 1) Clock edge (wake tasks waiting on tick)
+        clk.advance();
 
-    pub fn tick(&mut self) {
-        // poll all tasks once, advance clocks, commit states
+        // 2) Commit all registered states (flops update on edge)
+        {
+            let commits = self.state_commits.lock().unwrap();
+            for commit_fn in commits.iter() {
+                commit_fn();
+            }
+        }
+
+        // 3) Poll tasks once (combinational logic based on new state)
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for task in &mut self.tasks {
+            let _ = task.as_mut().poll(&mut cx);
+        }
+
         self.cycle += 1;
     }
-
+    
     pub fn cycle(&self) -> u64 {
         self.cycle
     }
+}
 
-    pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
-        clk.advance();
+#[derive(Clone)]
+pub struct StateFactory {
+    commits: Arc<Mutex<Vec<Box<dyn Fn() + Send>>>>,
+}
 
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        for task in &mut self.tasks {
-            let _ = task.as_mut().poll(&mut cx);
-        }
-
-        self.cycle += 1;
-    }
-
-    /// Poll all tasks once (no clock advance).
-    pub fn poll_tasks(&mut self) {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        for task in &mut self.tasks {
-            let _ = task.as_mut().poll(&mut cx);
-        }
+impl StateFactory {
+    pub fn create<T: Clone + Send + 'static>(&self, initial: T) -> State<T> {
+        let state = State::new(initial);
+        
+        // Create a closure that advances this specific state
+        let state_clone = state.clone();
+        let commit_fn = move || {
+            state_clone.advance_internal();
+        };
+        
+        self.commits.lock().unwrap().push(Box::new(commit_fn));
+        
+        state
     }
 }

@@ -4,6 +4,19 @@ pub mod types;
 pub use ir::{ModuleIR};
 pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain, Logic};
 
+// pub mod types;
+// pub mod verification;
+// pub use verification::Module;
+
+// // Public API exports
+// pub use types::{
+//     Bit, Bits, Clock, ClockDomain, Logic, Signal, State,
+// };
+
+// // Internal: for copper-sim executor
+#[doc(hidden)]
+pub use types::StateInner;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 
 pub struct Wire<const N: usize> {
