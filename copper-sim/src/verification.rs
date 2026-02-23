@@ -45,13 +45,15 @@ int main(int argc, char** argv) {{
     for cycle_data in &trace.cycles {
         tb.push_str(&format!("    // Cycle {}\n", cycle_data.cycle));
         
-        // Set inputs
-        for (name, values) in &cycle_data.inputs {
-            let value = logic_vec_to_int(values);
-            tb.push_str(&format!("    top->{} = {};\n", name, value));
-        }
-        
-        tb.push_str("    top->eval();\n");
+    for (name, values) in &cycle_data.inputs {
+        let value = logic_vec_to_int(values);
+        tb.push_str(&format!("    top->{} = {};\n", name, value));
+    }
+
+    tb.push_str("    top->clk = 0;\n");
+    tb.push_str("    top->eval();\n");
+    tb.push_str("    top->clk = 1;\n");
+    tb.push_str("    top->eval();\n");
         
         // Check outputs
         for (name, expected) in &cycle_data.outputs {
@@ -146,7 +148,7 @@ pub fn verify_with_verilator(
         return Err(format!("Simulation executable not found: {}", sim_exe));
     }
     
-    println!("Running Verilator simulation...");
+    println!("Running Verilator simulation... Executable: {}", sim_exe);
     let sim_output = Command::new(&sim_exe)
         .output()
         .map_err(|e| format!("Failed to run simulation: {}", e))?;

@@ -34,14 +34,23 @@ impl HardwareExecutor {
         self.tasks.push(Box::pin(future));
     }
 
-    pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
-        clk.advance();
-
+    fn poll_tasks(&mut self) {
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         for task in &mut self.tasks {
             let _ = task.as_mut().poll(&mut context);
-        } 
+        }
+    }
+
+    pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
+        // Pre-edge settle: allow combinational logic to run
+        self.poll_tasks();
+
+        // Advance clock edge
+        clk.advance();
+
+        // Post-edge settle: allow sequential logic to update
+        self.poll_tasks();
 
         self.cycle += 1;
     }
