@@ -50,9 +50,7 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 - ✅ Created `copper-core/src/types.rs` with foundational types
 - ✅ Implemented `Bit` type with 4-state logic (0, 1, X)
 - ✅ Implemented `Bits<N>` for bit vectors with compile-time width
-- ✅ Implemented `Signal<Domain, T>` with phantom type for clock domains
-- ✅ Implemented `Clock<Domain>` with tick semantics
-- ✅ Implemented `State<T>` wrapper for sequential state
+- ✅ Implemented `Clock<Domain>` with tick semantics and async/await support
 - ✅ Added comprehensive unit tests (10 tests, all passing)
 - ✅ Created demo example showing all type features
 - ✅ All types compile and pass tests
@@ -68,11 +66,11 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 
 **Goals:**
 - [ ] Implement `HardwareExecutor` with lockstep polling
-- [ ] Implement `ClockFuture` with waker registration
-- [ ] Implement atomic `State<T>` commit mechanism
+- [ ] Implement `ClockTick` Future with waker registration
 - [ ] Create working async counter example
 - [ ] Verify cycle-accurate simulation
 - [ ] Support multiple clock domains
+- [ ] Implement `#[hardware]` macro for port inference
 
 **Rationale:** Need working executor before function-typed modules can be properly demonstrated
 
@@ -90,10 +88,9 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 ### Type System Features
 - ✅ Bit with logic operations (AND, OR, XOR, NOT)
 - ✅ Bits<N> with arithmetic (add, shift, indexing)
-- ✅ Clock domain phantom types
-- ✅ Signal<Domain, T> for type-safe cross-domain checks
-- ✅ State<T> for sequential logic
-- ✅ Clock<Domain> for synchronous behavior
+- ✅ Clock<Domain> with async tick() for synchronous behavior
+- ✅ Clock domain phantom types for CDC safety
+- ✅ No wrapper types (Signal, State, Wire, Reg) - just plain Rust types
 
 ### Branch Information
 - **Branch:** `feature/new-type-system`
@@ -106,12 +103,12 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 
 1. ✅ Set up project tracking
 2. ✅ Create branch for new type system
-3. ✅ Begin implementing `Bit`, `Bits<N>`, `Signal<Domain, T>`
+3. ✅ Implement `Bit`, `Bits<N>`, `Clock<Domain>`
 4. ✅ Write first round of unit tests
 5. ✅ Define execution model (async executor with Verilator semantics)
 6. ✅ Document core design decisions
 7. [ ] Complete Week 1-2: Add more documentation and examples
-8. [ ] Start Week 3-4: Implement HardwareExecutor and ClockFuture
+8. [ ] Start Week 3-4: Implement HardwareExecutor and #[hardware] macro
 9. [ ] Build simple async counter example with executor
 
 ---
@@ -119,8 +116,8 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 ## Development Roadmap (12 Months)
 
 ### Month 1: Type System & Execution Runtime ⏳ IN PROGRESS
-- Week 1-2: Basic types (Bit, Bits, Signal, Clock, State) ✅ COMPLETE
-- Week 3-4: HardwareExecutor, ClockFuture, async runtime ⏳ NEXT
+- Week 1-2: Basic types (Bit, Bits, Clock) ✅ COMPLETE
+- Week 3-4: HardwareExecutor, ClockTick, async runtime ⏳ NEXT
 - **Deliverable:** Working Rust simulation of async counter with cycle-accurate execution
 
 ### Month 2: Function-Typed Modules & Macro System
@@ -190,24 +187,23 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 - **Type System Foundation**
   - `Bit` with 4-state logic
   - `Bits<N>` with const generic widths
-  - `Signal<Domain, T>` with phantom types
-  - `Clock<Domain>` with tick semantics
-  - `State<T>` with buffered updates
+  - `Clock<Domain>` with tick semantics and CDC tracking
+  - Logic enum supporting X (unknown) for simulation
   - 10 unit tests, all passing
   - Working demo example
 
 ### In Progress ⏳
-- **Week 1-2 Cleanup** (Minor)
-  - Add API docs for all public types
-  - Write migration guide from old Wire/Register
-  - Create more usage examples
+- **Week 1-2 Documentation** (Minor)
+  - Add API documentation for all public types
+  - Create usage examples demonstrating implicit registers
+  - Document type system design choices
 
 ### Next Up 🔜 (Week 3-4)
-- **HardwareExecutor** (PRIORITY)
+- **HardwareExecutor & Macro** (PRIORITY)
   - Implement lockstep executor loop
-  - Build ClockFuture with waker registration
+  - Build ClockTick with waker registration
   - Support multiple clock domains
-  - Atomic State<T> commit mechanism
+  - Implement `#[hardware]` macro for port inference
   - Create async counter example to validate
   
 **Then Month 2:**
@@ -240,7 +236,8 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 1. **Phantom types for clock domains** - Zero-cost abstraction, perfect fit for CDC safety
 2. **Const generics for bit widths** - Natural Rust feature, no macro magic needed
 3. **Async/await mapping** - Surprisingly natural for expressing sequential logic
-4. **State<T> buffering** - Clean separation of current vs next matches hardware semantics
+4. **Implicit registers** - Local variables across .await become registers automatically
+5. **Function-typed modules** - #[hardware] macro infers ports from signatures, no wrappers needed
 
 ### Technical Challenges
 1. **Async executor complexity** - Need careful design to match Verilator semantics exactly
@@ -275,14 +272,19 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 
 ### Design Decisions Made
 1. Clock domains use phantom types for zero-cost abstractions
-2. State<T> separates current/next for proper hardware semantics
-3. Bits<N> uses const generics for compile-time width checking
-4. Logic enum supports X (unknown) for simulation accuracy
+2. No wrapper types (Signal, State, Wire, Reg) - just plain Rust types
+3. Registers inferred from variables crossing .await boundaries
+4. #[hardware] macro infers ports from function signatures
+5. Bits<N> uses const generics for compile-time width checking
+6. Logic enum supports X (unknown) for simulation accuracy
 
 ### Lessons Learned
 - Phantom types in Rust work perfectly for clock domain tracking
 - const generics make bit-width type safety natural
-- State management needs explicit advance() for simulation
+- Wrapper types (Signal, State) are unnecessary - macro can infer everything
+- Rust's async transform automatically tracks variables across .await = implicit registers
+- Best HDLs (Clash, Esterel) don't distinguish wire/reg at type level
+- Function signatures ARE the port declarations - no explicit input/output needed
 
 ### Open Questions
 - Reset handling: Active high/low? Async/sync? Part of Clock or separate type?
@@ -307,21 +309,24 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 
 **Example:**
 ```rust
-async fn counter(clk: Clock<Domain>) {
-    let mut count = State::new(Bits::from(0u8));
+#[hardware]
+async fn counter(clk: Clock<Domain>) -> Bits<8> {
+    let mut count = Bits::from(0u8);  // Local variable = register
     loop {
         clk.tick().await;  // Pause here, resume on next clock edge
-        count.set(count.get() + Bits::from(1u8));
+        count = count + Bits::from(1u8);  // Direct assignment
     }
+    count  // Return value = output port
 }
 ```
 
 **How It Works:**
-1. Rust compiler transforms async fn into state machine automatically
-2. `ClockFuture::poll()` returns Pending until clock edge, then Ready
-3. Executor calls `tick()` → notifies all clocks → polls all tasks once
-4. All modules advance together, matching hardware parallelism
-5. Local variables in async fn = register state (preserved across cycles)
+1. `#[hardware]` macro analyzes function signature: parameters = inputs, return type = output
+2. Rust compiler transforms async fn into state machine automatically
+3. Local `mut` variables that cross `.await` = registers (automatic inference)
+4. `ClockFuture::poll()` returns Pending until clock edge, then Ready
+5. Executor polls all modules together (lockstep), matching hardware parallelism
+6. No wrapper types (Signal, State, Wire, Reg) - just plain Rust types in signatures
 
 ### Module Types
 - **Combinational**: Regular `fn` (zero delay, pure function, evaluated immediately)
@@ -336,21 +341,31 @@ async fn counter(clk: Clock<Domain>) {
 struct DomainA;
 struct DomainB;
 
-let sig_a: Signal<DomainA, Bits<8>> = ...;
-let sig_b: Signal<DomainB, Bits<8>> = ...;
+#[hardware]
+async fn module_a(clk: Clock<DomainA>) -> Bits<8> { /* ... */ }
 
-// Compile error: can't mix domains!
-let result = sig_a + sig_b;  // ❌ Type mismatch
+#[hardware]
+async fn module_b(clk: Clock<DomainB>) -> Bits<8> { /* ... */ }
 
-// Must use explicit synchronizer
-let sig_b_sync = synchronizer::two_ff(sig_b);  // Signal<DomainA, Bits<8>>
-let result = sig_a + sig_b_sync;  // ✅ Type-safe
+#[hardware]
+async fn top() {
+    let val_a = module_a(clk_a.clone());
+    let val_b = module_b(clk_b.clone());
+    
+    // Compile error: can't mix domains!
+    let result = val_a + val_b;  // ❌ Macro detects domain mismatch
+    
+    // Must use explicit synchronizer
+    let val_b_sync = synchronizer::two_ff::<DomainA>(val_b);
+    let result = val_a + val_b_sync;  // ✅ Type-safe
+}
 ```
 
 **Implementation:**
-- `Signal<Domain, T>` uses phantom type `Domain` (zero runtime cost)
-- Rust's type system prevents cross-domain operations
-- Synchronizers are explicit type conversions
+- `#[hardware]` macro tracks clock domains through parameters
+- Module outputs tagged with source clock domain (compile-time only)
+- Macro analysis prevents cross-domain operations
+- Synchronizers are explicit domain conversions
 - First HDL to leverage ownership for CDC safety
 
 ### No Combinational/Sequential Distinction
@@ -369,59 +384,92 @@ end
 **Copper:**
 ```rust
 // Function = combinational (automatic)
-fn logic(a: Bit, b: Bit) -> Bit {
-    a & b
+fn adder(a: Bits<8>, b: Bits<8>) -> Bits<8> {
+    a + b  // Pure function, evaluated immediately
 }
 
 // Async function = sequential (automatic)
-async fn register(clk: Clock<D>, d: Bit) -> Bit {
-    let mut q = State::new(Bit::ZERO);
+#[hardware]
+async fn register(clk: Clock<D>, d: Bits<8>) -> Bits<8> {
+    let mut q = Bits::from(0u8);  // Local variable = register
     loop {
-        clk.tick().await;
-        q.set(d);
+        clk.tick().await;  // Clock edge
+        q = d;  // Direct assignment
     }
+    q  // Output
 }
 ```
 
 No `always @(*)` vs `always @(posedge)` distinction needed - the type system knows!
 
 ### Module Instantiation & Hierarchy
-**Design Decision (In Progress):**
+**Design Decision (FINALIZED):**
+
+Modules are function-typed - the `#[hardware]` macro handles composition:
+
 ```rust
-// Option 1: Direct function calls (simplest)
-async fn top(clk: Clock<D>) {
-    let counter_out = counter(clk.clone()).await;
-    let adder_out = adder(counter_out, Bits::from(5u8));
+// Child module
+#[hardware]
+async fn counter(clk: Clock<Domain>) -> Bits<8> {
+    let mut count = Bits::from(0u8);
+    loop {
+        clk.tick().await;
+        count = count + 1;
+    }
+    count
 }
 
-// Option 2: Explicit spawn (clearer parallelism)
-async fn top(clk: Clock<D>) {
-    let counter = spawn(counter(clk.clone()));
-    let processor = spawn(processor(clk.clone()));
-    // Both run in parallel
+// Combinational module
+fn adder(a: Bits<8>, b: Bits<8>) -> Bits<8> {
+    a + b
+}
+
+// Parent module - composition through function calls
+#[hardware]
+async fn top(clk: Clock<Domain>) -> Bits<8> {
+    let counter_val = counter(clk.clone());  // Macro spawns child module
+    loop {
+        let sum = adder(counter_val, Bits::from(5u8));  // Combinational
+        clk.tick().await;
+    }
+    sum
 }
 ```
 
-**Still deciding:** Need to determine best API for expressing module connectivity
+**How It Works:**
+- `#[hardware]` macro intercepts function calls to other `#[hardware]` modules
+- Child modules are spawned in executor and run in parallel
+- Returns a handle that reads the child's current output
+- Combinational functions (`fn`) are called directly (zero delay)
+- Clean, natural Rust syntax - no explicit spawn/wire/connect
 
-### State Management & Register Updates
+### Register Inference & State Management
+**No explicit State<T> wrapper needed!**
+
 ```rust
-pub struct State<T> {
-    current: T,           // Value this cycle
-    next: Cell<Option<T>>, // Value next cycle (buffered)
-}
-
-impl<T> State<T> {
-    pub fn get(&self) -> T { self.current.clone() }
-    pub fn set(&self, value: T) { self.next.set(Some(value)) }
+#[hardware]
+async fn pipeline(clk: Clock<Domain>, input: Bits<8>) -> Bits<8> {
+    let mut stage1 = Bits::from(0u8);  // Register (crosses .await)
+    let mut stage2 = Bits::from(0u8);  // Register (crosses .await)
+    
+    loop {
+        let comb = input + Bits::from(1u8);  // Combinational (local to iteration)
+        
+        clk.tick().await;  // Clock edge boundary
+        
+        stage1 = comb;       // Updates on next clock
+        stage2 = stage1;     // Updates on next clock
+    }
+    stage2
 }
 ```
 
 **Semantics:**
-- `get()` returns current cycle value
-- `set()` buffers value for next cycle
-- All `State::commit()` happens atomically at cycle boundary
+- Variables that persist across `.await` = registers (Rust async transform tracks these)
+- Variables local to each loop iteration = wires/combinational
+- All register updates happen atomically at clock edge
 - Matches Verilog non-blocking assignment (`<=`) semantics
+- Macro analyzes variable lifetimes to generate correct Verilog
 
 ### Simulation vs Synthesis Path
 
@@ -470,16 +518,14 @@ impl<T> State<T> {
 ```rust
 Bit              // Single bit: 0, 1, or X (unknown)
 Bits<N>          // N-bit vector (const generic width)
-Signal<D, T>     // Value in clock domain D
 Clock<D>         // Clock source for domain D
-State<T>         // Register holding value T
 ```
 
 **Type Properties:**
 - `Bits<N>` supports: arithmetic (+, -, *), bitwise (&, |, ^), shifts (<<, >>), indexing
-- `Signal<D, T>` enforces: domain D must match for operations
 - `Clock<D>` provides: `tick()` returns `Future` for async/await
-- `State<T>` guarantees: atomic commit at cycle boundary
+- No wrapper types needed: function parameters/returns are plain types
+- CDC safety enforced through domain tracking in macro analysis
 
 ### Macro System (`#[hardware]`)
 
@@ -564,6 +610,43 @@ struct HardwareExecutor {
 - [ ] Build ClockFuture with proper waker semantics
 - [ ] Create async counter example
 - [ ] Document all design decisions in PROGRESS.md ✅
+
+---
+
+### February 22, 2026 - Execution Model Refinement
+
+**Major Decisions:**
+1. ✅ **Eliminate ALL wrapper types** - No Signal<>, State<>, Wire<>, Reg<>
+2. ✅ **Implicit register inference** - Variables crossing .await become registers automatically
+3. ✅ **Function-typed modules** - #[hardware] macro infers ports from function signature
+4. ✅ **Macro-based composition** - Child module calls intercepted and spawned by macro
+5. ✅ **Plain Rust types in signatures** - Just Bits<8>, not Signal<Domain, Bits<8>>
+
+**Research Insights from Other HDLs:**
+- **Clash/Lava:** No type-level wire/reg distinction, just delay operations
+- **Esterel:** Single signal type, `pause` creates cycle boundaries (like our .await)
+- **Bluespec:** Explicit Reg# type (what we want to avoid)
+- **Chisel:** Explicit Wire/Reg types (what we want to avoid)
+
+**Key Realization:**
+The most elegant HDLs (Clash, Lava, Esterel) don't distinguish wires/registers at the type level. Registers are created by **operations** (delay, pause, await), not by wrapping types. This is the true "function-typed modules" vision.
+
+**Implementation Strategy:**
+1. Keep Clock<Domain> for .await and CDC tracking
+2. Remove Signal<Domain, T> - just use plain T in signatures
+3. Remove State<T> - just use local mut variables
+4. #[hardware] macro does all the magic:
+   - Analyzes function signature for ports
+   - Tracks variable lifetimes for register inference
+   - Handles module composition/spawning
+   - Generates Verilog with correct wire/reg declarations
+
+**Action Items:**
+- [ ] Refactor copper-core/types.rs to remove Signal and State
+- [ ] Keep only: Bit, Bits<N>, Logic, Clock<Domain>, ClockTick
+- [ ] Update HardwareExecutor for macro-based module spawning
+- [ ] Implement register inference in #[hardware] macro
+- [ ] Create examples showing clean syntax without wrappers
 
 ---
 
