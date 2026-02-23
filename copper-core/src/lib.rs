@@ -2,7 +2,7 @@ pub mod ir;
 pub mod types;
 
 pub use ir::{ModuleIR};
-pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain, Logic};
+pub use types::{Bit, Bits, Clock, ClockDomain, Logic};
 
 // pub mod types;
 // pub mod verification;
@@ -13,9 +13,6 @@ pub use types::{Bit, Bits, Signal, Clock, State, ClockDomain, Logic};
 //     Bit, Bits, Clock, ClockDomain, Logic, Signal, State,
 // };
 
-// // Internal: for copper-sim executor
-#[doc(hidden)]
-pub use types::StateInner;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 

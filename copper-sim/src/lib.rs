@@ -5,9 +5,8 @@ pub mod verification;
 pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
 
 pub mod executor;
-// pub mod verification;
 
-pub use executor::{HardwareExecutor, StateFactory};
+pub use executor::{HardwareExecutor};
 
 pub struct Simulator<M: Module> {
     module: M,

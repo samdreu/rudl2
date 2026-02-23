@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemStruct, ItemImpl, ImplItem, Fields, Type};
+use syn::{parse_macro_input, ItemStruct, ItemImpl, ImplItem, Fields, Type, ItemFn};
 
 #[proc_macro_attribute]
 pub fn module_struct(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -120,5 +120,21 @@ pub fn module(args: TokenStream, input: TokenStream) -> TokenStream {
                 }
             }
         }
+    }.into()
+}
+
+/// #[hardware] macro for defining hardware modules
+/// 
+/// Transforms:
+/// - Regular fn → combinational logic
+/// - async fn → sequential logic with automatic register inference
+/// - Function signature → port declarations (no explicit input/output)
+#[proc_macro_attribute]
+pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(input as ItemFn);
+    // for now, just return the function unchanged
+    // In the future, we will transform this into a struct + impl with the appropriate traits
+    quote! {
+        #input_fn
     }.into()
 }
