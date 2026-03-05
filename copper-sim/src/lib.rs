@@ -6,7 +6,17 @@ pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
 
 pub mod executor;
 
-pub use executor::{HardwareExecutor};
+pub use executor::{HardwareExecutor, ModuleInfo};
+
+#[macro_export]
+macro_rules! spawn_child {
+    ($exec:expr, $parent:expr, $module_future:expr) => {{
+        $exec.spawn_child(stringify!($module_future), $parent, $module_future)
+    }};
+    ($exec:expr, $parent:expr, $child_name:expr, $module_future:expr) => {{
+        $exec.spawn_child($child_name, $parent, $module_future)
+    }};
+}
 
 pub struct Simulator<M: Module> {
     module: M,

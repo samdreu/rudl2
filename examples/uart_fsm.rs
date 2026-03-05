@@ -15,7 +15,7 @@ enum RxState {
 }
 
 // Simple UART RX: 1 start bit (0), 8 data bits LSB-first, 1 stop bit (1)
-#[hardware]
+// #[hardware]
 async fn uart_rx(
     clk: Clock<MainClk>,
     rx: Arc<Mutex<Bit>>,
