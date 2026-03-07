@@ -68,9 +68,6 @@ macro_rules! spawn_child {
 /// This provides a clearer API for sequential modules that emit outputs each cycle.
 #[macro_export]
 macro_rules! emit {
-    ($output:expr, $value:expr) => {{
-        *$output.lock().unwrap() = $value;
-    }};
     ($value:expr) => {{
         $crate::emit_to_current($value);
     }};
@@ -133,5 +130,14 @@ impl<M: Module> Simulator<M> {
     /// Get a mutable reference to the underlying module being simulated. This allows for modifying the module's state and properties during simulation.
     pub fn get_module_mut(&mut self) -> &mut M {
         &mut self.module
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[should_panic(expected = "emit!(value) called without a bound function-typed output")]
+    fn emit_without_bound_target_panics() {
+        crate::emit!(1u8);
     }
 }

@@ -11,11 +11,10 @@ impl ClockDomain for MainClk {}
 async fn valid_pipeline(
     clk: Clock<MainClk>, 
     input: Arc<Mutex<u8>>,
-    output: Arc<Mutex<u8>>,
 ) -> u8 {
     let mut reg = 0u8;
     loop {
-        emit!(output, reg);
+        emit!(reg);
         clk.tick().await;
         let val = *input.lock().unwrap();
         reg = val.wrapping_add(1);

@@ -6,9 +6,14 @@
 
 ### Completed
 - Added implicit function-typed emission: `emit!(value)` now works when a function-typed output is bound by the executor.
-- Kept explicit form for compatibility: `emit!(output, value)` still supported.
+- Removed legacy explicit emit form; the function-typed path now uses implicit `emit!(value)` exclusively.
 - Added `HardwareExecutor::spawn_function_typed(initial_output, future)` to spawn function-typed async modules without explicit output handle arguments in the module signature.
 - Added `HardwareExecutor::spawn_child_function_typed(...)` for hierarchical function-typed child modules with module hierarchy tracking.
+- Added runtime hardening tests for implicit-output execution:
+    - function-typed scalar output emission,
+    - tuple output emission,
+    - child hierarchy + implicit emission,
+    - panic behavior for `emit!(value)` without a bound target.
 
 ### Example Migration Status
 - Migrated to implicit output signatures (no explicit output handle parameter):
@@ -26,6 +31,33 @@
 
 ### Validation
 - `cargo build --examples` passes after migration.
+- All 14 examples execute successfully.
+- Full test suite passing (cargo test --all).
+
+### Educational Showcase: Verilog Pitfalls
+Created comprehensive educational showcases demonstrating common Verilog bugs that Copper's type system and ownership model prevent:
+
+**1. Basic Verilog Pitfalls (`examples/verilog_pitfalls.rs`)**
+- Latch inference from incomplete assignment (`bug_latch_inference.v`)
+- Implicit net declaration from typos (`bug_implicit_net_typo.v`)
+- Multiple driver races (`bug_multi_driver_race.v`)
+
+**2. Simulation Hazards (`examples/simulation_hazards.rs`)**
+Showcases with detailed cycle-by-cycle traces:
+- Blocking/non-blocking assignment races (`bug_blocking_race.v`)
+- Multiple assignments in one cycle (`bug_multi_assign_blocking.v`)
+- Read-during-write scheduler dependencies (`bug_read_write_race.v`)
+- Missing `default_nettype none (`bug_default_nettype.v`)
+
+**3. Security Vulnerabilities (`examples/security_showcase.rs`)**
+Hardware security bugs prevented by Copper:
+- Timing side-channels from incomplete case statements (`bug_timing_sidechannel.v`)
+- Uninitialized security-critical registers (`bug_register_init.v`)
+- FSM illegal state handling & fault injection resistance (`bug_fsm_illegal_state.v`)
+- Information leakage via unassigned outputs (`bug_info_leak.v`)
+- Privilege escalation via global state (prevented by ownership)
+
+These showcases provide concrete examples of Copper's safety advantages for publication and educational purposes.
 
 ### Core Mission
 Create a fundamentally better HDL that eliminates traditional hardware description pain points by leveraging Rust's unique features (ownership, type system, async/await).

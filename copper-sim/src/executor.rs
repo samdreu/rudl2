@@ -245,3 +245,81 @@ impl Default for HardwareExecutor {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HardwareExecutor;
+    use copper_core::{Clock, ClockDomain, Logic};
+
+    struct TestClk;
+    impl ClockDomain for TestClk {}
+
+    async fn counter_u8(clk: Clock<TestClk>) -> u8 {
+        let mut value = 0u8;
+        loop {
+            crate::emit!(value);
+            clk.tick().await;
+            value = value.wrapping_add(1);
+        }
+    }
+
+    async fn counter_tuple(clk: Clock<TestClk>) -> (u8, Logic) {
+        let mut value = 0u8;
+        loop {
+            let logic = if value & 1 == 1 { Logic::One } else { Logic::Zero };
+            crate::emit!((value, logic));
+            clk.tick().await;
+            value = value.wrapping_add(1);
+        }
+    }
+
+    #[test]
+    fn spawn_function_typed_emits_values() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let out = exec.spawn_function_typed(0u8, counter_u8(clk.clone()));
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*out.lock().unwrap(), 1u8);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*out.lock().unwrap(), 2u8);
+    }
+
+    #[test]
+    fn spawn_function_typed_supports_tuple_outputs() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let out = exec.spawn_function_typed((0u8, Logic::Zero), counter_tuple(clk.clone()));
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*out.lock().unwrap(), (1u8, Logic::One));
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*out.lock().unwrap(), (2u8, Logic::Zero));
+    }
+
+    #[test]
+    fn spawn_child_function_typed_tracks_hierarchy_and_emits() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let out = exec.spawn_child_function_typed(
+            "child_a",
+            "parent_a",
+            0u8,
+            counter_u8(clk.clone()),
+        );
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*out.lock().unwrap(), 1u8);
+
+        let parent = exec.module_info("parent_a").expect("missing parent module info");
+        assert!(parent.children.iter().any(|c| c == "child_a"));
+
+        let child = exec.module_info("child_a").expect("missing child module info");
+        assert_eq!(child.parent.as_deref(), Some("parent_a"));
+    }
+}
