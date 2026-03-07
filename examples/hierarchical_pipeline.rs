@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, spawn_child, verify_with_verilator};
+use copper_sim::{HardwareExecutor, SimulationTrace, spawn_child, verify_with_verilator, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -11,15 +11,15 @@ fn stage1_comb(input: u8) -> u8 {
     input.wrapping_add(1)
 }
 
-#[hardware]
+#[hardware(function_typed)]
 async fn stage1(
     clk: Clock<MainClk>,
     input: Arc<Mutex<u8>>,
     output: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let mut reg = 0u8;
     loop {
-        *output.lock().unwrap() = reg;
+        emit!(output, reg);
         clk.tick().await;
         reg = stage1_comb(*input.lock().unwrap());
     }
@@ -30,15 +30,15 @@ fn stage2_comb(input: u8) -> u8 {
     input.wrapping_add(input)
 }
 
-#[hardware]
+#[hardware(function_typed)]
 async fn stage2(
     clk: Clock<MainClk>,
     input: Arc<Mutex<u8>>,
     output: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let mut reg = 0u8;
     loop {
-        *output.lock().unwrap() = reg;
+        emit!(output, reg);
         clk.tick().await;
         let val = *input.lock().unwrap();
         reg = stage2_comb(val);

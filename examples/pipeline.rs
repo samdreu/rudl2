@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator};
+use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -7,18 +7,18 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 // 2-stage pipeline: stage1 increments by 1, stage2 doubles (adds to itself)
-#[hardware]
+#[hardware(function_typed)]
 async fn registered_pipeline(
     clk: Clock<MainClk>,
     in_data: Arc<Mutex<u8>>,
     out_data: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let mut stage1_data_r: u8 = 0;  // Registered stage1 output
     let mut stage2_data_r: u8 = 0;  // Registered stage2 output
 
     loop {
         // Output the registered stage2 value
-        *out_data.lock().unwrap() = stage2_data_r;
+        emit!(out_data, stage2_data_r);
 
         clk.tick().await;
 

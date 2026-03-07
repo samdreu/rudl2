@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator};
+use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -15,21 +15,21 @@ enum RxState {
 }
 
 // Simple UART RX: 1 start bit (0), 8 data bits LSB-first, 1 stop bit (1)
-// #[hardware]
+#[hardware(function_typed)]
 async fn uart_rx(
     clk: Clock<MainClk>,
     rx: Arc<Mutex<Bit>>,
     out_byte: Arc<Mutex<u8>>,
     out_valid: Arc<Mutex<Bit>>,
-) {
+) -> u8 {
     let mut state = RxState::Idle;
     let mut data: u8 = 0;
     let mut valid = Bit::ZERO;
 
     loop {
         // Output registered values
-        *out_byte.lock().unwrap() = data;
-        out_valid.lock().unwrap().clone_from(&valid);
+        emit!(out_byte, data);
+        emit!(out_valid, valid);
 
         clk.tick().await;
 

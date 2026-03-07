@@ -1,21 +1,21 @@
 use copper_core::{Clock, ClockDomain, Bits};
-use copper_sim::HardwareExecutor;
+use copper_sim::{HardwareExecutor, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-#[hardware]
+#[hardware(function_typed)]
 async fn counter(
     clk: Clock<MainClk>,
     increment: u128,
     output: Arc<Mutex<Bits<8>>>,
-) {
+) -> Bits<8> {
     let mut count = Bits::<8>::from_u128(0);
     
     loop {
-        output.lock().unwrap().clone_from(&count);
+        emit!(output, count.clone());
         clk.tick().await;
         count = count + Bits::<8>::from_u128(increment);
     }

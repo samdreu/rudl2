@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator};
+use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -15,18 +15,18 @@ fn alu(op: u8, a: u8, b: u8) -> u8 {
     }
 }
 
-#[hardware]
+#[hardware(function_typed)]
 async fn registered_alu(
     clk: Clock<MainClk>,
     op: Arc<Mutex<u8>>,
     a: Arc<Mutex<u8>>,
     b: Arc<Mutex<u8>>,
     out: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let mut reg: u8 = 0;
 
     loop {
-        *out.lock().unwrap() = reg;
+        emit!(out, reg);
         clk.tick().await;
 
         let op_val = *op.lock().unwrap();

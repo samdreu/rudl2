@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator};
+use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +7,7 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 // 2-stage pipeline with ready/valid
-#[hardware]
+#[hardware(function_typed)]
 async fn pipeline_ready_valid(
     clk: Clock<MainClk>,
     in_valid: Arc<Mutex<Bit>>,
@@ -16,7 +16,7 @@ async fn pipeline_ready_valid(
     in_ready: Arc<Mutex<Bit>>,
     out_valid: Arc<Mutex<Bit>>,
     out_data: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let mut s1_valid = Bit::ZERO;
     let mut s1_data: u8 = 0;
     let mut s2_valid = Bit::ZERO;
@@ -24,9 +24,9 @@ async fn pipeline_ready_valid(
 
     loop {
         // Output registered state
-        in_ready.lock().unwrap().clone_from(&Bit::from_bool(s1_valid == Bit::ZERO || s2_valid == Bit::ZERO || out_ready.lock().unwrap().0 == Logic::One));
-        out_valid.lock().unwrap().clone_from(&s2_valid);
-        *out_data.lock().unwrap() = s2_data;
+        emit!(in_ready, Bit::from_bool(s1_valid == Bit::ZERO || s2_valid == Bit::ZERO || out_ready.lock().unwrap().0 == Logic::One));
+        emit!(out_valid, s2_valid);
+        emit!(out_data, s2_data);
 
         clk.tick().await;
 

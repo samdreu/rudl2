@@ -1,24 +1,24 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator};
+use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-#[hardware]
+#[hardware(function_typed)]
 async fn simple_ram(
     clk: Clock<MainClk>,
     addr: Arc<Mutex<u8>>,
     we: Arc<Mutex<Bit>>,
     data_in: Arc<Mutex<u8>>,
     data_out: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let mut mem = [0u8; 4];
     let mut dout: u8 = 0;
 
     loop {
-        *data_out.lock().unwrap() = dout;
+        emit!(data_out, dout);
         clk.tick().await;
 
         let a = (*addr.lock().unwrap() & 0x3) as usize;
@@ -32,17 +32,17 @@ async fn simple_ram(
     }
 }
 
-#[hardware]
+#[hardware(function_typed)]
 async fn simple_rom(
     clk: Clock<MainClk>,
     addr: Arc<Mutex<u8>>,
     data_out: Arc<Mutex<u8>>,
-) {
+) -> u8 {
     let rom = [0x11u8, 0x22u8, 0x33u8, 0x44u8];
     let mut dout: u8 = 0;
 
     loop {
-        *data_out.lock().unwrap() = dout;
+        emit!(data_out, dout);
         clk.tick().await;
 
         let a = (*addr.lock().unwrap() & 0x3) as usize;

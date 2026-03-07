@@ -9,6 +9,8 @@ pub struct SimulationTrace {
     pub cycles: Vec<CycleData>,
 }
 
+/// Represents the data for a single cycle in the simulation, including the cycle number, input signal values, and output signal values. 
+/// This is used to compare against Verilator's output for verification.
 #[derive(Debug, Clone)]
 pub struct CycleData {
     pub cycle: usize,
@@ -17,10 +19,12 @@ pub struct CycleData {
 }
 
 impl SimulationTrace {
+    /// Create a new empty simulation trace. 
     pub fn new() -> Self {
         SimulationTrace { cycles: Vec::new() }
     }
 
+    /// Add a cycle's data to the trace. This includes the cycle number, input signal values, and output signal values.
     pub fn add_cycle(&mut self, cycle: usize, inputs: Vec<(String, Vec<Logic>)>, outputs: Vec<(String, Vec<Logic>)>) {
         self.cycles.push(CycleData { cycle, inputs, outputs });
     }

@@ -1,6 +1,6 @@
 use copper_core::{Bit, Clock, ClockDomain, Logic};
 use copper_macros::hardware;
-use copper_sim::{verify_with_verilator, HardwareExecutor, SimulationTrace};
+use copper_sim::{verify_with_verilator, HardwareExecutor, SimulationTrace, emit};
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
@@ -14,12 +14,12 @@ enum State {
 }
 
 // Mealy machine: detects "101". Output is 1 on the cycle the last '1' arrives.
-#[hardware]
+#[hardware(function_typed)]
 async fn mealy_101(
     clk: Clock<MainClk>,
     in_bit: Arc<Mutex<Bit>>,
     out_bit: Arc<Mutex<Bit>>,
-) {
+) -> Bit {
     let mut state = State::S0;
 
     loop {
@@ -30,7 +30,7 @@ async fn mealy_101(
             (_, Logic::X) => Bit::X,
             _ => Bit::ZERO,
         };
-        out_bit.lock().unwrap().clone_from(&output);
+        emit!(out_bit, output);
 
         clk.tick().await;
 
