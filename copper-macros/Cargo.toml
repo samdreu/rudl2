@@ -13,4 +13,7 @@ log = "0.4.29"
 proc-macro2 = "1.0.106"
 quote = "1.0.44"
 syn = { version = "2.0.114", features = ["full"] }
+
+[dev-dependencies]
 trybuild = "1.0.114"
+copper-sim = { version = "0.1.0", path = "../copper-sim" }

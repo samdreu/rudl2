@@ -13,10 +13,7 @@ async fn pipeline_ready_valid(
     in_valid: Arc<Mutex<Bit>>,
     in_data: Arc<Mutex<u8>>,
     out_ready: Arc<Mutex<Bit>>,
-    in_ready: Arc<Mutex<Bit>>,
-    out_valid: Arc<Mutex<Bit>>,
-    out_data: Arc<Mutex<u8>>,
-) -> u8 {
+) -> (Bit, Bit, u8) {
     let mut s1_valid = Bit::ZERO;
     let mut s1_data: u8 = 0;
     let mut s2_valid = Bit::ZERO;
@@ -24,9 +21,11 @@ async fn pipeline_ready_valid(
 
     loop {
         // Output registered state
-        emit!(in_ready, Bit::from_bool(s1_valid == Bit::ZERO || s2_valid == Bit::ZERO || out_ready.lock().unwrap().0 == Logic::One));
-        emit!(out_valid, s2_valid);
-        emit!(out_data, s2_data);
+        emit!((
+            Bit::from_bool(s1_valid == Bit::ZERO || s2_valid == Bit::ZERO || out_ready.lock().unwrap().0 == Logic::One),
+            s2_valid,
+            s2_data,
+        ));
 
         clk.tick().await;
 
@@ -72,19 +71,15 @@ fn main() {
     let in_valid = Arc::new(Mutex::new(Bit::ZERO));
     let in_data = Arc::new(Mutex::new(0u8));
     let out_ready = Arc::new(Mutex::new(Bit::ONE));
-    let in_ready = Arc::new(Mutex::new(Bit::ONE));
-    let out_valid = Arc::new(Mutex::new(Bit::ZERO));
-    let out_data = Arc::new(Mutex::new(0u8));
-
-    exec.spawn(pipeline_ready_valid(
-        clk.clone(),
-        Arc::clone(&in_valid),
-        Arc::clone(&in_data),
-        Arc::clone(&out_ready),
-        Arc::clone(&in_ready),
-        Arc::clone(&out_valid),
-        Arc::clone(&out_data),
-    ));
+    let out = exec.spawn_function_typed(
+        (Bit::ONE, Bit::ZERO, 0u8),
+        pipeline_ready_valid(
+            clk.clone(),
+            Arc::clone(&in_valid),
+            Arc::clone(&in_data),
+            Arc::clone(&out_ready),
+        ),
+    );
 
     let inputs = vec![1u8, 2, 3, 4, 5];
     let ready_pattern = vec![Logic::One, Logic::Zero, Logic::One, Logic::One, Logic::Zero, Logic::One, Logic::One];
@@ -97,7 +92,8 @@ fn main() {
         *out_ready.lock().unwrap() = Bit(ready);
 
         // Drive input if available and ready
-        let can_send = *in_ready.lock().unwrap() == Bit::ONE && in_idx < inputs.len();
+        let (in_ready, _, _) = *out.lock().unwrap();
+        let can_send = in_ready == Bit::ONE && in_idx < inputs.len();
         if can_send {
             *in_valid.lock().unwrap() = Bit::ONE;
             *in_data.lock().unwrap() = inputs[in_idx];
@@ -110,9 +106,7 @@ fn main() {
 
         let iv = *in_valid.lock().unwrap();
         let id = *in_data.lock().unwrap();
-        let ir = *in_ready.lock().unwrap();
-        let ov = *out_valid.lock().unwrap();
-        let od = *out_data.lock().unwrap();
+        let (ir, ov, od) = *out.lock().unwrap();
 
         println!(
             "cycle {} in_valid={:?} in_ready={:?} in_data={} out_valid={:?} out_ready={:?} out_data={}",

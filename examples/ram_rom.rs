@@ -12,13 +12,12 @@ async fn simple_ram(
     addr: Arc<Mutex<u8>>,
     we: Arc<Mutex<Bit>>,
     data_in: Arc<Mutex<u8>>,
-    data_out: Arc<Mutex<u8>>,
 ) -> u8 {
     let mut mem = [0u8; 4];
     let mut dout: u8 = 0;
 
     loop {
-        emit!(data_out, dout);
+        emit!(dout);
         clk.tick().await;
 
         let a = (*addr.lock().unwrap() & 0x3) as usize;
@@ -36,13 +35,12 @@ async fn simple_ram(
 async fn simple_rom(
     clk: Clock<MainClk>,
     addr: Arc<Mutex<u8>>,
-    data_out: Arc<Mutex<u8>>,
 ) -> u8 {
     let rom = [0x11u8, 0x22u8, 0x33u8, 0x44u8];
     let mut dout: u8 = 0;
 
     loop {
-        emit!(data_out, dout);
+        emit!(dout);
         clk.tick().await;
 
         let a = (*addr.lock().unwrap() & 0x3) as usize;
@@ -69,15 +67,15 @@ fn main() {
     let addr = Arc::new(Mutex::new(0u8));
     let we = Arc::new(Mutex::new(Bit::ZERO));
     let data_in = Arc::new(Mutex::new(0u8));
-    let data_out = Arc::new(Mutex::new(0u8));
-
-    exec.spawn(simple_ram(
-        clk.clone(),
-        Arc::clone(&addr),
-        Arc::clone(&we),
-        Arc::clone(&data_in),
-        Arc::clone(&data_out),
-    ));
+    let data_out = exec.spawn_function_typed(
+        0u8,
+        simple_ram(
+            clk.clone(),
+            Arc::clone(&addr),
+            Arc::clone(&we),
+            Arc::clone(&data_in),
+        ),
+    );
 
     println!("=== RAM Tests (Rust Simulation) ===");
     let mut ram_trace = SimulationTrace::new();
@@ -131,12 +129,10 @@ fn main() {
 
     // ROM test
     let addr_rom = Arc::new(Mutex::new(0u8));
-    let rom_out = Arc::new(Mutex::new(0u8));
-    exec.spawn(simple_rom(
-        clk.clone(),
-        Arc::clone(&addr_rom),
-        Arc::clone(&rom_out),
-    ));
+    let rom_out = exec.spawn_function_typed(
+        0u8,
+        simple_rom(clk.clone(), Arc::clone(&addr_rom)),
+    );
 
     let mut rom_trace = SimulationTrace::new();
     println!("\n=== ROM Tests (Rust Simulation) ===");

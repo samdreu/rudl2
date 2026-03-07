@@ -19,17 +19,14 @@ enum RxState {
 async fn uart_rx(
     clk: Clock<MainClk>,
     rx: Arc<Mutex<Bit>>,
-    out_byte: Arc<Mutex<u8>>,
-    out_valid: Arc<Mutex<Bit>>,
-) -> u8 {
+) -> (u8, Bit) {
     let mut state = RxState::Idle;
     let mut data: u8 = 0;
     let mut valid = Bit::ZERO;
 
     loop {
         // Output registered values
-        emit!(out_byte, data);
-        emit!(out_valid, valid);
+        emit!((data, valid));
 
         clk.tick().await;
 
@@ -80,15 +77,10 @@ fn main() {
     let mut exec = HardwareExecutor::new();
 
     let rx = Arc::new(Mutex::new(Bit::ONE));
-    let out_byte = Arc::new(Mutex::new(0u8));
-    let out_valid = Arc::new(Mutex::new(Bit::ZERO));
-
-    exec.spawn(uart_rx(
-        clk.clone(),
-        Arc::clone(&rx),
-        Arc::clone(&out_byte),
-        Arc::clone(&out_valid),
-    ));
+    let out = exec.spawn_function_typed(
+        (0u8, Bit::ZERO),
+        uart_rx(clk.clone(), Arc::clone(&rx)),
+    );
 
     // Send byte 0xA5 = 0b1010_0101, LSB-first: 1,0,1,0,0,1,0,1
     let mut bitstream = Vec::new();
@@ -113,8 +105,7 @@ fn main() {
     for &bit in bitstream.iter() {
         *rx.lock().unwrap() = Bit(bit);
         exec.tick_clock(&mut clk);
-        let byte = *out_byte.lock().unwrap();
-        let valid = *out_valid.lock().unwrap();
+        let (byte, valid) = *out.lock().unwrap();
         println!("cycle {} rx={:?} byte=0x{:02X} valid={:?}", clk.cycle(), bit, byte, valid.0);
 
         trace.add_cycle(

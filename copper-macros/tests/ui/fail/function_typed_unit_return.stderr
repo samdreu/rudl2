@@ -1,0 +1,13 @@
+error: #[hardware(function_typed)] does not allow unit `()` return type
+ --> tests/ui/fail/function_typed_unit_return.rs:9:53
+  |
+9 | async fn bad_module(clk: Clock<MainClk>, input: u8) -> () {
+  |                                                     ^^^^^
+
+warning: unused import: `Clock`
+ --> tests/ui/fail/function_typed_unit_return.rs:1:19
+  |
+1 | use copper_core::{Clock, ClockDomain};
+  |                   ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

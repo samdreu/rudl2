@@ -21,12 +21,11 @@ async fn registered_alu(
     op: Arc<Mutex<u8>>,
     a: Arc<Mutex<u8>>,
     b: Arc<Mutex<u8>>,
-    out: Arc<Mutex<u8>>,
 ) -> u8 {
     let mut reg: u8 = 0;
 
     loop {
-        emit!(out, reg);
+        emit!(reg);
         clk.tick().await;
 
         let op_val = *op.lock().unwrap();
@@ -69,15 +68,15 @@ fn main() {
     let op = Arc::new(Mutex::new(0u8));
     let a = Arc::new(Mutex::new(0u8));
     let b = Arc::new(Mutex::new(0u8));
-    let out = Arc::new(Mutex::new(0u8));
-
-    exec.spawn(registered_alu(
-        clk.clone(),
-        Arc::clone(&op),
-        Arc::clone(&a),
-        Arc::clone(&b),
-        Arc::clone(&out),
-    ));
+    let out = exec.spawn_function_typed(
+        0u8,
+        registered_alu(
+            clk.clone(),
+            Arc::clone(&op),
+            Arc::clone(&a),
+            Arc::clone(&b),
+        ),
+    );
 
     let pattern = vec![
         (0u8, 1u8, 2u8),

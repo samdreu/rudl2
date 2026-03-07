@@ -18,7 +18,6 @@ enum State {
 async fn mealy_101(
     clk: Clock<MainClk>,
     in_bit: Arc<Mutex<Bit>>,
-    out_bit: Arc<Mutex<Bit>>,
 ) -> Bit {
     let mut state = State::S0;
 
@@ -30,7 +29,7 @@ async fn mealy_101(
             (_, Logic::X) => Bit::X,
             _ => Bit::ZERO,
         };
-        emit!(out_bit, output);
+        emit!(output);
 
         clk.tick().await;
 
@@ -51,9 +50,10 @@ fn main() {
     let mut exec = HardwareExecutor::new();
 
     let in_bit = Arc::new(Mutex::new(Bit::ZERO));
-    let out_bit = Arc::new(Mutex::new(Bit::ZERO));
-
-    exec.spawn(mealy_101(clk.clone(), Arc::clone(&in_bit), Arc::clone(&out_bit)));
+    let out_bit = exec.spawn_function_typed(
+        Bit::ZERO,
+        mealy_101(clk.clone(), Arc::clone(&in_bit)),
+    );
 
     let inputs = vec![
         Logic::Zero,

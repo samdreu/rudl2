@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
 use copper_core::{Clock, ClockDomain};
@@ -22,11 +24,16 @@ fn noop_waker() -> Waker {
 /// which includes pre-edge and post-edge settling phases to allow combinational and sequential logic to execute properly.
 pub struct HardwareExecutor {
     // tasks to be done
-    tasks: Vec<Pin<Box<dyn Future<Output = ()>>>>,
+    tasks: Vec<TaskEntry>,
     // cycle that the exection is on
     cycle: u64,
     // modules included in the execution model
     modules: HashMap<String, ModuleInfo>,
+}
+
+struct TaskEntry {
+    future: Pin<Box<dyn Future<Output = ()>>>,
+    emit_target: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// Modules in the execution, with parent-child relationships. This is used for tracking the hierarchy of modules in the system, which can be useful for debugging and visualization.
@@ -66,7 +73,33 @@ impl HardwareExecutor {
         // Box it and pin it so it can be polled
         // - Boxing allows us to store different future types in the same vector
         // - Pinning ensures the future's memory location is stable, which is required for async
-        self.tasks.push(Box::pin(wrapped));
+        self.tasks.push(TaskEntry {
+            future: Box::pin(wrapped),
+            emit_target: None,
+        });
+    }
+
+    /// Spawn a function-typed module while automatically allocating a shared output signal.
+    ///
+    /// This keeps module call sites concise during migration: callers get back the output
+    /// handle and do not need to construct the `Arc<Mutex<T>>` manually.
+    pub fn spawn_function_typed<T, F>(&mut self, initial_output: T, future: F) -> Arc<Mutex<T>>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + 'static,
+    {
+        let output = Arc::new(Mutex::new(initial_output));
+        let emit_target: Arc<dyn Any + Send + Sync> = output.clone();
+
+        let wrapped = async move {
+            let _ = future.await;
+        };
+        self.tasks.push(TaskEntry {
+            future: Box::pin(wrapped),
+            emit_target: Some(emit_target),
+        });
+
+        output
     }
 
     /// spawn a child module's future, and track the parent-child relationship
@@ -105,6 +138,53 @@ impl HardwareExecutor {
         self.spawn(future);
     }
 
+    /// Spawn a function-typed child module, track hierarchy, and bind an implicit emit target.
+    pub fn spawn_child_function_typed<T, F>(
+        &mut self,
+        child_name: &str,
+        parent_name: &str,
+        initial_output: T,
+        future: F,
+    ) -> Arc<Mutex<T>>
+    where
+        T: Send + Sync + 'static,
+        F: Future<Output = T> + 'static,
+    {
+        // Ensure both parent and child modules are in the module info map
+        self.ensure_module(parent_name);
+        self.ensure_module(child_name);
+
+        {
+            let parent = self
+                .modules
+                .get_mut(parent_name)
+                .expect("parent module should exist");
+            if !parent.children.iter().any(|child| child == child_name) {
+                parent.children.push(child_name.to_string());
+            }
+        }
+
+        {
+            let child = self
+                .modules
+                .get_mut(child_name)
+                .expect("child module should exist");
+            child.parent = Some(parent_name.to_string());
+        }
+
+        let output = Arc::new(Mutex::new(initial_output));
+        let emit_target: Arc<dyn Any + Send + Sync> = output.clone();
+        let wrapped = async move {
+            let _ = future.await;
+        };
+        self.tasks.push(TaskEntry {
+            future: Box::pin(wrapped),
+            emit_target: Some(emit_target),
+        });
+
+        output
+    }
+
     /// Get information about a module by name, if it exists. This can be used to inspect the module hierarchy and relationships.
     pub fn module_info(&self, module_name: &str) -> Option<&ModuleInfo> {
         self.modules.get(module_name)
@@ -122,7 +202,8 @@ impl HardwareExecutor {
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         for task in &mut self.tasks {
-            let _ = task.as_mut().poll(&mut context);
+            let _emit_guard = crate::push_emit_target(task.emit_target.clone());
+            let _ = task.future.as_mut().poll(&mut context);
         }
     }
 

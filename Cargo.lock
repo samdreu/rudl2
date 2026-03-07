@@ -98,6 +98,7 @@ name = "copper-macros"
 version = "0.1.0"
 dependencies = [
  "copper-core",
+ "copper-sim",
  "env_logger",
  "log",
  "proc-macro2",

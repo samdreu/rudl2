@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, spawn_child, verify_with_verilator, emit};
+use copper_sim::{emit, HardwareExecutor, SimulationTrace, verify_with_verilator};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -15,11 +15,10 @@ fn stage1_comb(input: u8) -> u8 {
 async fn stage1(
     clk: Clock<MainClk>,
     input: Arc<Mutex<u8>>,
-    output: Arc<Mutex<u8>>,
 ) -> u8 {
     let mut reg = 0u8;
     loop {
-        emit!(output, reg);
+        emit!(reg);
         clk.tick().await;
         reg = stage1_comb(*input.lock().unwrap());
     }
@@ -34,11 +33,10 @@ fn stage2_comb(input: u8) -> u8 {
 async fn stage2(
     clk: Clock<MainClk>,
     input: Arc<Mutex<u8>>,
-    output: Arc<Mutex<u8>>,
 ) -> u8 {
     let mut reg = 0u8;
     loop {
-        emit!(output, reg);
+        emit!(reg);
         clk.tick().await;
         let val = *input.lock().unwrap();
         reg = stage2_comb(val);
@@ -55,23 +53,18 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    // Create wires connecting modules
     let in_data = Arc::new(Mutex::new(0u8));
-    let wire_s1_s2 = Arc::new(Mutex::new(0u8));
-    let out_data = Arc::new(Mutex::new(0u8));
-
-    // Spawn sequential child modules under a named parent.
-    spawn_child!(
-        exec,
-        "pipeline",
+    let wire_s1_s2 = exec.spawn_child_function_typed(
         "stage1",
-        stage1(clk.clone(), Arc::clone(&in_data), Arc::clone(&wire_s1_s2))
-    );
-    spawn_child!(
-        exec,
         "pipeline",
+        0u8,
+        stage1(clk.clone(), Arc::clone(&in_data)),
+    );
+    let out_data = exec.spawn_child_function_typed(
         "stage2",
-        stage2(clk.clone(), Arc::clone(&wire_s1_s2), Arc::clone(&out_data))
+        "pipeline",
+        0u8,
+        stage2(clk.clone(), Arc::clone(&wire_s1_s2)),
     );
 
     let test_inputs = vec![5u8, 10, 15];

@@ -11,14 +11,13 @@ impl ClockDomain for MainClk {}
 async fn registered_pipeline(
     clk: Clock<MainClk>,
     in_data: Arc<Mutex<u8>>,
-    out_data: Arc<Mutex<u8>>,
 ) -> u8 {
     let mut stage1_data_r: u8 = 0;  // Registered stage1 output
     let mut stage2_data_r: u8 = 0;  // Registered stage2 output
 
     loop {
         // Output the registered stage2 value
-        emit!(out_data, stage2_data_r);
+        emit!(stage2_data_r);
 
         clk.tick().await;
 
@@ -44,13 +43,10 @@ fn main() {
     let mut exec = HardwareExecutor::new();
 
     let in_data = Arc::new(Mutex::new(0u8));
-    let out_data = Arc::new(Mutex::new(0u8));
-
-    exec.spawn(registered_pipeline(
-        clk.clone(),
-        Arc::clone(&in_data),
-        Arc::clone(&out_data),
-    ));
+    let out_data = exec.spawn_function_typed(
+        0u8,
+        registered_pipeline(clk.clone(), Arc::clone(&in_data)),
+    );
 
     let test_inputs = vec![5u8, 10, 15];
     let mut trace = SimulationTrace::new();

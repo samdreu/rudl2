@@ -1,5 +1,8 @@
 use copper_core::Module;
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub mod verification;
 pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
@@ -7,6 +10,48 @@ pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
 pub mod executor;
 
 pub use executor::{HardwareExecutor, ModuleInfo};
+
+thread_local! {
+    static CURRENT_EMIT_TARGET: RefCell<Option<Arc<dyn Any + Send + Sync>>> = RefCell::new(None);
+}
+
+pub(crate) struct EmitTargetGuard {
+    previous: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl Drop for EmitTargetGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CURRENT_EMIT_TARGET.with(|cell| {
+            *cell.borrow_mut() = previous;
+        });
+    }
+}
+
+pub(crate) fn push_emit_target(target: Option<Arc<dyn Any + Send + Sync>>) -> EmitTargetGuard {
+    let previous = CURRENT_EMIT_TARGET.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        std::mem::replace(&mut *slot, target)
+    });
+    EmitTargetGuard { previous }
+}
+
+pub fn emit_to_current<T>(value: T)
+where
+    T: Send + 'static,
+{
+    CURRENT_EMIT_TARGET.with(|cell| {
+        let target = cell
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("emit!(value) called without a bound function-typed output");
+
+        let typed = Arc::downcast::<Mutex<T>>(target)
+            .expect("emit!(value) type mismatch for currently bound function-typed output");
+        *typed.lock().unwrap() = value;
+    });
+}
 
 /// A helper macro to spawn a child module's future and track the parent-child relationship in the executor.
 #[macro_export]
@@ -25,6 +70,9 @@ macro_rules! spawn_child {
 macro_rules! emit {
     ($output:expr, $value:expr) => {{
         *$output.lock().unwrap() = $value;
+    }};
+    ($value:expr) => {{
+        $crate::emit_to_current($value);
     }};
 }
 
