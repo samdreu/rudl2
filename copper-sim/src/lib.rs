@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 pub mod verification;
 pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
 
+pub mod testing;
+pub use testing::{HardwareTest, TestResult, make_cycle};
+
 pub mod executor;
 
 pub use executor::{HardwareExecutor, ModuleInfo};
@@ -113,7 +116,7 @@ impl<M: Module> Simulator<M> {
     }
 
     /// TODO: add methods for dumping waveforms, exporting VCD files, etc.
-    pub fn dump_vcd(&self, filename: &str) {
+    pub fn dump_vcd(&self, _filename: &str) {
         // Generate VCD (Value Change Dump) for waveform viewers
     }
 

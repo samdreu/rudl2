@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use log::trace;
 
 use copper_core::{Clock, ClockDomain};
 
@@ -198,13 +199,20 @@ impl HardwareExecutor {
     /// Poll all tasks in the executor. This will drive the execution of all async tasks, allowing them to make progress. 
     /// In a real hardware simulation, this would correspond to allowing all combinational logic to settle and all sequential
     /// logic to update based on the current inputs and clock edge.
-    fn poll_tasks(&mut self) {
+    /// Publicly poll all tasks (combinational settle phase)
+    pub fn poll_tasks(&mut self) {
+        // log::trace!("Polling tasks at cycle {}", self.cycle);
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         for task in &mut self.tasks {
             let _emit_guard = crate::push_emit_target(task.emit_target.clone());
             let _ = task.future.as_mut().poll(&mut context);
         }
+    }
+    /// Advance the clock edge only (no polling)
+    pub fn advance<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
+        clk.advance();
+        self.cycle += 1;
     }
 
     /// Advance the simulation by one clock cycle. 

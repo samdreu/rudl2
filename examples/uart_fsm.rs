@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
+use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -25,15 +25,12 @@ async fn uart_rx(
     let mut valid = Bit::ZERO;
 
     loop {
-        // Output registered values
         emit!((data, valid));
-
         clk.tick().await;
 
-        // Clear valid by default each cycle
         valid = Bit::ZERO;
-
         let rx_bit = *rx.lock().unwrap();
+
         match state {
             RxState::Idle => {
                 if rx_bit.0 == Logic::Zero {
@@ -41,7 +38,6 @@ async fn uart_rx(
                 }
             }
             RxState::Start => {
-                // Move directly into data sampling
                 state = RxState::Data(0);
             }
             RxState::Data(idx) => {
@@ -50,11 +46,7 @@ async fn uart_rx(
                 } else {
                     data &= !(1 << idx);
                 }
-                if idx == 7 {
-                    state = RxState::Stop;
-                } else {
-                    state = RxState::Data(idx + 1);
-                }
+                state = if idx == 7 { RxState::Stop } else { RxState::Data(idx + 1) };
             }
             RxState::Stop => {
                 if rx_bit.0 == Logic::One {
@@ -76,7 +68,7 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let rx = Arc::new(Mutex::new(Bit::ONE));
+    let rx  = Arc::new(Mutex::new(Bit::ONE));
     let out = exec.spawn_function_typed(
         (0u8, Bit::ZERO),
         uart_rx(clk.clone(), Arc::clone(&rx)),
@@ -85,43 +77,32 @@ fn main() {
     // Send byte 0xA5 = 0b1010_0101, LSB-first: 1,0,1,0,0,1,0,1
     let mut bitstream = Vec::new();
     bitstream.extend([Logic::One, Logic::One]); // idle
-    bitstream.push(Logic::Zero); // start
+    bitstream.push(Logic::Zero);                // start
     bitstream.extend([
-        Logic::One,
-        Logic::Zero,
-        Logic::One,
-        Logic::Zero,
-        Logic::Zero,
-        Logic::One,
-        Logic::Zero,
-        Logic::One,
+        Logic::One, Logic::Zero, Logic::One, Logic::Zero,
+        Logic::Zero, Logic::One, Logic::Zero, Logic::One,
     ]);
-    bitstream.push(Logic::One); // stop
+    bitstream.push(Logic::One);                 // stop
     bitstream.extend([Logic::One, Logic::One]); // idle
 
-    let mut trace = SimulationTrace::new();
+    let mut test = HardwareTest::new("uart_fsm")
+        .with_verilog("verilog/uart_fsm.v")
+        .with_waveform("waveforms/uart_fsm.vcd");
 
-    println!("=== UART RX FSM Tests (Rust Simulation) ===");
+    println!("=== UART RX FSM ===");
     for &bit in bitstream.iter() {
         *rx.lock().unwrap() = Bit(bit);
         exec.tick_clock(&mut clk);
         let (byte, valid) = *out.lock().unwrap();
         println!("cycle {} rx={:?} byte=0x{:02X} valid={:?}", clk.cycle(), bit, byte, valid.0);
 
-        trace.add_cycle(
+        let byte_logic = u8_to_logic_vec(byte);
+        test.record_cycle(
             clk.cycle() as usize,
-            vec![("rx".to_string(), vec![bit])],
-            vec![
-                ("out_valid".to_string(), vec![valid.0]),
-                ("out_byte".to_string(), u8_to_logic_vec(byte)),
-            ],
+            &[("rx", &[bit])],
+            &[("out_valid", &[valid.0]), ("out_byte", &byte_logic)],
         );
     }
 
-    println!("\n=== Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/uart_fsm.v", "uart_fsm", &trace) {
-        Ok(true) => println!("✓ Verilator verification PASSED! Rust and Verilog match!"),
-        Ok(false) => println!("✗ Verilator verification FAILED!"),
-        Err(e) => println!("⚠ Verilator verification error: {}", e),
-    }
+    test.finish().assert_passed();
 }

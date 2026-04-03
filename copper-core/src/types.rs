@@ -7,7 +7,7 @@
 
 use std::marker::PhantomData;
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -337,8 +337,8 @@ struct ClockState {
 /// Each clock has an associated domain type for safety.
 #[derive(Debug)]
 pub struct Clock<Domain: ClockDomain> {
-    state: Arc<Mutex<ClockState>>,
-    _domain: PhantomData<Domain>,
+    state: Arc<Mutex<ClockState>>, // shared state for tracking clock cycles and waiting tasks
+    _domain: PhantomData<Domain>, // phantom type to associate with clock domain
 }
 
 impl<Domain: ClockDomain> Clock<Domain> {
@@ -346,10 +346,10 @@ impl<Domain: ClockDomain> Clock<Domain> {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(ClockState {
-                cycle: 0,
-                wakers: Vec::new(),
+                cycle: 0, // starts at t=0
+                wakers: Vec::new(), // no wakers initially
             })),
-            _domain: PhantomData,
+            _domain: PhantomData, 
         }
     }
     
@@ -382,10 +382,11 @@ impl<Domain: ClockDomain> Clock<Domain> {
     /// }
     /// ```
     pub fn tick(&self) -> ClockTick<Domain> {
+        // TODO: add an error if overflow occurs (unlikely in practice)
         let target = self.cycle().wrapping_add(1); 
         ClockTick {
-            state: Arc::clone(&self.state),
-            target_cycle: target,
+            state: Arc::clone(&self.state), // get same state
+            target_cycle: target, // target is next cycle
             _domain: PhantomData,
         }
     }

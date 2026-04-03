@@ -1,12 +1,12 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
+use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-// 2-stage pipeline with ready/valid
+// 2-stage pipeline with ready/valid handshaking
 #[hardware(function_typed)]
 async fn pipeline_ready_valid(
     clk: Clock<MainClk>,
@@ -20,7 +20,6 @@ async fn pipeline_ready_valid(
     let mut s2_data: u8 = 0;
 
     loop {
-        // Output registered state
         emit!((
             Bit::from_bool(s1_valid == Bit::ZERO || s2_valid == Bit::ZERO || out_ready.lock().unwrap().0 == Logic::One),
             s2_valid,
@@ -29,28 +28,26 @@ async fn pipeline_ready_valid(
 
         clk.tick().await;
 
-        let in_v = *in_valid.lock().unwrap();
-        let in_d = *in_data.lock().unwrap();
+        let in_v  = *in_valid.lock().unwrap();
+        let in_d  = *in_data.lock().unwrap();
         let out_r = *out_ready.lock().unwrap();
 
         let s2_accept = s2_valid == Bit::ZERO || out_r == Bit::ONE;
         let s1_accept = s1_valid == Bit::ZERO || s2_accept;
 
-        // Update stage2
         if s2_accept {
             if s1_valid == Bit::ONE {
                 s2_valid = Bit::ONE;
-                s2_data = s1_data.wrapping_add(s1_data);
+                s2_data  = s1_data.wrapping_add(s1_data);
             } else {
                 s2_valid = Bit::ZERO;
             }
         }
 
-        // Update stage1
         if s1_accept {
             if in_v == Bit::ONE {
                 s1_valid = Bit::ONE;
-                s1_data = in_d.wrapping_add(1);
+                s1_data  = in_d.wrapping_add(1);
             } else {
                 s1_valid = Bit::ZERO;
             }
@@ -68,8 +65,8 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let in_valid = Arc::new(Mutex::new(Bit::ZERO));
-    let in_data = Arc::new(Mutex::new(0u8));
+    let in_valid  = Arc::new(Mutex::new(Bit::ZERO));
+    let in_data   = Arc::new(Mutex::new(0u8));
     let out_ready = Arc::new(Mutex::new(Bit::ONE));
     let out = exec.spawn_function_typed(
         (Bit::ONE, Bit::ZERO, 0u8),
@@ -81,22 +78,26 @@ fn main() {
         ),
     );
 
-    let inputs = vec![1u8, 2, 3, 4, 5];
-    let ready_pattern = vec![Logic::One, Logic::Zero, Logic::One, Logic::One, Logic::Zero, Logic::One, Logic::One];
+    let inputs        = vec![1u8, 2, 3, 4, 5];
+    let ready_pattern = vec![
+        Logic::One, Logic::Zero, Logic::One, Logic::One, Logic::Zero, Logic::One, Logic::One,
+    ];
 
-    let mut trace = SimulationTrace::new();
+    let mut test = HardwareTest::new("pipeline_stall")
+        .with_verilog("verilog/pipeline_stall.v")
+        .with_waveform("waveforms/pipeline_stall.vcd");
+
     let mut in_idx = 0usize;
 
-    println!("=== Pipeline Ready/Valid Tests (Rust Simulation) ===");
+    println!("=== Pipeline Ready/Valid ===");
     for &ready in ready_pattern.iter() {
         *out_ready.lock().unwrap() = Bit(ready);
 
-        // Drive input if available and ready
         let (in_ready, _, _) = *out.lock().unwrap();
         let can_send = in_ready == Bit::ONE && in_idx < inputs.len();
         if can_send {
             *in_valid.lock().unwrap() = Bit::ONE;
-            *in_data.lock().unwrap() = inputs[in_idx];
+            *in_data.lock().unwrap()  = inputs[in_idx];
             in_idx += 1;
         } else {
             *in_valid.lock().unwrap() = Bit::ZERO;
@@ -104,8 +105,8 @@ fn main() {
 
         exec.tick_clock(&mut clk);
 
-        let iv = *in_valid.lock().unwrap();
-        let id = *in_data.lock().unwrap();
+        let iv          = *in_valid.lock().unwrap();
+        let id          = *in_data.lock().unwrap();
         let (ir, ov, od) = *out.lock().unwrap();
 
         println!(
@@ -113,25 +114,22 @@ fn main() {
             clk.cycle(), iv.0, ir.0, id, ov.0, ready, od
         );
 
-        trace.add_cycle(
+        let id_logic  = u8_to_logic_vec(id);
+        let od_logic  = u8_to_logic_vec(od);
+        test.record_cycle(
             clk.cycle() as usize,
-            vec![
-                ("in_valid".to_string(), vec![iv.0]),
-                ("in_data".to_string(), u8_to_logic_vec(id)),
-                ("out_ready".to_string(), vec![ready]),
+            &[
+                ("in_valid",  &[iv.0]),
+                ("in_data",   &id_logic),
+                ("out_ready", &[ready]),
             ],
-            vec![
-                ("in_ready".to_string(), vec![ir.0]),
-                ("out_valid".to_string(), vec![ov.0]),
-                ("out_data".to_string(), u8_to_logic_vec(od)),
+            &[
+                ("in_ready",  &[ir.0]),
+                ("out_valid", &[ov.0]),
+                ("out_data",  &od_logic),
             ],
         );
     }
 
-    println!("\n=== Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/pipeline_stall.v", "pipeline_stall", &trace) {
-        Ok(true) => println!("✓ Verilator verification PASSED! Rust and Verilog match!"),
-        Ok(false) => println!("✗ Verilator verification FAILED!"),
-        Err(e) => println!("⚠ Verilator verification error: {}", e),
-    }
+    test.finish().assert_passed();
 }

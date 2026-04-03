@@ -1,6 +1,6 @@
 use copper_core::{Bit, Clock, ClockDomain, Logic};
 use copper_macros::hardware;
-use copper_sim::{verify_with_verilator, HardwareExecutor, SimulationTrace, emit};
+use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
@@ -13,7 +13,7 @@ enum State {
     S2, // saw '10'
 }
 
-// Mealy machine: detects "101". Output is 1 on the cycle the last '1' arrives.
+/// Mealy machine: detects "101". Output is 1 on the cycle the last '1' arrives.
 #[hardware(function_typed)]
 async fn mealy_101(
     clk: Clock<MainClk>,
@@ -34,11 +34,11 @@ async fn mealy_101(
         clk.tick().await;
 
         state = match (state, input.0) {
-            (State::S0, Logic::One) => State::S1,
+            (State::S0, Logic::One)  => State::S1,
             (State::S0, Logic::Zero) => State::S0,
             (State::S1, Logic::Zero) => State::S2,
-            (State::S1, Logic::One) => State::S1,
-            (State::S2, Logic::One) => State::S1,
+            (State::S1, Logic::One)  => State::S1,
+            (State::S2, Logic::One)  => State::S1,
             (State::S2, Logic::Zero) => State::S0,
             (_, Logic::X) => state,
         };
@@ -55,6 +55,7 @@ fn main() {
         mealy_101(clk.clone(), Arc::clone(&in_bit)),
     );
 
+    // Input stream — detects "101" at positions 3 and 6 (0-indexed)
     let inputs = vec![
         Logic::Zero,
         Logic::One,
@@ -67,26 +68,23 @@ fn main() {
         Logic::Zero,
     ];
 
-    let mut trace = SimulationTrace::new();
+    let mut test = HardwareTest::new("mealy")
+        .with_verilog("verilog/mealy.v")
+        .with_waveform("waveforms/mealy.vcd");
 
-    println!("=== Mealy 101 Detector (Rust Simulation) ===");
+    println!("=== Mealy 101 Detector ===");
     for &bit in inputs.iter() {
         *in_bit.lock().unwrap() = Bit(bit);
         exec.tick_clock(&mut clk);
         let out = *out_bit.lock().unwrap();
         println!("cycle {} in={:?} out={:?}", clk.cycle(), bit, out.0);
 
-        trace.add_cycle(
+        test.record_cycle(
             clk.cycle() as usize,
-            vec![("in_bit".to_string(), vec![bit])],
-            vec![("out_bit".to_string(), vec![out.0])],
+            &[("in_bit", &[bit])],
+            &[("out_bit", &[out.0])],
         );
     }
 
-    println!("\n=== Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/mealy.v", "mealy", &trace) {
-        Ok(true) => println!("✓ Verilator verification PASSED! Rust and Verilog match!"),
-        Ok(false) => println!("✗ Verilator verification FAILED!"),
-        Err(e) => println!("⚠ Verilator verification error: {}", e),
-    }
+    test.finish().assert_passed();
 }

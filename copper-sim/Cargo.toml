@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
+log = "0.4.29"
 syn = "2.0.114"

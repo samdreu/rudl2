@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
+use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -29,8 +29,8 @@ async fn registered_alu(
         clk.tick().await;
 
         let op_val = *op.lock().unwrap();
-        let a_val = *a.lock().unwrap();
-        let b_val = *b.lock().unwrap();
+        let a_val  = *a.lock().unwrap();
+        let b_val  = *b.lock().unwrap();
         reg = alu(op_val, a_val, b_val);
     }
 }
@@ -48,34 +48,21 @@ fn u2_to_logic_vec(val: u8) -> Vec<Logic> {
 }
 
 fn main() {
-    println!("=== Combinational ALU Tests ===");
-    let tests = vec![
-        (0u8, 10u8, 3u8),
-        (1u8, 10u8, 3u8),
-        (2u8, 0b1100u8, 0b1010u8),
-        (3u8, 0b1100u8, 0b1010u8),
-    ];
-
-    for (op, a, b) in tests.iter().copied() {
-        let out = alu(op, a, b);
-        println!("op={} a={} b={} -> out={}", op, a, b, out);
+    println!("=== Combinational ALU ===");
+    for (op, a, b) in [(0u8, 10u8, 3u8), (1, 10, 3), (2, 0b1100, 0b1010), (3, 0b1100, 0b1010)] {
+        println!("op={} a={} b={} -> out={}", op, a, b, alu(op, a, b));
     }
 
-    println!("\n=== Sequential ALU Tests (Rust Simulation) ===");
+    println!("\n=== Sequential ALU ===");
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
     let op = Arc::new(Mutex::new(0u8));
-    let a = Arc::new(Mutex::new(0u8));
-    let b = Arc::new(Mutex::new(0u8));
+    let a  = Arc::new(Mutex::new(0u8));
+    let b  = Arc::new(Mutex::new(0u8));
     let out = exec.spawn_function_typed(
         0u8,
-        registered_alu(
-            clk.clone(),
-            Arc::clone(&op),
-            Arc::clone(&a),
-            Arc::clone(&b),
-        ),
+        registered_alu(clk.clone(), Arc::clone(&op), Arc::clone(&a), Arc::clone(&b)),
     );
 
     let pattern = vec![
@@ -85,33 +72,29 @@ fn main() {
         (3u8, 0b1010u8, 0b1100u8),
     ];
 
-    let mut trace = SimulationTrace::new();
+    let mut test = HardwareTest::new("alu")
+        .with_verilog("verilog/alu.v")
+        .with_waveform("waveforms/alu.vcd");
 
     for (op_val, a_val, b_val) in pattern.iter().copied() {
         *op.lock().unwrap() = op_val;
-        *a.lock().unwrap() = a_val;
-        *b.lock().unwrap() = b_val;
+        *a.lock().unwrap()  = a_val;
+        *b.lock().unwrap()  = b_val;
 
         exec.tick_clock(&mut clk);
         let out_val = *out.lock().unwrap();
-
         println!("cycle {} op={} a={} b={} out={}", clk.cycle(), op_val, a_val, b_val, out_val);
 
-        trace.add_cycle(
+        let op_logic  = u2_to_logic_vec(op_val);
+        let a_logic   = u8_to_logic_vec(a_val);
+        let b_logic   = u8_to_logic_vec(b_val);
+        let out_logic = u8_to_logic_vec(out_val);
+        test.record_cycle(
             clk.cycle() as usize,
-            vec![
-                ("op".to_string(), u2_to_logic_vec(op_val)),
-                ("a".to_string(), u8_to_logic_vec(a_val)),
-                ("b".to_string(), u8_to_logic_vec(b_val)),
-            ],
-            vec![("out".to_string(), u8_to_logic_vec(out_val))],
+            &[("op", &op_logic), ("a", &a_logic), ("b", &b_logic)],
+            &[("out", &out_logic)],
         );
     }
 
-    println!("\n=== Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/alu.v", "alu", &trace) {
-        Ok(true) => println!("✓ Verilator verification PASSED! Rust and Verilog match!"),
-        Ok(false) => println!("✗ Verilator verification FAILED!"),
-        Err(e) => println!("⚠ Verilator verification error: {}", e),
-    }
+    test.finish().assert_passed();
 }
