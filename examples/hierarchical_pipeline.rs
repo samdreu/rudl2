@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Logic};
-use copper_sim::{emit, HardwareExecutor, SimulationTrace, verify_with_verilator};
+use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -36,10 +36,14 @@ async fn stage2(
 ) -> u8 {
     let mut reg = 0u8;
     loop {
+        // Sample stage1's currently-emitted (registered) output before the clock edge.
+        // This captures stage1's value from the previous cycle, matching Verilog's
+        // non-blocking assignment semantics where stage2_data uses stage1_data_r
+        // (the pre-edge registered value), not the same-edge combinatorial result.
+        let s1_val = *input.lock().unwrap();
         emit!(reg);
         clk.tick().await;
-        let val = *input.lock().unwrap();
-        reg = stage2_comb(val);
+        reg = stage2_comb(s1_val);
     }
 }
 
@@ -53,7 +57,7 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let in_data = Arc::new(Mutex::new(0u8));
+    let in_data   = Arc::new(Mutex::new(0u8));
     let wire_s1_s2 = exec.spawn_child_function_typed(
         "stage1",
         "pipeline",
@@ -68,43 +72,44 @@ fn main() {
     );
 
     let test_inputs = vec![5u8, 10, 15];
-    let mut trace = SimulationTrace::new();
 
-    println!("=== Hierarchical 2-Stage Pipeline (Rust Simulation) ===");
+    let mut test = HardwareTest::new("pipeline")
+        .with_verilog("verilog/pipeline.v")
+        .with_waveform("waveforms/hierarchical_pipeline.vcd");
+
+    println!("=== Hierarchical 2-Stage Pipeline ===");
     for &input in test_inputs.iter() {
         *in_data.lock().unwrap() = input;
         exec.tick_clock(&mut clk);
-        let output = *out_data.lock().unwrap();
+        let output   = *out_data.lock().unwrap();
         let wire_val = *wire_s1_s2.lock().unwrap();
-        println!("cycle {} input={:3} wire={:3} output={:3}", 
-                 clk.cycle(), input, wire_val, output);
+        println!("cycle {} input={:3} wire={:3} output={:3}", clk.cycle(), input, wire_val, output);
 
-        trace.add_cycle(
+        let in_logic  = u8_to_logic_vec(input);
+        let out_logic = u8_to_logic_vec(output);
+        test.record_cycle(
             clk.cycle() as usize,
-            vec![("in_data".to_string(), u8_to_logic_vec(input))],
-            vec![("out_data".to_string(), u8_to_logic_vec(output))],
+            &[("in_data",  &in_logic)],
+            &[("out_data", &out_logic)],
         );
     }
 
-    // Drain 2 more cycles
+    // Drain 2 more cycles to flush the pipeline
     for _ in 0..2 {
         *in_data.lock().unwrap() = 0;
         exec.tick_clock(&mut clk);
-        let output = *out_data.lock().unwrap();
+        let output   = *out_data.lock().unwrap();
         let wire_val = *wire_s1_s2.lock().unwrap();
         println!("cycle {} wire={:3} output={:3}", clk.cycle(), wire_val, output);
 
-        trace.add_cycle(
+        let in_logic  = u8_to_logic_vec(0);
+        let out_logic = u8_to_logic_vec(output);
+        test.record_cycle(
             clk.cycle() as usize,
-            vec![("in_data".to_string(), u8_to_logic_vec(0))],
-            vec![("out_data".to_string(), u8_to_logic_vec(output))],
+            &[("in_data",  &in_logic)],
+            &[("out_data", &out_logic)],
         );
     }
 
-    println!("\n=== Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/pipeline.v", "pipeline", &trace) {
-        Ok(true) => println!("✓ Verilator verification PASSED! Rust and Verilog match!"),
-        Ok(false) => println!("✗ Verilator verification FAILED!"),
-        Err(e) => println!("⚠ Verilator verification error: {}", e),
-    }
+    test.finish().assert_passed();
 }

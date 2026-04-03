@@ -1,5 +1,5 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace, verify_with_verilator, emit};
+use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +20,8 @@ async fn simple_ram(
         emit!(dout);
         clk.tick().await;
 
-        let a = (*addr.lock().unwrap() & 0x3) as usize;
-        let w = *we.lock().unwrap();
+        let a   = (*addr.lock().unwrap() & 0x3) as usize;
+        let w   = *we.lock().unwrap();
         let din = *data_in.lock().unwrap();
 
         if w == Bit::ONE {
@@ -64,95 +64,85 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let addr = Arc::new(Mutex::new(0u8));
-    let we = Arc::new(Mutex::new(Bit::ZERO));
+    let addr    = Arc::new(Mutex::new(0u8));
+    let we      = Arc::new(Mutex::new(Bit::ZERO));
     let data_in = Arc::new(Mutex::new(0u8));
     let data_out = exec.spawn_function_typed(
         0u8,
-        simple_ram(
-            clk.clone(),
-            Arc::clone(&addr),
-            Arc::clone(&we),
-            Arc::clone(&data_in),
-        ),
+        simple_ram(clk.clone(), Arc::clone(&addr), Arc::clone(&we), Arc::clone(&data_in)),
     );
 
-    println!("=== RAM Tests (Rust Simulation) ===");
-    let mut ram_trace = SimulationTrace::new();
+    let mut ram_test = HardwareTest::new("ram")
+        .with_verilog("verilog/ram.v")
+        .with_waveform("waveforms/ram.vcd");
 
-    // Write values
+    println!("=== RAM Write ===");
     for (a, v) in [(0u8, 0xAAu8), (1, 0x55), (2, 0x0F)] {
-        *addr.lock().unwrap() = a;
+        *addr.lock().unwrap()    = a;
         *data_in.lock().unwrap() = v;
-        *we.lock().unwrap() = Bit::ONE;
+        *we.lock().unwrap()      = Bit::ONE;
         exec.tick_clock(&mut clk);
         let dout = *data_out.lock().unwrap();
         println!("cycle {} WE=1 addr={} din=0x{:02X} dout=0x{:02X}", clk.cycle(), a, v, dout);
 
-        ram_trace.add_cycle(
+        let addr_logic = u2_to_logic_vec(a);
+        let din_logic  = u8_to_logic_vec(v);
+        let dout_logic = u8_to_logic_vec(dout);
+        ram_test.record_cycle(
             clk.cycle() as usize,
-            vec![
-                ("addr".to_string(), u2_to_logic_vec(a)),
-                ("we".to_string(), vec![Logic::One]),
-                ("data_in".to_string(), u8_to_logic_vec(v)),
-            ],
-            vec![("data_out".to_string(), u8_to_logic_vec(dout))],
+            &[("addr", &addr_logic), ("we", &[Logic::One]), ("data_in", &din_logic)],
+            &[("data_out", &dout_logic)],
         );
     }
 
-    // Read values
+    println!("\n=== RAM Read ===");
     *we.lock().unwrap() = Bit::ZERO;
     for a in [0u8, 1u8, 2u8, 3u8] {
-        *addr.lock().unwrap() = a;
+        *addr.lock().unwrap()    = a;
         *data_in.lock().unwrap() = 0;
         exec.tick_clock(&mut clk);
         let dout = *data_out.lock().unwrap();
         println!("cycle {} WE=0 addr={} dout=0x{:02X}", clk.cycle(), a, dout);
 
-        ram_trace.add_cycle(
+        let addr_logic = u2_to_logic_vec(a);
+        let din_logic  = u8_to_logic_vec(0);
+        let dout_logic = u8_to_logic_vec(dout);
+        ram_test.record_cycle(
             clk.cycle() as usize,
-            vec![
-                ("addr".to_string(), u2_to_logic_vec(a)),
-                ("we".to_string(), vec![Logic::Zero]),
-                ("data_in".to_string(), u8_to_logic_vec(0)),
-            ],
-            vec![("data_out".to_string(), u8_to_logic_vec(dout))],
+            &[("addr", &addr_logic), ("we", &[Logic::Zero]), ("data_in", &din_logic)],
+            &[("data_out", &dout_logic)],
         );
     }
 
-    println!("\n=== RAM Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/ram.v", "ram", &ram_trace) {
-        Ok(true) => println!("✓ RAM Verilator verification PASSED!"),
-        Ok(false) => println!("✗ RAM Verilator verification FAILED!"),
-        Err(e) => println!("⚠ RAM Verilator verification error: {}", e),
-    }
+    ram_test.finish().assert_passed();
 
-    // ROM test
+    // ── ROM ────────────────────────────────────────────────────────────────
+
     let addr_rom = Arc::new(Mutex::new(0u8));
-    let rom_out = exec.spawn_function_typed(
+    let rom_out  = exec.spawn_function_typed(
         0u8,
         simple_rom(clk.clone(), Arc::clone(&addr_rom)),
     );
 
-    let mut rom_trace = SimulationTrace::new();
-    println!("\n=== ROM Tests (Rust Simulation) ===");
+    let mut rom_test = HardwareTest::new("rom")
+        .with_verilog("verilog/rom.v")
+        .with_waveform("waveforms/rom.vcd");
+
+    println!("\n=== ROM Read ===");
     for a in [0u8, 1u8, 2u8, 3u8] {
         *addr_rom.lock().unwrap() = a;
         exec.tick_clock(&mut clk);
         let dout = *rom_out.lock().unwrap();
         println!("cycle {} addr={} dout=0x{:02X}", clk.cycle(), a, dout);
 
-        rom_trace.add_cycle(
+        let addr_logic = u2_to_logic_vec(a);
+        let dout_logic = u8_to_logic_vec(dout);
+        rom_test.record_cycle(
             clk.cycle() as usize,
-            vec![("addr".to_string(), u2_to_logic_vec(a))],
-            vec![("data_out".to_string(), u8_to_logic_vec(dout))],
+            &[("addr", &addr_logic)],
+            &[("data_out", &dout_logic)],
         );
     }
 
-    println!("\n=== ROM Cross-Validating with Verilator ===");
-    match verify_with_verilator("verilog/rom.v", "rom", &rom_trace) {
-        Ok(true) => println!("✓ ROM Verilator verification PASSED!"),
-        Ok(false) => println!("✗ ROM Verilator verification FAILED!"),
-        Err(e) => println!("⚠ ROM Verilator verification error: {}", e),
-    }
+    rom_test.finish().assert_passed();
 }

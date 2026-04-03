@@ -2,7 +2,10 @@ use copper_core::Module;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 pub mod verification;
 pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
@@ -16,6 +19,10 @@ pub use executor::{HardwareExecutor, ModuleInfo};
 
 thread_local! {
     static CURRENT_EMIT_TARGET: RefCell<Option<Arc<dyn Any + Send + Sync>>> = RefCell::new(None);
+    /// Set to true by `emit_to_current` whenever a value is written.
+    /// Reset to false by `push_emit_target` before each task poll so each poll starts clean.
+    /// Read by the executor after each poll to decide whether another delta cycle is needed.
+    static CURRENT_EMIT_DIRTY: RefCell<bool> = RefCell::new(false);
 }
 
 pub(crate) struct EmitTargetGuard {
@@ -32,6 +39,9 @@ impl Drop for EmitTargetGuard {
 }
 
 pub(crate) fn push_emit_target(target: Option<Arc<dyn Any + Send + Sync>>) -> EmitTargetGuard {
+    // Clear the dirty flag so the upcoming poll starts with a clean slate.
+    CURRENT_EMIT_DIRTY.with(|cell| *cell.borrow_mut() = false);
+
     let previous = CURRENT_EMIT_TARGET.with(|cell| {
         let mut slot = cell.borrow_mut();
         std::mem::replace(&mut *slot, target)
@@ -39,9 +49,19 @@ pub(crate) fn push_emit_target(target: Option<Arc<dyn Any + Send + Sync>>) -> Em
     EmitTargetGuard { previous }
 }
 
+/// Read and reset the dirty flag that `emit_to_current` sets.
+/// Returns true if the most recent task poll called `emit!` at least once.
+pub(crate) fn take_emit_dirty() -> bool {
+    CURRENT_EMIT_DIRTY.with(|cell| {
+        let dirty = *cell.borrow();
+        *cell.borrow_mut() = false;
+        dirty
+    })
+}
+
 pub fn emit_to_current<T>(value: T)
 where
-    T: Send + 'static,
+    T: PartialEq + Send + 'static,
 {
     CURRENT_EMIT_TARGET.with(|cell| {
         let target = cell
@@ -52,8 +72,51 @@ where
 
         let typed = Arc::downcast::<Mutex<T>>(target)
             .expect("emit!(value) type mismatch for currently bound function-typed output");
-        *typed.lock().unwrap() = value;
+        let mut guard = typed.lock().unwrap();
+        // Only mark dirty when the value actually changes. This prevents modules
+        // that unconditionally call emit! with the same value from preventing the
+        // delta-cycle loop from reaching a fixed point.
+        if *guard != value {
+            *guard = value;
+            CURRENT_EMIT_DIRTY.with(|cell| *cell.borrow_mut() = true);
+        }
     });
+}
+
+/// A future that suspends for exactly one delta cycle, then resumes.
+///
+/// On the first poll it returns `Pending`, allowing other tasks in the same
+/// delta-cycle pass to run.  On the next pass the executor polls it again and
+/// it returns `Ready(())`, so the caller continues immediately.
+///
+/// This is the building block for writing purely combinational modules that
+/// re-evaluate every delta cycle instead of every clock edge.  It is also
+/// what makes the delta-cycle limitation observable: a module that calls
+/// `emit!` unconditionally before `delta_yield().await` will mark the signal
+/// dirty on *every* pass, preventing the executor from ever detecting a fixed
+/// point and causing it to panic at `MAX_DELTA_CYCLES`.
+pub struct DeltaYield {
+    yielded: bool,
+}
+
+impl Future for DeltaYield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            Poll::Pending
+        }
+    }
+}
+
+/// Suspend for one delta cycle and resume on the next executor pass.
+///
+/// See [`DeltaYield`] for full semantics.
+pub fn delta_yield() -> DeltaYield {
+    DeltaYield { yielded: false }
 }
 
 /// A helper macro to spawn a child module's future and track the parent-child relationship in the executor.

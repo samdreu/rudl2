@@ -86,7 +86,7 @@ impl HardwareExecutor {
     /// handle and do not need to construct the `Arc<Mutex<T>>` manually.
     pub fn spawn_function_typed<T, F>(&mut self, initial_output: T, future: F) -> Arc<Mutex<T>>
     where
-        T: Send + 'static,
+        T: PartialEq + Send + 'static,
         F: Future<Output = T> + 'static,
     {
         let output = Arc::new(Mutex::new(initial_output));
@@ -148,7 +148,7 @@ impl HardwareExecutor {
         future: F,
     ) -> Arc<Mutex<T>>
     where
-        T: Send + Sync + 'static,
+        T: PartialEq + Send + Sync + 'static,
         F: Future<Output = T> + 'static,
     {
         // Ensure both parent and child modules are in the module info map
@@ -196,17 +196,44 @@ impl HardwareExecutor {
         &self.modules
     }
 
-    /// Poll all tasks in the executor. This will drive the execution of all async tasks, allowing them to make progress. 
-    /// In a real hardware simulation, this would correspond to allowing all combinational logic to settle and all sequential
-    /// logic to update based on the current inputs and clock edge.
-    /// Publicly poll all tasks (combinational settle phase)
+    /// Poll all tasks in a delta-cycle loop until no signal changes.
+    ///
+    /// One call = one simulation phase (pre-edge or post-edge settle).  Within that
+    /// phase the executor repeatedly polls every task until a full pass produces no
+    /// new `emit!` calls — i.e. every signal has reached a fixed point.
+    ///
+    /// For purely sequential designs (all state behind `clk.tick().await`) this
+    /// converges in at most two passes: tasks emit on the first pass and sleep on
+    /// the second.  For acyclic combinational chains the loop propagates changes
+    /// one level per pass.  A genuine combinational loop (A drives B drives A with
+    /// no register) will never converge and panics once `MAX_DELTA_CYCLES` is hit.
     pub fn poll_tasks(&mut self) {
-        // log::trace!("Polling tasks at cycle {}", self.cycle);
+        const MAX_DELTA_CYCLES: usize = 1000;
+
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
-        for task in &mut self.tasks {
-            let _emit_guard = crate::push_emit_target(task.emit_target.clone());
-            let _ = task.future.as_mut().poll(&mut context);
+
+        for delta in 0..=MAX_DELTA_CYCLES {
+            assert!(
+                delta < MAX_DELTA_CYCLES,
+                "Delta-cycle limit ({MAX_DELTA_CYCLES}) exceeded — \
+                 possible combinational loop in the design"
+            );
+
+            let mut any_dirty = false;
+            for task in &mut self.tasks {
+                // push_emit_target resets the dirty flag before the poll
+                let _emit_guard = crate::push_emit_target(task.emit_target.clone());
+                let _ = task.future.as_mut().poll(&mut context);
+                // take_emit_dirty reads and resets the flag set by emit!
+                if crate::take_emit_dirty() {
+                    any_dirty = true;
+                }
+            }
+
+            if !any_dirty {
+                break; // fixed point reached
+            }
         }
     }
     /// Advance the clock edge only (no polling)

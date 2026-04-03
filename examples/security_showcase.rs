@@ -6,7 +6,6 @@
 
 use copper_core::{Bit, Bits, Clock, ClockDomain};
 use copper_sim::{HardwareExecutor, emit};
-use std::sync::{Arc, Mutex};
 
 enum MainClk {}
 impl ClockDomain for MainClk {}
@@ -85,6 +84,7 @@ enum SecureState {
     Idle,
     AuthCheck,
     Authenticated,
+    #[allow(dead_code)]
     Locked,
 }
 

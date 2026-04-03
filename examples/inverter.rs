@@ -1,12 +1,14 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, SimulationTrace};
+use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
 use copper_macros::hardware;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-// Combinational inverter (pure function)
+#[hardware]
 fn inverter(bit: Bit) -> Bit {
     match bit.0 {
         Logic::Zero => Bit::ONE,
@@ -15,7 +17,6 @@ fn inverter(bit: Bit) -> Bit {
     }
 }
 
-// Sequential inverter with registered output
 #[hardware]
 async fn registered_inverter(
     clk: Clock<MainClk>,
@@ -23,79 +24,80 @@ async fn registered_inverter(
     output: Arc<Mutex<Bit>>,
 ) {
     let mut reg = Bit::ZERO;
-    
+
     loop {
-        // Output the registered value
         output.lock().unwrap().clone_from(&reg);
-        
         clk.tick().await;
-        
-        // Capture input and compute for next cycle
         let input_val = *input.lock().unwrap();
         reg = inverter(input_val);
     }
 }
 
 fn main() {
-    println!("=== Combinational Inverter Tests ===");
-    
-    // Test combinational inverter
-    let test_cases = vec![
-        (Bit::ZERO, Bit::ONE),
-        (Bit::ONE, Bit::ZERO),
-        (Bit::X, Bit::X),
-    ];
-    
-    for (input, expected) in test_cases {
-        let output = inverter(input);
-        let status = if output == expected { "✓" } else { "✗" };
-        println!("inverter({:?}) = {:?} (expected {:?}) {}", input.0, output.0, expected.0, status);
+    // ── Combinational inverter ──────────────────────────────────────────────
+
+    let comb_verilog = copper_codegen::module_verilog!(inverter);
+    println!("=== Generated Verilog (Combinational) ===\n{}", comb_verilog);
+
+    let comb_path = "verilog/generated-verilog/inverter.v";
+    if let Some(parent) = Path::new(comb_path).parent() {
+        fs::create_dir_all(parent).expect("failed to create Verilog output directory");
     }
-    
-    println!("\n=== Sequential Inverter Tests (Rust Simulation) ===");
-    
+    fs::write(comb_path, &comb_verilog).expect("failed to write combinational Verilog");
+
+    let input_pattern = [Logic::Zero, Logic::One, Logic::X];
+    let mut comb_test = HardwareTest::new("inverter")
+        .with_verilog(comb_path)
+        .with_waveform("waveforms/inverter_comb.vcd");
+
+    for (i, &input) in input_pattern.iter().enumerate() {
+        let output = inverter(Bit(input));
+        comb_test.record_cycle(i + 1, &[("bit", &[input])], &[("out", &[output.0])]);
+    }
+
+    let comb_expected = SimulationTrace::from_cycles(vec![
+        make_cycle(1, &[("bit", &[Logic::Zero])], &[("out", &[Logic::One])]),
+        make_cycle(2, &[("bit", &[Logic::One])],  &[("out", &[Logic::Zero])]),
+        make_cycle(3, &[("bit", &[Logic::X])],    &[("out", &[Logic::X])]),
+    ]);
+
+    comb_test.finish_with_expected(&comb_expected).assert_passed();
+
+    // ── Sequential (registered) inverter ───────────────────────────────────
+
+    let seq_verilog = copper_codegen::module_verilog!(registered_inverter);
+    println!("\n=== Generated Verilog (Sequential) ===\n{}", seq_verilog);
+
+    let seq_path = "verilog/generated-verilog/inverter_seq.v";
+    fs::write(seq_path, &seq_verilog).expect("failed to write sequential Verilog");
+
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
-    
     let input = Arc::new(Mutex::new(Bit::ZERO));
     let output = Arc::new(Mutex::new(Bit::ZERO));
-    
     exec.spawn(registered_inverter(clk.clone(), Arc::clone(&input), Arc::clone(&output)));
-    
-    let input_pattern = vec![Logic::Zero, Logic::One, Logic::Zero, Logic::One, Logic::Zero];
-    let mut trace = SimulationTrace::new();
+
+    let seq_pattern = [Logic::Zero, Logic::One, Logic::Zero, Logic::One, Logic::Zero];
+    let mut seq_test = HardwareTest::new("registered_inverter")
+        .with_verilog(seq_path)
+        .with_waveform("waveforms/inverter_seq.vcd");
     let mut cycle_count = 0;
-    
-    for (idx, &input_logic) in input_pattern.iter().enumerate() {
+
+    for &input_logic in seq_pattern.iter() {
         *input.lock().unwrap() = Bit(input_logic);
         exec.tick_clock(&mut clk);
         let output_val = *output.lock().unwrap();
-        
-        println!("cycle {} input={:?} output={:?}", 
-                 clk.cycle(), input_logic, output_val.0);
-        
-        // Add to trace for Verilator verification (skip first cycle due to reset/initialization)
+
+        // Skip the first cycle (reset/initialization)
         if clk.cycle() > 1 {
-            trace.add_cycle(
-                cycle_count + 1,
-                vec![("in_data".to_string(), vec![input_logic])],
-                vec![("out_data".to_string(), vec![output_val.0])],
-            );
             cycle_count += 1;
+            seq_test.record_cycle(
+                cycle_count,
+                &[("input_sig", &[input_logic])],
+                &[("out", &[output_val.0])],
+            );
         }
     }
-    
-    // Cross-validate with Verilator
-    println!("\n=== Cross-Validating with Verilator ===");
-    match copper_sim::verify_with_verilator("verilog/inverter.v", "inverter", &trace) {
-        Ok(true) => println!("✓ Verilator verification PASSED! Rust and Verilog match!"),
-        Ok(false) => {
-            println!("✗ Verilator verification FAILED!");
-            std::process::exit(1);
-        },
-        Err(e) => {
-            println!("⚠ Verilator verification error: {}", e);
-            println!("   (Verilator may not be installed)");
-        }
-    }
+
+    seq_test.finish().assert_passed();
 }
