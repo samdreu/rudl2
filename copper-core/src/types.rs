@@ -308,6 +308,41 @@ impl<const N: usize> std::ops::Not for Bits<N> {
     }
 }
 
+/// Trait for types that have a defined unknown/X state.
+///
+/// Implemented by all built-in logic types (`Logic`, `Bit`, `Bits<N>`) and
+/// their tuples.  The executor uses this when a combinational loop is detected:
+/// rather than panicking, it sets the oscillating signal to `unknown()` so
+/// that X propagates through downstream combinational logic and the simulation
+/// reaches a fixed point — matching real Verilog simulator behaviour.
+pub trait HasUnknown {
+    fn unknown() -> Self;
+}
+
+impl HasUnknown for Logic {
+    fn unknown() -> Self { Logic::X }
+}
+
+impl HasUnknown for Bit {
+    fn unknown() -> Self { Bit::X }
+}
+
+impl<const N: usize> HasUnknown for Bits<N> {
+    fn unknown() -> Self { Bits::x() }
+}
+
+impl<A: HasUnknown, B: HasUnknown> HasUnknown for (A, B) {
+    fn unknown() -> Self { (A::unknown(), B::unknown()) }
+}
+
+impl<A: HasUnknown, B: HasUnknown, C: HasUnknown> HasUnknown for (A, B, C) {
+    fn unknown() -> Self { (A::unknown(), B::unknown(), C::unknown()) }
+}
+
+impl<A: HasUnknown, B: HasUnknown, C: HasUnknown, D: HasUnknown> HasUnknown for (A, B, C, D) {
+    fn unknown() -> Self { (A::unknown(), B::unknown(), C::unknown(), D::unknown()) }
+}
+
 /// Clock domain marker (phantom type for compile-time tracking)
 /// 
 /// This trait marks types that represent clock domains.
