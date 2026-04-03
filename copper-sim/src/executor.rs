@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use log::trace;
 
-use copper_core::{Clock, ClockDomain};
+use copper_core::{Clock, ClockDomain, HasUnknown};
 
 /// A no-op waker that can be used to poll futures without needing an actual wake-up mechanism.
 /// This is useful in our executor since we will be polling all tasks every cycle, and we don't need to wake them up asynchronously.
@@ -35,6 +35,16 @@ pub struct HardwareExecutor {
 struct TaskEntry {
     future: Pin<Box<dyn Future<Output = ()>>>,
     emit_target: Option<Arc<dyn Any + Send + Sync>>,
+    /// Sets the emit target to its X/unknown state.
+    /// Only present for tasks spawned via `spawn_function_typed_with_unknown` or
+    /// `spawn_child_function_typed_with_unknown`.  When the executor detects that
+    /// a task's output has changed on every delta cycle for `OSCILLATION_THRESHOLD`
+    /// consecutive passes it calls this closure to inject X, which then propagates
+    /// through downstream logic until the simulation reaches a fixed point.
+    set_unknown: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Number of consecutive delta cycles in which this task's output changed.
+    /// Reset to 0 whenever a pass produces no change for this task.
+    consecutive_dirty: usize,
 }
 
 /// Modules in the execution, with parent-child relationships. This is used for tracking the hierarchy of modules in the system, which can be useful for debugging and visualization.
@@ -77,6 +87,8 @@ impl HardwareExecutor {
         self.tasks.push(TaskEntry {
             future: Box::pin(wrapped),
             emit_target: None,
+            set_unknown: None,
+            consecutive_dirty: 0,
         });
     }
 
@@ -98,9 +110,83 @@ impl HardwareExecutor {
         self.tasks.push(TaskEntry {
             future: Box::pin(wrapped),
             emit_target: Some(emit_target),
+            set_unknown: None,
+            consecutive_dirty: 0,
         });
 
         output
+    }
+
+    /// Like `spawn_function_typed` but also registers an X-propagation callback.
+    ///
+    /// Use this for combinational modules whose output type implements `HasUnknown`
+    /// (i.e. `Logic`, `Bit`, `Bits<N>`, or tuples of those).  If the executor detects
+    /// that this module's output oscillates — changing on every consecutive delta cycle
+    /// for `OSCILLATION_THRESHOLD` passes — it calls the callback to set the output
+    /// to X rather than panicking, allowing downstream logic to propagate X to a
+    /// stable fixed point.
+    pub fn spawn_function_typed_with_unknown<T, F>(
+        &mut self,
+        initial_output: T,
+        future: F,
+    ) -> Arc<Mutex<T>>
+    where
+        T: PartialEq + HasUnknown + Send + 'static,
+        F: Future<Output = T> + 'static,
+    {
+        let output = Arc::new(Mutex::new(initial_output));
+        let emit_target: Arc<dyn Any + Send + Sync> = output.clone();
+
+        let output_for_x = output.clone();
+        let set_unknown: Box<dyn Fn() + Send + Sync> =
+            Box::new(move || *output_for_x.lock().unwrap() = T::unknown());
+
+        let wrapped = async move { let _ = future.await; };
+        self.tasks.push(TaskEntry {
+            future: Box::pin(wrapped),
+            emit_target: Some(emit_target),
+            set_unknown: Some(set_unknown),
+            consecutive_dirty: 0,
+        });
+
+        output
+    }
+
+    /// Spawn a module into a caller-provided output signal with X propagation.
+    ///
+    /// Unlike `spawn_function_typed_with_unknown`, the caller creates and owns the
+    /// `Arc<Mutex<T>>` and passes it in as the emit target.  This is the correct
+    /// way to model a **self-feedback loop**: the same Arc is passed to the module
+    /// as an input *and* used here as the emit target, so every `emit!` inside the
+    /// module writes to the signal the module itself is reading.
+    ///
+    /// ```rust,ignore
+    /// let wire = Arc::new(Mutex::new(Logic::Zero));
+    /// exec.spawn_into_with_unknown(Arc::clone(&wire), self_inverter(Arc::clone(&wire)));
+    /// // wire is both the input read by self_inverter and the output it drives
+    /// ```
+    pub fn spawn_into_with_unknown<T, F>(
+        &mut self,
+        output: Arc<Mutex<T>>,
+        future: F,
+    )
+    where
+        T: PartialEq + HasUnknown + Send + 'static,
+        F: Future<Output = T> + 'static,
+    {
+        let emit_target: Arc<dyn Any + Send + Sync> = output.clone();
+
+        let output_for_x = output.clone();
+        let set_unknown: Box<dyn Fn() + Send + Sync> =
+            Box::new(move || *output_for_x.lock().unwrap() = T::unknown());
+
+        let wrapped = async move { let _ = future.await; };
+        self.tasks.push(TaskEntry {
+            future: Box::pin(wrapped),
+            emit_target: Some(emit_target),
+            set_unknown: Some(set_unknown),
+            consecutive_dirty: 0,
+        });
     }
 
     /// spawn a child module's future, and track the parent-child relationship
@@ -181,6 +267,53 @@ impl HardwareExecutor {
         self.tasks.push(TaskEntry {
             future: Box::pin(wrapped),
             emit_target: Some(emit_target),
+            set_unknown: None,
+            consecutive_dirty: 0,
+        });
+
+        output
+    }
+
+    /// Like `spawn_child_function_typed` but registers an X-propagation callback.
+    /// See `spawn_function_typed_with_unknown` for full semantics.
+    pub fn spawn_child_function_typed_with_unknown<T, F>(
+        &mut self,
+        child_name: &str,
+        parent_name: &str,
+        initial_output: T,
+        future: F,
+    ) -> Arc<Mutex<T>>
+    where
+        T: PartialEq + HasUnknown + Send + Sync + 'static,
+        F: Future<Output = T> + 'static,
+    {
+        self.ensure_module(parent_name);
+        self.ensure_module(child_name);
+
+        {
+            let parent = self.modules.get_mut(parent_name).expect("parent module should exist");
+            if !parent.children.iter().any(|c| c == child_name) {
+                parent.children.push(child_name.to_string());
+            }
+        }
+        {
+            let child = self.modules.get_mut(child_name).expect("child module should exist");
+            child.parent = Some(parent_name.to_string());
+        }
+
+        let output = Arc::new(Mutex::new(initial_output));
+        let emit_target: Arc<dyn Any + Send + Sync> = output.clone();
+
+        let output_for_x = output.clone();
+        let set_unknown: Box<dyn Fn() + Send + Sync> =
+            Box::new(move || *output_for_x.lock().unwrap() = T::unknown());
+
+        let wrapped = async move { let _ = future.await; };
+        self.tasks.push(TaskEntry {
+            future: Box::pin(wrapped),
+            emit_target: Some(emit_target),
+            set_unknown: Some(set_unknown),
+            consecutive_dirty: 0,
         });
 
         output
@@ -200,14 +333,35 @@ impl HardwareExecutor {
     ///
     /// One call = one simulation phase (pre-edge or post-edge settle).  Within that
     /// phase the executor repeatedly polls every task until a full pass produces no
-    /// new `emit!` calls — i.e. every signal has reached a fixed point.
+    /// value changes — i.e. every signal has reached a fixed point.
     ///
-    /// For purely sequential designs (all state behind `clk.tick().await`) this
-    /// converges in at most two passes: tasks emit on the first pass and sleep on
-    /// the second.  For acyclic combinational chains the loop propagates changes
-    /// one level per pass.  A genuine combinational loop (A drives B drives A with
-    /// no register) will never converge and panics once `MAX_DELTA_CYCLES` is hit.
+    /// **Convergence** — purely sequential designs (all state behind `clk.tick().await`)
+    /// converge in at most two passes.  Acyclic combinational chains take one pass per
+    /// level of logic depth.
+    ///
+    /// **Oscillation detection** — each task tracks `consecutive_dirty`: how many
+    /// consecutive delta cycles its output has changed.  For a task in a chain,
+    /// this is always 1 (it changes once and then stabilises).  For a task in a
+    /// genuine combinational loop the value keeps changing every pass, so
+    /// `consecutive_dirty` grows until it hits `OSCILLATION_THRESHOLD`.
+    ///
+    /// When a task hits the threshold:
+    /// - If it was spawned with `spawn_function_typed_with_unknown` (or the child
+    ///   variant), `set_unknown()` is called to drive the output to X.  Downstream
+    ///   combinational logic then sees X, computes X-valued results, emits X — which
+    ///   is identical to the stored value — so the loop terminates cleanly.
+    /// - Otherwise the executor panics with a message identifying the task index and
+    ///   suggesting the `_with_unknown` spawn variant.
     pub fn poll_tasks(&mut self) {
+        /// A task whose output changes on every delta cycle for this many passes
+        /// is diagnosed as part of a combinational loop.
+        ///
+        /// Rationale: in an acyclic combinational graph a signal is dirty for at
+        /// most as many delta cycles as there are independent input chains feeding
+        /// into it.  Genuine loops cause the signal to be dirty on every pass
+        /// indefinitely.  20 is generous for typical RTL fan-in depths while still
+        /// catching loops far earlier than the previous 1000-cycle hard limit.
+        const OSCILLATION_THRESHOLD: usize = 20;
         const MAX_DELTA_CYCLES: usize = 1000;
 
         let waker = noop_waker();
@@ -217,22 +371,57 @@ impl HardwareExecutor {
             assert!(
                 delta < MAX_DELTA_CYCLES,
                 "Delta-cycle limit ({MAX_DELTA_CYCLES}) exceeded — \
-                 possible combinational loop in the design"
+                 combinational loop not resolved even after X propagation"
             );
 
             let mut any_dirty = false;
             for task in &mut self.tasks {
-                // push_emit_target resets the dirty flag before the poll
                 let _emit_guard = crate::push_emit_target(task.emit_target.clone());
                 let _ = task.future.as_mut().poll(&mut context);
-                // take_emit_dirty reads and resets the flag set by emit!
                 if crate::take_emit_dirty() {
+                    task.consecutive_dirty += 1;
                     any_dirty = true;
+                } else {
+                    task.consecutive_dirty = 0;
                 }
             }
 
             if !any_dirty {
-                break; // fixed point reached
+                // Reset all consecutive counters between settle phases.
+                for task in &mut self.tasks {
+                    task.consecutive_dirty = 0;
+                }
+                break;
+            }
+
+            // Check for oscillating tasks and inject X where possible.
+            let mut injected_any = false;
+            for (i, task) in self.tasks.iter_mut().enumerate() {
+                if task.consecutive_dirty < OSCILLATION_THRESHOLD {
+                    continue;
+                }
+                match &task.set_unknown {
+                    Some(set_x) => {
+                        set_x();
+                        task.consecutive_dirty = 0;
+                        injected_any = true;
+                    }
+                    None => panic!(
+                        "Combinational loop detected: task {i} output changed on {n} \
+                         consecutive delta cycles with no fixed point.\n\
+                         To enable automatic X propagation, spawn this module with \
+                         `spawn_function_typed_with_unknown` (or the child variant) \
+                         and ensure the output type implements `HasUnknown`.",
+                        i = i,
+                        n = task.consecutive_dirty,
+                    ),
+                }
+            }
+
+            // If we injected X into any signals, force another pass so the X
+            // value propagates through downstream combinational logic.
+            if injected_any {
+                any_dirty = true;
             }
         }
     }

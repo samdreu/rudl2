@@ -1,74 +1,110 @@
-/// Delta-cycle convergence demonstration.
+/// Delta-cycle behaviour: stable convergence and combinational loop resolution.
 ///
-/// Copper's delta cycling asks "did any signal value change this pass?" to
-/// decide whether to run another pass.  Because emit_to_current requires
-/// T: PartialEq, it only marks a signal dirty when the newly emitted value
-/// actually differs from the stored one.
+/// This example demonstrates two distinct scenarios:
 ///
-/// This means a combinational module that unconditionally calls emit! with
-/// the same value will NOT prevent convergence — the executor sees no changes
-/// and stops after a small number of passes.
+/// ## Part 1 — Stable circuit with unconditional emit (converges cleanly)
 ///
-/// This example demonstrates that using delta_yield(), a future that suspends
-/// for exactly one delta cycle so a combinational module can be re-evaluated
-/// on every pass.  Despite both modules calling emit! unconditionally, the
-/// circuit converges because the values stabilise after pass 1.
+/// Two chained combinational passthroughs both call emit! on every delta cycle
+/// regardless of whether their output changed.  Value-change detection means the
+/// executor only marks a signal dirty when the stored value actually changes, so
+/// the circuit converges after two delta cycles despite the unconditional emits:
 ///
-/// A true combinational loop — where outputs never stop changing — would
-/// still exceed MAX_DELTA_CYCLES and panic.  That is the remaining genuine
-/// limitation: value-change detection handles stable circuits with redundant
-/// emits, but cannot resolve an oscillating combinational loop.
+///   pass 1: a emits 5 (0→5, dirty), b emits 6 (0→6, dirty)
+///   pass 2: a emits 5 (unchanged), b emits 6 (unchanged) → fixed point
+///
+/// ## Part 2 — Genuine combinational loop (resolves to X)
+///
+/// A NOT gate wired to its own output genuinely oscillates.  Because the module
+/// reads from the same Arc it emits to, every pass flips the value:
+///
+///   pass 1: reads Zero, emits One  (Zero→One, dirty). consecutive_dirty = 1.
+///   pass 2: reads One,  emits Zero (One→Zero, dirty). consecutive_dirty = 2.
+///   ...
+///   pass 20: consecutive_dirty hits OSCILLATION_THRESHOLD.
+///            set_unknown() drives the output to Logic::X.
+///   pass 21: reads X, emits NOT(X) = X (unchanged). → fixed point.
+///
+/// The final value is Logic::X — correctly modelling Verilog simulator behaviour
+/// where a combinational loop resolves to an unknown/indeterminate state.
 ///
 /// Run this example:
 ///
 ///     cargo run --example delta_cycle_limitation
+use copper_core::Logic;
 use copper_sim::{delta_yield, emit, HardwareExecutor};
 use std::sync::{Arc, Mutex};
 
-// ── Two chained combinational passthrough modules ────────────────────────────
-//
-// comb_stage_a reads raw_input and forwards it unchanged.
-// comb_stage_b reads wire_a (stage A's output) and adds 1.
-//
-// Both use delta_yield() so they are re-evaluated on every delta cycle.
-// Both unconditionally call emit! regardless of whether their input changed.
-//
-// The signal values reach a fixed point after a single delta cycle:
-//   pass 1 — a emits 5 (changed from 0), b emits 6 (changed from 0)  → dirty
-//   pass 2 — a emits 5 (unchanged), b emits 6 (unchanged)             → not dirty → stop
-//
-// With value-change detection, the executor correctly identifies that no
-// signal actually changed on pass 2 and terminates cleanly.
+// ── Part 1: stable chained passthroughs ──────────────────────────────────────
 
-async fn comb_stage_a(raw_input: Arc<Mutex<u8>>) -> u8 {
+async fn passthrough(input: Arc<Mutex<u8>>) -> u8 {
     loop {
-        let val = *raw_input.lock().unwrap();
-        emit!(val); // always fires — even when val hasn't changed
+        emit!(*input.lock().unwrap());
         delta_yield().await;
     }
 }
 
-async fn comb_stage_b(wire_a: Arc<Mutex<u8>>) -> u8 {
+async fn increment(input: Arc<Mutex<u8>>) -> u8 {
     loop {
-        let val = *wire_a.lock().unwrap();
-        emit!(val.wrapping_add(1)); // always fires
+        emit!(input.lock().unwrap().wrapping_add(1));
+        delta_yield().await;
+    }
+}
+
+// ── Part 2: self-inverter (genuine combinational loop) ────────────────────────
+
+async fn self_inverter(wire: Arc<Mutex<Logic>>) -> Logic {
+    loop {
+        let current = *wire.lock().unwrap();
+        emit!(match current {
+            Logic::Zero => Logic::One,
+            Logic::One  => Logic::Zero,
+            Logic::X    => Logic::X,
+        });
         delta_yield().await;
     }
 }
 
 fn main() {
-    let mut exec = HardwareExecutor::new();
+    // ── Part 1 ───────────────────────────────────────────────────────────────
+    println!("=== Part 1: stable chained passthroughs ===");
+    {
+        let mut exec = HardwareExecutor::new();
 
-    let raw_input = Arc::new(Mutex::new(5u8));
-    let wire_a = exec.spawn_function_typed(0u8, comb_stage_a(Arc::clone(&raw_input)));
-    let _wire_b = exec.spawn_function_typed(0u8, comb_stage_b(Arc::clone(&wire_a)));
+        let raw = Arc::new(Mutex::new(5u8));
+        let wire_a = exec.spawn_function_typed(0u8, passthrough(Arc::clone(&raw)));
+        let wire_b = exec.spawn_function_typed(0u8, increment(Arc::clone(&wire_a)));
 
-    println!("Calling poll_tasks() with two unconditional-emit combinational modules.");
-    println!("Values stabilise after 1 delta cycle; value-change detection stops the loop.\n");
+        exec.poll_tasks();
 
-    // Converges cleanly: pass 1 changes values (0→5 and 0→6), pass 2 emits
-    // identical values so no signal is marked dirty, loop terminates.
-    exec.poll_tasks();
+        println!("wire_a = {} (expected 5)", *wire_a.lock().unwrap());
+        println!("wire_b = {} (expected 6)", *wire_b.lock().unwrap());
+        assert_eq!(*wire_a.lock().unwrap(), 5);
+        assert_eq!(*wire_b.lock().unwrap(), 6);
+    }
 
-    println!("wire_a = {}", *wire_a.lock().unwrap()); // 5
+    println!();
+
+    // ── Part 2 ───────────────────────────────────────────────────────────────
+    println!("=== Part 2: self-inverter loop (X propagation) ===");
+    {
+        let mut exec = HardwareExecutor::new();
+
+        // `wire` is both the input the module reads AND the signal it drives.
+        // Using spawn_into_with_unknown wires this correctly: the caller creates
+        // the Arc, passes a clone to the module as input, and passes the Arc
+        // itself as the emit target.
+        let wire = Arc::new(Mutex::new(Logic::Zero));
+        exec.spawn_into_with_unknown(
+            Arc::clone(&wire),
+            self_inverter(Arc::clone(&wire)),
+        );
+
+        exec.poll_tasks();
+
+        // The executor detected the oscillation (consecutive_dirty hit 20),
+        // injected Logic::X, and the module settled: NOT(X) = X.
+        let result = *wire.lock().unwrap();
+        println!("self-inverter output = {:?} (expected X)", result);
+        assert_eq!(result, Logic::X);
+    }
 }
