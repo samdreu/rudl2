@@ -2,7 +2,7 @@ pub mod ir;
 pub mod types;
 
 pub use ir::{ModuleIR};
-pub use types::{Bit, Bits, Clock, ClockDomain, HasUnknown, Logic};
+pub use types::{Bit, Bits, Clock, ClockDomain, Logic};
 
 // pub mod types;
 // pub mod verification;

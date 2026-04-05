@@ -1,14 +1,10 @@
 use copper_core::{Bits, Logic};
 use copper_sim::{HardwareTest, SimulationTrace, make_cycle};
-use copper_macros::hardware;
-use std::fs;
-use std::path::Path;
 
 fn bits_to_logic_vec<const N: usize>(bits: &Bits<N>) -> Vec<Logic> {
     bits.as_array().to_vec()
 }
 
-#[hardware]
 fn mux_4to1(a: Bits<4>, b: Bits<4>, c: Bits<4>, d: Bits<4>, sel: Bits<2>) -> Bits<4> {
     match sel.as_u128() {
         0 => a,
@@ -36,17 +32,8 @@ fn main() {
     println!("sel | output");
     println!("----+--------");
 
-    // Generate Verilog from Rust source
-    let verilog = copper_codegen::module_verilog!(mux_4to1);
-    let verilog_path = "verilog/generated-verilog/mux_4to1.v";
-    if let Some(parent) = Path::new(verilog_path).parent() {
-        fs::create_dir_all(parent).expect("failed to create Verilog output directory");
-    }
-    fs::write(verilog_path, &verilog).expect("failed to write Verilog");
-    println!("=== Generated Verilog ===\n{}", verilog);
-
     let mut test = HardwareTest::new("mux_4to1")
-        .with_verilog(verilog_path)
+        .with_verilog("verilog/mux_4to1.v")
         .with_waveform("waveforms/mux_4to1.vcd");
 
     let a_logic = bits_to_logic_vec(&a);

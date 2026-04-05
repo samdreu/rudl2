@@ -1,9 +1,9 @@
 use copper_core::{ModuleIR, Port, Logic};
-use copper_core::ir::{Statement, Expression, Signal};
+use copper_core::ir::{UnaryOp, BinaryOp, Statement, Expression, Signal, LogicValue};
 use syn::{ItemFn, Stmt, Expr, ExprMatch};
 use quote::{ToTokens, quote};
 use syn::ExprMethodCall;
-use log::{debug, warn, error};
+use log::{debug, info, warn, error};
 
 
 #[derive(Debug, Clone)]
@@ -165,7 +165,7 @@ impl IRBuilder {
             }
 
             // If expressions: if cond { then } else { else }
-            Expr::If(_if_expr) => {
+            Expr::If(if_expr) => {
                 warn!("Unsupported If expression encountered");
                 Err(LowerError::UnsupportedExpr("if expression".to_string()))
             }

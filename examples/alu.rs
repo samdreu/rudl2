@@ -1,8 +1,6 @@
 use copper_core::{Clock, ClockDomain, Logic};
 use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
-use std::fs;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
@@ -74,17 +72,8 @@ fn main() {
         (3u8, 0b1010u8, 0b1100u8),
     ];
 
-    // Generate Verilog from Rust source and verify against it
-    let verilog = copper_codegen::module_verilog!(registered_alu);
-    let verilog_path = "verilog/generated-verilog/registered_alu.v";
-    if let Some(parent) = Path::new(verilog_path).parent() {
-        fs::create_dir_all(parent).expect("failed to create Verilog output directory");
-    }
-    fs::write(verilog_path, &verilog).expect("failed to write Verilog");
-    println!("=== Generated Verilog ===\n{}", verilog);
-
-    let mut test = HardwareTest::new("registered_alu")
-        .with_verilog(verilog_path)
+    let mut test = HardwareTest::new("alu")
+        .with_verilog("verilog/alu.v")
         .with_waveform("waveforms/alu.vcd");
 
     for (op_val, a_val, b_val) in pattern.iter().copied() {

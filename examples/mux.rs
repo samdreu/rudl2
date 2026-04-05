@@ -1,14 +1,11 @@
 use copper_core::{Clock, ClockDomain, Bit, Logic};
 use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
 use copper_macros::hardware;
-use std::fs;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-#[hardware]
 fn mux(select: Bit, input0: Bit, input1: Bit) -> Bit {
     match select.0 {
         Logic::Zero => input0,
@@ -50,17 +47,8 @@ fn main() {
         (Logic::Zero, Logic::One,  Logic::One,  Logic::One),
     ];
 
-    // Generate Verilog from Rust source
-    let mux_verilog = copper_codegen::module_verilog!(mux);
-    let mux_verilog_path = "verilog/generated-verilog/mux.v";
-    if let Some(parent) = Path::new(mux_verilog_path).parent() {
-        fs::create_dir_all(parent).expect("failed to create Verilog output directory");
-    }
-    fs::write(mux_verilog_path, &mux_verilog).expect("failed to write Verilog");
-    println!("=== Generated Verilog (Combinational) ===\n{}", mux_verilog);
-
     let mut comb_test = HardwareTest::new("mux")
-        .with_verilog(mux_verilog_path)
+        .with_verilog("verilog/mux.v")
         .with_waveform("waveforms/mux_comb.vcd");
 
     let mut comb_expected_cycles = Vec::new();
@@ -108,13 +96,7 @@ fn main() {
         (Logic::Zero, Logic::Zero, Logic::One),
     ];
 
-    let reg_mux_verilog = copper_codegen::module_verilog!(registered_mux);
-    let reg_mux_verilog_path = "verilog/generated-verilog/registered_mux.v";
-    fs::write(reg_mux_verilog_path, &reg_mux_verilog).expect("failed to write Verilog");
-    println!("=== Generated Verilog (Sequential) ===\n{}", reg_mux_verilog);
-
     let mut seq_test = HardwareTest::new("registered_mux")
-        .with_verilog(reg_mux_verilog_path)
         .with_waveform("waveforms/mux_seq.vcd");
 
     for &(sel, in0, in1) in seq_pattern.iter() {
@@ -129,7 +111,7 @@ fn main() {
             seq_test.record_cycle(
                 (clk.cycle() - 1) as usize,
                 &[("select", &[sel]), ("input0", &[in0]), ("input1", &[in1])],
-                &[("out", &[output_val.0])],
+                &[("out_data", &[output_val.0])],
             );
         }
     }
