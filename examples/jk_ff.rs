@@ -6,6 +6,7 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 // emit-then-tick: state is computed and emitted BEFORE the clock edge
+#[copper_macros::hardware]
 async fn jk_ff(
     j: Arc<Mutex<Bit>>,
     k: Arc<Mutex<Bit>>,
@@ -91,8 +92,13 @@ fn main() {
     //
     // record_cycle_phased captures both pre and post for the phased VCD, and uses
     // post-clock values for the Verilator cross-validation trace.
+    // Note: jk_ff uses tuple-pattern match `(j, k)` which is not yet supported
+    // by the sequential Verilog codegen (requires FSM expansion for multi-variable
+    // patterns). Using hand-written Verilog for cross-validation.
+    let verilog_path = "verilog/jk_ff.v";
+
     let mut test_registered = HardwareTest::new("jk_ff")
-        .with_verilog("verilog/jk_ff.v")
+        .with_verilog(verilog_path)
         .with_waveform("waveforms/jk_ff.vcd")
         .with_phased_waveform("waveforms/jk_ff_phased.vcd")
         .with_verilator_waveform("waveforms/jk_ff_verilator.vcd");

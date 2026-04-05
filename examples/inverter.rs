@@ -81,22 +81,17 @@ fn main() {
     let mut seq_test = HardwareTest::new("registered_inverter")
         .with_verilog(seq_path)
         .with_waveform("waveforms/inverter_seq.vcd");
-    let mut cycle_count = 0;
 
-    for &input_logic in seq_pattern.iter() {
+    for (cycle_count, &input_logic) in seq_pattern.iter().enumerate() {
         *input.lock().unwrap() = Bit(input_logic);
         exec.tick_clock(&mut clk);
         let output_val = *output.lock().unwrap();
 
-        // Skip the first cycle (reset/initialization)
-        if clk.cycle() > 1 {
-            cycle_count += 1;
-            seq_test.record_cycle(
-                cycle_count,
-                &[("input_sig", &[input_logic])],
-                &[("out", &[output_val.0])],
-            );
-        }
+        seq_test.record_cycle(
+            cycle_count + 1,
+            &[("input_sig", &[input_logic])],
+            &[("out", &[output_val.0])],
+        );
     }
 
     seq_test.finish().assert_passed();

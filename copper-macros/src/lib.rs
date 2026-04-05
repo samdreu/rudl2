@@ -1,19 +1,16 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{parse_macro_input, Error, FnArg, ItemFn, Pat, ReturnType, Type};
 
 /// #[hardware] macro for defining hardware modules
 /// 
-/// Marks an async function as a hardware module.
-/// - Function parameters become input ports
-/// - Return type becomes the output port  
-/// - Local variables crossing .await become registers (implicit)
+/// Marks a function as a hardware module (sync or async).
+/// - Sync functions: treated as combinational logic
+/// - Async functions: treated as sequential logic
 ///
 /// Experimental mode:
 /// - `#[hardware(function_typed)]` enforces read-only input signatures and
 ///   a non-unit return type for staged migration to function-typed modules.
-/// 
-/// Currently a marker; real work happens in the executor.
 #[proc_macro_attribute]
 pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(input as ItemFn);
@@ -26,9 +23,16 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
         return err.to_compile_error().into();
     }
     
-    // Just pass through - executor handles the rest
+    let fn_name = &input_fn.sig.ident;
+    let verilog_helper_name = format_ident!("{}_verilog", fn_name);
+    let fn_vis = &input_fn.vis;
+
     quote! {
         #input_fn
+
+        #fn_vis fn #verilog_helper_name() -> String {
+            copper_codegen::to_verilog_from_str_with_source(stringify!(#input_fn), file!())
+        }
     }.into()
 }
 
@@ -48,16 +52,11 @@ fn parse_function_typed_flag(args: TokenStream) -> Result<bool, Error> {
 }
 
 fn validate_hardware_fn(input_fn: &ItemFn, function_typed: bool) -> Result<(), Error> {
-    if input_fn.sig.asyncness.is_none() {
-        return Err(Error::new_spanned(
-            &input_fn.sig,
-            "#[hardware] can only be applied to async functions",
-        ));
-    }
-
     if !function_typed {
         return Ok(());
     }
+
+    // function_typed mode validation
 
     match &input_fn.sig.output {
         ReturnType::Default => {

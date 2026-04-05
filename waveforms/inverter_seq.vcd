@@ -1,0 +1,26 @@
+$timescale 1ps $end
+$scope module registered_inverter $end
+$var wire 1 ! input_sig $end
+$var wire 1 " out $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+b0 !
+b1 "
+$end
+#1
+b0 !
+b1 "
+#2
+b1 !
+b0 "
+#3
+b0 !
+b1 "
+#4
+b1 !
+b0 "
+#5
+b0 !
+b1 "

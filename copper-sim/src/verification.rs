@@ -171,7 +171,8 @@ pub fn generate_testbench(
 
         for (name, values) in &cycle_data.inputs {
             let value = logic_vec_to_int(values);
-            tb.push_str(&format!("    top->{} = {};\n", name, value));
+            let port = sanitize_port_name(name);
+            tb.push_str(&format!("    top->{} = {};\n", port, value));
         }
 
         if has_clock {
@@ -193,19 +194,31 @@ pub fn generate_testbench(
         }
 
         // Output checks — log failures but keep running so the full waveform is captured.
+        // Cycles whose expected output contains X are skipped: Verilator is a 2-value
+        // simulator and cannot propagate 4-state unknowns the same way as a 4-state sim.
         for (name, expected) in &cycle_data.outputs {
-            let expected_val = logic_vec_to_int(expected);
-            tb.push_str(&format!(
-                "    if (top->{name} != {exp}) {{\n\
-                 \x20\x20\x20\x20    std::cout << \"FAIL: Cycle {cyc} {name} expected {exp} got \" << (int)top->{name} << std::endl;\n\
-                 \x20\x20\x20\x20    failures++;\n\
-                 \x20\x20\x20\x20}} else {{\n\
-                 \x20\x20\x20\x20    std::cout << \"PASS: Cycle {cyc} {name}\" << std::endl;\n\
-                 \x20\x20\x20\x20}}\n",
-                name = name,
-                exp  = expected_val,
-                cyc  = cycle_data.cycle,
-            ));
+            let port = sanitize_port_name(name);
+            if has_x(expected) {
+                tb.push_str(&format!(
+                    "    std::cout << \"SKIP: Cycle {cyc} {name} (X-state)\" << std::endl;\n",
+                    cyc  = cycle_data.cycle,
+                    name = name,
+                ));
+            } else {
+                let expected_val = logic_vec_to_int(expected);
+                tb.push_str(&format!(
+                    "    if (top->{port} != {exp}) {{\n\
+                     \x20\x20\x20\x20    std::cout << \"FAIL: Cycle {cyc} {name} expected {exp} got \" << (int)top->{port} << std::endl;\n\
+                     \x20\x20\x20\x20    failures++;\n\
+                     \x20\x20\x20\x20}} else {{\n\
+                     \x20\x20\x20\x20    std::cout << \"PASS: Cycle {cyc} {name}\" << std::endl;\n\
+                     \x20\x20\x20\x20}}\n",
+                    port = port,
+                    name = name,
+                    exp  = expected_val,
+                    cyc  = cycle_data.cycle,
+                ));
+            }
         }
 
         tb.push_str("\n");
@@ -230,14 +243,36 @@ pub fn generate_testbench(
     tb
 }
 
-/// Convert Logic vector to integer for C++ testbench
+/// Apply the same keyword sanitization used by the Verilog code generator.
+///
+/// Verilog reserved words cannot be used as identifiers, so `ir_builder`
+/// appends `_sig` to any port/signal name that is a keyword.  The testbench
+/// must use the sanitized name to match the Verilator-compiled module struct.
+fn sanitize_port_name(name: &str) -> String {
+    const VERILOG_KEYWORDS: &[&str] = &[
+        "input", "output", "inout", "wire", "reg", "module", "endmodule", "always",
+        "assign", "begin", "end", "if", "else", "case", "endcase", "default", "bit",
+    ];
+    if VERILOG_KEYWORDS.contains(&name) {
+        format!("{}_sig", name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// Return true if any bit in the vector is X (unknown).
+fn has_x(values: &[Logic]) -> bool {
+    values.iter().any(|v| matches!(v, Logic::X))
+}
+
+/// Convert Logic vector to integer for C++ testbench.
+/// X bits are treated as 0 to match Verilator's 2-value simulation.
 fn logic_vec_to_int(values: &[Logic]) -> u64 {
     let mut result = 0u64;
     for (i, val) in values.iter().enumerate() {
         match val {
             Logic::One  => result |= 1 << i,
-            Logic::Zero => {}
-            Logic::X    => result |= 1 << i, // treat X as 1 for testbench purposes
+            Logic::Zero | Logic::X => {}
         }
     }
     result

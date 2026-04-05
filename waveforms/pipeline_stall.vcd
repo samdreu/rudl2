@@ -1,0 +1,68 @@
+$timescale 1ps $end
+$scope module pipeline_stall $end
+$var wire 1 ! in_valid $end
+$var wire 8 " in_data $end
+$var wire 1 # out_ready $end
+$var wire 1 $ in_ready $end
+$var wire 1 % out_valid $end
+$var wire 8 & out_data $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+b1 !
+b00000001 "
+b1 #
+b1 $
+b0 %
+b00000000 &
+$end
+#1
+b1 !
+b00000001 "
+b1 #
+b1 $
+b0 %
+b00000000 &
+#2
+b1 !
+b00000010 "
+b0 #
+b0 $
+b1 %
+b00000100 &
+#3
+b0 !
+b00000010 "
+b1 #
+b1 $
+b1 %
+b00000110 &
+#4
+b1 !
+b00000011 "
+b1 #
+b1 $
+b0 %
+b00000110 &
+#5
+b1 !
+b00000100 "
+b0 #
+b0 $
+b1 %
+b00001000 &
+#6
+b0 !
+b00000100 "
+b1 #
+b1 $
+b1 %
+b00001010 &
+#7
+b1 !
+b00000101 "
+b1 #
+b1 $
+b0 %
+b00001010 &

@@ -1,6 +1,8 @@
 use copper_core::{Clock, ClockDomain, Logic};
 use copper_sim::{emit, HardwareExecutor, HardwareTest};
 use copper_macros::hardware;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct MainClk;
@@ -35,6 +37,15 @@ fn u8_to_logic_vec(val: u8) -> Vec<Logic> {
 }
 
 fn main() {
+    // Generate Verilog from Rust source and write to file
+    let verilog = copper_codegen::module_verilog!(registered_pipeline);
+    let verilog_path = "verilog/generated-verilog/pipeline.v";
+    if let Some(parent) = Path::new(verilog_path).parent() {
+        fs::create_dir_all(parent).expect("failed to create Verilog output directory");
+    }
+    fs::write(verilog_path, &verilog).expect("failed to write Verilog");
+    println!("=== Generated Verilog ===\n{}", verilog);
+
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
@@ -46,8 +57,8 @@ fn main() {
 
     let test_inputs = vec![5u8, 10, 15];
 
-    let mut test = HardwareTest::new("pipeline")
-        .with_verilog("verilog/pipeline.v")
+    let mut test = HardwareTest::new("registered_pipeline")
+        .with_verilog(verilog_path)
         .with_waveform("waveforms/pipeline.vcd");
 
     println!("=== 2-Stage Pipeline ===");
@@ -62,7 +73,7 @@ fn main() {
         test.record_cycle(
             clk.cycle() as usize,
             &[("in_data",  &in_logic)],
-            &[("out_data", &out_logic)],
+            &[("out", &out_logic)],
         );
     }
 
@@ -78,7 +89,7 @@ fn main() {
         test.record_cycle(
             clk.cycle() as usize,
             &[("in_data",  &in_logic)],
-            &[("out_data", &out_logic)],
+            &[("out", &out_logic)],
         );
     }
 
