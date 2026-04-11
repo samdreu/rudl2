@@ -124,6 +124,7 @@ See [PROGRESS.md](PROGRESS.md) for detailed development tracking.
 - [PROGRESS.md](PROGRESS.md) - Detailed development progress and roadmap
 - [MODULE_COMPOSITION.md](MODULE_COMPOSITION.md) - Module composition patterns
 - [VERILATOR_VERIFICATION.md](VERILATOR_VERIFICATION.md) - Verilator integration guide
+- [VERILOG_OUTPUT_STANDARDS.md](VERILOG_OUTPUT_STANDARDS.md) - Verilog/SystemVerilog output standards and PR review checklist
 
 ## Contributing
 

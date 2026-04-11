@@ -86,6 +86,7 @@ dependencies = [
  "copper-core",
  "log",
  "paste",
+ "proc-macro2",
  "quote",
  "syn",
 ]

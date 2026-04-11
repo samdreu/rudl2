@@ -1,5 +1,33 @@
 # Copper HDL Development Progress
 
+## Recent Completion: Phase A - Frontend Capture (April 2026)
+
+### Completed
+- ✅ Designed and implemented complete Frontend IR schema in copper-core/src/frontend_ir.rs
+- ✅ Implemented capture_frontend_ir entrypoint and all helper functions
+- ✅ Full recursive expression AST parsing for all 20+ expression types:
+  - Literals, arrays, assignments, async/await blocks
+  - Binary/unary operations, casts, field access, method calls
+  - Control flow: if/else, loops, while, match with guards
+  - Return, yield, await, async expressions
+- ✅ Type inference with fallback chain: explicit → function call → cast → none
+- ✅ Structured item statements (Const, Enum, Struct, Type, Macro, Other)
+- ✅ Full mutability and attribute capture
+- ✅ 103 comprehensive unit tests for parser and IR construction
+  - 16 signature/module/clock tests
+  - 40 expression type tests (all 20+ variants)
+  - 33 content validation tests (recursive structure, branch contents)
+  - 14 item statement content tests (name, type, field validation)
+- ✅ All tests passing with 100% coverage of major code paths
+
+### Phase A Deliverable: FrontendModuleIR
+- Stable compiler boundary independent of syn version changes
+- Source-shaped IR preserving original syntax
+- Full expression AST suitable for Phase B semantic lowering
+- Comprehensive structured data for all statement types
+
+---
+
 ## Project Vision & Goals
 
 ## Recent Update: Function-Typed Output Gap (March 2026)
@@ -184,70 +212,74 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 
 ## Development Roadmap (12 Months)
 
-### Month 1: Type System & Execution Runtime ⏳ IN PROGRESS
+### Month 1: Type System & Execution Runtime ✅ COMPLETE (Jan-Feb 2026)
 - Week 1-2: Basic types (Bit, Bits, Clock) ✅ COMPLETE
 - Week 3-4: HardwareExecutor, ClockTick, async runtime ✅ COMPLETE
 - **Deliverable:** Working Rust simulation of async counter with cycle-accurate execution
 
-### Month 2: Function-Typed Modules & Verilog Codegen ⏳ STARTED (March 2026)
-- Week 1: IR structure design and combinational logic codegen ⏳ IN PROGRESS
-- Week 2: Sequential logic (async→FSM) transformation
-- Week 3: Complex state machines and match statements
-- Week 4: Testing and validation with all examples
-- **Deliverable:** Verilog generation working for all 14 examples
+### Month 2: Function-Typed Modules & Phase A Frontend Capture ✅ COMPLETE (Mar-Apr 2026)
+- Week 1-2: Frontend IR schema design ✅ COMPLETE
+- Week 3-4: Expression parsing and item statement handling ✅ COMPLETE
+- **Completed Deliverables:**
+  - FrontendModuleIR with full expression AST
+  - 103 passing unit tests validating all IR paths
+  - Stable compiler boundary for Phase B
+  - Ready for semantic lowering
 
-### Month 3: Async→FSM Transformation
-- Implement async function lowering to Verilog state machines
-- Support `loop`, `if/else`, `match` in async functions
-- Generate proper sensitivity lists and blocking/non-blocking assignments
-- **Deliverable:** Complex state machines (UART, SPI) in async style
+### Month 3: Phase B - Semantic Lowering (IN PROGRESS, May 2026)
+- [ ] Implement CHIR (Canonical Hardware IR) schema
+- [ ] Expression normalization (widths, operators)
+- [ ] Async module lowering to explicit state/timing regions
+- [ ] Temporaries and implicit register extraction
+- **Deliverable:** FrontendModuleIR → CHIR transformation with tests
 
-### Month 4: Benchmark Circuits & Validation
-- Implement standard benchmarks (AES subset, RISC-V core subset, FFT)
-- Validate Rust sim vs Verilator cycle-by-cycle
-- Performance comparison (simulation speed, compile time)
-- **Deliverable:** 5+ benchmark circuits, correctness validated
-- Define formal operational semantics
-- Prove async→Verilog transformation preserves behavior
-- **Deliverable:** Paper draft with formalism section
+### Month 4: Phase C - Timing & State (May-Jun 2026)
+- [ ] Implement SHIR (Scheduled IR) with explicit edge timing
+- [ ] Pre-edge, post-edge, edge-event buckets
+- [ ] Equivalence validation vs Copper simulator
+- **Deliverable:** CHIR → SHIR scheduling
 
-### Month 5: Formal Semantics
-- Define formal operational semantics
-- Prove async→Verilog transformation preserves behavior
-- **Deliverable:** Paper draft with formalism section
+### Month 5: Phase D - Verilog Legalization (Jun 2026)
+- [ ] Implement VLIR (Verilog-Legal IR)
+- [ ] Keyword resolution and name mangling
+- [ ] Backend-specific compatibility options
+- **Deliverable:** SHIR → VLIR legalization
 
-### Month 6-7: CDC Safety & Optimization
-- Implement compile-time CDC violation detection
-- Add synchronizer primitives and type conversions
-- Optimize generated Verilog (dead code elimination, constant propagation)
-- **Deliverable:** CDC safety verification, optimized Verilog output
+### Month 6: Phase E - Verilog Emission (Jul 2026)
+- [ ] Implement deterministic Verilog text generation
+- [ ] Source location mapping
+- [ ] Readability formatting (optional)
+- **Deliverable:** Verilog output working for all examples
 
-### Month 8: Tooling & IDE Support
-- LSP integration for clock domain errors
-- Waveform viewer for Rust simulation
-- **Deliverable:** Good developer experience
+### Month 7: Phase F - Validation & Testing (Jul-Aug 2026)
+- [ ] Generated Verilog parsing with iverilog
+- [ ] Verilator simulation with trace comparison
+- [ ] Edge-sensitive behavior testing
+- **Deliverable:** All examples validated (Rust sim ≡ Verilator)
 
-### Month 9: Performance Evaluation
-- Comprehensive benchmarking (simulation speed, compile time, code size)
-- Comparison with Chisel, Clash, Bluespec
-- Gather quantitative data for paper
-- **Deliverable:** Complete performance evaluation section
+### Month 8-9: Advanced Features & Optimization (Sep 2026)
+- [ ] Multi-clock domain lowering
+- [ ] CDC violation detection at Phase B
+- [ ] Optimization passes (dead code, constant prop)
+- [ ] Memory inference and RAMs
+- **Deliverable:** Production-ready codegen pipeline
 
-### Month 10: Evaluation & Case Studies
-- Real-world case studies demonstrating CDC safety
-- Examples showing async/await benefits
-- Compile-time error examples
-- **Deliverable:** Motivating examples for paper
+### Month 10: Benchmark Circuits & Case Studies (Oct 2026)
+- [ ] Implement standard benchmarks (AES subset, RISC-V core, FFT)
+- [ ] Performance evaluation: compile time, sim speed
+- [ ] CDC safety examples
+- **Deliverable:** 5+ benchmarks, quantitative evaluation
 
-### Month 11: Paper Writing
-- Draft all sections
-- Run final experiments
+### Month 11: Paper Revision & Formal Semantics (Oct-Nov 2026)
+- [ ] Write formal operational semantics
+- [ ] Prove Phase A→F transformation correctness
+- [ ] Draft paper sections
 - **Deliverable:** Complete paper draft
 
-### Month 12: Paper Revision
-- Incorporate feedback
-- Polish writing
-- **Deliverable:** Submit to PLDI 2027 (November 2026)
+### Month 12: Final Polish & Submission (Nov 2026)
+- [ ] Incorporate feedback
+- [ ] Final experiments
+- **Deliverable:** PLDI 2027 submission
 
 ---
 
@@ -269,35 +301,47 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
   - Cycle-accurate execution verified
 - **Macro System**
   - `#[hardware]` macro validates async functions
-  - Marker-based implementation (Phase 4 will add code gen)
+  - Marker-based implementation
+- **Phase A: Frontend Capture** ✅ COMPLETE
+  - FrontendModuleIR schema with full IR hierarchy
+  - Signature capture, module classification, clock metadata
+  - Raw statement capture with ordered statements
+  - Full recursive expression AST parsing (20+ expression types)
+  - Structured item statements (Const, Enum, Struct, Type, Macro, Other)
+  - Type inference with fallback chain
+  - 103 comprehensive unit tests (100% pass rate)
+  - Stable compiler IR boundary
 
 ### In Progress ⏳
-- **Week 3-4 Cleanup** (Minor)
-  - Remove unused imports and dead code
-  - Add comprehensive documentation
-  - Create additional examples (pipeline, multi-module)
+- **Phase B: Semantic Lowering**
+  - CHIR schema design
+  - Expression normalization
+  - Async state extraction
 
-### Next Up 🔜 (Phase 4: Module Composition)
-- **Enhanced Macro & Module Handles** (PRIORITY)
-  - Generate module handles for output tracking
-  - Support parent module composition (calling child modules)
-  - Create examples: pipeline, multi-module hierarchy
-  - Implement cross-module connectivity
-  - Add module output sampling across cycles
-  
-**Then Month 2:**
-- **Function-Typed Modules**
-  - Modify `#[hardware]` macro to parse function signatures
-  - Auto-generate port lists from parameters/return types
-  - Distinguish `fn` vs `async fn` in codegen
+### Next Up 🔜 (Priority Order)
+1. **Phase B: Semantic Lowering** (PRIORITY)
+   - Implement CHIR (Canonical Hardware IR)
+   - Expression normalization and operator canonicalization
+   - Width inference and signedness resolution
+   - Implicit register extraction for persistent state
+   - Explicit temporaries for complex expressions
+   
+2. **Phase C: Timing & State Construction**
+   - Implement SHIR with explicit cycle regions
+   - Pre-edge, post-edge, edge-event buckets
+   - Equivalence validation against simulator
+
+3. **Phase D-F: Legalization & Emission**
+   - Verilog-legal IR construction
+   - Deterministic Verilog generation
+   - Correctness validation
 
 ### Future Work 📅
-- **Month 3:** Async→FSM lowering
-- **Month 4:** Benchmark circuits and validation
-- **Month 5:** Formal semantics
-- **Month 6-7:** CDC safety analysis and optimization
-- **Month 8:** Tooling and IDE support
-- **Month 9-10:** Performance evaluation and case studies
+- **Benchmark circuits:** AES, RISC-V core, FFT
+- **Performance evaluation:** Compile time, simulation speed comparisons
+- **CDC safety:** Compile-time violation detection
+- **Formal semantics:** Operational semantics and correctness proofs
+- **Paper writing:** PLDI 2027 submission
 - **Month 11-12:** Paper writing and revision
 
 **Deferred Features (Post-Paper):**

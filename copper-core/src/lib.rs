@@ -1,7 +1,19 @@
 pub mod ir;
+pub mod frontend_ir;
 pub mod types;
 
 pub use ir::{ModuleIR};
+pub use frontend_ir::{
+    ClockParamMeta,
+    FrontendClassification,
+    FrontendModuleIR,
+    FrontendSignature,
+    RawParam,
+    RawStmt,
+    RawStmtKind,
+    RawTypeRef,
+    SourceSpan,
+};
 pub use types::{Bit, Bits, Clock, ClockDomain, Logic};
 
 // pub mod types;
