@@ -44,11 +44,11 @@ impl IRBuilder {
     }
 }
 
-pub fn capture_frontend_ir(design_fn: &ItemFn) -> Result<FrontendModuleIR, LowerError> {
+pub fn capture_frontend_ir(design_fn: &ItemFn, hardware_fns: &std::collections::HashSet<String>) -> Result<FrontendModuleIR, LowerError> {
     let signature = capture_signature(design_fn);
     let clocks = capture_clock_metadata(design_fn);
     let classification = classify_module(design_fn);
-    let raw_statements = capture_raw_statements(design_fn);
+    let raw_statements = capture_raw_statements(design_fn, hardware_fns);
 
     Ok(FrontendModuleIR {
         module_name: design_fn.sig.ident.to_string(),
@@ -135,7 +135,7 @@ fn capture_clock_metadata(design_fn: &ItemFn) -> Vec<ClockParamMeta> {
     clocks
 }
 
-fn capture_raw_statements(design_fn: &ItemFn) -> Vec<RawStmt> {
+fn capture_raw_statements(design_fn: &ItemFn, hardware_fns: &std::collections::HashSet<String>) -> Vec<RawStmt> {
     design_fn
         .block
         .stmts
@@ -143,18 +143,18 @@ fn capture_raw_statements(design_fn: &ItemFn) -> Vec<RawStmt> {
         .enumerate()
         .map(|(order, stmt)| RawStmt {
             order,
-            kind: classify_raw_stmt_kind(stmt),
+            kind: classify_raw_stmt_kind(stmt, hardware_fns),
             text: quote!(#stmt).to_string(),
             span: capture_source_span(stmt),
         })
         .collect()
 }
 
-fn classify_raw_stmt_kind(stmt: &Stmt) -> RawStmtKind {
+fn classify_raw_stmt_kind(stmt: &Stmt, hardware_fns: &std::collections::HashSet<String>) -> RawStmtKind {
     match stmt {
-        Stmt::Local(local) => parse_local_stmt(local),
+        Stmt::Local(local) => parse_local_stmt(local, hardware_fns),
         Stmt::Item(item) => parse_item_stmt(item),
-        Stmt::Expr(expr, semi) => parse_expr_stmt(expr, semi.is_some()),
+        Stmt::Expr(expr, semi) => parse_expr_stmt(expr, semi.is_some(), hardware_fns),
         Stmt::Macro(stmt_macro) => RawStmtKind::Expr(ExprStmt {
             expr: ExprType::Lit(ExprLit {
                 text: quote!(#stmt_macro).to_string(),
@@ -166,7 +166,7 @@ fn classify_raw_stmt_kind(stmt: &Stmt) -> RawStmtKind {
     }
 }
 
-fn parse_local_stmt(local: &syn::Local) -> RawStmtKind {
+fn parse_local_stmt(local: &syn::Local, hardware_fns: &std::collections::HashSet<String>) -> RawStmtKind {
     let is_mut = match &local.pat {
         syn::Pat::Ident(pat_ident) => pat_ident.mutability.is_some(),
         syn::Pat::Type(pat_ty) => matches!(
@@ -185,7 +185,7 @@ fn parse_local_stmt(local: &syn::Local) -> RawStmtKind {
         is_mut,
         ty,
         name,
-        init: local.init.as_ref().map(|init| parse_expr_type(&init.expr)),
+        init: local.init.as_ref().map(|init| parse_expr_type(&init.expr, hardware_fns)),
         attrs: local.attrs.iter().map(|a| quote!(#a).to_string()).collect(),
         span: capture_source_span(local),
     })
@@ -304,24 +304,24 @@ fn parse_item_stmt(item: &syn::Item) -> RawStmtKind {
     RawStmtKind::Item(item_stmt)
 }
 
-fn parse_expr_stmt(expr: &Expr, has_semi: bool) -> RawStmtKind {
+fn parse_expr_stmt(expr: &Expr, has_semi: bool, hardware_fns: &std::collections::HashSet<String>) -> RawStmtKind {
     RawStmtKind::Expr(ExprStmt {
-        expr: parse_expr_type(expr),
+        expr: parse_expr_type(expr, hardware_fns),
         has_semi,
         span: capture_source_span(expr),
     })
 }
 
-fn parse_expr_type(expr: &Expr) -> ExprType {
+fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>) -> ExprType {
     match expr {
         Expr::Array(e) => ExprType::Array(ExprArray {
-            elements: e.elems.iter().map(parse_expr_type).collect(),
+            elements: e.elems.iter().map(|e| parse_expr_type(e, hardware_fns)).collect(),
             span: capture_source_span(e),
         }),
 
         Expr::Assign(e) => ExprType::Assign(ExprAssign {
-            left: Box::new(parse_expr_type(&e.left)),
-            right: Box::new(parse_expr_type(&e.right)),
+            left: Box::new(parse_expr_type(&e.left, hardware_fns)),
+            right: Box::new(parse_expr_type(&e.right, hardware_fns)),
             span: capture_source_span(e),
         }),
 
@@ -329,7 +329,7 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
             is_move: e.capture.is_some(),
             block: e.block.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
                 order,
-                kind: classify_raw_stmt_kind(stmt),
+                kind: classify_raw_stmt_kind(stmt, hardware_fns),
                 text: quote!(#stmt).to_string(),
                 span: capture_source_span(stmt),
             }).collect(),
@@ -337,25 +337,34 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         }),
 
         Expr::Await(e) => ExprType::Await(ExprAwait {
-            base: Box::new(parse_expr_type(&e.base)),
+            base: Box::new(parse_expr_type(&e.base, hardware_fns)),
             span: capture_source_span(e),
         }),
 
         Expr::Binary(e) => ExprType::Binary(ExprBinary {
-            left: Box::new(parse_expr_type(&e.left)),
+            left: Box::new(parse_expr_type(&e.left, hardware_fns)),
             op: format_binop(&e.op),
-            right: Box::new(parse_expr_type(&e.right)),
+            right: Box::new(parse_expr_type(&e.right, hardware_fns)),
             span: capture_source_span(e),
         }),
 
-        Expr::Call(e) => ExprType::Call(ExprCall {
-            func: Box::new(parse_expr_type(&e.func)),
-            args: e.args.iter().map(parse_expr_type).collect(),
-            span: capture_source_span(e),
-        }),
+        Expr::Call(e) => {
+            let is_hardware_module = match &*e.func {
+                Expr::Path(p) => p.path.segments.last()
+                    .map(|seg| hardware_fns.contains(&seg.ident.to_string()))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            ExprType::Call(ExprCall {
+                func: Box::new(parse_expr_type(&e.func, hardware_fns)),
+                args: e.args.iter().map(|a| parse_expr_type(a, hardware_fns)).collect(),
+                is_hardware_module,
+                span: capture_source_span(e),
+            })
+        }
 
         Expr::Cast(e) => ExprType::Cast(ExprCast {
-            expr: Box::new(parse_expr_type(&e.expr)),
+            expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             target_ty: RawTypeRef {
                 ty_text: e.ty.to_token_stream().to_string(),
                 span: capture_source_span(&*e.ty),
@@ -364,7 +373,7 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         }),
 
         Expr::Field(e) => ExprType::Field(ExprField {
-            base: Box::new(parse_expr_type(&e.base)),
+            base: Box::new(parse_expr_type(&e.base, hardware_fns)),
             member: match &e.member {
                 syn::Member::Named(ident) => ident.to_string(),
                 syn::Member::Unnamed(index) => index.index.to_string(),
@@ -373,22 +382,22 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         }),
 
         Expr::If(e) => ExprType::If(ExprIf {
-            condition: Box::new(parse_expr_type(&e.cond)),
+            condition: Box::new(parse_expr_type(&e.cond, hardware_fns)),
             then_block: e.then_branch.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
                 order,
-                kind: classify_raw_stmt_kind(stmt),
+                kind: classify_raw_stmt_kind(stmt, hardware_fns),
                 text: quote!(#stmt).to_string(),
                 span: capture_source_span(stmt),
             }).collect(),
             else_branch: e.else_branch.as_ref().map(|(_, expr)| {
-                Box::new(parse_expr_type(expr))
+                Box::new(parse_expr_type(expr, hardware_fns))
             }),
             span: capture_source_span(e),
         }),
 
         Expr::Let(e) => ExprType::Let(ExprLet {
-            pattern_text: quote!(&e.pat).to_string(),
-            expr: Box::new(parse_expr_type(&e.expr)),
+            pattern_text: e.pat.to_token_stream().to_string(),
+            expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             span: capture_source_span(e),
         }),
 
@@ -400,7 +409,7 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         Expr::Loop(e) => ExprType::Loop(ExprLoop {
             body: e.body.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
                 order,
-                kind: classify_raw_stmt_kind(stmt),
+                kind: classify_raw_stmt_kind(stmt, hardware_fns),
                 text: quote!(#stmt).to_string(),
                 span: capture_source_span(stmt),
             }).collect(),
@@ -408,12 +417,12 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         }),
 
         Expr::Match(e) => ExprType::Match(ExprMatch {
-            scrutinee: Box::new(parse_expr_type(&e.expr)),
+            scrutinee: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             arms: e.arms.iter().map(|arm| {
                 ExprMatchArm {
-                    pattern_text: quote!(&arm.pat).to_string(),
-                    guard: arm.guard.as_ref().map(|(_, g)| Box::new(parse_expr_type(g))),
-                    body: Box::new(parse_expr_type(&arm.body)),
+                    pattern_text: arm.pat.to_token_stream().to_string(),
+                    guard: arm.guard.as_ref().map(|(_, g)| Box::new(parse_expr_type(g, hardware_fns))),
+                    body: Box::new(parse_expr_type(&arm.body, hardware_fns)),
                     span: capture_source_span(arm),
                 }
             }).collect(),
@@ -421,47 +430,47 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         }),
 
         Expr::MethodCall(e) => ExprType::MethodCall(ExprMethodCall {
-            receiver: Box::new(parse_expr_type(&e.receiver)),
+            receiver: Box::new(parse_expr_type(&e.receiver, hardware_fns)),
             method: e.method.to_string(),
-            args: e.args.iter().map(parse_expr_type).collect(),
+            args: e.args.iter().map(|a| parse_expr_type(a, hardware_fns)).collect(),
             span: capture_source_span(e),
         }),
 
         Expr::Range(e) => ExprType::Range(ExprRange {
-            start: e.start.as_ref().map(|e| Box::new(parse_expr_type(e))),
-            end: e.end.as_ref().map(|e| Box::new(parse_expr_type(e))),
+            start: e.start.as_ref().map(|e| Box::new(parse_expr_type(e, hardware_fns))),
+            end: e.end.as_ref().map(|e| Box::new(parse_expr_type(e, hardware_fns))),
             inclusive: matches!(e.limits, syn::RangeLimits::Closed(_)),
             span: capture_source_span(e),
         }),
 
         Expr::Reference(e) => ExprType::Reference(ExprReference {
             is_mut: e.mutability.is_some(),
-            expr: Box::new(parse_expr_type(&e.expr)),
+            expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             span: capture_source_span(e),
         }),
 
         Expr::Repeat(e) => ExprType::Repeat(ExprRepeat {
-            expr: Box::new(parse_expr_type(&e.expr)),
-            len: Box::new(parse_expr_type(&e.len)),
+            expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
+            len: Box::new(parse_expr_type(&e.len, hardware_fns)),
             span: capture_source_span(e),
         }),
 
         Expr::Return(e) => ExprType::Return(ExprReturn {
-            value: e.expr.as_ref().map(|e| Box::new(parse_expr_type(e))),
+            value: e.expr.as_ref().map(|e| Box::new(parse_expr_type(e, hardware_fns))),
             span: capture_source_span(e),
         }),
 
         Expr::Unary(e) => ExprType::Unary(ExprUnary {
             op: format_unop(&e.op),
-            expr: Box::new(parse_expr_type(&e.expr)),
+            expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             span: capture_source_span(e),
         }),
 
         Expr::While(e) => ExprType::While(ExprWhile {
-            condition: Box::new(parse_expr_type(&e.cond)),
+            condition: Box::new(parse_expr_type(&e.cond, hardware_fns)),
             body: e.body.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
                 order,
-                kind: classify_raw_stmt_kind(stmt),
+                kind: classify_raw_stmt_kind(stmt, hardware_fns),
                 text: quote!(#stmt).to_string(),
                 span: capture_source_span(stmt),
             }).collect(),
@@ -469,7 +478,7 @@ fn parse_expr_type(expr: &Expr) -> ExprType {
         }),
 
         Expr::Yield(e) => ExprType::Yield(ExprYield {
-            value: e.expr.as_ref().map(|e| Box::new(parse_expr_type(e))),
+            value: e.expr.as_ref().map(|e| Box::new(parse_expr_type(e, hardware_fns))),
             span: capture_source_span(e),
         }),
 
@@ -699,7 +708,7 @@ mod tests {
             }
         };
 
-        let raw_statements = capture_raw_statements(&design_fn);
+        let raw_statements = capture_raw_statements(&design_fn, &Default::default());
         assert_eq!(raw_statements.len(), 3);
         assert_eq!(raw_statements[0].order, 0);
         assert!(matches!(raw_statements[0].kind, RawStmtKind::Local(_)));
@@ -715,7 +724,7 @@ mod tests {
             let mut count: Bits<8> = Bits::<8>::from_u128(0);
         });
 
-        let kind = parse_local_stmt(&local);
+        let kind = parse_local_stmt(&local, &Default::default());
         match kind {
             RawStmtKind::Local(local_stmt) => {
                 assert!(local_stmt.is_mut);
@@ -733,7 +742,7 @@ mod tests {
             let mut count = Bits::<8>::from_u128(0);
         });
 
-        let kind = parse_local_stmt(&local);
+        let kind = parse_local_stmt(&local, &Default::default());
         match kind {
             RawStmtKind::Local(local_stmt) => {
                 assert!(local_stmt.is_mut);
@@ -751,7 +760,7 @@ mod tests {
             let count: u16 = Bits::<8>::from_u128(0);
         });
 
-        let kind = parse_local_stmt(&local);
+        let kind = parse_local_stmt(&local, &Default::default());
         match kind {
             RawStmtKind::Local(local_stmt) => {
                 let ty = local_stmt.ty.expect("explicit type should be captured");
@@ -767,7 +776,7 @@ mod tests {
             let count = input as Bits<8>;
         });
 
-        let kind = parse_local_stmt(&local);
+        let kind = parse_local_stmt(&local, &Default::default());
         match kind {
             RawStmtKind::Local(local_stmt) => {
                 let ty = local_stmt.ty.expect("cast type hint should be captured");
@@ -783,7 +792,7 @@ mod tests {
             let count = input;
         });
 
-        let kind = parse_local_stmt(&local);
+        let kind = parse_local_stmt(&local, &Default::default());
         match kind {
             RawStmtKind::Local(local_stmt) => {
                 assert!(!local_stmt.is_mut);
@@ -800,7 +809,7 @@ mod tests {
             const WIDTH: usize = 8;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Const(const_item)) => {
                 assert_eq!(const_item.name, "WIDTH");
@@ -816,7 +825,7 @@ mod tests {
             enum State { Idle, Busy }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Enum(enum_item)) => {
                 assert_eq!(enum_item.name, "State");
@@ -836,7 +845,7 @@ mod tests {
             }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Macro(macro_item)) => {
                 assert_eq!(macro_item.name, "my_macro");
@@ -851,7 +860,7 @@ mod tests {
             struct Reg8 { value: u8 }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Struct(struct_item)) => {
                 assert_eq!(struct_item.name, "Reg8");
@@ -869,7 +878,7 @@ mod tests {
             type Word = u16;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Type(type_item)) => {
                 assert_eq!(type_item.name, "Word");
@@ -885,7 +894,7 @@ mod tests {
             fn helper() {}
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Other(_)) => {
                 // Successfully matched Other variant
@@ -902,7 +911,7 @@ mod tests {
             const BUFFER_SIZE: usize = 256;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Const(const_item)) => {
                 assert_eq!(const_item.name, "BUFFER_SIZE");
@@ -920,7 +929,7 @@ mod tests {
             const WIDTH: u32 = 8;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Const(const_item)) => {
                 assert_eq!(const_item.name, "WIDTH");
@@ -936,7 +945,7 @@ mod tests {
             enum State { Idle, Busy, Done }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Enum(enum_item)) => {
                 assert_eq!(enum_item.name, "State");
@@ -955,7 +964,7 @@ mod tests {
             enum Code { Success = 0, Error = 1, Pending = 2 }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Enum(enum_item)) => {
                 assert_eq!(enum_item.name, "Code");
@@ -975,7 +984,7 @@ mod tests {
             struct Register { value: u32, mask: u32 }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Struct(struct_item)) => {
                 assert_eq!(struct_item.name, "Register");
@@ -995,7 +1004,7 @@ mod tests {
             struct Point(i32, i32);
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Struct(struct_item)) => {
                 assert_eq!(struct_item.name, "Point");
@@ -1016,7 +1025,7 @@ mod tests {
             struct Marker;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Struct(struct_item)) => {
                 assert_eq!(struct_item.name, "Marker");
@@ -1035,7 +1044,7 @@ mod tests {
             }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Struct(struct_item)) => {
                 assert_eq!(struct_item.name, "Container");
@@ -1056,7 +1065,7 @@ mod tests {
             type Byte = u8;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Type(type_item)) => {
                 assert_eq!(type_item.name, "Byte");
@@ -1072,7 +1081,7 @@ mod tests {
             type IntMap = std::collections::HashMap<String, i32>;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Type(type_item)) => {
                 assert_eq!(type_item.name, "IntMap");
@@ -1089,7 +1098,7 @@ mod tests {
             type Result<T> = std::result::Result<T, Error>;
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Type(type_item)) => {
                 assert_eq!(type_item.name, "Result");
@@ -1110,7 +1119,7 @@ mod tests {
             }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Macro(macro_item)) => {
                 assert_eq!(macro_item.name, "assert_hw");
@@ -1131,7 +1140,7 @@ mod tests {
             }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Enum(enum_item)) => {
                 assert_eq!(enum_item.name, "Signal");
@@ -1152,7 +1161,7 @@ mod tests {
             struct Point { x: i32, y: i32 }
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Item(ItemStmt::Struct(struct_item)) => {
                 assert_eq!(struct_item.name, "Point");
@@ -1169,7 +1178,7 @@ mod tests {
             foo();
         };
 
-        let kind = classify_raw_stmt_kind(&stmt);
+        let kind = classify_raw_stmt_kind(&stmt, &Default::default());
         match kind {
             RawStmtKind::Expr(expr_stmt) => {
                 assert!(expr_stmt.has_semi);
@@ -1183,7 +1192,7 @@ mod tests {
     #[test]
     fn test_parse_expr_array() {
         let expr: Expr = parse_quote!([1, 2, 3]);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Array(arr) => {
                 assert_eq!(arr.elements.len(), 3);
                 match &arr.elements[0] {
@@ -1198,7 +1207,7 @@ mod tests {
     #[test]
     fn test_parse_expr_assign() {
         let expr: Expr = parse_quote!(x = 42);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Assign(assign) => {
                 assert!(matches!(*assign.left, ExprType::Lit(_)));
                 assert!(matches!(*assign.right, ExprType::Lit(_)));
@@ -1213,7 +1222,7 @@ mod tests {
             let x = 5;
             x + 1
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Async(async_expr) => {
                 assert_eq!(async_expr.block.len(), 2);
                 assert!(!async_expr.is_move);
@@ -1227,7 +1236,7 @@ mod tests {
         let expr: Expr = parse_quote!(async move {
             let x = 5;
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Async(async_expr) => {
                 assert!(async_expr.is_move);
             }
@@ -1238,7 +1247,7 @@ mod tests {
     #[test]
     fn test_parse_expr_await() {
         let expr: Expr = parse_quote!(foo.await);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Await(await_expr) => {
                 assert!(matches!(*await_expr.base, ExprType::Lit(_)));
             }
@@ -1249,7 +1258,7 @@ mod tests {
     #[test]
     fn test_parse_expr_binary_add() {
         let expr: Expr = parse_quote!(a + b);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Binary(bin) => {
                 assert_eq!(bin.op, "+");
                 assert!(matches!(*bin.left, ExprType::Lit(_)));
@@ -1262,7 +1271,7 @@ mod tests {
     #[test]
     fn test_parse_expr_binary_bitwise_or() {
         let expr: Expr = parse_quote!(a | b);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Binary(bin) => {
                 assert_eq!(bin.op, "|");
             }
@@ -1273,7 +1282,7 @@ mod tests {
     #[test]
     fn test_parse_expr_binary_logical_and() {
         let expr: Expr = parse_quote!(a && b);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Binary(bin) => {
                 assert_eq!(bin.op, "&&");
             }
@@ -1284,7 +1293,7 @@ mod tests {
     #[test]
     fn test_parse_expr_call() {
         let expr: Expr = parse_quote!(foo(1, 2));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Call(call) => {
                 assert_eq!(call.args.len(), 2);
                 assert!(matches!(&call.args[0], ExprType::Lit(_)));
@@ -1297,7 +1306,7 @@ mod tests {
     #[test]
     fn test_parse_expr_cast() {
         let expr: Expr = parse_quote!(x as u32);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Cast(cast) => {
                 assert!(matches!(*cast.expr, ExprType::Lit(_)));
                 assert_eq!(compact_ws(&cast.target_ty.ty_text), "u32");
@@ -1309,7 +1318,7 @@ mod tests {
     #[test]
     fn test_parse_expr_field() {
         let expr: Expr = parse_quote!(obj.field);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Field(field) => {
                 assert_eq!(field.member, "field");
                 assert!(matches!(*field.base, ExprType::Lit(_)));
@@ -1321,7 +1330,7 @@ mod tests {
     #[test]
     fn test_parse_expr_if() {
         let expr: Expr = parse_quote!(if x > 0 { 1 } else { 2 });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert!(matches!(*if_expr.condition, ExprType::Binary(_)));
                 assert_eq!(if_expr.then_block.len(), 1);
@@ -1334,7 +1343,7 @@ mod tests {
     #[test]
     fn test_parse_expr_if_without_else() {
         let expr: Expr = parse_quote!(if x > 0 { 1 });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert!(matches!(*if_expr.condition, ExprType::Binary(_)));
                 assert_eq!(if_expr.then_block.len(), 1);
@@ -1347,7 +1356,7 @@ mod tests {
     #[test]
     fn test_parse_expr_let() {
         let expr: Expr = parse_quote!(let x = foo());
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Let(let_expr) => {
                 // pattern_text contains the pattern, may have various formats
                 assert!(!let_expr.pattern_text.is_empty());
@@ -1360,7 +1369,7 @@ mod tests {
     #[test]
     fn test_parse_expr_lit_int() {
         let expr: Expr = parse_quote!(42);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Lit(lit) => {
                 assert_eq!(compact_ws(&lit.text), "42");
             }
@@ -1371,7 +1380,7 @@ mod tests {
     #[test]
     fn test_parse_expr_lit_string() {
         let expr: Expr = parse_quote!("hello");
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Lit(lit) => {
                 assert!(lit.text.contains("hello"));
             }
@@ -1384,7 +1393,7 @@ mod tests {
         let expr: Expr = parse_quote!(loop {
             if x { break; }
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Loop(loop_expr) => {
                 assert_eq!(loop_expr.body.len(), 1);
             }
@@ -1399,7 +1408,7 @@ mod tests {
             2 => "two",
             _ => "other",
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 assert_eq!(match_expr.arms.len(), 3);
                 assert!(matches!(*match_expr.scrutinee, ExprType::Lit(_)));
@@ -1415,7 +1424,7 @@ mod tests {
             1 if x > 0 => "positive",
             _ => "other",
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 assert!(match_expr.arms[0].guard.is_some());
             }
@@ -1426,7 +1435,7 @@ mod tests {
     #[test]
     fn test_parse_expr_method_call() {
         let expr: Expr = parse_quote!(obj.method(1, 2));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::MethodCall(method) => {
                 assert_eq!(method.method, "method");
                 assert_eq!(method.args.len(), 2);
@@ -1439,7 +1448,7 @@ mod tests {
     #[test]
     fn test_parse_expr_range_exclusive() {
         let expr: Expr = parse_quote!(1..10);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Range(range) => {
                 assert!(range.start.is_some());
                 assert!(range.end.is_some());
@@ -1452,7 +1461,7 @@ mod tests {
     #[test]
     fn test_parse_expr_range_inclusive() {
         let expr: Expr = parse_quote!(1..=10);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Range(range) => {
                 assert!(range.inclusive);
             }
@@ -1463,7 +1472,7 @@ mod tests {
     #[test]
     fn test_parse_expr_range_open_start() {
         let expr: Expr = parse_quote!(..10);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Range(range) => {
                 assert!(range.start.is_none());
                 assert!(range.end.is_some());
@@ -1475,7 +1484,7 @@ mod tests {
     #[test]
     fn test_parse_expr_range_open_end() {
         let expr: Expr = parse_quote!(1..);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Range(range) => {
                 assert!(range.start.is_some());
                 assert!(range.end.is_none());
@@ -1487,7 +1496,7 @@ mod tests {
     #[test]
     fn test_parse_expr_reference_immut() {
         let expr: Expr = parse_quote!(&x);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref_expr) => {
                 assert!(!ref_expr.is_mut);
                 assert!(matches!(*ref_expr.expr, ExprType::Lit(_)));
@@ -1499,7 +1508,7 @@ mod tests {
     #[test]
     fn test_parse_expr_reference_mut() {
         let expr: Expr = parse_quote!(&mut x);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref_expr) => {
                 assert!(ref_expr.is_mut);
                 assert!(matches!(*ref_expr.expr, ExprType::Lit(_)));
@@ -1511,7 +1520,7 @@ mod tests {
     #[test]
     fn test_parse_expr_repeat() {
         let expr: Expr = parse_quote!([0; 8]);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Repeat(repeat) => {
                 assert!(matches!(*repeat.expr, ExprType::Lit(_)));
                 assert!(matches!(*repeat.len, ExprType::Lit(_)));
@@ -1523,7 +1532,7 @@ mod tests {
     #[test]
     fn test_parse_expr_return_with_value() {
         let expr: Expr = parse_quote!(return x);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Return(ret) => {
                 assert!(ret.value.is_some());
             }
@@ -1534,7 +1543,7 @@ mod tests {
     #[test]
     fn test_parse_expr_return_without_value() {
         let expr: Expr = parse_quote!(return);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Return(ret) => {
                 assert!(ret.value.is_none());
             }
@@ -1545,7 +1554,7 @@ mod tests {
     #[test]
     fn test_parse_expr_unary_neg() {
         let expr: Expr = parse_quote!(-x);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Unary(unary) => {
                 assert_eq!(unary.op, "-");
                 assert!(matches!(*unary.expr, ExprType::Lit(_)));
@@ -1557,7 +1566,7 @@ mod tests {
     #[test]
     fn test_parse_expr_unary_not() {
         let expr: Expr = parse_quote!(!flag);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Unary(unary) => {
                 assert_eq!(unary.op, "!");
             }
@@ -1568,7 +1577,7 @@ mod tests {
     #[test]
     fn test_parse_expr_unary_deref() {
         let expr: Expr = parse_quote!(*ptr);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Unary(unary) => {
                 assert_eq!(unary.op, "*");
             }
@@ -1581,7 +1590,7 @@ mod tests {
         let expr: Expr = parse_quote!(while x > 0 {
             x -= 1;
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::While(while_expr) => {
                 assert!(matches!(*while_expr.condition, ExprType::Binary(_)));
                 assert_eq!(while_expr.body.len(), 1);
@@ -1593,7 +1602,7 @@ mod tests {
     #[test]
     fn test_parse_expr_yield_with_value() {
         let expr: Expr = parse_quote!(yield x);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Yield(yield_expr) => {
                 assert!(yield_expr.value.is_some());
             }
@@ -1604,7 +1613,7 @@ mod tests {
     #[test]
     fn test_parse_expr_yield_without_value() {
         let expr: Expr = parse_quote!(yield);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Yield(yield_expr) => {
                 assert!(yield_expr.value.is_none());
             }
@@ -1615,7 +1624,7 @@ mod tests {
     #[test]
     fn test_parse_expr_nested_binary_and_call() {
         let expr: Expr = parse_quote!(foo(a + b));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Call(call) => {
                 assert_eq!(call.args.len(), 1);
                 assert!(matches!(&call.args[0], ExprType::Binary(_)));
@@ -1627,7 +1636,7 @@ mod tests {
     #[test]
     fn test_parse_expr_deeply_nested() {
         let expr: Expr = parse_quote!(if foo(a + b) { (x as u32).field } else { 42 });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(_) => {
                 // Just verify it parses without panicking
             }
@@ -1640,7 +1649,7 @@ mod tests {
     #[test]
     fn test_parse_expr_if_validates_condition_type() {
         let expr: Expr = parse_quote!(if x > 5 { 1 });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 // Verify condition is a binary operation
                 assert!(matches!(*if_expr.condition, ExprType::Binary(ref b) if b.op == ">"));
@@ -1655,7 +1664,7 @@ mod tests {
             let a = 1;
             a + 2
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert_eq!(if_expr.then_block.len(), 2);
                 assert!(matches!(if_expr.then_block[0].kind, RawStmtKind::Local(_)));
@@ -1668,7 +1677,7 @@ mod tests {
     #[test]
     fn test_parse_expr_if_else_validates_else_expr_type() {
         let expr: Expr = parse_quote!(if x > 0 { 1 } else { 2 });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert!(if_expr.else_branch.is_some());
                 // The else branch is present and should be a literal
@@ -1681,7 +1690,7 @@ mod tests {
     #[test]
     fn test_parse_expr_if_else_if_chain() {
         let expr: Expr = parse_quote!(if x > 0 { 1 } else if x < 0 { 2 } else { 3 });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 // else_branch should be another If
                 assert!(matches!(**if_expr.else_branch.as_ref().unwrap(), ExprType::If(_)));
@@ -1697,7 +1706,7 @@ mod tests {
             1 => error(),
             _ => unknown(),
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 assert_eq!(match_expr.arms.len(), 3);
                 // All arms should be calls
@@ -1715,7 +1724,7 @@ mod tests {
             val if val > 10 => "big",
             _ => "small",
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 let guard = match_expr.arms[0].guard.as_ref().unwrap();
                 assert!(matches!(**guard, ExprType::Binary(ref b) if b.op == ">"));
@@ -1727,7 +1736,7 @@ mod tests {
     #[test]
     fn test_parse_expr_call_validates_arg_types() {
         let expr: Expr = parse_quote!(foo(42, "string", x + y));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Call(call) => {
                 assert_eq!(call.args.len(), 3);
                 assert!(matches!(call.args[0], ExprType::Lit(_)));
@@ -1741,7 +1750,7 @@ mod tests {
     #[test]
     fn test_parse_expr_call_validates_func_expr() {
         let expr: Expr = parse_quote!(obj.method()(1));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Call(call) => {
                 // func should be a method call (obj.method())
                 assert!(matches!(*call.func, ExprType::MethodCall(_)));
@@ -1753,7 +1762,7 @@ mod tests {
     #[test]
     fn test_parse_expr_binary_validates_operands() {
         let expr: Expr = parse_quote!(foo(1) + bar(2));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Binary(bin) => {
                 assert_eq!(bin.op, "+");
                 assert!(matches!(*bin.left, ExprType::Call(_)));
@@ -1766,7 +1775,7 @@ mod tests {
     #[test]
     fn test_parse_expr_binary_validates_operator_string() {
         let expr: Expr = parse_quote!(a << b);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Binary(bin) => {
                 assert_eq!(bin.op, "<<");
             }
@@ -1777,7 +1786,7 @@ mod tests {
     #[test]
     fn test_parse_expr_cast_validates_target_type() {
         let expr: Expr = parse_quote!(foo() as Vec<String>);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Cast(cast) => {
                 assert!(matches!(*cast.expr, ExprType::Call(_)));
                 assert_eq!(compact_ws(&cast.target_ty.ty_text), "Vec<String>");
@@ -1789,7 +1798,7 @@ mod tests {
     #[test]
     fn test_parse_expr_field_validates_base_expr() {
         let expr: Expr = parse_quote!(foo().bar.baz);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Field(field) => {
                 assert_eq!(field.member, "baz");
                 // base should be another Field
@@ -1802,7 +1811,7 @@ mod tests {
     #[test]
     fn test_parse_expr_array_validates_element_types() {
         let expr: Expr = parse_quote!([1, foo(), x + y, &z]);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Array(arr) => {
                 assert_eq!(arr.elements.len(), 4);
                 assert!(matches!(arr.elements[0], ExprType::Lit(_)));
@@ -1817,7 +1826,7 @@ mod tests {
     #[test]
     fn test_parse_expr_reference_validates_nested_content() {
         let expr: Expr = parse_quote!(&obj.method());
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref_expr) => {
                 // expr should be a method call
                 assert!(matches!(*ref_expr.expr, ExprType::MethodCall(_)));
@@ -1829,7 +1838,7 @@ mod tests {
     #[test]
     fn test_parse_expr_repeat_validates_array_elements() {
         let expr: Expr = parse_quote!([foo(x); 5]);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Repeat(repeat) => {
                 assert!(matches!(*repeat.expr, ExprType::Call(_)));
                 assert!(matches!(*repeat.len, ExprType::Lit(_)));
@@ -1845,7 +1854,7 @@ mod tests {
             if done { break; }
             count += 1;
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Loop(loop_expr) => {
                 assert_eq!(loop_expr.body.len(), 3);
                 assert!(matches!(loop_expr.body[0].kind, RawStmtKind::Local(_)));
@@ -1862,7 +1871,7 @@ mod tests {
             x = x + 1;
             process(x);
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::While(while_expr) => {
                 assert!(matches!(*while_expr.condition, ExprType::Binary(ref b) if b.op == "<"));
                 assert_eq!(while_expr.body.len(), 2);
@@ -1878,7 +1887,7 @@ mod tests {
             let y = 2;
             foo(x, y).await;
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Async(async_expr) => {
                 assert_eq!(async_expr.block.len(), 3);
                 assert!(matches!(async_expr.block[0].kind, RawStmtKind::Local(_)));
@@ -1892,7 +1901,7 @@ mod tests {
     #[test]
     fn test_parse_expr_method_call_validates_receiver_and_args() {
         let expr: Expr = parse_quote!(obj.process(x, y as u32));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::MethodCall(method) => {
                 assert_eq!(method.method, "process");
                 assert_eq!(method.args.len(), 2);
@@ -1906,7 +1915,7 @@ mod tests {
     #[test]
     fn test_parse_expr_unary_validates_operand() {
         let expr: Expr = parse_quote!(!foo(x));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Unary(unary) => {
                 assert_eq!(unary.op, "!");
                 assert!(matches!(*unary.expr, ExprType::Call(_)));
@@ -1918,7 +1927,7 @@ mod tests {
     #[test]
     fn test_parse_expr_assign_validates_both_sides() {
         let expr: Expr = parse_quote!(x.field = foo());
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Assign(assign) => {
                 assert!(matches!(*assign.left, ExprType::Field(_)));
                 assert!(matches!(*assign.right, ExprType::Call(_)));
@@ -1936,7 +1945,7 @@ mod tests {
                 _ => baz(),
             }
         ) { success } else { failure });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 // condition should be a call
                 assert!(matches!(*if_expr.condition, ExprType::Call(_)));
@@ -1953,7 +1962,7 @@ mod tests {
     #[test]
     fn test_parse_expr_range_with_function_bounds() {
         let expr: Expr = parse_quote!(start() ..= end());
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Range(range) => {
                 assert!(matches!(**range.start.as_ref().unwrap(), ExprType::Call(_)));
                 assert!(matches!(**range.end.as_ref().unwrap(), ExprType::Call(_)));
@@ -1966,7 +1975,7 @@ mod tests {
     #[test]
     fn test_parse_expr_double_reference() {
         let expr: Expr = parse_quote!(&&x);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref1) => {
                 assert!(!ref1.is_mut);
                 let inner_is_ref_and_immut = matches!(*ref1.expr, ExprType::Reference(ref r2) if !r2.is_mut);
@@ -1979,7 +1988,7 @@ mod tests {
     #[test]
     fn test_parse_expr_reference_to_mutable_field() {
         let expr: Expr = parse_quote!(&mut obj.inner);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref_expr) => {
                 assert!(ref_expr.is_mut);
                 assert!(matches!(*ref_expr.expr, ExprType::Field(_)));
@@ -1995,7 +2004,7 @@ mod tests {
             1 if enable => "active",
             _ => "inactive",
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 assert!(match_expr.arms[0].guard.is_some());
                 assert!(match_expr.arms[1].guard.is_some());
@@ -2008,7 +2017,7 @@ mod tests {
     #[test]
     fn test_parse_expr_chained_method_calls_with_args() {
         let expr: Expr = parse_quote!(obj.first(a).second(b).third(c));
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::MethodCall(method) => {
                 assert_eq!(method.method, "third");
                 assert_eq!(method.args.len(), 1);
@@ -2025,7 +2034,7 @@ mod tests {
     #[test]
     fn test_parse_expr_await_on_method_result() {
         let expr: Expr = parse_quote!(obj.async_method().await);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Await(await_expr) => {
                 assert!(matches!(*await_expr.base, ExprType::MethodCall(_)));
             }
@@ -2039,7 +2048,7 @@ mod tests {
             1 => "one",
             _ => "other",
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Return(ret) => {
                 assert!(ret.value.is_some());
                 assert!(matches!(**ret.value.as_ref().unwrap(), ExprType::Match(_)));
@@ -2051,7 +2060,7 @@ mod tests {
     #[test]
     fn test_parse_expr_yield_with_complex_expression() {
         let expr: Expr = parse_quote!(yield foo() + bar());
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Yield(yield_expr) => {
                 assert!(yield_expr.value.is_some());
                 assert!(matches!(**yield_expr.value.as_ref().unwrap(), ExprType::Binary(_)));
@@ -2063,7 +2072,7 @@ mod tests {
     #[test]
     fn test_parse_expr_cast_chain() {
         let expr: Expr = parse_quote!(x as u32 as u16);
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Cast(outer_cast) => {
                 assert_eq!(compact_ws(&outer_cast.target_ty.ty_text), "u16");
                 // expr should be another cast
@@ -2084,7 +2093,7 @@ mod tests {
             let result = compute();
             result
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert_eq!(if_expr.then_block.len(), 2);
                 if let RawStmtKind::Local(local) = &if_expr.then_block[0].kind {
@@ -2105,7 +2114,7 @@ mod tests {
             3..=5 => "few",
             _ => "many",
         });
-        match parse_expr_type(&expr) {
+        match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 assert_eq!(match_expr.arms.len(), 4);
                 // Just verify patterns aren't empty
@@ -2114,6 +2123,296 @@ mod tests {
                 }
             }
             _ => panic!("expected match"),
+        }
+    }
+
+    // ========== Hardware Module Detection Tests ==========
+
+    fn hw(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_expr_call_is_hardware_module_when_in_set() {
+        let expr: Expr = parse_quote!(full_adder(a, b));
+        match parse_expr_type(&expr, &hw(&["full_adder"])) {
+            ExprType::Call(call) => {
+                assert!(call.is_hardware_module);
+            }
+            _ => panic!("expected call"),
+        }
+    }
+
+    #[test]
+    fn test_expr_call_is_not_hardware_module_when_not_in_set() {
+        let expr: Expr = parse_quote!(full_adder(a, b));
+        match parse_expr_type(&expr, &hw(&["some_other_fn"])) {
+            ExprType::Call(call) => {
+                assert!(!call.is_hardware_module);
+            }
+            _ => panic!("expected call"),
+        }
+    }
+
+    #[test]
+    fn test_expr_call_is_not_hardware_module_with_empty_set() {
+        let expr: Expr = parse_quote!(foo(x));
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Call(call) => {
+                assert!(!call.is_hardware_module);
+            }
+            _ => panic!("expected call"),
+        }
+    }
+
+    #[test]
+    fn test_expr_call_hardware_module_with_multiple_fns_in_set() {
+        let fns = hw(&["alu", "full_adder", "mux"]);
+        for name in &["alu", "full_adder", "mux"] {
+            let expr: Expr = syn::parse_str(&format!("{}(x)", name)).unwrap();
+            match parse_expr_type(&expr, &fns) {
+                ExprType::Call(call) => {
+                    assert!(call.is_hardware_module, "{} should be hardware module", name);
+                }
+                _ => panic!("expected call"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_expr_call_method_call_is_never_hardware_module() {
+        // MethodCall is a separate variant; function calls via method syntax
+        // are never matched as hardware module instantiations
+        let expr: Expr = parse_quote!(obj.full_adder(a, b));
+        match parse_expr_type(&expr, &hw(&["full_adder"])) {
+            ExprType::MethodCall(_) => {
+                // Correct: method calls produce MethodCall, not Call
+            }
+            ExprType::Call(call) => {
+                // If it parsed as Call for some reason, is_hardware_module should be false
+                // since it goes through the method call path, not the path check
+                assert!(!call.is_hardware_module);
+            }
+            _ => {}
+        }
+    }
+
+    // ========== Pattern Text Bug Fix Tests ==========
+
+    #[test]
+    fn test_expr_let_pattern_text_simple_ident() {
+        // Bug fix: was quote!(&e.pat) which produced literal "& e . pat"
+        let expr: Expr = parse_quote!(let x = foo());
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Let(let_expr) => {
+                assert_eq!(let_expr.pattern_text, "x");
+            }
+            _ => panic!("expected let"),
+        }
+    }
+
+    #[test]
+    fn test_expr_let_pattern_text_tuple_destructure() {
+        let expr: Expr = parse_quote!(let (a, b) = pair());
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Let(let_expr) => {
+                // Should look like "(a , b)" or "(a, b)" — not "& e . pat"
+                let compact: String = let_expr.pattern_text.chars().filter(|c| !c.is_whitespace()).collect();
+                assert_eq!(compact, "(a,b)");
+            }
+            _ => panic!("expected let"),
+        }
+    }
+
+    #[test]
+    fn test_expr_match_arm_pattern_text_literal() {
+        // Bug fix: was quote!(&arm.pat) which produced literal "& arm . pat"
+        let expr: Expr = parse_quote!(match x { 0 => "zero", _ => "other" });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Match(match_expr) => {
+                assert_eq!(match_expr.arms[0].pattern_text, "0");
+                assert_eq!(match_expr.arms[1].pattern_text, "_");
+            }
+            _ => panic!("expected match"),
+        }
+    }
+
+    #[test]
+    fn test_expr_match_arm_pattern_text_tuple_pattern() {
+        let expr: Expr = parse_quote!(match pair {
+            (0, 0) => "origin",
+            (x, y) => "other",
+        });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Match(match_expr) => {
+                let compact0: String = match_expr.arms[0].pattern_text.chars().filter(|c| !c.is_whitespace()).collect();
+                let compact1: String = match_expr.arms[1].pattern_text.chars().filter(|c| !c.is_whitespace()).collect();
+                assert_eq!(compact0, "(0,0)");
+                assert_eq!(compact1, "(x,y)");
+            }
+            _ => panic!("expected match"),
+        }
+    }
+
+    #[test]
+    fn test_expr_match_arm_pattern_text_wildcard() {
+        let expr: Expr = parse_quote!(match x { _ => 0 });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Match(match_expr) => {
+                assert_eq!(match_expr.arms[0].pattern_text, "_");
+            }
+            _ => panic!("expected match"),
+        }
+    }
+
+    #[test]
+    fn test_expr_match_arm_pattern_text_or_pattern() {
+        let expr: Expr = parse_quote!(match x { 1 | 2 | 3 => "low", _ => "high" });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Match(match_expr) => {
+                // Should contain the | separators, not "& arm . pat"
+                assert!(match_expr.arms[0].pattern_text.contains('|'));
+            }
+            _ => panic!("expected match"),
+        }
+    }
+
+    #[test]
+    fn test_pattern_text_not_containing_legacy_bug_string() {
+        // Regression: quote!(&e.pat) produced "& e . pat" literally
+        let let_expr: Expr = parse_quote!(let x = 0);
+        let match_expr: Expr = parse_quote!(match x { _ => 0 });
+
+        match parse_expr_type(&let_expr, &Default::default()) {
+            ExprType::Let(e) => assert!(!e.pattern_text.contains("e . pat")),
+            _ => panic!(),
+        }
+        match parse_expr_type(&match_expr, &Default::default()) {
+            ExprType::Match(m) => assert!(!m.arms[0].pattern_text.contains("arm . pat")),
+            _ => panic!(),
+        }
+    }
+
+    // ========== Recognized Hardware Pattern Tests ==========
+
+    #[test]
+    fn test_emit_macro_captured_as_lit_stmt() {
+        // emit!(value) as a top-level statement is captured via Stmt::Macro path
+        // → RawStmtKind::Expr(ExprStmt { expr: ExprType::Lit { text: "emit ! (value)" } })
+        let design_fn: ItemFn = parse_quote! {
+            async fn counter(clk: Clock<MainClk>, input: Arc<Mutex<u8>>) {
+                emit!(42u8);
+            }
+        };
+        let stmts = capture_raw_statements(&design_fn, &Default::default());
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            RawStmtKind::Expr(expr_stmt) => {
+                match &expr_stmt.expr {
+                    ExprType::Lit(lit) => {
+                        // text should contain "emit" and the argument
+                        assert!(lit.text.contains("emit"), "expected 'emit' in: {}", lit.text);
+                        assert!(lit.text.contains("42"), "expected '42' in: {}", lit.text);
+                    }
+                    _ => panic!("expected Lit for emit! macro statement, got {:?}", expr_stmt.expr),
+                }
+            }
+            _ => panic!("expected Expr stmt for emit!"),
+        }
+    }
+
+    #[test]
+    fn test_clk_tick_await_fir_shape() {
+        // clk.tick().await must produce:
+        // ExprType::Await { base: ExprType::MethodCall { receiver: Lit("clk"), method: "tick", args: [] } }
+        let expr: Expr = parse_quote!(clk.tick().await);
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Await(await_expr) => {
+                match &*await_expr.base {
+                    ExprType::MethodCall(method) => {
+                        assert_eq!(method.method, "tick");
+                        assert_eq!(method.args.len(), 0);
+                        // receiver should be the clk variable (Lit path)
+                        assert!(matches!(*method.receiver, ExprType::Lit(_)));
+                    }
+                    _ => panic!("expected MethodCall as await base, got {:?}", await_expr.base),
+                }
+            }
+            _ => panic!("expected Await expression"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_tick_boundaries_in_loop_body() {
+        // A loop with two tick boundaries must capture both in order
+        let design_fn: ItemFn = parse_quote! {
+            async fn two_phase(clk: Clock<MainClk>, input: Arc<Mutex<u8>>) {
+                loop {
+                    let stage1 = *input.lock().unwrap();
+                    clk.tick().await;
+                    let stage2 = stage1;
+                    clk.tick().await;
+                }
+            }
+        };
+        let stmts = capture_raw_statements(&design_fn, &Default::default());
+        // The loop is the single top-level statement
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            RawStmtKind::Expr(expr_stmt) => {
+                match &expr_stmt.expr {
+                    ExprType::Loop(loop_expr) => {
+                        assert_eq!(loop_expr.body.len(), 4, "loop body should have 4 statements");
+                        // Statements 1 and 3 (0-indexed) should be await expressions
+                        let tick1 = &loop_expr.body[1];
+                        let tick2 = &loop_expr.body[3];
+                        for tick in &[tick1, tick2] {
+                            match &tick.kind {
+                                RawStmtKind::Expr(es) => {
+                                    assert!(matches!(es.expr, ExprType::Await(_)),
+                                        "expected Await at tick boundary");
+                                }
+                                _ => panic!("expected expr stmt at tick boundary"),
+                            }
+                        }
+                    }
+                    _ => panic!("expected loop"),
+                }
+            }
+            _ => panic!("expected expr stmt"),
+        }
+    }
+
+    #[test]
+    fn test_arc_mutex_type_text_preserved() {
+        // Arc<Mutex<T>> in parameter type must be preserved verbatim in ty_text
+        // Phase B strips it — FIR just captures the raw text
+        let design_fn: ItemFn = parse_quote! {
+            async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) { }
+        };
+        let sig = capture_signature(&design_fn);
+        let data_param = &sig.params[1];
+        assert_eq!(data_param.name, "data");
+        let compact: String = data_param.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(compact, "Arc<Mutex<u8>>");
+    }
+
+    #[test]
+    fn test_hardware_call_is_not_annotated_in_method_calls() {
+        // hardware_fns should only annotate Expr::Call (function call syntax),
+        // not Expr::MethodCall. Receiver-style calls are never hardware modules.
+        let design_fn: ItemFn = parse_quote! {
+            async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+                data.lock().unwrap();
+            }
+        };
+        let stmts = capture_raw_statements(&design_fn, &hw(&["lock", "unwrap"]));
+        match &stmts[0].kind {
+            RawStmtKind::Expr(expr_stmt) => {
+                // Should be a MethodCall chain, not ExprType::Call with is_hardware_module=true
+                assert!(matches!(expr_stmt.expr, ExprType::MethodCall(_)));
+            }
+            _ => panic!("expected expr stmt"),
         }
     }
 }

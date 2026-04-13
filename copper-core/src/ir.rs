@@ -1,6 +1,8 @@
 use crate::{Port};
 use crate::types::{Logic};
 
+// Depriciated????
+
 #[derive(Debug, Clone)]
 pub enum HardwareIR {
     Module(ModuleIR),

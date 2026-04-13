@@ -1,6 +1,7 @@
 // use copper_core::{Module, Direction, ModuleIR, Statement, Expression, Signal, UnaryOp, BinaryOp};
 mod parser;
 mod verilog;
+pub mod chir_lower;
 
 use copper_core::{Module};
 use parser::IRBuilder;

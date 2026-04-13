@@ -1,5 +1,6 @@
 pub mod ir;
 pub mod frontend_ir;
+pub mod chir;
 pub mod types;
 
 pub use ir::{ModuleIR};
@@ -14,7 +15,7 @@ pub use frontend_ir::{
     RawTypeRef,
     SourceSpan,
 };
-pub use types::{Bit, Bits, Clock, ClockDomain, Logic};
+pub use types::{Bit, Bits, Clock, ClockDomain, HasUnknown, Logic};
 
 // pub mod types;
 // pub mod verification;

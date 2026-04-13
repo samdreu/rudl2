@@ -231,6 +231,9 @@ pub struct ExprBinary {
 pub struct ExprCall {
     pub func: Box<ExprType>,
     pub args: Vec<ExprType>,
+    /// True if the callee was annotated with #[hardware] — this call site
+    /// will be lowered to a CHIRSubmoduleInst rather than an inlined call.
+    pub is_hardware_module: bool,
     pub span: SourceSpan,
 }
 
