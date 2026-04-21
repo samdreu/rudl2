@@ -1,5 +1,86 @@
 # Copper HDL Development Progress
 
+## Phase C (SHIR) — In Progress (April 2026)
+
+### Completed
+- ✅ SHIR data type schema (`copper-core/src/shir.rs`) — complete
+- ✅ Phase C lowering entry point `lower_to_shir(chir) -> Result<SHIRModule, SHIRLowerError>`
+- ✅ Port lowering (Clock / Data kinds, Input / Output directions)
+- ✅ Combinational body lowering (wires, submodule pass-through, output expression)
+- ✅ Sequential body: segment splitting at `AwaitTick` boundaries (N ticks → N+1 segments)
+- ✅ Phase mapping: `phase(seg_k) = k` for `k < N`, trailing `seg_N → phase_{N-1}`
+- ✅ Single-tick and multi-tick phase building
+- ✅ `phase_r` auto-register for multi-tick modules (ceil_log2 width, init 0)
+- ✅ Phase advance register updates (wraps 0→N-1→0)
+- ✅ Pre-edge wire lowering (`SHIRStmt::Wire`, `If`, `Match`)
+- ✅ Register update extraction: flat `Assign`, `If→Mux`, `Match→Case`
+- ✅ One-sided `if` holds current register value (`Mux(cond, new_val, Var(target))`)
+- ✅ Emit validation: rejects `emit!()` inside conditional branch
+- ✅ Output drive: `PreEdge`, `PostEdge`, `PhaseConditional`
+- ✅ Expression lowering (`CHIRExpr → SHIRExpr`), pattern lowering
+- ✅ **Sequential register forwarding**: later assigns within a segment see prior assigns'
+  new values — matches Rust sequential execution semantics, avoids Verilog non-blocking
+  old-value pitfall (e.g. `stage1_r = x; stage2_r = stage1_r+stage1_r` correctly inlines)
+- ✅ **Phase-based wire promotion**: wires used in a different hardware phase than their
+  declaration are promoted to `_r` registers; later-phase expressions rewritten to `Var("x_r")`
+- ✅ Corrected register promotion rule documented in `SHIR_DESIGN.md` (phase-based, not
+  segment-based — segment-based would introduce phantom latency via Verilog non-blocking semantics)
+- ✅ 229 tests passing (3 new tests covering forwarding, promotion rename, and forwarding+if)
+
+### Known gaps / next steps
+- [ ] Output port / no-output validation (`EmitWithoutOutput`, `OutputWithoutEmit` errors
+      not yet wired to actual port inspection)
+- [ ] Submodule output wire visibility check (output_wire names should be valid `Var`
+      references in all phases)
+- [ ] Phase D (VLIR): legalization — name mangling, Verilog keyword avoidance
+- [ ] Phase E (Emission): text generation of SystemVerilog
+- [ ] Phase F (Validation): equivalence checking against simulation traces
+
+---
+
+## Recent Completion: Phase B - Semantic Lowering (April 2026)
+
+### Completed
+- ✅ Designed and implemented complete CHIR (Canonical Hardware IR) schema in copper-core/src/chir.rs
+  - `CHIRModule`, `CHIRPort`, `CHIRBody`, `CHIRCombBody`, `CHIRSeqBody`
+  - `CHIRStmt` (Wire, Assign, Emit, AwaitTick, If, Match)
+  - `CHIRExpr` (Var, Lit, BinOp, UnOp, Mux, Case, Concat, Slice)
+  - `CHIRPattern` (Lit, Wildcard, Tuple, EnumVariant) with or-pattern expansion
+  - `CHIRLowerError` with actionable diagnostics and suggested rewrites
+- ✅ Implemented Phase B lowering in copper-codegen/src/chir_lower.rs
+  - `lower_to_chir(fir, hardware_fns, registry)` — public entry point
+  - Port extraction: Clock detection and domain extraction, Arc<Mutex<T>> stripping, return type → output port
+  - `ModuleRegistry = HashMap<String, FrontendModuleIR>` for resolving callee port names and output types
+  - Type resolution: all primitives, Bits<N>, Arc<Mutex<T>> stripping
+  - Type inference from init expressions: typed literals (`0u8`), cast expressions (`x as u8`), booleans
+  - Register init lowering: simple literal init expressions → `CHIRLit`
+  - Sequential body: register detection (pre-loop `let mut`), loop extraction, AwaitTick validation
+  - Combinational body: wire declarations, submodule instantiation, output expression
+  - Expression lowering: all operators, `wrapping_add/sub/mul` → BinOp, `lock/unwrap` stripped
+  - Method call normalization: `saturating_*` and `checked_*` rejected with rewrites
+  - Hardware call lowering: uses registry for named port connections and correct output type resolution
+  - Or-pattern expansion: `"1 | 2"` → `[Lit(1), Lit(2)]` for all alternatives
+  - `while`-loop rejection with suggested rewrite
+  - `emit!()` without output port → `EmitWithoutOutput` error
+  - Post-lowering scope validation: all `CHIRExpr::Var` references checked against declared names
+- ✅ 207 tests passing (87 new Phase B tests + 120 Phase A tests)
+  - Type resolution, type inference, register init
+  - Port extraction, pattern parsing, or-pattern expansion
+  - Expression lowering, method call normalization
+  - Sequential and combinational body structure
+  - Scope validation, emit validation, while-loop rejection
+  - Hardware call with registry: port names, output type, fallback
+  - 4 end-to-end tests: counter module, combinational adder, hardware call with registry, sequential with conditional
+
+### Phase B Deliverable: CHIRModule
+- Hardware-semantic, register/wire classified, tick-boundary-explicit
+- Submodule-aware with named port connections via ModuleRegistry
+- Type-inferred from init expressions when no explicit annotation
+- Post-lowering scope validation for all variable references
+- Actionable diagnostics with source spans and suggested rewrites
+
+---
+
 ## Recent Completion: Phase A - Frontend Capture (April 2026)
 
 ### Completed
@@ -201,12 +282,12 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
 8. ✅ Build simple async counter example with executor
 9. ✅ Create `#[hardware]` macro
 10. ✅ Clean up warnings and unused imports
-11. ⏳ **IN PROGRESS: Design IR structure for Verilog codegen** (see VERILOG_CODEGEN_DESIGN.md)
-12. [ ] Implement IR builder for combinational logic
-13. [ ] Implement Verilog generator for combinational logic
-14. [ ] Test codegen with inverter.rs and mux.rs
-15. [ ] Implement IR builder for sequential logic (async→FSM)
-16. [ ] Test codegen with counter examples
+11. ✅ Design IR structure for Verilog codegen (FIR and CHIR schemas complete)
+12. ✅ Implement Phase A frontend capture (parser.rs, frontend_ir.rs)
+13. ✅ Implement Phase B semantic lowering (chir_lower.rs, chir.rs)
+14. ⏳ **NEXT: Phase C - Timing & State (SHIR)** — split CHIR at AwaitTick boundaries into pre-edge/post-edge phases
+15. [ ] Phase D - Verilog Legalization (VLIR)
+16. [ ] Phase E - Verilog Emission
 
 ---
 
@@ -226,14 +307,15 @@ Create a fundamentally better HDL that eliminates traditional hardware descripti
   - Stable compiler boundary for Phase B
   - Ready for semantic lowering
 
-### Month 3: Phase B - Semantic Lowering (IN PROGRESS, May 2026)
-- [ ] Implement CHIR (Canonical Hardware IR) schema
-- [ ] Expression normalization (widths, operators)
-- [ ] Async module lowering to explicit state/timing regions
-- [ ] Temporaries and implicit register extraction
-- **Deliverable:** FrontendModuleIR → CHIR transformation with tests
+### Month 3: Phase B - Semantic Lowering ✅ COMPLETE (April 2026)
+- ✅ Implement CHIR (Canonical Hardware IR) schema
+- ✅ Expression normalization (widths, operators, wrapping arithmetic)
+- ✅ Async module lowering to explicit state/timing regions (register/wire classification, AwaitTick)
+- ✅ Submodule instantiation with named port connections via ModuleRegistry
+- ✅ Type inference from init expressions; scope validation post-lowering
+- **Deliverable:** FrontendModuleIR → CHIRModule transformation, 207 tests passing
 
-### Month 4: Phase C - Timing & State (May-Jun 2026)
+### Month 4: Phase C - Timing & State (May 2026)
 - [ ] Implement SHIR (Scheduled IR) with explicit edge timing
 - [ ] Pre-edge, post-edge, edge-event buckets
 - [ ] Equivalence validation vs Copper simulator

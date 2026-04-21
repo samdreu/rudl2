@@ -342,6 +342,9 @@ fn lower_seq_body(
     if has_emit && !has_output_port {
         return Err(CHIRLowerError::EmitWithoutOutput { span: fir.span });
     }
+    if has_output_port && !has_emit {
+        return Err(CHIRLowerError::OutputWithoutEmit { span: fir.span });
+    }
 
     Ok(CHIRSeqBody {
         clock,
@@ -1717,23 +1720,30 @@ mod tests {
 
     #[test]
     fn test_emit_without_output_port_returns_error() {
-        // emit! used but no return type → EmitWithoutOutput
-        // We need to smuggle emit! into the parsed IR; use the macro path
-        // Since parser captures macros as Lit, we test via lower_seq_body directly
-        // This test checks the validation in lower_seq_body
-        // A module with no return type but emit!() in its loop should fail
-        // Note: we can't easily inject emit! via syn parse here since our parser
-        // captures it — test the validate path via direct construction instead.
-        // Instead, test via full parse of a module known to produce emit stmt
-        // when the parser captures emit! macro calls.
-        // We'll trust the EmitWithoutOutput check is covered by the validate_module path.
-        // Placeholder: ensure modules with output port work fine
+        // emit!() in loop body but no return type → EmitWithoutOutput
+        let fir = make_fir(
+            "async fn m(clk: Clock<C>, x: u8) {
+                loop { emit!(x); clk.tick().await; }
+            }"
+        );
+        assert!(matches!(
+            lower_seq_body(&fir, &no_hw(), &empty_registry()),
+            Err(CHIRLowerError::EmitWithoutOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn test_output_port_without_emit_returns_error() {
+        // Module has return type (output port) but no emit!() → OutputWithoutEmit
         let fir = make_fir(
             "async fn m(clk: Clock<C>, x: u8) -> u8 {
                 loop { clk.tick().await; }
             }"
         );
-        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_ok());
+        assert!(matches!(
+            lower_seq_body(&fir, &no_hw(), &empty_registry()),
+            Err(CHIRLowerError::OutputWithoutEmit { .. })
+        ));
     }
 
     // ── Tick detection ───────────────────────────────────────────────────────

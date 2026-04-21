@@ -2,6 +2,7 @@ use crate::frontend_ir::SourceSpan;
 
 // ── Top-level module ─────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct CHIRModule {
     pub name: String,
     pub ports: Vec<CHIRPort>,
@@ -11,6 +12,7 @@ pub struct CHIRModule {
 
 // ── Ports ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub struct CHIRPort {
     pub name: String,
     pub direction: CHIRPortDir,
@@ -18,11 +20,13 @@ pub struct CHIRPort {
     pub span: SourceSpan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CHIRPortDir {
     Input,
     Output,
 }
 
+#[derive(Debug, Clone)]
 pub enum CHIRPortKind {
     /// Clock — not a data signal; carries domain name for multi-clock future use.
     Clock { domain: String },
@@ -43,12 +47,14 @@ pub enum CHIRType {
 
 // ── Module body ───────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub enum CHIRBody {
     Combinational(CHIRCombBody),
     Sequential(CHIRSeqBody),
 }
 
 /// Combinational module body: submodule instances, named wire values, output.
+#[derive(Debug, Clone)]
 pub struct CHIRCombBody {
     /// #[hardware] submodule instantiations, in source order.
     pub submodules: Vec<CHIRSubmoduleInst>,
@@ -58,6 +64,7 @@ pub struct CHIRCombBody {
     pub output: CHIRExpr,
 }
 
+#[derive(Debug, Clone)]
 pub struct CHIRWireDecl {
     pub name: String,
     pub ty: CHIRType,
@@ -66,6 +73,7 @@ pub struct CHIRWireDecl {
 }
 
 /// Sequential module body: registers, submodule instances, and loop body.
+#[derive(Debug, Clone)]
 pub struct CHIRSeqBody {
     /// Name of the clock parameter this module is clocked on.
     pub clock: String,
@@ -79,6 +87,7 @@ pub struct CHIRSeqBody {
     pub loop_body: Vec<CHIRStmt>,
 }
 
+#[derive(Debug, Clone)]
 pub struct CHIRRegDecl {
     pub name: String,
     pub ty: CHIRType,
@@ -95,6 +104,7 @@ pub struct CHIRRegDecl {
 ///   - A CHIRSubmoduleInst with a generated inst_name and output_wire name
 ///   - All references to `result` in subsequent expressions replaced with
 ///     Var(output_wire)
+#[derive(Debug, Clone)]
 pub struct CHIRSubmoduleInst {
     /// Unique instance name within this module, e.g. "full_adder_0".
     pub inst_name: String,
@@ -111,6 +121,7 @@ pub struct CHIRSubmoduleInst {
 
 // ── Statement model ───────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub enum CHIRStmt {
     /// Declare a combinational wire value. Does not cross a tick boundary.
     Wire {
@@ -157,6 +168,7 @@ pub enum CHIRStmt {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct CHIRMatchArm {
     pub patterns: Vec<CHIRPattern>,
     pub guard: Option<CHIRExpr>,
@@ -310,6 +322,11 @@ pub enum CHIRLowerError {
         span: SourceSpan,
     },
 
+    /// Sequential module has an output port but never calls emit!().
+    OutputWithoutEmit {
+        span: SourceSpan,
+    },
+
     /// Width cannot be inferred; explicit annotation required.
     AmbiguousWidth {
         span: SourceSpan,
@@ -329,6 +346,8 @@ impl std::fmt::Display for CHIRLowerError {
                 write!(f, "clk.tick().await inside a conditional branch is not supported"),
             CHIRLowerError::EmitWithoutOutput { .. } =>
                 write!(f, "emit!() used in a module with no output port"),
+            CHIRLowerError::OutputWithoutEmit { .. } =>
+                write!(f, "module has an output port but never calls emit!()"),
             CHIRLowerError::AmbiguousWidth { .. } =>
                 write!(f, "cannot infer bit width; add an explicit type annotation"),
         }

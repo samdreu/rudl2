@@ -185,27 +185,106 @@ pub fn capture_frontend_ir(design_fn: &ItemFn) -> Result<FrontendModuleIR, Lower
 - No width inference or type resolution
 - Ready for downstream Phase B semantic lowering
 
-## Phase B: Semantic Lowering
+## Phase B: Semantic Lowering ✅ COMPLETE
 
-FIR to Canonical Hardware IR (CHIR):
-- Normalize control flow.
-- Convert expression forms into a restricted hardware expression set.
-- Resolve widths and signedness.
-- Make implicit temporaries explicit where needed.
+FIR to Canonical Hardware IR (CHIR) — fully implemented in `copper-codegen/src/chir_lower.rs`.
 
-For async modules:
-- Lower await boundaries into explicit cycle-step regions.
-- Infer persistent state across await points as registers.
-- Represent emit timing as explicit phase operations.
+### Completed Implementation
 
-## Phase C: Timing and State Construction
+**Entrypoint API:**
+```rust
+pub fn lower_to_chir(
+    fir: &FrontendModuleIR,
+    hardware_fns: &HashSet<String>,
+    registry: &ModuleRegistry,
+) -> Result<CHIRModule, CHIRLowerError>
 
-CHIR to Scheduled IR (SHIR):
-- Build explicit sequential update sets per clock edge.
-- Split pre-edge and post-edge behavior according to Copper semantics.
-- Resolve non-blocking vs blocking assignment intent from schedule position.
+pub type ModuleRegistry = HashMap<String, FrontendModuleIR>;
+```
 
-This phase is where we must preserve equivalence with Copper simulation executor behavior.
+**Type Resolution:**
+- All primitives: `u8`..`u128`, `i8`..`i128`, `bool`, `Bit`, `Logic`, `Bits<N>`
+- `Arc<Mutex<T>>` → strips wrapper, resolves inner type
+- Type inference from init expressions: typed literals (`0u8`), cast expressions (`x as u8`), booleans
+- Hard error (`AmbiguousWidth`) for unresolvable types — no silent coercions
+
+**Port Extraction:**
+- `Clock<Domain>` params → `CHIRPortKind::Clock { domain }`
+- Data params → `CHIRPortKind::Data { ty }` (with Arc<Mutex<T>> stripping)
+- Return type → implicit `out` output port
+
+**Combinational Body Lowering:**
+- `let` declarations → `CHIRWireDecl` (type inferred if no annotation)
+- Final expression-without-semicolon → `CHIRCombBody::output`
+- Hardware calls → `CHIRSubmoduleInst` (named ports from registry)
+
+**Sequential Body Lowering:**
+- Pre-loop `let mut` declarations → `CHIRRegDecl` with type + optional init literal
+- Top-level `loop { }` → `CHIRSeqBody::loop_body`
+- `while` loops → hard error with rewrite suggestion
+- `clk.tick().await` → `CHIRStmt::AwaitTick`
+- `emit!(value)` → `CHIRStmt::Emit` (error if no output port)
+- `x = expr` → `CHIRStmt::Assign`
+- `if`/`else` → `CHIRStmt::If` (ticks inside branches rejected)
+- `match` → `CHIRStmt::Match` with or-pattern expansion
+
+**Expression Lowering:**
+- All binary/unary operators
+- `wrapping_add/sub/mul` → `BinOp { wrapping: true }`
+- `saturating_*`, `checked_*` → hard error with rewrite
+- `lock()`, `unwrap()` → stripped (simulation artifact)
+- `if`-as-expression → `CHIRExpr::Mux`
+- `match`-as-expression → `CHIRExpr::Case`
+- Hardware calls → `CHIRExpr::Var(output_wire)` + submodule registered in ctx
+- Cast expressions → strip cast, lower inner expr
+
+**Hardware Call Lowering (with ModuleRegistry):**
+- Looks up callee in registry for named port connections (skips Clock params)
+- Resolves output type from callee's return type
+- Falls back to positional names (`arg0`, `arg1`) if callee not in registry
+- Generates unique instance names (`full_adder_0`) and output wires (`full_adder_0_out`)
+
+**Pattern Parsing:**
+- `_` → `Wildcard`
+- Integer literals and booleans → `Lit`
+- Tuple patterns → `Tuple(Vec<CHIRPattern>)`
+- Uppercase identifiers → `EnumVariant`
+- Or-patterns (`1 | 2 | 3`) → fully expanded to all alternatives via `parse_or_patterns`
+
+**Post-Lowering Validation:**
+- Scope check: all `CHIRExpr::Var` references validated against declared port/register/wire/submodule-output names
+- `emit!()` used without output port → `EmitWithoutOutput` error
+
+**Test Coverage:** 87 Phase B tests (207 total with Phase A)
+- Type resolution, inference, register init, port extraction
+- Pattern parsing, or-pattern expansion
+- Expression lowering, method call normalization
+- Sequential/combinational body structure
+- Scope validation, emit validation, while-loop rejection
+- Hardware call with registry (port names, output type, fallback)
+- 4 end-to-end tests: counter, combinational adder, hardware call, sequential with conditional
+
+## Phase C: Timing and State Construction — IN PROGRESS
+
+CHIR to Scheduled IR (SHIR) — implemented in `copper-codegen/src/shir_lower.rs`.
+
+### Implemented
+- `lower_to_shir(chir) -> Result<SHIRModule, SHIRLowerError>` entry point
+- Segment splitting at `AwaitTick` boundaries; phase mapping (`seg_k → phase_k`, trailing `→ phase_{N-1}`)
+- Single-tick and multi-tick phase building; `phase_r` auto-register for multi-tick
+- Pre-edge wire lowering (`SHIRStmt::Wire/If/Match`); register update extraction
+- Conditional flattening: `If → Mux`, `Match → Case` on `next_value` (one-sided if holds current value)
+- **Sequential register forwarding**: assigns within a segment propagate new values to later assigns,
+  matching Rust sequential execution semantics and avoiding Verilog non-blocking old-value pitfall
+- **Phase-based wire promotion**: wires referenced in a later hardware phase are promoted to `_r` registers;
+  expressions in later phases rewritten to `Var("x_r")` — phase-based (not segment-based) to avoid phantom latency
+- Output drive model: `PreEdge`, `PostEdge`, `PhaseConditional`
+- Emit validation: rejects `emit!()` inside conditional branch
+- 229 tests passing
+
+### Remaining
+- Output port / no-output validation (`EmitWithoutOutput`, `OutputWithoutEmit`)
+- Submodule output wire visibility enforcement across phases
 
 ## Worked Example: Difference Between Phases A, B, and C
 

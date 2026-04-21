@@ -2,6 +2,7 @@
 mod parser;
 mod verilog;
 pub mod chir_lower;
+pub mod shir_lower;
 
 use copper_core::{Module};
 use parser::IRBuilder;

@@ -1,6 +1,7 @@
 pub mod ir;
 pub mod frontend_ir;
 pub mod chir;
+pub mod shir;
 pub mod types;
 
 pub use ir::{ModuleIR};
