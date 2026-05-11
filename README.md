@@ -2,6 +2,18 @@
 
 A fundamentally safer hardware description language embedded in Rust that eliminates entire classes of bugs through ownership and type system guarantees.
 
+## Design Goals
+
+Three principles guide every design decision in Copper:
+
+1. **The simulation and the hardware are the same program.** Not "the simulator approximates the hardware" — the *same source* compiles to a cycle-accurate Rust simulation and to synthesizable Verilog. If the simulation is wrong, the hardware is wrong, and vice versa. This is a correctness guarantee, not a convenience feature.
+
+2. **Illegal hardware states should be inexpressible, not just detectable.** A type error is better than a runtime assertion, and a runtime assertion is better than a silent bug. Copper's type system and ownership model make entire classes of hardware bugs physically impossible to write, not merely flagged at simulation time.
+
+3. **Abstraction shouldn't cost you hardware quality.** High-level constructs (async/await FSMs, phantom-type clock domains, const-generic bit widths) must compile to the same hardware as hand-written Verilog. Zero-cost means zero gap between what you write and what you get.
+
+**Anti-goals:** Copper is not trying to be "Verilog with better syntax" — that would just be a more comfortable way to write the same bugs. And "runs fast" is not a primary goal: correctness and safety come first.
+
 ## What Makes Copper Different?
 
 Traditional HDLs like Verilog and VHDL were designed in the 1980s before modern type theory and programming language advances. Copper leverages Rust's unique features to prevent common hardware design mistakes at compile time:
