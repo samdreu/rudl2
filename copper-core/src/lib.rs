@@ -1,6 +1,8 @@
 pub mod ir;
 pub mod frontend_ir;
 pub mod chir;
+pub mod memory_old;
+pub mod memory;
 pub mod shir;
 pub mod types;
 
@@ -17,6 +19,7 @@ pub use frontend_ir::{
     SourceSpan,
 };
 pub use types::{Bit, Bits, Clock, ClockDomain, HasUnknown, Logic};
+pub use memory::{Memory, ReadMode, WriteMode};
 
 // pub mod types;
 // pub mod verification;

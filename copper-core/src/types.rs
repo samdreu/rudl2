@@ -343,6 +343,11 @@ impl<A: HasUnknown, B: HasUnknown, C: HasUnknown, D: HasUnknown> HasUnknown for 
     fn unknown() -> Self { (A::unknown(), B::unknown(), C::unknown(), D::unknown()) }
 }
 
+/// Traits for types that listen to clock edges (synchronous logic)
+pub(crate) trait ClockEdgeListener: Send + Sync {
+    fn on_posedge(&self);
+}
+
 /// Clock domain marker (phantom type for compile-time tracking)
 /// 
 /// This trait marks types that represent clock domains.
@@ -364,6 +369,7 @@ pub trait ClockDomain: 'static {}
 struct ClockState {
     cycle: u64,
     wakers: Vec<Waker>,
+    listeners: Vec<std::sync::Weak<dyn ClockEdgeListener>>,
 }
 
 /// Clock source for synchronous logic
@@ -383,6 +389,7 @@ impl<Domain: ClockDomain> Clock<Domain> {
             state: Arc::new(Mutex::new(ClockState {
                 cycle: 0, // starts at t=0
                 wakers: Vec::new(), // no wakers initially
+                listeners: Vec::new(), // no listeners initially
             })),
             _domain: PhantomData, 
         }
@@ -397,6 +404,17 @@ impl<Domain: ClockDomain> Clock<Domain> {
     pub fn advance(&mut self) {
         let mut state = self.state.lock().unwrap();
         state.cycle += 1;
+
+        // call on_posedge for all listeners
+        state.listeners.retain(|weak_listener| {
+            match weak_listener.upgrade() {
+                Some(listener) => {
+                    listener.on_posedge();
+                    true // keep in list
+                },
+                None => false, // remove if listener was dropped
+            }
+        });
         // wake any tasks waiting on this clock tick
         let wakers = std::mem::take(&mut state.wakers);
         drop(state); // release lock before waking ?????
@@ -424,6 +442,11 @@ impl<Domain: ClockDomain> Clock<Domain> {
             target_cycle: target, // target is next cycle
             _domain: PhantomData,
         }
+    }
+
+    pub(crate) fn register_listener(&self, listener: std::sync::Weak<dyn ClockEdgeListener>) {
+        let mut state = self.state.lock().unwrap();
+        state.listeners.push(listener);
     }
 }
 

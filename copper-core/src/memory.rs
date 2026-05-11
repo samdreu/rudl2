@@ -1,162 +1,191 @@
-use std::cell::UnsafeCell;
-use std::ops::{Index, IndexMut};
-use crate::types::{Clock, ClockDomain};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Controls read-during-write behavior when the same address is read and written in the same cycle.
+use crate::types::{Clock, ClockDomain, ClockEdgeListener};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
-    /// Output register captures old data before the write commits.
-    /// Default — matches most FPGA block RAMs (Xilinx RAMB, Intel M20K).
     ReadFirst,
-    /// Writes commit before output capture; same-address read sees the new value.
     WriteFirst,
 }
 
-/// Controls whether the read output is registered (synchronous) or combinational (asynchronous).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadMode {
-    /// `rp.output()` returns the registered value captured at the last clock edge.
-    /// `rp[addr]` drives the read address and returns current committed data.
-    /// Default — matches FPGA block RAM read port behavior.
     Sync,
-    /// `rp[addr]` returns data immediately (combinational). `rp.output()` always returns `None`.
     Async,
 }
 
-struct MemoryInner<T, const R: usize, const W: usize> {
-    data: Vec<T>, // Actual storage for the data.
-    /// W staged writes, one per write port. Committed atomically on the next clock edge.
-    /// Like a reservation station for each write port's pending update. Only the last staged write
-    /// to a given address will survive, matching real hardware behavior.
-    staging: [Option<(usize, T)>; W],
-    /// R registered read addresses — updated by `rp[addr]`, captured at each clock edge.
-    read_addr: [usize; R],
-    /// R registered read outputs — `None` until the first clock edge fires (hardware X state).
-    output_reg: [Option<T>; R],
-    /// Tracks whether each write port has been used this cycle. Reset each clock edge.
-    /// Used by `debug_assert!` to catch designs that drive the same write port twice in a cycle,
-    /// which is impossible in real hardware (a physical write port has one data/address bus).
-    write_used: [bool; W],
-    last_cycle: u64,
-}
-
-/// A clocked, multi-port memory that models Verilog block RAM semantics.
+/// Multi-port synchronous memory with configurable read and write latency.
 ///
-/// `R` = number of independent read ports.
-/// `W` = number of independent write ports.
-/// `D` = clock domain marker.
+/// - `R` = read port count, `W` = write port count
+/// - `READ_LAT` = cycles from address presentation to valid output (≥ 1)
+/// - `WRITE_LAT` = cycles from write call to data committed in memory (≥ 1)
 ///
-/// # Port access
-/// - `mem.read_port::<I>()` — returns read port I (for I in 0..R)
-/// - `mem.write_port::<I>()` — returns write port I (for I in 0..W)
-///
-/// # Array indexing
-/// - `rp[addr]` — drives the read address; returns current committed data
-///   (or staged value in write-first mode if a write to `addr` is pending)
-/// - `rp.output()` — returns the registered output from the last clock edge (`None` before
-///   the first edge — hardware X state)
-/// - `wp[addr] = val` — queues a write; committed at the next clock edge
-/// - `wp[addr] += n` — read-modify-write: reads committed value, stages the modified result
-///
-/// # Simple dual-port example
-/// ```rust,ignore
-/// let mut mem = Memory::<u8, 1, 1, MainClk>::new(clk.clone(), 256);
-/// loop {
-///     let _ = mem.read_port::<0>()[rd_addr];     // drive read address
-///     emit!(*mem.read_port::<0>().output().unwrap_or(&0)); // registered output
-///     clk.tick().await;                           // edge: write commits, output_reg captured
-///     if we { mem.write_port::<0>()[wr_addr] = din; }
-/// }
-/// ```
-///
-/// # ROM initialization
-/// Use `from_contents` or `from_fn` — do not use `IndexMut` for multi-entry init since each
-/// write port holds a single staging slot (only the last staged value survives).
-pub struct Memory<T, const R: usize, const W: usize, D: ClockDomain> {
-    inner: UnsafeCell<MemoryInner<T, R, W>>,
-    clock: Clock<D>,
-    write_mode: WriteMode,
+/// Both read and write ports are fully pipelined: a new address/value may be
+/// presented every cycle regardless of in-flight accesses. `ReadPort::is_ready`
+/// signals when the output pipeline holds valid data. `WritePort::is_ready` is
+/// always true (pipelined writes are always accepted).
+pub struct Memory<
+    T,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const READ_LAT: usize = 1,
+    const WRITE_LAT: usize = 1,
+> {
+    shared: Arc<MemoryShared<T, R, W, READ_LAT, WRITE_LAT>>,
+    _clock: Clock<D>,
     read_mode: ReadMode,
 }
 
-// SAFETY: Memory is only created and accessed from the single-threaded simulation executor.
-// The UnsafeCell never crosses a thread boundary.
-unsafe impl<T: Send, const R: usize, const W: usize, D: ClockDomain> Send
-    for Memory<T, R, W, D>
+struct MemoryInner<T, const R: usize, const W: usize, const READ_LAT: usize, const WRITE_LAT: usize>
 {
+    data: Vec<T>,
+    /// Per-write-port pipeline. Index [port][0] is the most recently issued
+    /// write; index [port][WRITE_LAT-1] commits on the next posedge.
+    write_pipeline: [[Option<(usize, T)>; WRITE_LAT]; W],
+    /// Per-read-port pipeline. Index [port][0] is the value captured at the
+    /// most recent posedge; index [port][READ_LAT-1] is the output.
+    read_pipeline: [[Option<T>; READ_LAT]; R],
+    /// Address staged by the user this cycle, captured into the pipeline on
+    /// posedge. Cleared after each capture so the user must re-present the
+    /// address every cycle to keep the pipeline active.
+    pending_read_addr: [Option<usize>; R],
 }
 
-impl<T: Clone, const R: usize, const W: usize, D: ClockDomain> Memory<T, R, W, D> {
-    /// If the clock has advanced, commit staged writes and update output registers.
-    /// This is the Rust equivalent of `always @(posedge clk)`.
-    fn sync_if_advanced(&self) {
-        let cycle = self.clock.cycle();
-        // SAFETY: single-threaded simulation — no concurrent access.
-        let inner = unsafe { &mut *self.inner.get() };
-        if cycle <= inner.last_cycle {
-            return;
-        }
+struct MemoryShared<T, const R: usize, const W: usize, const READ_LAT: usize, const WRITE_LAT: usize>
+{
+    inner: Mutex<MemoryInner<T, R, W, READ_LAT, WRITE_LAT>>,
+    /// `true` = WriteFirst, `false` = ReadFirst. Stored atomically so the
+    /// builder methods (`write_first` / `read_first`) can set it through the
+    /// shared `Arc` without needing exclusive ownership.
+    write_first_mode: AtomicBool,
+}
 
-        match self.write_mode {
-            WriteMode::ReadFirst => {
-                // Capture output registers BEFORE committing writes.
-                if self.read_mode == ReadMode::Sync {
-                    for i in 0..R {
-                        inner.output_reg[i] = Some(inner.data[inner.read_addr[i]].clone());
-                    }
-                }
-                for staged in inner.staging.iter_mut() {
-                    if let Some((addr, val)) = staged.take() {
-                        inner.data[addr] = val;
-                    }
-                }
+impl<
+    T: Clone + Send + Sync,
+    const R: usize,
+    const W: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> ClockEdgeListener for MemoryShared<T, R, W, READ_LAT, WRITE_LAT>
+{
+    fn on_posedge(&self) {
+        let mut inner = self.inner.lock().unwrap();
+
+        let write_first = self.write_first_mode.load(Ordering::Relaxed);
+        match write_first {
+            false => {
+                // ReadFirst: capture reads before committing writes so a
+                // simultaneous read/write at the same address sees the old value.
+                advance_read_pipelines::<T, R, W, READ_LAT, WRITE_LAT>(&mut inner);
+                advance_write_pipelines::<T, R, W, READ_LAT, WRITE_LAT>(&mut inner);
             }
-            WriteMode::WriteFirst => {
-                // Commit writes first, THEN capture output registers.
-                for staged in inner.staging.iter_mut() {
-                    if let Some((addr, val)) = staged.take() {
-                        inner.data[addr] = val;
-                    }
-                }
-                if self.read_mode == ReadMode::Sync {
-                    for i in 0..R {
-                        inner.output_reg[i] = Some(inner.data[inner.read_addr[i]].clone());
-                    }
-                }
+            true => {
+                // WriteFirst: commit writes before capturing reads so a
+                // simultaneous read/write at the same address sees the new value.
+                advance_write_pipelines::<T, R, W, READ_LAT, WRITE_LAT>(&mut inner);
+                advance_read_pipelines::<T, R, W, READ_LAT, WRITE_LAT>(&mut inner);
             }
         }
-        inner.write_used = [false; W];
-        inner.last_cycle = cycle;
     }
+}
 
-    /// Get read port I. Multiple read ports may be used independently in the same cycle.
-    pub fn read_port<const I: usize>(&self) -> ReadPort<'_, T, R, W, D, I> {
+fn advance_write_pipelines<
+    T,
+    const R: usize,
+    const W: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+>(
+    inner: &mut MemoryInner<T, R, W, READ_LAT, WRITE_LAT>,
+) {
+    for port in 0..W {
+        // Commit the oldest stage.
+        if let Some((addr, value)) = inner.write_pipeline[port][WRITE_LAT - 1].take() {
+            inner.data[addr] = value;
+        }
+        // Shift toward the output end: stage N ← stage N-1.
+        for stage in (1..WRITE_LAT).rev() {
+            inner.write_pipeline[port][stage] = inner.write_pipeline[port][stage - 1].take();
+        }
+        // Stage 0 is now empty, ready for the next write this cycle.
+    }
+}
+
+fn advance_read_pipelines<
+    T: Clone,
+    const R: usize,
+    const W: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+>(
+    inner: &mut MemoryInner<T, R, W, READ_LAT, WRITE_LAT>,
+) {
+    for port in 0..R {
+        // Shift toward the output end: stage N ← stage N-1.
+        for stage in (1..READ_LAT).rev() {
+            inner.read_pipeline[port][stage] = inner.read_pipeline[port][stage - 1].take();
+        }
+        // Capture pending address into stage 0; clear pending so it must be
+        // re-presented next cycle.
+        inner.read_pipeline[port][0] = inner.pending_read_addr[port]
+            .take()
+            .map(|addr| inner.data[addr].clone());
+    }
+}
+
+// ── Port handles ──────────────────────────────────────────────────────────────
+
+pub struct ReadPort<
+    'a,
+    T,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const I: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> {
+    mem: &'a Memory<T, R, W, D, READ_LAT, WRITE_LAT>,
+}
+
+pub struct WritePort<
+    'a,
+    T,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const I: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> {
+    mem: &'a Memory<T, R, W, D, READ_LAT, WRITE_LAT>,
+}
+
+// ── Memory methods ────────────────────────────────────────────────────────────
+
+impl<T, const R: usize, const W: usize, D: ClockDomain, const READ_LAT: usize, const WRITE_LAT: usize>
+    Memory<T, R, W, D, READ_LAT, WRITE_LAT>
+{
+    pub fn read_port<const I: usize>(&self) -> ReadPort<'_, T, R, W, D, I, READ_LAT, WRITE_LAT> {
         ReadPort { mem: self }
     }
 
-    /// Get write port I.
-    pub fn write_port<const I: usize>(&self) -> WritePort<'_, T, R, W, D, I> {
+    pub fn write_port<const I: usize>(&self) -> WritePort<'_, T, R, W, D, I, READ_LAT, WRITE_LAT> {
         WritePort { mem: self }
     }
 
-    /// Switch to write-first mode: same-address reads see the pending write value.
-    pub fn write_first(mut self) -> Self {
-        self.write_mode = WriteMode::WriteFirst;
-        self
-    }
-
-    /// Switch to asynchronous (combinational) read. `output()` always returns `None`.
-    pub fn async_read(mut self) -> Self {
-        self.read_mode = ReadMode::Async;
-        self
-    }
-
     pub fn size(&self) -> usize {
-        unsafe { (*self.inner.get()).data.len() }
+        self.shared.inner.lock().unwrap().data.len()
     }
 
     pub fn write_mode(&self) -> WriteMode {
-        self.write_mode
+        if self.shared.write_first_mode.load(Ordering::Relaxed) {
+            WriteMode::WriteFirst
+        } else {
+            WriteMode::ReadFirst
+        }
     }
 
     pub fn read_mode(&self) -> ReadMode {
@@ -164,188 +193,141 @@ impl<T: Clone, const R: usize, const W: usize, D: ClockDomain> Memory<T, R, W, D
     }
 }
 
-impl<T: Clone + Default, const R: usize, const W: usize, D: ClockDomain> Memory<T, R, W, D> {
-    fn make_inner(data: Vec<T>, cycle: u64) -> MemoryInner<T, R, W> {
-        MemoryInner {
-            data,
-            staging: std::array::from_fn(|_| None),
-            read_addr: [0; R],
-            output_reg: std::array::from_fn(|_| None), // X — undefined until first edge
-            write_used: [false; W],
-            last_cycle: cycle,
-        }
-    }
-
-    /// Create a zeroed memory with `size` elements.
-    /// Defaults: sync read, read-first write mode.
+impl<
+    T: Default + Clone + Send + Sync + 'static,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> Memory<T, R, W, D, READ_LAT, WRITE_LAT>
+{
     pub fn new(clock: Clock<D>, size: usize) -> Self {
-        let cycle = clock.cycle();
-        Memory {
-            inner: UnsafeCell::new(Self::make_inner(vec![T::default(); size], cycle)),
-            clock,
-            write_mode: WriteMode::ReadFirst,
-            read_mode: ReadMode::Sync,
-        }
+        let data = std::iter::repeat_with(T::default).take(size).collect();
+        Self::from_data(clock, data)
     }
+}
 
-    /// Create a memory pre-loaded with `data`.
-    /// All entries are written directly to storage — no staging, no clock edge required.
-    /// Use for ROM initialization and lookup tables.
+impl<
+    T: Clone + Send + Sync + 'static,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> Memory<T, R, W, D, READ_LAT, WRITE_LAT>
+{
     pub fn from_contents(clock: Clock<D>, data: Vec<T>) -> Self {
-        let cycle = clock.cycle();
-        Memory {
-            inner: UnsafeCell::new(Self::make_inner(data, cycle)),
-            clock,
-            write_mode: WriteMode::ReadFirst,
-            read_mode: ReadMode::Sync,
-        }
+        Self::from_data(clock, data)
     }
 
-    /// Create a memory of `size` elements where `f(address)` computes each initial value.
     pub fn from_fn(clock: Clock<D>, size: usize, mut f: impl FnMut(usize) -> T) -> Self {
         let data = (0..size).map(|i| f(i)).collect();
-        Self::from_contents(clock, data)
+        Self::from_data(clock, data)
     }
 
-}
-
-// ── Read port ─────────────────────────────────────────────────────────────────
-
-/// A handle to one of the R read ports. Lifetime tied to the `Memory` it came from.
-/// `I` identifies which port (0..R).
-pub struct ReadPort<'a, T, const R: usize, const W: usize, D: ClockDomain, const I: usize> {
-    mem: &'a Memory<T, R, W, D>,
-}
-
-impl<'a, T: Clone + Default, const R: usize, const W: usize, D: ClockDomain, const I: usize>
-    ReadPort<'a, T, R, W, D, I>
-{
-    /// Clone a value out of the memory at `addr`.
-    /// Also records `addr` for output-register capture at the next clock edge (sync mode).
-    pub fn read(&self, addr: usize) -> T {
-        self[addr].clone()
-    }
-
-    /// The registered output captured at the last clock edge.
-    ///
-    /// Returns `None` before the first clock edge — the output register is undefined (X)
-    /// until the first posedge, matching real block RAM behavior.
-    ///
-    /// Always returns `None` in async read mode (no output register).
-    pub fn output(&self) -> Option<&T> {
-        self.mem.sync_if_advanced();
-        // SAFETY: single-threaded — no mutable alias while this shared ref lives.
-        unsafe { (*self.mem.inner.get()).output_reg[I].as_ref() }
-    }
-}
-
-/// `rp[addr]` — drive the read address and return current committed data.
-///
-/// - Records `addr` so it is captured into the output register at the next clock edge (sync mode).
-/// - In write-first mode: if any write port has `addr` staged, returns that pending value instead
-///   of the committed data (same-cycle read-after-write visibility).
-/// - Calls `sync_if_advanced` so state is always up-to-date.
-impl<'a, T: Clone + Default, const R: usize, const W: usize, D: ClockDomain, const I: usize>
-    Index<usize> for ReadPort<'a, T, R, W, D, I>
-{
-    type Output = T;
-
-    fn index(&self, addr: usize) -> &T {
-        self.mem.sync_if_advanced();
-        // SAFETY: single-threaded — no mutable alias while this shared ref lives.
-        let inner = unsafe { &mut *self.mem.inner.get() };
-        inner.read_addr[I] = addr;
-
-        // Write-first: return the staged value from any write port if address matches.
-        if self.mem.write_mode == WriteMode::WriteFirst {
-            for staged in inner.staging.iter() {
-                if let Some((wr_addr, val)) = staged {
-                    if *wr_addr == addr {
-                        return val;
-                    }
-                }
-            }
+    fn from_data(clock: Clock<D>, data: Vec<T>) -> Self {
+        let shared = Arc::new(MemoryShared {
+            inner: Mutex::new(MemoryInner {
+                data,
+                write_pipeline: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+                read_pipeline: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+                pending_read_addr: std::array::from_fn(|_| None),
+            }),
+            write_first_mode: AtomicBool::new(false),
+        });
+        let listener: Arc<dyn ClockEdgeListener> = shared.clone();
+        clock.register_listener(Arc::downgrade(&listener));
+        Self {
+            shared,
+            _clock: clock,
+            read_mode: ReadMode::Sync,
         }
-
-        &inner.data[addr]
     }
 }
 
-// ── Write port ────────────────────────────────────────────────────────────────
+// ── ReadPort methods ──────────────────────────────────────────────────────────
 
-/// A handle to one of the W write ports. Lifetime tied to the `Memory` it came from.
-/// `I` identifies which port (0..W).
-pub struct WritePort<'a, T, const R: usize, const W: usize, D: ClockDomain, const I: usize> {
-    mem: &'a Memory<T, R, W, D>,
+impl<
+    'a,
+    T: Clone,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const I: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> ReadPort<'a, T, R, W, D, I, READ_LAT, WRITE_LAT>
+{
+    /// Stage `addr` to be captured into the read pipeline on the next posedge.
+    ///
+    /// After `READ_LAT` posedges, `data()` will return the value at `addr`.
+    /// Call this every cycle to keep the pipeline continuously fed.
+    pub fn read(&self, addr: usize) {
+        self.mem.shared.inner.lock().unwrap().pending_read_addr[I] = Some(addr);
+    }
+
+    /// Returns `true` once the output stage of the read pipeline holds valid
+    /// data (i.e., at least `READ_LAT` posedges have occurred since the first
+    /// `read()` call on this port).
+    pub fn is_ready(&self) -> bool {
+        self.mem.shared.inner.lock().unwrap().read_pipeline[I][READ_LAT - 1].is_some()
+    }
+
+    /// Returns the value at the read pipeline output.
+    ///
+    /// Panics if `is_ready()` is `false`.
+    pub fn data(&self) -> T {
+        self.mem.shared.inner.lock().unwrap().read_pipeline[I][READ_LAT - 1]
+            .clone()
+            .expect("read pipeline output is not yet valid; check is_ready() first")
+    }
 }
 
-impl<'a, T: Clone, const R: usize, const W: usize, D: ClockDomain, const I: usize>
-    WritePort<'a, T, R, W, D, I>
+// ── Memory builder methods ────────────────────────────────────────────────────
+
+impl<T, const R: usize, const W: usize, D: ClockDomain, const READ_LAT: usize, const WRITE_LAT: usize>
+    Memory<T, R, W, D, READ_LAT, WRITE_LAT>
 {
-    /// Stage a write to `addr`. Committed at the next clock edge.
-    /// Panics in debug builds if this port is driven more than once in the same cycle —
-    /// a physical write port has one address/data bus; driving it twice is a hardware error.
+    /// Set WriteFirst read-during-write mode. Returns self for chaining.
+    ///
+    /// Called by the `#[hardware]` macro when it infers WriteFirst ordering from
+    /// the position of reads and writes in the loop body.
+    pub fn write_first(self) -> Self {
+        self.shared.write_first_mode.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Set ReadFirst read-during-write mode (the default). Returns self for chaining.
+    pub fn read_first(self) -> Self {
+        self.shared.write_first_mode.store(false, Ordering::Relaxed);
+        self
+    }
+}
+
+// ── WritePort methods ─────────────────────────────────────────────────────────
+
+impl<
+    'a,
+    T,
+    const R: usize,
+    const W: usize,
+    D: ClockDomain,
+    const I: usize,
+    const READ_LAT: usize,
+    const WRITE_LAT: usize,
+> WritePort<'a, T, R, W, D, I, READ_LAT, WRITE_LAT>
+{
+    /// Stage a write into the write pipeline. The value will be committed to
+    /// memory after `WRITE_LAT` posedges.
     pub fn write(&self, addr: usize, value: T) {
-        self.mem.sync_if_advanced();
-        // SAFETY: single-threaded.
-        let inner = unsafe { &mut *self.mem.inner.get() };
-        debug_assert!(
-            !inner.write_used[I],
-            "write port {} driven more than once in the same cycle (hardware violation)",
-            I
-        );
-        inner.write_used[I] = true;
-        inner.staging[I] = Some((addr, value));
+        self.mem.shared.inner.lock().unwrap().write_pipeline[I][0] = Some((addr, value));
     }
-}
 
-/// `wp[addr]` — return the current view from this write port's perspective.
-///
-/// In write-first mode: if this port has `addr` staged, returns the staged (pending) value.
-/// Otherwise returns the committed data.
-impl<'a, T: Clone + Default, const R: usize, const W: usize, D: ClockDomain, const I: usize>
-    Index<usize> for WritePort<'a, T, R, W, D, I>
-{
-    type Output = T;
-
-    fn index(&self, addr: usize) -> &T {
-        self.mem.sync_if_advanced();
-        // SAFETY: single-threaded.
-        let inner = unsafe { &*self.mem.inner.get() };
-        if self.mem.write_mode == WriteMode::WriteFirst {
-            if let Some((wr_addr, val)) = &inner.staging[I] {
-                if *wr_addr == addr {
-                    return val;
-                }
-            }
-        }
-        &inner.data[addr]
-    }
-}
-
-/// `wp[addr] = val` — stage a write via assignment syntax.
-///
-/// Also supports read-modify-write: `wp[addr] += n` reads the committed value,
-/// stages it in the slot, then adds `n` to the staged copy.
-///
-/// `wp[addr] = val` — stage a write via assignment syntax.
-/// Panics in debug builds if this port is driven more than once in the same cycle.
-impl<'a, T: Clone + Default, const R: usize, const W: usize, D: ClockDomain, const I: usize>
-    IndexMut<usize> for WritePort<'a, T, R, W, D, I>
-{
-    fn index_mut(&mut self, addr: usize) -> &mut T {
-        self.mem.sync_if_advanced();
-        // SAFETY: single-threaded, no read alias active simultaneously.
-        let inner = unsafe { &mut *self.mem.inner.get() };
-        debug_assert!(
-            !inner.write_used[I],
-            "write port {} driven more than once in the same cycle (hardware violation)",
-            I
-        );
-        inner.write_used[I] = true;
-        // Seed staging from committed value so read-modify-write works correctly.
-        inner.staging[I] = Some((addr, inner.data[addr].clone()));
-        &mut inner.staging[I].as_mut().unwrap().1
+    /// Always returns `true`: pipelined write ports accept a new write every
+    /// cycle regardless of in-flight writes.
+    pub fn is_ready(&self) -> bool {
+        true
     }
 }
 
@@ -363,250 +345,236 @@ mod tests {
         Clock::<TestClk>::new()
     }
 
-    // ── Construction ─────────────────────────────────────────────────────────
+    // ── Read latency ──────────────────────────────────────────────────────────
 
     #[test]
-    fn from_contents_preloads_data() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::from_contents(clock, vec![0x11, 0x22, 0x33]);
-        let rp = memory.read_port::<0>();
-        assert_eq!(rp.read(0), 0x11);
-        assert_eq!(rp.read(1), 0x22);
-        assert_eq!(rp.read(2), 0x33);
+    fn read_lat1_not_ready_before_first_tick() {
+        let clk = clk();
+        let mem = Memory::<u8, 1, 0, TestClk>::from_contents(clk, vec![0xAA, 0xBB]);
+        mem.read_port::<0>().read(0);
+        assert!(!mem.read_port::<0>().is_ready());
     }
 
     #[test]
-    fn from_fn_computes_each_entry() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::from_fn(clock, 4, |i| (i * 10) as u8);
-        let rp = memory.read_port::<0>();
-        assert_eq!(rp.read(0), 0);
-        assert_eq!(rp.read(1), 10);
-        assert_eq!(rp.read(2), 20);
-        assert_eq!(rp.read(3), 30);
+    fn read_lat1_ready_after_one_tick() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 0, TestClk>::from_contents(clk.clone(), vec![0x42]);
+        mem.read_port::<0>().read(0);
+        clk.advance();
+        assert!(mem.read_port::<0>().is_ready());
+        assert_eq!(mem.read_port::<0>().data(), 0x42);
     }
 
     #[test]
-    fn new_zeroed() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock, 4);
-        let rp = memory.read_port::<0>();
-        for i in 0..4 {
-            assert_eq!(rp.read(i), 0);
-        }
-    }
-
-    // ── output_reg X semantics ────────────────────────────────────────────────
-
-    #[test]
-    fn output_is_none_before_first_clock_edge() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock, 4);
-        assert_eq!(memory.read_port::<0>().output(), None);
+    fn read_lat2_not_ready_after_one_tick() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 0, TestClk, 2, 1>::from_contents(clk.clone(), vec![0x99]);
+        mem.read_port::<0>().read(0);
+        clk.advance();
+        assert!(!mem.read_port::<0>().is_ready());
     }
 
     #[test]
-    fn output_some_after_first_clock_edge() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4);
-        clock.advance();
-        // read_addr defaults to 0, data[0] = 0
-        assert_eq!(memory.read_port::<0>().output(), Some(&0u8));
-    }
-
-    // ── Sync write (staged commit) ────────────────────────────────────────────
-
-    #[test]
-    fn write_commits_on_next_clock_edge() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4);
-
-        memory.write_port::<0>().write(2, 0xAB);
-        assert_eq!(memory.read_port::<0>().read(2), 0); // not yet committed
-
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().read(2), 0xAB);
+    fn read_lat2_ready_after_two_ticks() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 0, TestClk, 2, 1>::from_contents(clk.clone(), vec![0x77]);
+        // Cycle 0: stage address
+        mem.read_port::<0>().read(0);
+        clk.advance(); // posedge 0: captured into pipeline[0]
+        // Cycle 1: re-stage (keep pipeline fed); still not ready
+        mem.read_port::<0>().read(0);
+        assert!(!mem.read_port::<0>().is_ready());
+        clk.advance(); // posedge 1: pipeline[1] = pipeline[0] → output valid
+        assert!(mem.read_port::<0>().is_ready());
+        assert_eq!(mem.read_port::<0>().data(), 0x77);
     }
 
     #[test]
-    #[should_panic(expected = "write port 0 driven more than once in the same cycle")]
-    fn write_port_reuse_in_same_cycle_panics() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock, 4);
+    fn pipelined_reads_deliver_correct_values_in_order() {
+        // Two different addresses staged in consecutive cycles; verify that
+        // each result appears in the correct slot as the pipeline shifts.
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 0, TestClk, 2, 1>::from_contents(
+            clk.clone(),
+            vec![0x11, 0x22, 0x33],
+        );
 
-        memory.write_port::<0>().write(1, 0x10);
-        memory.write_port::<0>().write(1, 0x20); // second drive on same port — hardware violation
+        // Cycle 0: stage addr 0
+        mem.read_port::<0>().read(0);
+        clk.advance();
+
+        // Cycle 1: stage addr 1; addr-0 result not yet at output
+        mem.read_port::<0>().read(1);
+        assert!(!mem.read_port::<0>().is_ready());
+        clk.advance();
+
+        // Cycle 2: addr-0 result arrives at output (READ_LAT=2)
+        assert!(mem.read_port::<0>().is_ready());
+        assert_eq!(mem.read_port::<0>().data(), 0x11);
+
+        // Stage addr 2 and advance; addr-1 result arrives next
+        mem.read_port::<0>().read(2);
+        clk.advance();
+
+        assert_eq!(mem.read_port::<0>().data(), 0x22);
+
+        mem.read_port::<0>().read(0); // any address to keep pipeline fed
+        clk.advance();
+
+        assert_eq!(mem.read_port::<0>().data(), 0x33);
+    }
+
+    // ── Write latency ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn write_lat1_commits_after_one_tick() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 1, TestClk>::new(clk.clone(), 4);
+
+        mem.write_port::<0>().write(2, 0xCD);
+        // Not visible yet — write is in flight
+        mem.read_port::<0>().read(2);
+        clk.advance(); // posedge: ReadFirst → read captures 0, write commits 0xCD
+
+        // Pipeline output holds pre-write value (ReadFirst default)
+        assert_eq!(mem.read_port::<0>().data(), 0x00);
+
+        // Next tick: addr 2 staged again, data[2] is now 0xCD
+        mem.read_port::<0>().read(2);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 0xCD);
     }
 
     #[test]
-    fn write_port_index_syntax_stages_write() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4);
+    fn write_lat2_commits_after_two_ticks() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 1, TestClk, 1, 2>::new(clk.clone(), 4);
 
-        {
-            let mut wp = memory.write_port::<0>();
-            wp[3] = 0x42;
-        }
-        assert_eq!(memory.read_port::<0>().read(3), 0); // not committed yet
+        // Stage write; it takes 2 posedges to commit.
+        mem.write_port::<0>().write(3, 0xEF);
+        clk.advance(); // posedge 0: write moves to pipeline stage[1]
 
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().read(3), 0x42);
+        // Posedge 1: ReadFirst — read captures data[3] BEFORE the write commits,
+        // so it still sees 0. Write commits at the end of this posedge.
+        mem.read_port::<0>().read(3);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 0x00);
+
+        // Posedge 2: write has already committed at posedge 1; no concurrent
+        // write this cycle, so the read captures the committed value 0xEF.
+        mem.read_port::<0>().read(3);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 0xEF);
     }
 
     #[test]
-    fn write_port_read_modify_write() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::from_contents(clock.clone(), vec![10, 20, 30]);
-
-        {
-            let mut wp = memory.write_port::<0>();
-            wp[1] += 5; // staging initialized from 20, becomes 25
-        }
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().read(1), 25);
+    fn write_port_is_ready_is_always_true() {
+        let clk = clk();
+        let mem = Memory::<u8, 0, 1, TestClk>::new(clk, 4);
+        assert!(mem.write_port::<0>().is_ready());
     }
 
-    // ── Sync read-first (default) ─────────────────────────────────────────────
+    // ── Read-during-write semantics ───────────────────────────────────────────
 
     #[test]
-    fn sync_read_first_output_captures_old_value() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4);
+    fn read_first_sees_old_value_on_same_addr_write() {
+        let mut clk = clk();
+        // data[0] starts at 0
+        let mem = Memory::<u8, 1, 1, TestClk>::new(clk.clone(), 4);
 
-        // Write and read same address in same cycle (read-first: output captures pre-write data).
-        memory.write_port::<0>().write(0, 42);
-        let _ = memory.read_port::<0>()[0]; // set read_addr = 0
+        // Same cycle: read and write addr 0
+        mem.read_port::<0>().read(0);
+        mem.write_port::<0>().write(0, 0xFF);
+        clk.advance(); // ReadFirst: read captures 0 before write commits
 
-        clock.advance();
-        // output_reg should have 0 (captured before 42 was committed)
-        assert_eq!(memory.read_port::<0>().output(), Some(&0u8));
-        // committed data is now 42
-        assert_eq!(memory.read_port::<0>().read(0), 42);
+        assert_eq!(mem.read_port::<0>().data(), 0x00);
     }
 
     #[test]
-    fn sync_read_first_output_updates_each_cycle() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4);
+    fn write_first_sees_new_value_on_same_addr_write() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 1, TestClk>::new(clk.clone(), 4).write_first();
 
-        memory.write_port::<0>().write(0, 10);
-        let _ = memory.read_port::<0>()[0];
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().output(), Some(&0u8)); // pre-write capture
+        // Same cycle: read and write addr 0
+        mem.read_port::<0>().read(0);
+        mem.write_port::<0>().write(0, 0xFF);
+        clk.advance(); // WriteFirst: write commits before read captures
 
-        let _ = memory.read_port::<0>()[0];
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().output(), Some(&10u8)); // now captures committed 10
-    }
-
-    // ── Sync write-first ──────────────────────────────────────────────────────
-
-    #[test]
-    fn write_first_read_port_sees_staged_value() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock, 4).write_first();
-
-        memory.write_port::<0>().write(0, 42);
-        // Same-cycle read via read port should return staged 42 (write-first)
-        assert_eq!(memory.read_port::<0>().read(0), 42);
+        assert_eq!(mem.read_port::<0>().data(), 0xFF);
     }
 
     #[test]
-    fn write_first_output_captures_new_value() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4).write_first();
+    fn read_first_sees_old_value_different_addr_unaffected() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 1, TestClk>::from_contents(clk.clone(), vec![0x10, 0x20]);
 
-        memory.write_port::<0>().write(0, 42);
-        let _ = memory.read_port::<0>()[0]; // read_addr = 0
-        clock.advance();
-        // write committed first, then output captured — should be 42
-        assert_eq!(memory.read_port::<0>().output(), Some(&42u8));
+        // Write addr 1, read addr 0 simultaneously
+        mem.read_port::<0>().read(0);
+        mem.write_port::<0>().write(1, 0xFF);
+        clk.advance();
+
+        // Read at addr 0 is unaffected by write at addr 1
+        assert_eq!(mem.read_port::<0>().data(), 0x10);
     }
 
-    #[test]
-    fn write_first_different_address_unaffected() {
-        let clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock, 4).write_first();
-
-        memory.write_port::<0>().write(1, 42);
-        assert_eq!(memory.read_port::<0>().read(0), 0); // different addr, write invisible
-    }
-
-    // ── Async read ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn async_read_returns_immediate_data() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4).async_read();
-
-        memory.write_port::<0>().write(0, 42);
-        assert_eq!(memory.read_port::<0>().read(0), 0); // read-first: write not yet visible
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().read(0), 42);
-    }
-
-    #[test]
-    fn async_output_always_none() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 1, TestClk>::new(clock.clone(), 4).async_read();
-        clock.advance();
-        assert_eq!(memory.read_port::<0>().output(), None);
-    }
-
-    // ── Multiple independent ports ────────────────────────────────────────────
+    // ── Multiple ports ────────────────────────────────────────────────────────
 
     #[test]
     fn two_read_ports_independent() {
-        let clock = clk();
-        let memory =
-            Memory::<u8, 2, 1, TestClk>::from_contents(clock, vec![1, 2, 3, 4]);
+        let mut clk = clk();
+        let mem = Memory::<u8, 2, 0, TestClk>::from_contents(clk.clone(), vec![0xAA, 0xBB]);
 
-        assert_eq!(memory.read_port::<0>().read(0), 1);
-        assert_eq!(memory.read_port::<1>().read(3), 4);
+        mem.read_port::<0>().read(0);
+        mem.read_port::<1>().read(1);
+        clk.advance();
+
+        assert_eq!(mem.read_port::<0>().data(), 0xAA);
+        assert_eq!(mem.read_port::<1>().data(), 0xBB);
     }
 
     #[test]
-    fn two_write_ports_both_commit() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 2, TestClk>::new(clock.clone(), 4);
+    fn two_write_ports_last_wins_at_same_addr() {
+        // When both write ports target the same address in the same cycle,
+        // port 0 commits first (lower index), then port 1 overwrites it.
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 2, TestClk>::new(clk.clone(), 4);
 
-        memory.write_port::<0>().write(0, 0xAA);
-        memory.write_port::<1>().write(1, 0xBB);
-        clock.advance();
+        mem.write_port::<0>().write(0, 0x11);
+        mem.write_port::<1>().write(0, 0x22);
+        clk.advance(); // both commit: port 0 then port 1 → 0x22 wins
 
-        assert_eq!(memory.read_port::<0>().read(0), 0xAA);
-        assert_eq!(memory.read_port::<0>().read(1), 0xBB);
+        mem.read_port::<0>().read(0);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 0x22);
+    }
+
+    // ── Constructors ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_contents_preloads_data() {
+        let mut clk = clk();
+        let mem = Memory::<u32, 1, 0, TestClk>::from_contents(clk.clone(), vec![10, 20, 30]);
+        assert_eq!(mem.size(), 3);
+        mem.read_port::<0>().read(2);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 30u32);
     }
 
     #[test]
-    fn two_write_ports_conflicting_addr_both_commit_independently() {
-        let mut clock = clk();
-        let memory = Memory::<u8, 1, 2, TestClk>::new(clock.clone(), 4);
-
-        // Both write to addr 0 in same cycle — both stage into separate slots.
-        // Both commit (last slot in iteration order wins in data[]).
-        memory.write_port::<0>().write(0, 0x11);
-        memory.write_port::<1>().write(0, 0x22);
-        clock.advance();
-
-        // Port 0 and port 1 both staged to addr 0; port 1 (index 1) commits last.
-        let val = memory.read_port::<0>().read(0);
-        assert!(val == 0x11 || val == 0x22, "one of the two ports committed");
+    fn from_fn_preloads_data() {
+        let mut clk = clk();
+        let mem = Memory::<u32, 1, 0, TestClk>::from_fn(clk.clone(), 4, |i| (i * i) as u32);
+        mem.read_port::<0>().read(3);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 9u32);
     }
 
-    // ── Registered read per port ──────────────────────────────────────────────
-
     #[test]
-    fn each_read_port_has_independent_output_register() {
-        let mut clock = clk();
-        let memory =
-            Memory::<u8, 2, 1, TestClk>::from_contents(clock.clone(), vec![0xAA, 0xBB, 0xCC, 0xDD]);
-
-        let _ = memory.read_port::<0>()[0]; // port 0 reads addr 0
-        let _ = memory.read_port::<1>()[3]; // port 1 reads addr 3
-        clock.advance();
-
-        assert_eq!(memory.read_port::<0>().output(), Some(&0xAAu8));
-        assert_eq!(memory.read_port::<1>().output(), Some(&0xDDu8));
+    fn new_initializes_to_default() {
+        let mut clk = clk();
+        let mem = Memory::<u8, 1, 0, TestClk>::new(clk.clone(), 8);
+        mem.read_port::<0>().read(7);
+        clk.advance();
+        assert_eq!(mem.read_port::<0>().data(), 0u8);
     }
 }
