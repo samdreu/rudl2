@@ -474,8 +474,13 @@ pub enum CHIRLowerError {
         span: SourceSpan,
     },
 
-    // emit!() used without a corresponding spawn_function_typed context
+    // emit!() used in a module with no output port
     EmitWithoutOutput {
+        span: SourceSpan,
+    },
+
+    // Module has an output port but never calls emit!()
+    OutputWithoutEmit {
         span: SourceSpan,
     },
 

@@ -133,10 +133,31 @@ See [PROGRESS.md](PROGRESS.md) for detailed development tracking.
 
 ## Documentation
 
-- [PROGRESS.md](PROGRESS.md) - Detailed development progress and roadmap
-- [MODULE_COMPOSITION.md](MODULE_COMPOSITION.md) - Module composition patterns
-- [VERILATOR_VERIFICATION.md](VERILATOR_VERIFICATION.md) - Verilator integration guide
+### Transpilation Pipeline
+
+- [TRANSPILATION_PLAN.md](TRANSPILATION_PLAN.md) - Overall pipeline architecture and decision log
+- [ASYNC_AWAIT_SEMANTICS.md](ASYNC_AWAIT_SEMANTICS.md) - Clock/tick/emit runtime semantics (canonical reference)
+- [FIR_DESIGN.md](FIR_DESIGN.md) - Phase A: Frontend IR capture from Rust AST ✅
+- [CHIR_DESIGN.md](CHIR_DESIGN.md) - Phase B: Canonical Hardware IR semantic lowering ✅
+- [SHIR_DESIGN.md](SHIR_DESIGN.md) - Phase C: Scheduled Hardware IR timing and state construction ⏳
+- [VLIR_DESIGN.md](VLIR_DESIGN.md) - Phase D: Verilog-Legal IR legalization (designed, not yet implemented)
+- [EMISSION_DESIGN.md](EMISSION_DESIGN.md) - Phase E: Verilog text emission (designed, not yet implemented)
+- [VALIDATION_DESIGN.md](VALIDATION_DESIGN.md) - Phase F: Equivalence validation strategy
 - [VERILOG_OUTPUT_STANDARDS.md](VERILOG_OUTPUT_STANDARDS.md) - Verilog/SystemVerilog output standards and PR review checklist
+
+### Runtime and Features
+
+- [MEMORY_DESIGN.md](MEMORY_DESIGN.md) - Memory as a first-class hardware construct (plan; simulation side complete)
+- [MODULE_COMPOSITION.md](MODULE_COMPOSITION.md) - Module composition patterns
+- [LATENCY_INSENSITIVE_DESIGN.md](LATENCY_INSENSITIVE_DESIGN.md) - Latency-insensitive memory interface design
+- [RV32I_CPU_DESIGN.md](RV32I_CPU_DESIGN.md) - RV32I CPU example design
+
+### Testing and Verification
+
+- [PROGRESS.md](PROGRESS.md) - Detailed development progress and roadmap
+- [VERILATOR_VERIFICATION.md](VERILATOR_VERIFICATION.md) - Verilator integration guide
+- [BINARY_TESTING_GUIDE.md](BINARY_TESTING_GUIDE.md) - Binary testing guide
+- [TEST_RESULTS.md](TEST_RESULTS.md) - Test results snapshot
 
 ## Contributing
 

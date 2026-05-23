@@ -1,5 +1,13 @@
 # Memory as a First-Class Language Construct
 
+## Implementation Status
+
+**Simulation side — complete.** `Memory<T, R, W, D, READ_LAT, WRITE_LAT>` in `copper-core/src/memory.rs` is fully implemented: multi-port, configurable read/write latency pipelines, `ReadFirst`/`WriteFirst` semantics, `ClockEdgeListener` hook for posedge-driven updates. The `sync_ram`, `reg_file`, FIFO, and RV32I CPU examples all use it and pass Verilator cross-validation.
+
+**Compiler integration — not yet started.** The `#[hardware]` macro currently treats `Memory` as an opaque library type. The five-step plan described below (spec language, macro enforcement, CHIR memory nodes, SHIR scheduling, Verilog emission) has not been implemented. Memory-using modules cannot be transpiled to Verilog yet.
+
+---
+
 ## The Problem
 
 `Memory<T, R, W, D>` currently works as a simulation tool — the Rust executor handles clock-edge semantics correctly and the examples pass Verilator cross-validation. But it is a library type the compiler knows nothing about. This creates two real problems:

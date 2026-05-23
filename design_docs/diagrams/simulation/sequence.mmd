@@ -1,0 +1,24 @@
+# Runtime sequence for one clock cycle
+
+```mermaid
+sequenceDiagram
+  participant TB as Testbench
+  participant EX as Executor
+  participant TK as Clock
+  participant M1 as Module A
+  participant M2 as Module B
+
+  TB->>EX: tick_clock()
+  EX->>M1: poll_tasks(pre-edge)
+  EX->>M2: poll_tasks(pre-edge)
+  M1-->>EX: emit / suspend on tick().await
+  M2-->>EX: emit / suspend on tick().await
+  EX->>TK: advance()
+  TK-->>M1: wake waiting task
+  TK-->>M2: wake waiting task
+  EX->>M1: poll_tasks(post-edge)
+  EX->>M2: poll_tasks(post-edge)
+  M1-->>EX: resume after tick().await
+  M2-->>EX: resume after tick().await
+  EX-->>TB: cycle complete
+```

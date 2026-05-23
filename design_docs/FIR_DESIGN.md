@@ -318,29 +318,25 @@ Phase B detects `emit!` by checking if `ExprLit::text` (whitespace-stripped) sta
 
 ### `clk.tick().await` — clock edge boundary
 
-This is a method call chain followed by `.await`. Phase A produces the following nested tree:
+This is a method call followed by `.await`. Phase A produces the following nested tree:
 
 ```rust
 ExprType::Await(ExprAwait {
-    base: Box::new(ExprType::Call(ExprCall {
-        func: Box::new(ExprType::MethodCall(ExprMethodCall {
-            receiver: Box::new(ExprType::Var("clk")),   // clock parameter name
-            method: "tick",
-            args: [],
-            ...
-        })),
+    base: Box::new(ExprType::MethodCall(ExprMethodCall {
+        receiver: Box::new(ExprType::Lit(ExprLit { text: "clk", ... })),
+        method: "tick",
         args: [],
-        is_hardware_module: false,
         ...
     })),
     ...
 })
 ```
 
-More precisely, `clk.tick()` is a method call that returns a future, and `.await` is the await expression on it. Phase B identifies a tick boundary by matching:
+`clk.tick()` is a method call (not a free function call — there is no intermediate `ExprCall` layer). Phase B identifies a tick boundary by matching:
 - `ExprType::Await` whose `base` is
-- an `ExprMethodCall` with `method == "tick"` whose `receiver` is
-- a `Var` or `Path` matching a known clock parameter name from `FrontendModuleIR::clocks`
+- `ExprType::MethodCall` with `method == "tick"` and no args
+
+The receiver is not verified against the clock parameter list at Phase B — the `AwaitTick` node is emitted using `ctx.clock_name` (the declared clock parameter name) regardless of the receiver text. Phase C later validates that `AwaitTick` clock names are consistent with the module's declared clock.
 
 Multiple `clk.tick().await` calls in a single loop body all produce separate `ExprAwait` nodes in source order — Phase B collects all of them as `AwaitTick` boundaries, implementing the multi-tick support from SHIR_DESIGN.md Decision D5.
 
@@ -422,7 +418,7 @@ These hold for all output produced by `capture_frontend_ir`:
 
 ## Test Coverage
 
-Phase A has 103 unit tests covering:
+Phase A has 120 unit tests covering:
 
 - Signature capture: simple params, no-return, tuple-return
 - Classification: async vs sync detection
@@ -446,7 +442,7 @@ Phase B receives `FrontendModuleIR` and its entry contract is:
 - It may assume all Phase A invariants hold
 - `ExprCall::is_hardware_module == true` → generate `CHIRSubmoduleInst`; `false` → inline or reject
 - `emit!()` detection: find `ExprType::Lit` nodes whose `text` whitespace-stripped starts with `"emit!("` — extract the argument name from within the parentheses
-- `clk.tick().await` detection: find `ExprType::Await` whose `base` is an `ExprMethodCall` with `method == "tick"` on a receiver matching a clock parameter name; multiple such nodes in a loop body produce multiple `CHIRStmt::AwaitTick` entries (multi-tick support per SHIR_DESIGN.md D5)
+- `clk.tick().await` detection: find `ExprType::Await` whose `base` is `ExprType::MethodCall` with `method == "tick"` and no args; the receiver text is not verified against the clock parameter list — Phase B emits `CHIRStmt::AwaitTick { clock: ctx.clock_name }` using the declared clock name; multiple such nodes in a loop body produce multiple `CHIRStmt::AwaitTick` entries (multi-tick support per SHIR_DESIGN.md D5)
 - `pattern_text` in `ExprMatchArm` is a raw token-stream string; Phase B must parse it to identify tuple patterns `(A, B)`, literal patterns, wildcards `_`, and enum variant patterns
 - `ty_text` in `RawTypeRef` is a raw string; Phase B must parse it to resolve `CHIRType` — including stripping `Arc<Mutex<T>>` wrappers on input parameters
 - `*x.lock().unwrap()` method call chains on clock-excluded parameters must be recognized and collapsed to a direct `CHIRExpr::Var` reference to the underlying port

@@ -98,8 +98,8 @@ pub struct SHIRSeqBody {
     // For multi-tick modules: one entry per phase (0..N-1)
     pub phases: Vec<SHIRPhase>,
 
-    // How the output port is driven — see Output Drive Model section
-    pub output_drive: SHIROutputDrive,
+    // How the output port is driven — None if the module has no output port
+    pub output_drive: Option<SHIROutputDrive>,
 }
 
 pub struct SHIRReg {
@@ -655,7 +655,7 @@ For multi-tick modules:
 1. Every register named in a `SHIRRegUpdate::target` is declared in `SHIRSeqBody::registers`
 2. Every variable referenced in a `SHIRExpr` is either a port, a declared register, a `Wire` declared earlier in the same `pre_edge` list, or a submodule `output_wire` in `SHIRSeqBody::submodules`
 3. Assignment intent is fully determined: no statement is ambiguous about blocking vs non-blocking vs continuous
-4. `SHIROutputDrive` is always `Continuous` for combinational modules, and always `PreEdge`, `PostEdge`, or `PhaseConditional` for sequential modules — never absent for a module with an output port
+4. `output_drive` is `Some(Continuous(...))` for combinational modules with an output port, and `Some(PreEdge | PostEdge | PhaseConditional)` for sequential modules with an output port — `None` only when the module has no output port
 5. `phase_r` is present if and only if `phases.len() > 1`
 6. Each `SHIRPhase::post_edge` ends with a phase-advance `SHIRRegUpdate` if and only if `phases.len() > 1`
 7. No `AwaitTick` or `Emit` appear in the output — these are consumed by Phase C and do not exist in SHIR

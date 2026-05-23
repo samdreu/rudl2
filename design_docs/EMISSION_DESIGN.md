@@ -1,5 +1,7 @@
 # Copper Verilog Emission Design — Phase E
 
+**Implementation status: designed, not yet implemented.** This document describes the Phase E text emitter that will operate on `VLIRModule` (Phase D output). It cannot be implemented until Phase D (VLIR legalization) is complete.
+
 ## Purpose
 
 This document defines Phase E of the Copper transpilation pipeline: Verilog text emission. Phase E receives a `VLIRModule` (Phase D output) and produces a `String` containing valid, formatted SystemVerilog source text.

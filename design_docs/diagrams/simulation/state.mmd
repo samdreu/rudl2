@@ -1,0 +1,15 @@
+# Async task state machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> Ready
+  Ready --> Running: poll
+  Running --> WaitingClock: tick().await
+  Running --> WaitingDelta: delta_yield().await
+  Running --> Completed: future ends
+  WaitingClock --> Ready: Clock::advance()
+  WaitingDelta --> Ready: next poll pass
+  WaitingClock --> XInjected: oscillation detected
+  XInjected --> Ready: downstream stabilizes
+  Completed --> [*]
+```

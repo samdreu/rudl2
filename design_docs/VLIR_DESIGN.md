@@ -1,5 +1,7 @@
 # Copper Verilog-Legal IR (VLIR) Design — Phase D
 
+**Implementation status: designed, not yet implemented.** The VLIR data types and legalization passes described here are the design target. `copper-codegen/src/verilog.rs` contains a legacy emitter that pre-dates this pipeline and is not part of the CHIR/SHIR/VLIR flow. Phase D implementation begins once Phase C gaps are closed.
+
 ## Purpose
 
 This document defines Phase D of the Copper transpilation pipeline: Verilog Legalization. Phase D receives a `SHIRModule` (Phase C output) and produces a `VLIRModule` — a fully legalized representation that maps 1:1 onto valid SystemVerilog syntax. After Phase D, the only remaining work is mechanical text serialization (Phase E).

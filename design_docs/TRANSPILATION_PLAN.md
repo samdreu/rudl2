@@ -8,9 +8,8 @@ This draft is intentionally opinionated so it can be reviewed and changed quickl
 
 ## Current State (Observed in This Repository)
 
-- A codegen crate exists in [copper-codegen/src/lib.rs](copper-codegen/src/lib.rs), [copper-codegen/src/parser.rs](copper-codegen/src/parser.rs), and [copper-codegen/src/verilog.rs](copper-codegen/src/verilog.rs).
-- Current lowering is mostly combinational and statement-limited, with substantial unsupported Rust AST surface.
-- Existing design intent is documented in [VERILOG_CODEGEN_DESIGN.md](VERILOG_CODEGEN_DESIGN.md).
+- The codegen crate lives in `../copper-codegen/src/` — key files: `lib.rs`, `parser.rs`, `chir_lower.rs`, `shir_lower.rs`, `verilog.rs` (legacy emitter, not part of the new pipeline).
+- Phases A and B are complete; Phase C (SHIR) is nearly complete; Phases D–F are not yet started.
 - Runtime semantics for cycle boundaries and emit behavior are documented in [ASYNC_AWAIT_SEMANTICS.md](ASYNC_AWAIT_SEMANTICS.md).
 
 ## Research Summary: Prior Transpilation Codebases
@@ -255,7 +254,7 @@ pub type ModuleRegistry = HashMap<String, FrontendModuleIR>;
 - Scope check: all `CHIRExpr::Var` references validated against declared port/register/wire/submodule-output names
 - `emit!()` used without output port → `EmitWithoutOutput` error
 
-**Test Coverage:** 87 Phase B tests (207 total with Phase A)
+**Test Coverage:** 88 Phase B tests (208 total with Phase A)
 - Type resolution, inference, register init, port extraction
 - Pattern parsing, or-pattern expansion
 - Expression lowering, method call normalization

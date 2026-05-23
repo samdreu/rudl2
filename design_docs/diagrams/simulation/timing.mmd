@@ -1,0 +1,17 @@
+# Timing diagram for pre-edge and post-edge settle
+
+```mermaid
+flowchart LR
+  A[pre-edge settle] --> B[clk.advance()]
+  B --> C[post-edge settle]
+
+  A1[poll pass 1] --> A2[poll pass 2] --> A3[fixed point]
+  C1[poll pass 1] --> C2[poll pass 2] --> C3[fixed point]
+
+  A -.-> A1
+  A -.-> A2
+  A -.-> A3
+  C -.-> C1
+  C -.-> C2
+  C -.-> C3
+```

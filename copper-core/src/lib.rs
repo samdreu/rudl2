@@ -1,7 +1,6 @@
 pub mod ir;
 pub mod frontend_ir;
 pub mod chir;
-pub mod memory_old;
 pub mod memory;
 pub mod shir;
 pub mod types;
