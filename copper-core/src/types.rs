@@ -48,10 +48,16 @@ impl From<bool> for Logic {
     }
 }
 
+/// Convert Logic to a boolean if possible (panics on X/Z)
+impl Into<bool> for Logic {
+    fn into(self) -> bool {
+        self.as_bool()
+    }
+}
+
 impl std::ops::Not for Logic {
     type Output = Logic;
     
-    // should i have it throw an error for X and Z?
     fn not(self) -> Self::Output {
         match self {
             Logic::Zero => Logic::One,
@@ -132,28 +138,6 @@ impl fmt::Binary for Logic {
             Logic::One => write!(f, "1"),
             Logic::X => write!(f, "X"),
         }
-    }
-}
-
-impl fmt::LowerHex for Logic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Binary::fmt(self, f)
-    }
-}
-
-impl fmt::UpperHex for Logic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Logic::Zero => write!(f, "0"),
-            Logic::One => write!(f, "1"),
-            Logic::X => write!(f, "X"),
-        }
-    }
-}
-
-impl fmt::Octal for Logic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Binary::fmt(self, f)
     }
 }
 
@@ -678,4 +662,183 @@ mod tests {
     
     // Tests to add: TODO!
     // logic: from bool and as bool
+    #[test]
+    fn test_logic_from_bool() {
+        assert_eq!(Logic::from_bool(false), Logic::Zero);
+        assert_eq!(Logic::from_bool(true), Logic::One);
+    }
+
+    #[test]
+    fn test_logic_as_bool() {
+        assert_eq!(Logic::Zero.as_bool(), false);
+        assert_eq!(Logic::One.as_bool(), true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot convert X to bool")]
+    fn test_logic_as_bool_panic() {
+        Logic::X.as_bool();
+    }
+
+    #[test]
+    fn test_valid_logic() {
+        assert!(Logic::Zero.is_valid());
+        assert!(Logic::One.is_valid());
+    }
+
+    #[test]
+    fn test_bool_to_logic() {
+        assert_eq!(Logic::from(false), Logic::Zero);
+        assert_eq!(Logic::from(true), Logic::One);
+    }
+
+    #[test]
+    fn test_logic_into_bool() {
+        let zero: bool = Logic::Zero.into();
+        let one: bool = Logic::One.into();
+        assert_eq!(zero, false);
+        assert_eq!(one, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot convert X to bool")]
+    fn test_logic_into_bool_panic() {
+        let _x: bool = Logic::X.into();
+    }
+
+    #[test]
+    fn test_not() {
+        assert_eq!(!Logic::Zero, Logic::One);
+        assert_eq!(!Logic::One, Logic::Zero);
+        assert_eq!(!Logic::X, Logic::X);
+    }
+
+    #[test]
+    fn test_and() {
+        assert_eq!(Logic::Zero & Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::Zero & Logic::One, Logic::Zero);
+        assert_eq!(Logic::One & Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::One & Logic::One, Logic::One);
+        assert_eq!(Logic::X & Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::X & Logic::One, Logic::X);
+        assert_eq!(Logic::X & Logic::X, Logic::X);
+    }
+
+    #[test]
+    fn test_bit_and_assign() {
+        let mut a = Logic::One;
+        a &= Logic::Zero;
+        assert_eq!(a, Logic::Zero);
+
+        let mut b = Logic::X;
+        b &= Logic::One;
+        assert_eq!(b, Logic::X);
+
+        let mut c = Logic::X;
+        c &= Logic::X;
+        assert_eq!(c, Logic::X);
+
+        let mut d = Logic::Zero;
+        d &= Logic::X;
+        assert_eq!(d, Logic::Zero);
+
+        let mut e = Logic::One;
+        e &= Logic::X;
+        assert_eq!(e, Logic::X);
+
+        let mut f = Logic::X;
+        f &= Logic::Zero;
+        assert_eq!(f, Logic::Zero);
+
+        let mut g = Logic::X;
+        g &= Logic::X;
+        assert_eq!(g, Logic::X);
+    }
+
+    #[test]
+    fn test_or() {
+        assert_eq!(Logic::Zero | Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::Zero | Logic::One, Logic::One);
+        assert_eq!(Logic::One | Logic::Zero, Logic::One);
+        assert_eq!(Logic::One | Logic::One, Logic::One);
+        assert_eq!(Logic::X | Logic::Zero, Logic::X);
+        assert_eq!(Logic::X | Logic::One, Logic::One);
+        assert_eq!(Logic::X | Logic::X, Logic::X);
+    }
+
+    #[test]
+    fn test_bit_or_assign() {
+        let mut a = Logic::Zero;
+        a |= Logic::Zero;
+        assert_eq!(a, Logic::Zero);
+
+        let mut b = Logic::Zero;
+        b |= Logic::One;
+        assert_eq!(b, Logic::One);
+
+        let mut c = Logic::X;
+        c |= Logic::Zero;
+        assert_eq!(c, Logic::X);
+
+        let mut d = Logic::X;
+        d |= Logic::One;
+        assert_eq!(d, Logic::One);
+
+        let mut e = Logic::X;
+        e |= Logic::X;
+        assert_eq!(e, Logic::X);
+    }
+
+    #[test]
+    fn test_xor() {
+        assert_eq!(Logic::Zero ^ Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::Zero ^ Logic::One, Logic::One);
+        assert_eq!(Logic::One ^ Logic::Zero, Logic::One);
+        assert_eq!(Logic::One ^ Logic::One, Logic::Zero);
+        assert_eq!(Logic::X ^ Logic::Zero, Logic::X);
+        assert_eq!(Logic::X ^ Logic::One, Logic::X);
+        assert_eq!(Logic::X ^ Logic::X, Logic::X);
+    }
+
+    #[test]
+    fn test_bit_xor_assign() {
+        let mut a = Logic::Zero;
+        a ^= Logic::Zero;
+        assert_eq!(a, Logic::Zero);
+
+        let mut b = Logic::Zero;
+        b ^= Logic::One;
+        assert_eq!(b, Logic::One);
+
+        let mut c = Logic::X;
+        c ^= Logic::Zero;
+        assert_eq!(c, Logic::X);
+
+        let mut d = Logic::X;
+        d ^= Logic::One;
+        assert_eq!(d, Logic::X);
+
+        let mut e = Logic::X;
+        e ^= Logic::X;
+        assert_eq!(e, Logic::X);
+    }
+
+    #[test]
+    fn test_logic_display() {
+        assert_eq!(format!("{}", Logic::Zero), "0");
+        assert_eq!(format!("{}", Logic::One), "1");
+        assert_eq!(format!("{}", Logic::X), "X");
+    }
+
+    #[test]
+    fn test_logic_debug() {
+        assert_eq!(format!("{:?}", Logic::Zero), "Zero");
+        assert_eq!(format!("{:?}", Logic::One), "One");
+        assert_eq!(format!("{:?}", Logic::X), "X");
+    }
+
+
+
+
+
 }
