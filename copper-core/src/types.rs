@@ -1,8 +1,8 @@
 //! Core type system for Copper HDL
 //! 
 //! This module defines the foundational types for hardware design:
-//! - `Bit`: Single bit with 4-state logic
-//! - `Bits<N>`: Bit vectors of compile-time width
+//! - `Logic`: Single Logic with 4-state logic
+//! - `Bits<N>`: Logic vectors of compile-time width
 //! - `Clock`: Clock source for synchronous logic
 
 use std::marker::PhantomData;
@@ -10,116 +10,150 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 
 // primitive logic values (0, 1, X)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Logic {
     Zero = 0,
     One = 1,
     X, // unknown
 }
 
-/// A single hardware bit with 4-state logic (0, 1, X, Z)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Bit(pub Logic);
-
-impl Bit {
-    /// Constant for logic zero
-    pub const ZERO: Bit = Bit(Logic::Zero);
-    
-    /// Constant for logic one
-    pub const ONE: Bit = Bit(Logic::One);
-    
-    /// Constant for unknown/uninitialized
-    pub const X: Bit = Bit(Logic::X);
-    
-    /// Create a new bit from a boolean
+/// A single hardware logic value with 3-state logic (0, 1, X)
+impl Logic {
+    /// Create a new Logic from a boolean
     pub fn from_bool(b: bool) -> Self {
-        if b { Self::ONE } else { Self::ZERO }
+        if b { Self::One } else { Self::Zero }
     }
     
     /// Convert to boolean if possible (panics on X/Z)
     pub fn as_bool(&self) -> bool {
-        match self.0 {
+        match self {
             Logic::Zero => false,
             Logic::One => true,
             Logic::X => panic!("Cannot convert X to bool"),
         }
     }
     
-    /// Check if this bit is a valid boolean (not X)
+    /// Check if this Logic is a valid boolean (not X or Z)
     pub fn is_valid(&self) -> bool {
-        matches!(self.0, Logic::Zero | Logic::One)
+        matches!(self, Logic::Zero | Logic::One)
     }
 }
 
-impl From<bool> for Bit {
+/// Convert a boolean to a Logic value
+impl From<bool> for Logic {
     fn from(b: bool) -> Self {
         Self::from_bool(b)
     }
 }
 
-impl From<Logic> for Bit {
-    fn from(l: Logic) -> Self {
-        Bit(l)
-    }
-}
-
-impl std::ops::Not for Bit {
-    type Output = Bit;
+impl std::ops::Not for Logic {
+    type Output = Logic;
     
+    // should i have it throw an error for X and Z?
     fn not(self) -> Self::Output {
-        match self.0 {
-            Logic::Zero => Bit::ONE,
-            Logic::One => Bit::ZERO,
-            Logic::X => Bit::X,
+        match self {
+            Logic::Zero => Logic::One,
+            Logic::One => Logic::Zero,
+            Logic::X => Logic::X,
         }
     }
 }
 
-impl std::ops::BitAnd for Bit {
-    type Output = Bit;
+impl std::ops::BitAnd for Logic {
+    type Output = Logic;
     
     fn bitand(self, rhs: Self) -> Self::Output {
-        match (self.0, rhs.0) {
-            (Logic::Zero, _) | (_, Logic::Zero) => Bit::ZERO,
-            (Logic::One, Logic::One) => Bit::ONE,
-            _ => Bit::X,
+        match (self, rhs) {
+            (Logic::Zero, _) | (_, Logic::Zero) => Logic::Zero,
+            (Logic::One, Logic::One) => Logic::One,
+            _ => Logic::X,
         }
     }
 }
 
-impl std::ops::BitOr for Bit {
-    type Output = Bit;
+impl std::ops::BitAndAssign for Logic {
+    fn bitand_assign(&mut self, rhs: Self) {
+        *self = *self & rhs;
+    }
+}
+
+impl std::ops::BitOr for Logic {
+    type Output = Logic;
     
     fn bitor(self, rhs: Self) -> Self::Output {
-        match (self.0, rhs.0) {
-            (Logic::One, _) | (_, Logic::One) => Bit::ONE,
-            (Logic::Zero, Logic::Zero) => Bit::ZERO,
-            _ => Bit::X,
+        match (self, rhs) {
+            (Logic::One, _) | (_, Logic::One) => Logic::One,
+            (Logic::Zero, Logic::Zero) => Logic::Zero,
+            _ => Logic::X,
         }
     }
 }
 
-impl std::ops::BitXor for Bit {
-    type Output = Bit;
+impl std::ops::BitOrAssign for Logic {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
+
+impl std::ops::BitXor for Logic {
+    type Output = Logic;
     
     fn bitxor(self, rhs: Self) -> Self::Output {
-        match (self.0, rhs.0) {
-            (Logic::Zero, Logic::Zero) | (Logic::One, Logic::One) => Bit::ZERO,
-            (Logic::Zero, Logic::One) | (Logic::One, Logic::Zero) => Bit::ONE,
-            _ => Bit::X,
+        match (self, rhs) {
+            (Logic::Zero, Logic::Zero) | (Logic::One, Logic::One) => Logic::Zero,
+            (Logic::Zero, Logic::One) | (Logic::One, Logic::Zero) => Logic::One,
+            _ => Logic::X,
         }
     }
 }
 
-impl fmt::Display for Bit {
+impl std::ops::BitXorAssign for Logic {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
+    }
+}
+
+impl fmt::Display for Logic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
+        match self {
             Logic::Zero => write!(f, "0"),
             Logic::One => write!(f, "1"),
             Logic::X => write!(f, "X"),
         }
+    }
+}
+
+impl fmt::Binary for Logic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Logic::Zero => write!(f, "0"),
+            Logic::One => write!(f, "1"),
+            Logic::X => write!(f, "X"),
+        }
+    }
+}
+
+impl fmt::LowerHex for Logic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(self, f)
+    }
+}
+
+impl fmt::UpperHex for Logic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Logic::Zero => write!(f, "0"),
+            Logic::One => write!(f, "1"),
+            Logic::X => write!(f, "X"),
+        }
+    }
+}
+
+impl fmt::Octal for Logic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(self, f)
     }
 }
 
@@ -144,7 +178,7 @@ impl<const N: usize> Bits<N> {
     pub fn x() -> Self {
         Self { bits: [Logic::X; N] }
     }
-    
+
     /// Create from an array of Logic values
     pub fn from_array(bits: [Logic; N]) -> Self {
         Self { bits }
@@ -159,6 +193,7 @@ impl<const N: usize> Bits<N> {
     }
     
     /// Create from an unsigned integer (up to u128)
+    /// TODO: What if there isn't enough bits to represent the value?
     pub fn from_u128(val: u128) -> Self {
         let mut bits = [Logic::Zero; N];
         for i in 0..N {
@@ -183,17 +218,19 @@ impl<const N: usize> Bits<N> {
         }
         result
     }
+
+    // TODO: Add other conversion methods (e.g., as_i128, as_f64, etc.)
     
-    /// Get the bit at index i (LSB = 0)
-    pub fn get(&self, i: usize) -> Bit {
-        assert!(i < N, "Bit index out of bounds");
-        Bit(self.bits[i])
+    /// Get the Logic at index i (LSB = 0)
+    pub fn get(&self, i: usize) -> Logic {
+        assert!(i < N, "Logic index out of bounds");
+        self.bits[i]
     }
     
-    /// Set the bit at index i
-    pub fn set(&mut self, i: usize, bit: Bit) {
-        assert!(i < N, "Bit index out of bounds");
-        self.bits[i] = bit.0;
+    /// Set the Logic at index i
+    pub fn set(&mut self, i: usize, logic: Logic) {
+        assert!(i < N, "Bits index out of bounds");
+        self.bits[i] = logic;
     }
     
     /// Get the internal array
@@ -206,7 +243,7 @@ impl<const N: usize> Bits<N> {
         &mut self.bits
     }
     
-    /// Check if all bits are valid (not X)
+    /// Check if all bits are valid (not X or Z)
     pub fn is_valid(&self) -> bool {
         self.bits.iter().all(|b| matches!(b, Logic::Zero | Logic::One))
     }
@@ -221,6 +258,7 @@ impl<const N: usize> Bits<N> {
     }
     
     /// Shift right by n positions (logical shift)
+    /// TODO: Check for correctness
     pub fn shift_right(&self, n: usize) -> Self {
         let mut result = [Logic::Zero; N];
         for i in 0..(N.saturating_sub(n)) {
@@ -229,17 +267,17 @@ impl<const N: usize> Bits<N> {
         Self { bits: result }
     }
     
-    /// Set the LSB (bit 0) to a new value
-    pub fn with_lsb(&self, bit: Bit) -> Self {
+    /// Set the LSB (Logic 0) to a new value
+    pub fn with_lsb(&self, logic: Logic) -> Self {
         let mut result = self.clone();
-        result.bits[0] = bit.0;
+        result.bits[0] = logic;
         result
     }
     
-    /// Set the MSB (bit N-1) to a new value
-    pub fn with_msb(&self, bit: Bit) -> Self {
+    /// Set the MSB (Logic N-1) to a new value
+    pub fn with_msb(&self, logic: Logic) -> Self {
         let mut result = self.clone();
-        result.bits[N - 1] = bit.0;
+        result.bits[N - 1] = logic;
         result
     }
 }
@@ -257,7 +295,7 @@ impl<const N: usize> fmt::Debug for Bits<N> {
             match bit {
                 Logic::Zero => write!(f, "0")?,
                 Logic::One => write!(f, "1")?,
-                Logic::X => write!(f, "X")?,
+                Logic::X => write!(f, "x")?,
             }
             if i > 0 && i % 4 == 0 {
                 write!(f, "_")?;
@@ -273,7 +311,86 @@ impl<const N: usize> fmt::Display for Bits<N> {
             match bit {
                 Logic::Zero => write!(f, "0")?,
                 Logic::One => write!(f, "1")?,
-                Logic::X => write!(f, "X")?,
+                Logic::X => write!(f, "x")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> fmt::Binary for Bits<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for bit in self.bits.iter().rev() {
+            match bit {
+                Logic::Zero => write!(f, "0")?,
+                Logic::One => write!(f, "1")?,
+                Logic::X => write!(f, "x")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> fmt::LowerHex for Bits<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let num_digits = (N + 3) / 4;
+        for d in (0..num_digits).rev() {
+            let lo = d * 4;
+            let hi = (d * 4 + 3).min(N - 1);
+            if (lo..=hi).any(|i| self.bits[i] == Logic::X) {
+                write!(f, "x")?;
+            } else {
+                let mut val = 0u8;
+                for i in lo..=hi {
+                    if self.bits[i] == Logic::One {
+                        val |= 1 << (i - lo);
+                    }
+                }
+                write!(f, "{:x}", val)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> fmt::UpperHex for Bits<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let num_digits = (N + 3) / 4;
+        for d in (0..num_digits).rev() {
+            let lo = d * 4;
+            let hi = (d * 4 + 3).min(N - 1);
+            if (lo..=hi).any(|i| self.bits[i] == Logic::X) {
+                write!(f, "X")?;
+            } else {
+                let mut val = 0u8;
+                for i in lo..=hi {
+                    if self.bits[i] == Logic::One {
+                        val |= 1 << (i - lo);
+                    }
+                }
+                write!(f, "{:X}", val)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> fmt::Octal for Bits<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let num_digits = (N + 2) / 3;
+        for d in (0..num_digits).rev() {
+            let lo = d * 3;
+            let hi = (d * 3 + 2).min(N - 1);
+            if (lo..=hi).any(|i| self.bits[i] == Logic::X) {
+                write!(f, "x")?;
+            } else {
+                let mut val = 0u8;
+                for i in lo..=hi {
+                    if self.bits[i] == Logic::One {
+                        val |= 1 << (i - lo);
+                    }
+                }
+                write!(f, "{:o}", val)?;
             }
         }
         Ok(())
@@ -281,16 +398,20 @@ impl<const N: usize> fmt::Display for Bits<N> {
 }
 
 // Arithmetic operations
-impl<const N: usize> std::ops::Add for Bits<N> {
-    type Output = Self;
+
+// TODO:
+// Maybe don't support these?
+// You would need to add in a adder circuit for it actually do do something.
+// impl<const N: usize> std::ops::Add for Bits<N> {
+//     type Output = Self;
     
-    fn add(self, rhs: Self) -> Self::Output {
-        let a = self.as_u128();
-        let b = rhs.as_u128();
-        let sum = a.wrapping_add(b);
-        Self::from_u128(sum)
-    }
-}
+//     fn add(self, rhs: Self) -> Self::Output {
+//         let a = self.as_u128();
+//         let b = rhs.as_u128();
+//         let sum = a.wrapping_add(b);
+//         Self::from_u128(sum)
+//     }
+// }
 
 impl<const N: usize> std::ops::Not for Bits<N> {
     type Output = Self;
@@ -308,6 +429,8 @@ impl<const N: usize> std::ops::Not for Bits<N> {
     }
 }
 
+// TODO: Add other bitwise operations (AND, OR, XOR)
+
 /// Trait for types that have a defined unknown/X state.
 ///
 /// Implemented by all built-in logic types (`Logic`, `Bit`, `Bits<N>`) and
@@ -321,10 +444,6 @@ pub trait HasUnknown {
 
 impl HasUnknown for Logic {
     fn unknown() -> Self { Logic::X }
-}
-
-impl HasUnknown for Bit {
-    fn unknown() -> Self { Bit::X }
 }
 
 impl<const N: usize> HasUnknown for Bits<N> {
@@ -499,27 +618,27 @@ mod tests {
     
     #[test]
     fn test_bit_creation() {
-        assert_eq!(Bit::ZERO.0, Logic::Zero);
-        assert_eq!(Bit::ONE.0, Logic::One);
-        assert_eq!(Bit::X.0, Logic::X);
+        assert_eq!(Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::One, Logic::One);
+        assert_eq!(Logic::X, Logic::X);
     }
     
     #[test]
     fn test_bit_from_bool() {
-        assert_eq!(Bit::from_bool(false), Bit::ZERO);
-        assert_eq!(Bit::from_bool(true), Bit::ONE);
+        assert_eq!(Logic::from_bool(false), Logic::Zero);
+        assert_eq!(Logic::from_bool(true), Logic::One);
     }
     
     #[test]
     fn test_bit_logic_ops() {
-        assert_eq!(!Bit::ZERO, Bit::ONE);
-        assert_eq!(!Bit::ONE, Bit::ZERO);
-        assert_eq!(Bit::ONE & Bit::ONE, Bit::ONE);
-        assert_eq!(Bit::ONE & Bit::ZERO, Bit::ZERO);
-        assert_eq!(Bit::ONE | Bit::ZERO, Bit::ONE);
-        assert_eq!(Bit::ZERO | Bit::ZERO, Bit::ZERO);
-        assert_eq!(Bit::ONE ^ Bit::ZERO, Bit::ONE);
-        assert_eq!(Bit::ONE ^ Bit::ONE, Bit::ZERO);
+        assert_eq!(!Logic::Zero, Logic::One);
+        assert_eq!(!Logic::One, Logic::Zero);
+        assert_eq!(Logic::One & Logic::One, Logic::One);
+        assert_eq!(Logic::One & Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::One | Logic::Zero, Logic::One);
+        assert_eq!(Logic::Zero | Logic::Zero, Logic::Zero);
+        assert_eq!(Logic::One ^ Logic::Zero, Logic::One);
+        assert_eq!(Logic::One ^ Logic::One, Logic::Zero);
     }
     
     #[test]
@@ -544,8 +663,7 @@ mod tests {
     fn test_bits_add() {
         let a: Bits<8> = Bits::from_u128(10);
         let b: Bits<8> = Bits::from_u128(20);
-        let sum = a + b;
-        assert_eq!(sum.as_u128(), 30);
+        assert_eq!(a.as_u128() + b.as_u128(), 30);
     }
     
     #[test]
@@ -558,5 +676,6 @@ mod tests {
         assert_eq!(right.as_u128(), 0b00101101);
     }
     
-
+    // Tests to add: TODO!
+    // logic: from bool and as bool
 }
