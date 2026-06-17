@@ -10,3 +10,6 @@ Cargo.lock
 
 # Generated files
 *.d
+
+# macOS system files
+.DS_Store
