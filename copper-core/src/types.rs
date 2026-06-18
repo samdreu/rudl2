@@ -201,6 +201,19 @@ impl<const N: usize> Bits<N> {
         Self::from_uint(val)
     }
 
+    /// Create `Bits<N>` from a compile-time constant.
+    /// The required bit width is inferred from the constant value itself,
+    /// and the call is rejected at compile time if `N` is too narrow.
+    ///
+    /// ```compile_fail
+    /// let _: Bits<4> = Bits::from_lit::<31>(); // 31 needs 5 bits — compile error
+    /// ```
+    pub fn from_lit<const VAL: u128>() -> Self {
+        const { assert!(N >= 128 - VAL.leading_zeros() as usize,
+            "constant value does not fit in Bits<N>: N is too narrow for this literal") };
+        Self::from_uint(VAL)
+    }
+
     fn from_uint(val: u128) -> Self {
         let mut bits = [Logic::Zero; N];
         for i in 0..N.min(128) {
@@ -623,7 +636,7 @@ impl<const N: usize> std::ops::Add for Bits<N> {
     fn add(self, rhs: Self) -> Self::Output {
         if !self.is_valid() || !rhs.is_valid() { return Self::x(); }
         let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
-        Self::from_u128(self.as_u128().wrapping_add(rhs.as_u128()) & mask)
+        Self::from_uint(self.as_u128().wrapping_add(rhs.as_u128()) & mask)
     }
 }
 
@@ -632,7 +645,7 @@ impl<const N: usize> std::ops::Sub for Bits<N> {
     fn sub(self, rhs: Self) -> Self::Output {
         if !self.is_valid() || !rhs.is_valid() { return Self::x(); }
         let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
-        Self::from_u128(self.as_u128().wrapping_sub(rhs.as_u128()) & mask)
+        Self::from_uint(self.as_u128().wrapping_sub(rhs.as_u128()) & mask)
     }
 }
 
@@ -641,7 +654,7 @@ impl<const N: usize> std::ops::Mul for Bits<N> {
     fn mul(self, rhs: Self) -> Self::Output {
         if !self.is_valid() || !rhs.is_valid() { return Self::x(); }
         let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
-        Self::from_u128(self.as_u128().wrapping_mul(rhs.as_u128()) & mask)
+        Self::from_uint(self.as_u128().wrapping_mul(rhs.as_u128()) & mask)
     }
 }
 
@@ -650,7 +663,7 @@ impl<const N: usize> std::ops::Div for Bits<N> {
     fn div(self, rhs: Self) -> Self::Output {
         if !self.is_valid() || !rhs.is_valid() { return Self::x(); }
         if rhs.as_u128() == 0 { return Self::x(); }
-        Self::from_u128(self.as_u128() / rhs.as_u128())
+        Self::from_uint(self.as_u128() / rhs.as_u128())
     }
 }
 
@@ -659,7 +672,7 @@ impl<const N: usize> std::ops::Rem for Bits<N> {
     fn rem(self, rhs: Self) -> Self::Output {
         if !self.is_valid() || !rhs.is_valid() { return Self::x(); }
         if rhs.as_u128() == 0 { return Self::x(); }
-        Self::from_u128(self.as_u128() % rhs.as_u128())
+        Self::from_uint(self.as_u128() % rhs.as_u128())
     }
 }
 
@@ -668,7 +681,7 @@ impl<const N: usize> std::ops::Neg for Bits<N> {
     fn neg(self) -> Self::Output {
         if !self.is_valid() { return Self::x(); }
         let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
-        Self::from_u128(self.as_u128().wrapping_neg() & mask)
+        Self::from_uint(self.as_u128().wrapping_neg() & mask)
     }
 }
 
@@ -1102,7 +1115,7 @@ mod tests {
 
     #[test]
     fn test_from_u128() {
-        let bits: Bits<8> = Bits::from_u128(255);
+        let bits: Bits<8> = Bits::from_lit::<255>();
 
         assert_eq!(format!("{}", bits), "11111111");
 
@@ -1148,7 +1161,7 @@ mod tests {
 
     #[test]
     fn test_bits_shift_left() {
-        let bits: Bits<8> = Bits::from_u128(0b1011_0011);
+        let bits: Bits<8> = Bits::from_lit::<0b1011_0011>();
 
         let shifted = bits.shift_left(2);
 
@@ -1157,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_bits_shift_right() {
-        let bits: Bits<8> = Bits::from_u128(0b1011_0011);
+        let bits: Bits<8> = Bits::from_lit::<0b1011_0011>();
 
         let shifted = bits.shift_right(3);
 
@@ -1186,7 +1199,7 @@ mod tests {
 
     #[test]
     fn test_bits_display_binary_hex_octal_and_debug() {
-        let bits: Bits<8> = Bits::from_u128(0b1010_1101);
+        let bits: Bits<8> = Bits::from_lit::<0b1010_1101>();
 
         assert_eq!(format!("{}", bits), "10101101");
         assert_eq!(format!("{:b}", bits), "10101101");
@@ -1200,8 +1213,8 @@ mod tests {
 
     #[test]
     fn test_bits_bitwise_and() {
-        let a: Bits<4> = Bits::from_u128(0b1100);
-        let b: Bits<4> = Bits::from_u128(0b1010);
+        let a: Bits<4> = Bits::from_lit::<0b1100>();
+        let b: Bits<4> = Bits::from_lit::<0b1010>();
         assert_eq!((a & b).as_u128(), 0b1000);
     }
 
@@ -1216,8 +1229,8 @@ mod tests {
 
     #[test]
     fn test_bits_bitwise_or() {
-        let a: Bits<4> = Bits::from_u128(0b1100);
-        let b: Bits<4> = Bits::from_u128(0b1010);
+        let a: Bits<4> = Bits::from_lit::<0b1100>();
+        let b: Bits<4> = Bits::from_lit::<0b1010>();
         assert_eq!((a | b).as_u128(), 0b1110);
     }
 
@@ -1232,8 +1245,8 @@ mod tests {
 
     #[test]
     fn test_bits_bitwise_xor() {
-        let a: Bits<4> = Bits::from_u128(0b1100);
-        let b: Bits<4> = Bits::from_u128(0b1010);
+        let a: Bits<4> = Bits::from_lit::<0b1100>();
+        let b: Bits<4> = Bits::from_lit::<0b1010>();
         assert_eq!((a ^ b).as_u128(), 0b0110);
     }
 
@@ -1247,16 +1260,16 @@ mod tests {
 
     #[test]
     fn test_bits_bitwise_assign_ops() {
-        let mut a: Bits<4> = Bits::from_u128(0b1111);
-        a &= Bits::from_u128(0b1010);
+        let mut a: Bits<4> = Bits::from_lit::<0b1111>();
+        a &= Bits::from_lit::<0b1010>();
         assert_eq!(a.as_u128(), 0b1010);
 
-        let mut b: Bits<4> = Bits::from_u128(0b0000);
-        b |= Bits::from_u128(0b1010);
+        let mut b: Bits<4> = Bits::from_lit::<0b0000>();
+        b |= Bits::from_lit::<0b1010>();
         assert_eq!(b.as_u128(), 0b1010);
 
-        let mut c: Bits<4> = Bits::from_u128(0b1111);
-        c ^= Bits::from_u128(0b1010);
+        let mut c: Bits<4> = Bits::from_lit::<0b1111>();
+        c ^= Bits::from_lit::<0b1010>();
         assert_eq!(c.as_u128(), 0b0101);
     }
 
@@ -1264,86 +1277,86 @@ mod tests {
 
     #[test]
     fn test_bits_add_basic() {
-        let a: Bits<8> = Bits::from_u128(10);
-        let b: Bits<8> = Bits::from_u128(20);
+        let a: Bits<8> = Bits::from_u8(10);
+        let b: Bits<8> = Bits::from_u8(20);
         assert_eq!((a + b).as_u128(), 30);
     }
 
     #[test]
     fn test_bits_add_wrapping() {
-        let a: Bits<8> = Bits::from_u128(200);
-        let b: Bits<8> = Bits::from_u128(100);
+        let a: Bits<8> = Bits::from_u8(200);
+        let b: Bits<8> = Bits::from_u8(100);
         assert_eq!((a + b).as_u128(), 44); // 300 mod 256
     }
 
     #[test]
     fn test_bits_add_x_propagation() {
         let a: Bits<8> = Bits::x();
-        let b: Bits<8> = Bits::from_u128(1);
+        let b: Bits<8> = Bits::from_lit::<1>();
         assert_eq!(a + b, Bits::x());
     }
 
     #[test]
     fn test_bits_sub_basic() {
-        let a: Bits<8> = Bits::from_u128(30);
-        let b: Bits<8> = Bits::from_u128(10);
+        let a: Bits<8> = Bits::from_lit::<30>();
+        let b: Bits<8> = Bits::from_lit::<10>();
         assert_eq!((a - b).as_u128(), 20);
     }
 
     #[test]
     fn test_bits_sub_wrapping() {
-        let a: Bits<8> = Bits::from_u128(0);
-        let b: Bits<8> = Bits::from_u128(1);
+        let a: Bits<8> = Bits::from_lit::<0>();
+        let b: Bits<8> = Bits::from_lit::<1>();
         assert_eq!((a - b).as_u128(), 255);
     }
 
     #[test]
     fn test_bits_mul() {
-        let a: Bits<8> = Bits::from_u128(6);
-        let b: Bits<8> = Bits::from_u128(7);
+        let a: Bits<8> = Bits::from_lit::<6>();
+        let b: Bits<8> = Bits::from_lit::<7>();
         assert_eq!((a * b).as_u128(), 42);
     }
 
     #[test]
     fn test_bits_mul_wrapping() {
-        let a: Bits<8> = Bits::from_u128(200);
-        let b: Bits<8> = Bits::from_u128(2);
+        let a: Bits<8> = Bits::from_lit::<200>();
+        let b: Bits<8> = Bits::from_lit::<2>();
         assert_eq!((a * b).as_u128(), 144); // 400 mod 256
     }
 
     #[test]
     fn test_bits_div() {
-        let a: Bits<8> = Bits::from_u128(42);
-        let b: Bits<8> = Bits::from_u128(6);
+        let a: Bits<8> = Bits::from_lit::<42>();
+        let b: Bits<8> = Bits::from_lit::<6>();
         assert_eq!((a / b).as_u128(), 7);
     }
 
     #[test]
     fn test_bits_div_by_zero_is_x() {
-        let a: Bits<8> = Bits::from_u128(42);
-        let b: Bits<8> = Bits::from_u128(0);
+        let a: Bits<8> = Bits::from_lit::<42>();
+        let b: Bits<8> = Bits::from_lit::<0>();
         assert_eq!(a / b, Bits::x());
     }
 
     #[test]
     fn test_bits_rem() {
-        let a: Bits<8> = Bits::from_u128(17);
-        let b: Bits<8> = Bits::from_u128(5);
+        let a: Bits<8> = Bits::from_lit::<17>();
+        let b: Bits<8> = Bits::from_lit::<5>();
         assert_eq!((a % b).as_u128(), 2);
     }
 
     #[test]
     fn test_bits_rem_by_zero_is_x() {
-        let a: Bits<8> = Bits::from_u128(17);
-        let b: Bits<8> = Bits::from_u128(0);
+        let a: Bits<8> = Bits::from_lit::<17>();
+        let b: Bits<8> = Bits::from_lit::<0>();
         assert_eq!(a % b, Bits::x());
     }
 
     #[test]
     fn test_bits_neg() {
-        let a: Bits<8> = Bits::from_u128(1);
+        let a: Bits<8> = Bits::from_lit::<1>();
         assert_eq!((-a).as_u128(), 255); // two's complement: -1 mod 256
-        let b: Bits<8> = Bits::from_u128(0);
+        let b: Bits<8> = Bits::from_lit::<0>();
         assert_eq!((-b).as_u128(), 0);
     }
 
@@ -1357,27 +1370,27 @@ mod tests {
 
     #[test]
     fn test_bits_shl_operator() {
-        let a: Bits<8> = Bits::from_u128(0b0000_0001);
+        let a: Bits<8> = Bits::from_lit::<0b0000_0001>();
         assert_eq!((a << 3).as_u128(), 0b0000_1000);
     }
 
     #[test]
     fn test_bits_shr_operator() {
-        let a: Bits<8> = Bits::from_u128(0b1000_0000);
+        let a: Bits<8> = Bits::from_lit::<0b1000_0000>();
         assert_eq!((a >> 3).as_u128(), 0b0001_0000);
     }
 
     #[test]
     fn test_bits_arithmetic_shift_right_positive() {
         // MSB = 0 (positive), fills with 0
-        let a: Bits<8> = Bits::from_u128(0b0100_0000);
+        let a: Bits<8> = Bits::from_lit::<0b0100_0000>();
         assert_eq!(a.arithmetic_shift_right(2).as_u128(), 0b0001_0000);
     }
 
     #[test]
     fn test_bits_arithmetic_shift_right_negative() {
         // MSB = 1 (negative), fills with 1
-        let a: Bits<8> = Bits::from_u128(0b1000_0000);
+        let a: Bits<8> = Bits::from_lit::<0b1000_0000>();
         assert_eq!(a.arithmetic_shift_right(2).as_u128(), 0b1110_0000);
     }
 
@@ -1394,7 +1407,7 @@ mod tests {
     #[test]
     fn test_and_reduce() {
         assert_eq!(Bits::<4>::one().and_reduce(), Logic::One);
-        assert_eq!(Bits::<4>::from_u128(0b1110).and_reduce(), Logic::Zero);
+        assert_eq!(Bits::<4>::from_lit::<0b1110>().and_reduce(), Logic::Zero);
         // X & 1 & 1 & 1 = X
         let x1 = Bits::from_array([Logic::X, Logic::One, Logic::One, Logic::One]);
         assert_eq!(x1.and_reduce(), Logic::X);
@@ -1406,7 +1419,7 @@ mod tests {
     #[test]
     fn test_or_reduce() {
         assert_eq!(Bits::<4>::zero().or_reduce(), Logic::Zero);
-        assert_eq!(Bits::<4>::from_u128(0b0001).or_reduce(), Logic::One);
+        assert_eq!(Bits::<4>::from_lit::<0b0001>().or_reduce(), Logic::One);
         // X | 0 | 0 | 0 = X
         let x0 = Bits::from_array([Logic::X, Logic::Zero, Logic::Zero, Logic::Zero]);
         assert_eq!(x0.or_reduce(), Logic::X);
@@ -1417,8 +1430,8 @@ mod tests {
 
     #[test]
     fn test_xor_reduce() {
-        assert_eq!(Bits::<4>::from_u128(0b0110).xor_reduce(), Logic::Zero); // even parity
-        assert_eq!(Bits::<4>::from_u128(0b0111).xor_reduce(), Logic::One);  // odd parity
+        assert_eq!(Bits::<4>::from_lit::<0b0110>().xor_reduce(), Logic::Zero); // even parity
+        assert_eq!(Bits::<4>::from_lit::<0b0111>().xor_reduce(), Logic::One);  // odd parity
         let xv = Bits::from_array([Logic::X, Logic::Zero, Logic::Zero, Logic::Zero]);
         assert_eq!(xv.xor_reduce(), Logic::X);
     }
@@ -1427,32 +1440,32 @@ mod tests {
     fn test_nand_nor_xnor_reduce() {
         assert_eq!(Bits::<4>::one().nand_reduce(), Logic::Zero);
         assert_eq!(Bits::<4>::zero().nor_reduce(), Logic::One);
-        assert_eq!(Bits::<4>::from_u128(0b0110).xnor_reduce(), Logic::One); // even parity → xnor = 1
+        assert_eq!(Bits::<4>::from_lit::<0b0110>().xnor_reduce(), Logic::One); // even parity → xnor = 1
     }
 
     // ── X-aware comparisons ───────────────────────────────────────────────────
 
     #[test]
     fn test_eq_logic() {
-        let a: Bits<8> = Bits::from_u128(42);
-        assert_eq!(a.eq_logic(&Bits::from_u128(42)), Logic::One);
-        assert_eq!(a.eq_logic(&Bits::from_u128(43)), Logic::Zero);
+        let a: Bits<8> = Bits::from_lit::<42>();
+        assert_eq!(a.eq_logic(&Bits::from_lit::<42>()), Logic::One);
+        assert_eq!(a.eq_logic(&Bits::from_lit::<43>()), Logic::Zero);
         assert_eq!(a.eq_logic(&Bits::x()), Logic::X);
-        assert_eq!(Bits::<8>::x().eq_logic(&Bits::from_u128(42)), Logic::X);
+        assert_eq!(Bits::<8>::x().eq_logic(&Bits::from_lit::<42>()), Logic::X);
     }
 
     #[test]
     fn test_ne_logic() {
-        let a: Bits<8> = Bits::from_u128(42);
-        assert_eq!(a.ne_logic(&Bits::from_u128(43)), Logic::One);
-        assert_eq!(a.ne_logic(&Bits::from_u128(42)), Logic::Zero);
+        let a: Bits<8> = Bits::from_lit::<42>();
+        assert_eq!(a.ne_logic(&Bits::from_lit::<43>()), Logic::One);
+        assert_eq!(a.ne_logic(&Bits::from_lit::<42>()), Logic::Zero);
         assert_eq!(a.ne_logic(&Bits::x()), Logic::X);
     }
 
     #[test]
     fn test_lt_le_gt_ge_logic() {
-        let five: Bits<8> = Bits::from_u128(5);
-        let ten: Bits<8>  = Bits::from_u128(10);
+        let five: Bits<8> = Bits::from_lit::<5>();
+        let ten: Bits<8>  = Bits::from_lit::<10>();
         assert_eq!(five.lt_logic(&ten), Logic::One);
         assert_eq!(ten.lt_logic(&five), Logic::Zero);
         assert_eq!(five.lt_logic(&five), Logic::Zero);
@@ -1466,7 +1479,7 @@ mod tests {
 
     #[test]
     fn test_zero_extend() {
-        let a: Bits<4> = Bits::from_u128(0b1010);
+        let a: Bits<4> = Bits::from_lit::<0b1010>();
         let b: Bits<8> = a.zero_extend();
         assert_eq!(b.as_u128(), 0b1010);
         assert_eq!(format!("{}", b), "00001010");
@@ -1475,7 +1488,7 @@ mod tests {
     #[test]
     fn test_sign_extend_positive() {
         // MSB = 0, sign bit = 0 → fills with zeros
-        let a: Bits<4> = Bits::from_u128(0b0101); // 5
+        let a: Bits<4> = Bits::from_lit::<0b0101>(); // 5
         let b: Bits<8> = a.sign_extend();
         assert_eq!(b.as_u128(), 5);
     }
@@ -1483,7 +1496,7 @@ mod tests {
     #[test]
     fn test_sign_extend_negative() {
         // MSB = 1 (0b1101 = -3 in 4-bit two's complement)
-        let a: Bits<4> = Bits::from_u128(0b1101);
+        let a: Bits<4> = Bits::from_lit::<0b1101>();
         let b: Bits<8> = a.sign_extend();
         assert_eq!(b.as_u128(), 0b1111_1101); // -3 in 8-bit
     }
@@ -1498,7 +1511,7 @@ mod tests {
 
     #[test]
     fn test_truncate() {
-        let a: Bits<8> = Bits::from_u128(0b1010_0101);
+        let a: Bits<8> = Bits::from_lit::<0b1010_0101>();
         let b: Bits<4> = a.truncate();
         assert_eq!(b.as_u128(), 0b0101); // keeps LSBs
     }
@@ -1507,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_part_select() {
-        let a: Bits<8> = Bits::from_u128(0b1010_0110);
+        let a: Bits<8> = Bits::from_lit::<0b1010_0110>();
         // bits [2..+4) = bits 2,3,4,5 = 1001
         let s: Bits<4> = a.part_select(2);
         assert_eq!(s.as_u128(), 0b1001);
@@ -1516,8 +1529,8 @@ mod tests {
     #[test]
     fn test_concat() {
         // {0b1010, 0b0101} = 0b1010_0101
-        let hi: Bits<4> = Bits::from_u128(0b1010);
-        let lo: Bits<4> = Bits::from_u128(0b0101);
+        let hi: Bits<4> = Bits::from_lit::<0b1010>();
+        let lo: Bits<4> = Bits::from_lit::<0b0101>();
         let result: Bits<8> = hi.concat(&lo);
         assert_eq!(result.as_u128(), 0b1010_0101);
     }
@@ -1532,7 +1545,7 @@ mod tests {
 
     #[test]
     fn test_replicate() {
-        let a: Bits<4> = Bits::from_u128(0b1010);
+        let a: Bits<4> = Bits::from_lit::<0b1010>();
         let r: Bits<8> = a.replicate();
         assert_eq!(r.as_u128(), 0b1010_1010);
     }
@@ -1541,23 +1554,23 @@ mod tests {
 
     #[test]
     fn test_mux_one_selects_a() {
-        let a: Bits<4> = Bits::from_u128(0b1010);
-        let b: Bits<4> = Bits::from_u128(0b0101);
+        let a: Bits<4> = Bits::from_lit::<0b1010>();
+        let b: Bits<4> = Bits::from_lit::<0b0101>();
         assert_eq!(Bits::mux(Logic::One, &a, &b), a);
     }
 
     #[test]
     fn test_mux_zero_selects_b() {
-        let a: Bits<4> = Bits::from_u128(0b1010);
-        let b: Bits<4> = Bits::from_u128(0b0101);
+        let a: Bits<4> = Bits::from_lit::<0b1010>();
+        let b: Bits<4> = Bits::from_lit::<0b0101>();
         assert_eq!(Bits::mux(Logic::Zero, &a, &b), b);
     }
 
     #[test]
     fn test_mux_x_matching_bits_pass_through() {
         // a = 0b1110, b = 0b1010 (LSB-first: [0,1,1,1] vs [0,1,0,1])
-        let a: Bits<4> = Bits::from_u128(0b1110);
-        let b: Bits<4> = Bits::from_u128(0b1010);
+        let a: Bits<4> = Bits::from_lit::<0b1110>();
+        let b: Bits<4> = Bits::from_lit::<0b1010>();
         let r = Bits::mux(Logic::X, &a, &b);
         // bit0: 0==0 → 0, bit1: 1==1 → 1, bit2: 1!=0 → X, bit3: 1==1 → 1
         assert_eq!(r.as_array(), &[Logic::Zero, Logic::One, Logic::X, Logic::One]);
@@ -1586,7 +1599,7 @@ mod tests {
 
     #[test]
     fn test_from_u128_for_bits() {
-        let b: Bits<8> = Bits::from(42u128);
+        let b: Bits<8> = Bits::from_lit::<42>();
         assert_eq!(b.as_u128(), 42);
     }
 }
