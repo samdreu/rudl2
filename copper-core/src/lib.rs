@@ -17,7 +17,7 @@ pub use frontend_ir::{
     RawTypeRef,
     SourceSpan,
 };
-pub use types::{Bit, Bits, Clock, ClockDomain, HasUnknown, Logic};
+pub use types::{Bits, Clock, ClockDomain, HasUnknown, Logic};
 pub use memory::{Memory, ReadMode, WriteMode};
 
 // pub mod types;
