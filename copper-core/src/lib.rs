@@ -2,6 +2,7 @@ pub mod ir;
 pub mod frontend_ir;
 pub mod chir;
 pub mod memory;
+pub mod port;
 pub mod shir;
 pub mod types;
 
