@@ -1,7 +1,7 @@
 //! Core type system for Copper HDL
 //! 
 //! This module defines the foundational types for hardware design:
-//! - `Logic`: Single Logic with 4-state logic
+//! - `Logic`: Single logic value with 3-state logic (0, 1, X)
 //! - `Bits<N>`: Logic vectors of compile-time width
 //! - `Clock`: Clock source for synchronous logic
 
@@ -26,7 +26,7 @@ impl Logic {
         if b { Self::One } else { Self::Zero }
     }
     
-    /// Convert to boolean if possible (panics on X/Z)
+    /// Convert to boolean if possible (panics on X)
     pub fn as_bool(&self) -> bool {
         match self {
             Logic::Zero => false,
@@ -35,7 +35,7 @@ impl Logic {
         }
     }
     
-    /// Check if this Logic is a valid boolean (not X or Z)
+    /// Check if this Logic is a valid boolean (not X)
     pub fn is_valid(&self) -> bool {
         matches!(self, Logic::Zero | Logic::One)
     }
@@ -48,7 +48,7 @@ impl From<bool> for Logic {
     }
 }
 
-/// Convert Logic to a boolean if possible (panics on X/Z)
+/// Convert Logic to a boolean if possible (panics on X)
 impl Into<bool> for Logic {
     fn into(self) -> bool {
         self.as_bool()
@@ -268,7 +268,7 @@ impl<const N: usize> Bits<N> {
         &mut self.bits
     }
     
-    /// Check if all bits are valid (not X or Z)
+    /// Check if all bits are valid (not X)
     pub fn is_valid(&self) -> bool {
         self.bits.iter().all(|b| matches!(b, Logic::Zero | Logic::One))
     }
@@ -686,7 +686,7 @@ impl<const N: usize> std::ops::Shr<usize> for Bits<N> {
 
 /// Trait for types that have a defined unknown/X state.
 ///
-/// Implemented by all built-in logic types (`Logic`, `Bit`, `Bits<N>`) and
+/// Implemented by all built-in logic types (`Logic`, `Bits<N>`) and
 /// their tuples.  The executor uses this when a combinational loop is detected:
 /// rather than panicking, it sets the oscillating signal to `unknown()` so
 /// that X propagates through downstream combinational logic and the simulation
