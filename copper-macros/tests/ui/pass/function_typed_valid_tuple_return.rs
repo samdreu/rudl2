@@ -1,17 +1,11 @@
-use copper_core::{Clock, ClockDomain, Bit};
+use copper_core::Logic;
+use copper_core::port::{In, Out};
 use copper_macros::hardware;
 
-struct MainClk;
-impl ClockDomain for MainClk {}
-
-// This should pass: function_typed with tuple return type for multiple outputs
-#[hardware(function_typed)]
-async fn valid_mealy(clk: Clock<MainClk>, input: Bit) -> (Bit, u8) {
-    let mut state = 0u8;
-    loop {
-        clk.tick().await;
-        state = state.wrapping_add(1);
-    }
+// Should pass: valid combinational module
+#[hardware(combinational)]
+fn and_gate(a: In<Logic>, b: In<Logic>, out: Out<Logic>) {
+    out.write(a.read() & b.read());
 }
 
 fn main() {}
