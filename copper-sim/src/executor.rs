@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::Context;
+use copper_core::port::DirtyHandle;
 use log::trace;
 
 use copper_core::{Clock, ClockDomain, HasUnknown};
@@ -35,6 +36,7 @@ struct TaskEntry {
     /// Number of consecutive delta cycles in which this task's output changed.
     /// Reset to 0 whenever a pass produces no change for this task.
     consecutive_dirty: usize,
+    port_dirties: Vec<DirtyHandle>
 }
 
 /// Modules in the execution, with parent-child relationships. This is used for tracking the hierarchy of modules in the system, which can be useful for debugging and visualization.
@@ -79,6 +81,7 @@ impl HardwareExecutor {
             emit_target: None,
             set_unknown: None,
             consecutive_dirty: 0,
+            port_dirties: vec![],
         });
     }
 
@@ -102,6 +105,7 @@ impl HardwareExecutor {
             emit_target: Some(emit_target),
             set_unknown: None,
             consecutive_dirty: 0,
+            port_dirties: vec![],
         });
 
         output
@@ -137,6 +141,7 @@ impl HardwareExecutor {
             emit_target: Some(emit_target),
             set_unknown: Some(set_unknown),
             consecutive_dirty: 0,
+            port_dirties: vec![],
         });
 
         output
@@ -176,6 +181,38 @@ impl HardwareExecutor {
             emit_target: Some(emit_target),
             set_unknown: Some(set_unknown),
             consecutive_dirty: 0,
+            port_dirties: vec![],
+        });
+    }
+
+    /// Spawn a module that uses [`copper_core::port::Out`] / [`copper_core::port::In`]
+    /// for its outputs instead of the legacy `emit!` macro.
+    ///
+    /// `dirties` is the list of [`DirtyHandle`]s obtained by calling
+    /// [`Out::dirty_handle`] on each output port before handing the `Out` to the
+    /// module.  The executor polls these flags after each task poll to decide
+    /// whether another delta cycle is needed — exactly the same role the
+    /// `emit_target` dirty flag plays for legacy tasks.
+    ///
+    /// Passing an empty `dirties` vec is valid: the module still runs, but the
+    /// executor cannot observe its output changes, so it will never trigger
+    /// additional delta cycles on behalf of this task.  This is useful for
+    /// purely side-effectful tasks (tracing, logging).
+    ///
+    /// # Oscillation
+    /// If a `spawn_wired` task is part of a combinational loop, `consecutive_dirty`
+    /// will grow until it hits `OSCILLATION_THRESHOLD` and the executor will panic,
+    /// since there is currently no `set_unknown` callback for wired tasks.
+    pub fn spawn_wired<F>(&mut self, future: F, dirties: Vec<DirtyHandle>)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        self.tasks.push(TaskEntry {
+            future: Box::pin(future),
+            emit_target: None,
+            set_unknown: None,
+            consecutive_dirty: 0,
+            port_dirties: dirties,
         });
     }
 
@@ -259,6 +296,7 @@ impl HardwareExecutor {
             emit_target: Some(emit_target),
             set_unknown: None,
             consecutive_dirty: 0,
+            port_dirties: vec![],
         });
 
         output
@@ -304,6 +342,7 @@ impl HardwareExecutor {
             emit_target: Some(emit_target),
             set_unknown: Some(set_unknown),
             consecutive_dirty: 0,
+            port_dirties: vec![],
         });
 
         output
@@ -368,7 +407,9 @@ impl HardwareExecutor {
             for task in &mut self.tasks {
                 let _emit_guard = crate::push_emit_target(task.emit_target.clone());
                 let _ = task.future.as_mut().poll(&mut context);
-                if crate::take_emit_dirty() {
+                let emit_dirty = crate::take_emit_dirty();
+                let port_dirty = task.port_dirties.iter().any(|h| h.take());
+                if emit_dirty || port_dirty {
                     task.consecutive_dirty += 1;
                     any_dirty = true;
                 } else {
@@ -775,5 +816,181 @@ mod tests {
         // Both advance in lockstep; they are completely independent futures
         // that happen to share a clock. The executor polls them sequentially
         // within each delta pass but their state never intersects.
+    }
+
+    // ── spawn_wired tests ─────────────────────────────────────────────────────
+
+    use copper_core::port::{wire, In, Out};
+
+    async fn wired_counter(clk: Clock<TestClk>, out: Out<u8>) {
+        let mut value = 0u8;
+        loop {
+            out.write(value);
+            clk.tick().await;
+            value = value.wrapping_add(1);
+        }
+    }
+
+    async fn wired_passthrough(input: In<u8>, out: Out<u8>) {
+        loop {
+            out.write(input.read());
+            crate::delta_yield().await;
+        }
+    }
+
+    #[test]
+    fn spawn_wired_sequential_counter_advances_each_cycle() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let (out, in_) = wire::<u8, ()>(0);
+        let dirty = out.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), out), vec![dirty]);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_.read(), 1);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_.read(), 2);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_.read(), 3);
+    }
+
+    #[test]
+    fn spawn_wired_dirty_flag_consumed_after_convergence() {
+        // A probe handle (clone of the same dirty flag) should read false after
+        // tick_clock, because poll_tasks consumed all dirty flags while settling.
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let (out, _in) = wire::<u8, ()>(0);
+        let dirty_for_exec = out.dirty_handle();
+        let dirty_probe    = out.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), out), vec![dirty_for_exec]);
+
+        exec.tick_clock(&mut clk);
+        assert!(!dirty_probe.take(), "dirty flag must be clear after settling");
+    }
+
+    #[test]
+    fn spawn_wired_combinational_passthrough_follows_counter() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let (counter_out, counter_in) = wire::<u8, ()>(0);
+        let counter_dirty = counter_out.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), counter_out), vec![counter_dirty]);
+
+        let (pass_out, pass_in) = wire::<u8, ()>(0);
+        let pass_dirty = pass_out.dirty_handle();
+        exec.spawn_wired(wired_passthrough(counter_in, pass_out), vec![pass_dirty]);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(pass_in.read(), 1, "passthrough must reflect counter after one cycle");
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(pass_in.read(), 2);
+    }
+
+    #[test]
+    fn spawn_wired_no_spurious_dirty_when_value_unchanged() {
+        // A task that keeps writing the same value must not keep the dirty flag
+        // set, which would prevent the executor from finding a fixed point.
+        let mut exec = HardwareExecutor::new();
+
+        let (out, in_) = wire::<u8, ()>(42);
+        let dirty_probe    = out.dirty_handle();
+        let dirty_for_exec = out.dirty_handle();
+
+        exec.spawn_wired(
+            async move {
+                loop {
+                    out.write(42);
+                    crate::delta_yield().await;
+                }
+            },
+            vec![dirty_for_exec],
+        );
+
+        exec.poll_tasks();
+
+        assert_eq!(in_.read(), 42);
+        assert!(!dirty_probe.take(), "no dirty after writing identical value");
+    }
+
+    #[test]
+    fn spawn_wired_multiple_readers_all_see_same_output() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let (out, in_a) = wire::<u8, ()>(0);
+        let in_b = in_a.clone();
+        let in_c = in_a.clone();
+        let dirty = out.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), out), vec![dirty]);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_a.read(), 1);
+        assert_eq!(in_b.read(), 1);
+        assert_eq!(in_c.read(), 1);
+    }
+
+    #[test]
+    fn spawn_wired_coexists_with_legacy_emit_tasks() {
+        // Both the old emit! path and the new wired path must work in the same executor.
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let legacy_out = exec.spawn_function_typed(0u8, counter_u8(clk.clone()));
+
+        let (wired_out, wired_in) = wire::<u8, ()>(0);
+        let dirty = wired_out.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), wired_out), vec![dirty]);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*legacy_out.lock().unwrap(), 1u8, "legacy task still works");
+        assert_eq!(wired_in.read(), 1u8,             "wired task works alongside legacy");
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(*legacy_out.lock().unwrap(), 2u8);
+        assert_eq!(wired_in.read(), 2u8);
+    }
+
+    #[test]
+    fn spawn_wired_empty_dirties_module_runs_but_changes_are_invisible() {
+        // With no dirty handles the executor cannot observe output changes, so it
+        // declares a fixed point after the first pass.  The module still ran and
+        // wrote to the wire — the value is readable via the In handle.
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let (out, in_) = wire::<u8, ()>(0);
+        exec.spawn_wired(wired_counter(clk.clone(), out), vec![]); // no dirty tracking
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_.read(), 1, "module ran even without dirty tracking");
+    }
+
+    #[test]
+    fn spawn_wired_two_independent_counters_run_concurrently() {
+        let mut clk = Clock::<TestClk>::new();
+        let mut exec = HardwareExecutor::new();
+
+        let (out_a, in_a) = wire::<u8, ()>(0);
+        let dirty_a = out_a.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), out_a), vec![dirty_a]);
+
+        let (out_b, in_b) = wire::<u8, ()>(0);
+        let dirty_b = out_b.dirty_handle();
+        exec.spawn_wired(wired_counter(clk.clone(), out_b), vec![dirty_b]);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_a.read(), 1);
+        assert_eq!(in_b.read(), 1);
+
+        exec.tick_clock(&mut clk);
+        assert_eq!(in_a.read(), 2);
+        assert_eq!(in_b.read(), 2);
     }
 }
