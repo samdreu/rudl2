@@ -142,7 +142,7 @@ impl fmt::Binary for Logic {
 }
 
 /// A bit vector of compile-time constant width N
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Bits<const N: usize> {
     bits: [Logic; N],
 }
@@ -640,12 +640,30 @@ impl<const N: usize> std::ops::Add for Bits<N> {
     }
 }
 
+impl<const N: usize> std::ops::Add for &Bits<N> {
+    type Output = Bits<N>;
+    fn add(self, rhs: Self) -> Self::Output {
+        if !self.is_valid() || !rhs.is_valid() { return Bits::<N>::x(); }
+        let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
+        Bits::<N>::from_uint(self.as_u128().wrapping_add(rhs.as_u128()) & mask)
+    }
+}
+
 impl<const N: usize> std::ops::Sub for Bits<N> {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self::Output {
         if !self.is_valid() || !rhs.is_valid() { return Self::x(); }
         let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
         Self::from_uint(self.as_u128().wrapping_sub(rhs.as_u128()) & mask)
+    }
+}
+
+impl<const N: usize> std::ops::Sub for &Bits<N> {
+    type Output = Bits<N>;
+    fn sub(self, rhs: Self) -> Self::Output {
+        if !self.is_valid() || !rhs.is_valid() { return Bits::<N>::x(); }
+        let mask = if N < 128 { (1u128 << N) - 1 } else { u128::MAX };
+        Bits::<N>::from_uint(self.as_u128().wrapping_sub(rhs.as_u128()) & mask)
     }
 }
 
