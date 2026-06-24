@@ -1,13 +1,15 @@
 use copper_core::{Clock, ClockDomain};
+use copper_core::port::{In, Out};
 use copper_macros::hardware;
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-// This should fail: function_typed doesn't allow unit return type
-#[hardware(function_typed)]
-async fn bad_module(clk: Clock<MainClk>, input: u8) -> () {
+// Should fail: hardware functions must not have a return value
+#[hardware(sequential)]
+async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) -> u8 {
     loop {
+        out.write(input.read());
         clk.tick().await;
     }
 }

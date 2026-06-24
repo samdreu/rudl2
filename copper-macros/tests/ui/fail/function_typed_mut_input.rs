@@ -1,14 +1,15 @@
 use copper_core::{Clock, ClockDomain};
+use copper_core::port::{In, Out};
 use copper_macros::hardware;
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-// This should fail: function_typed doesn't allow `mut` bindings on inputs
-#[hardware(function_typed)]
-async fn bad_module(clk: Clock<MainClk>, mut input: u8) -> u8 {
+// Should fail: raw parameter type — all params must be Clock<D>, In<T>, or Out<T>
+#[hardware(sequential)]
+async fn counter(clk: Clock<MainClk>, input: u8, out: Out<u8>) {
     loop {
-        input = input + 1;  // Error: can't mutate input
+        out.write(input);
         clk.tick().await;
     }
 }

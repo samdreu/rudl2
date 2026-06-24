@@ -1,16 +1,14 @@
 use copper_core::{Clock, ClockDomain};
+use copper_core::port::{In, Out};
 use copper_macros::hardware;
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
-// This should fail: function_typed doesn't allow mutable reference inputs
-#[hardware(function_typed)]
-async fn bad_module(clk: Clock<MainClk>, input: &mut u8) -> u8 {
-    loop {
-        *input = *input + 1;  // Error: can't use &mut ref
-        clk.tick().await;
-    }
+// Should fail: combinational cannot have a Clock parameter
+#[hardware(combinational)]
+fn gate(clk: Clock<MainClk>, a: In<u8>, out: Out<u8>) {
+    out.write(a.read());
 }
 
 fn main() {}
