@@ -1,120 +1,106 @@
-use copper_core::{Clock, ClockDomain, Bit, Logic};
-use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
+use copper_core::port::*;
+use copper_core::types::*;
+use copper_sim::*;
 use copper_macros::hardware;
-use std::sync::{Arc, Mutex};
 
-struct MainClk;
-impl ClockDomain for MainClk {}
-
-fn mux(select: Bit, input0: Bit, input1: Bit) -> Bit {
-    match select.0 {
-        Logic::Zero => input0,
-        Logic::One => input1,
-        Logic::X => Bit::X,
+const fn safe_clog2(n: usize) -> usize {
+    match n {
+        0 | 1 => 0,
+        _ => {
+            let mut bits = 0;
+            let mut v = n - 1;
+            while v > 0 { 
+                v >>=1; bits += 1;
+            }
+            bits
+        }
     }
 }
 
-#[hardware]
-async fn registered_mux(
-    clk: Clock<MainClk>,
-    select: Arc<Mutex<Bit>>,
-    input0: Arc<Mutex<Bit>>,
-    input1: Arc<Mutex<Bit>>,
-    output: Arc<Mutex<Bit>>,
+#[hardware(combinational)]
+fn mux<
+    const WIDTH_P: usize,
+    const ELS_P: usize,
+    const LG_ELS_LP: usize,
+> (
+    data_i: In<[Bits<WIDTH_P>; ELS_P]>,
+    sel_i: In<Bits<LG_ELS_LP>>,
+    data_o: Out<Bits<WIDTH_P>>,
 ) {
-    let mut reg = Bit::ZERO;
+    const { assert!(LG_ELS_LP == safe_clog2(ELS_P), "LG_ELS_LP must equal safe_clog2(ELS_P)") };
 
-    loop {
-        output.lock().unwrap().clone_from(&reg);
-        clk.tick().await;
-        let sel = *select.lock().unwrap();
-        let in0 = *input0.lock().unwrap();
-        let in1 = *input1.lock().unwrap();
-        reg = mux(sel, in0, in1);
+    if ELS_P == 1 {
+        data_o.write(data_i.read()[0]);
+    } else {
+        data_o.write(data_i.read()[sel_i.read().as_u128() as usize]);
     }
 }
 
 fn main() {
-    // ── Combinational mux ──────────────────────────────────────────────────
+    const WIDTH: usize = 8;
+    const ELS: usize = 4;
+    const LG_ELS: usize = safe_clog2(ELS); // 2
 
-    // (select, input0, input1, expected_output)
-    let comb_cases = vec![
-        (Logic::Zero, Logic::Zero, Logic::Zero, Logic::Zero),
-        (Logic::Zero, Logic::One,  Logic::Zero, Logic::One),
-        (Logic::One,  Logic::One,  Logic::Zero, Logic::Zero),
-        (Logic::One,  Logic::One,  Logic::One,  Logic::One),
-        (Logic::Zero, Logic::Zero, Logic::One,  Logic::Zero),
-        (Logic::Zero, Logic::One,  Logic::One,  Logic::One),
+    let mut executor = HardwareExecutor::new();
+
+    let (data_drv, data_in)  = wire::<[Bits<WIDTH>; ELS], ()>([Bits::zero(); ELS]);
+    let (sel_drv,  sel_in)   = wire::<Bits<LG_ELS>, ()>(Bits::zero());
+    let (data_out, data_obs) = wire::<Bits<WIDTH>, ()>(Bits::zero());
+
+    let dh = data_out.dirty_handle();
+
+    executor.spawn_wired(
+        mux::<WIDTH, ELS, LG_ELS>(data_in, sel_in, data_out),
+        vec![dh],
+    );
+
+    let mut test = HardwareTest::new("bsg_mux")
+        .with_verilog("examples/combinational/sv/mux.sv")
+        .with_waveform("waveforms/bsg_mux.vcd");
+
+    // Fixed input data: distinct values so any selection error is visible.
+    let data: [Bits<WIDTH>; ELS] = [
+        Bits::from_u8(0xAA),
+        Bits::from_u8(0xBB),
+        Bits::from_u8(0xCC),
+        Bits::from_u8(0xDD),
     ];
 
-    let mut comb_test = HardwareTest::new("mux")
-        .with_verilog("verilog/mux.v")
-        .with_waveform("waveforms/mux_comb.vcd");
+    // (sel, expected_output): one case per input, cycling through all sel values.
+    let cases: &[(Bits<LG_ELS>, Bits<WIDTH>)] = &[
+        (Bits::from_slice(&[Logic::Zero, Logic::Zero]), Bits::from_u8(0xAA)), // sel=0 → data[0]
+        (Bits::from_slice(&[Logic::One,  Logic::Zero]), Bits::from_u8(0xBB)), // sel=1 → data[1]
+        (Bits::from_slice(&[Logic::Zero, Logic::One ]), Bits::from_u8(0xCC)), // sel=2 → data[2]
+        (Bits::from_slice(&[Logic::One,  Logic::One ]), Bits::from_u8(0xDD)), // sel=3 → data[3]
+    ];
 
-    let mut comb_expected_cycles = Vec::new();
+    // Flatten [Bits<WIDTH>; ELS] → Vec<Logic> (element 0 at LSBs) for the Verilator port.
+    let data_flat: Vec<Logic> = data.iter()
+        .flat_map(|b| b.as_array().iter().copied())
+        .collect();
 
-    for (i, &(sel, in0, in1, exp)) in comb_cases.iter().enumerate() {
-        let output = mux(Bit(sel), Bit(in0), Bit(in1));
-        comb_test.record_cycle(
-            i + 1,
-            &[("select", &[sel]), ("input0", &[in0]), ("input1", &[in1])],
-            &[("out", &[output.0])],
+    for (i, (sel, _expected)) in cases.iter().enumerate() {
+        data_drv.write(data);
+        sel_drv.write(*sel);
+        executor.poll_tasks();
+
+        let output = data_obs.read();
+        test.record_cycle(
+            i,
+            &[("data_i", &data_flat), ("sel_i", sel.as_array())],
+            &[("data_o", output.as_array())],
         );
-        comb_expected_cycles.push(make_cycle(
-            i + 1,
-            &[("select", &[sel]), ("input0", &[in0]), ("input1", &[in1])],
-            &[("out", &[exp])],
-        ));
     }
 
-    let comb_expected = SimulationTrace::from_cycles(comb_expected_cycles);
-    comb_test.finish_with_expected(&comb_expected).assert_passed();
+    let expected = SimulationTrace::from_cycles(
+        cases.iter().enumerate().map(|(i, (sel, expected_out))| {
+            make_cycle(
+                i,
+                &[("data_i", &data_flat), ("sel_i", sel.as_array())],
+                &[("data_o", expected_out.as_array())],
+            )
+        }).collect(),
+    );
 
-    // ── Sequential (registered) mux ────────────────────────────────────────
-
-    let mut clk = Clock::<MainClk>::new();
-    let mut exec = HardwareExecutor::new();
-    let select = Arc::new(Mutex::new(Bit::ZERO));
-    let input0 = Arc::new(Mutex::new(Bit::ZERO));
-    let input1 = Arc::new(Mutex::new(Bit::ZERO));
-    let output = Arc::new(Mutex::new(Bit::ZERO));
-
-    exec.spawn(registered_mux(
-        clk.clone(),
-        Arc::clone(&select),
-        Arc::clone(&input0),
-        Arc::clone(&input1),
-        Arc::clone(&output),
-    ));
-
-    // (select, input0, input1)
-    let seq_pattern = vec![
-        (Logic::Zero, Logic::Zero, Logic::Zero),
-        (Logic::Zero, Logic::One,  Logic::Zero),
-        (Logic::One,  Logic::One,  Logic::Zero),
-        (Logic::One,  Logic::One,  Logic::One),
-        (Logic::Zero, Logic::Zero, Logic::One),
-    ];
-
-    let mut seq_test = HardwareTest::new("registered_mux")
-        .with_waveform("waveforms/mux_seq.vcd");
-
-    for &(sel, in0, in1) in seq_pattern.iter() {
-        *select.lock().unwrap() = Bit(sel);
-        *input0.lock().unwrap() = Bit(in0);
-        *input1.lock().unwrap() = Bit(in1);
-
-        exec.tick_clock(&mut clk);
-        let output_val = *output.lock().unwrap();
-
-        if clk.cycle() > 1 {
-            seq_test.record_cycle(
-                (clk.cycle() - 1) as usize,
-                &[("select", &[sel]), ("input0", &[in0]), ("input1", &[in1])],
-                &[("out_data", &[output_val.0])],
-            );
-        }
-    }
-
-    seq_test.finish().assert_passed();
+    test.finish_with_expected(&expected).assert_passed();
 }
