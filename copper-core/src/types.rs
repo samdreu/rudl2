@@ -264,7 +264,8 @@ impl<const N: usize> Bits<N> {
         assert!(i < N, "Logic index out of bounds");
         self.bits[i]
     }
-    
+
+
     /// Set the Logic at index i
     pub fn set(&mut self, i: usize, logic: Logic) {
         assert!(i < N, "Bits index out of bounds");
@@ -715,6 +716,17 @@ impl<const N: usize> std::ops::Shr<usize> for Bits<N> {
     fn shr(self, rhs: usize) -> Self::Output { self.shift_right(rhs) }
 }
 
+// ── Slice access ─────────────────────────────────────────────────────────────
+
+impl<const N: usize> std::ops::Deref for Bits<N> {
+    type Target = [Logic];
+    fn deref(&self) -> &[Logic] { &self.bits }
+}
+
+impl<const N: usize> std::ops::DerefMut for Bits<N> {
+    fn deref_mut(&mut self) -> &mut [Logic] { &mut self.bits }
+}
+
 /// Trait for types that have a defined unknown/X state.
 ///
 /// Implemented by all built-in logic types (`Logic`, `Bits<N>`) and
@@ -758,6 +770,20 @@ impl From<Bits<1>> for Logic {
 
 impl<const N: usize> From<u128> for Bits<N> {
     fn from(val: u128) -> Self { Self::from_u128(val) }
+}
+
+impl<const N: usize> From<[Logic; N]> for Bits<N> {
+    fn from(bits: [Logic; N]) -> Self { Self::from_array(bits) }
+}
+
+impl<const N: usize> TryFrom<&[Logic]> for Bits<N> {
+    type Error = String;
+    fn try_from(slice: &[Logic]) -> Result<Self, Self::Error> {
+        if slice.len() != N {
+            return Err(format!("slice length {} does not match Bits<{}>", slice.len(), N));
+        }
+        Ok(Self::from_slice(slice))
+    }
 }
 
 /// Traits for types that listen to clock edges (synchronous logic)
