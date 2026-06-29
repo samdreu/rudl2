@@ -201,6 +201,14 @@ impl<const N: usize> Bits<N> {
         Self::from_uint(val)
     }
 
+    /// Convert a runtime `usize` to `Bits<N>` — equivalent to SV's `N'(expr)` cast.
+    /// Panics if `val` doesn't fit in `N` bits.
+    pub fn from_usize(val: usize) -> Self {
+        let fits = N >= 64 || val < (1usize << N);
+        assert!(fits, "value {val} does not fit in Bits<{N}>");
+        Self::from_uint(val as u128)
+    }
+
     /// Create `Bits<N>` from a compile-time constant.
     /// The required bit width is inferred from the constant value itself,
     /// and the call is rejected at compile time if `N` is too narrow.
