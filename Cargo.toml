@@ -26,3 +26,15 @@ path = "examples/combinational/mux.rs"
 [[example]]
 name = "ripple_carry_adder"
 path = "examples/combinational/ripple_carry_adder.rs"
+
+[[example]]
+name = "rotate_right"
+path = "examples/combinational/rotate_right.rs"
+
+[[example]]
+name = "priority_encode"
+path = "examples/combinational/priority_encode.rs"
+
+[[example]]
+name = "shift_register"
+path = "examples/sequential/shift_register.rs"
