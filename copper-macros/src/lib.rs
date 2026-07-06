@@ -1,6 +1,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Error, FnArg, ItemFn, Pat, ReturnType, Type};
+use std::collections::HashSet;
+use syn::{parse_macro_input, visit::Visit, Error, FnArg, ItemFn, Pat, ReturnType, Type};
 
 enum HardwareMode {
     Sequential,
@@ -25,6 +26,27 @@ fn outer_type_name(ty: &Type) -> Option<String> {
         type_path.path.segments.last().map(|s| s.ident.to_string())
     } else {
         None
+    }
+}
+
+/// Visits an async fn body and records which clock parameter names have a `.tick().await` call.
+struct TickAwaitVisitor<'a> {
+    clock_names: &'a HashSet<String>,
+    found: HashSet<String>,
+}
+
+impl<'ast, 'a> Visit<'ast> for TickAwaitVisitor<'a> {
+    fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
+        if let syn::Expr::MethodCall(method) = &*node.base {
+            if method.method == "tick" && method.args.is_empty() {
+                if let syn::Expr::Path(path) = &*method.receiver {
+                    if let Some(ident) = path.path.get_ident() {
+                        self.found.insert(ident.to_string());
+                    }
+                }
+            }
+        }
+        syn::visit::visit_expr_await(self, node);
     }
 }
 
@@ -163,9 +185,42 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         ));
     }
 
-    // TODO: for sequential functions, verify there is at least one clk.tick().await in the body
+    // Sequential: every Clock<D> parameter must have at least one `name.tick().await` in the body.
+    if matches!(hardware_mode, HardwareMode::Sequential) {
+        let clock_names: HashSet<String> = input_fn.sig.inputs.iter()
+            .filter_map(|arg| {
+                if let FnArg::Typed(pat_ty) = arg {
+                    if outer_type_name(&pat_ty.ty).as_deref() == Some("Clock") {
+                        if let Pat::Ident(pi) = &*pat_ty.pat {
+                            return Some(pi.ident.to_string());
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let mut visitor = TickAwaitVisitor { clock_names: &clock_names, found: HashSet::new() };
+        visitor.visit_block(&input_fn.block);
+
+        for arg in &input_fn.sig.inputs {
+            if let FnArg::Typed(pat_ty) = arg {
+                if outer_type_name(&pat_ty.ty).as_deref() == Some("Clock") {
+                    if let Pat::Ident(pi) = &*pat_ty.pat {
+                        let name = pi.ident.to_string();
+                        if !visitor.found.contains(&name) {
+                            return Err(Error::new_spanned(
+                                arg,
+                                format!("#[hardware(sequential)] body must contain `{name}.tick().await`"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // TODO: for sequential functions, verify the body contains a top-level infinite loop
-    //       (THIS MIGHT CHANGE IN THE FUTURE)
 
     Ok(())
 }
@@ -242,9 +297,19 @@ mod tests {
     #[test]
     fn valid_sequential() {
         let f: syn::ItemFn = parse_quote! {
-            async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) { loop {} }
+            async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) {
+                loop { clk.tick().await; }
+            }
         };
         assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_ok());
+    }
+
+    #[test]
+    fn sequential_missing_tick_await() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) { loop {} }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_err());
     }
 
     #[test]

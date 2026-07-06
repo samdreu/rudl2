@@ -255,6 +255,11 @@ impl<const N: usize> Bits<N> {
         self.as_uint()
     }
 
+    pub fn as_usize(&self) -> usize {
+        const { assert!(N <= 64, "Bits<N> too wide for usize; N must be <= 64") };
+        self.as_uint() as usize
+    }
+
     fn as_uint(&self) -> u128 {
         let mut result = 0u128;
         for (i, bit) in self.bits.iter().enumerate() {
