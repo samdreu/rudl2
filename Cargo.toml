@@ -58,3 +58,11 @@ path = "examples/sequential/lfsr.rs"
 [[example]]
 name = "dual_port_ram"
 path = "examples/memory/dual_port_ram.rs"
+
+[[example]]
+name = "rv32i_cpu"
+path = "examples/cpu/rv32i_cpu.rs"
+
+[[example]]
+name = "rv32i_cpu_pipelined"
+path = "examples/cpu/rv32i_cpu_pipelined.rs"
