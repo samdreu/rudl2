@@ -17,12 +17,31 @@ pub mod executor;
 
 pub use executor::{HardwareExecutor, ModuleInfo};
 
+/// Which phase of the clock cycle `tick_clock` is currently executing.
+/// Set by the executor before each `poll_tasks()` call so that phase-aware futures
+/// (`PreEdgeBarrier`) can determine whether to block or proceed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollPhase {
+    PreEdge,
+    PostEdge,
+}
+
 thread_local! {
     static CURRENT_EMIT_TARGET: RefCell<Option<Arc<dyn Any + Send + Sync>>> = RefCell::new(None);
     /// Set to true by `emit_to_current` whenever a value is written.
     /// Reset to false by `push_emit_target` before each task poll so each poll starts clean.
     /// Read by the executor after each poll to decide whether another delta cycle is needed.
     static CURRENT_EMIT_DIRTY: RefCell<bool> = RefCell::new(false);
+    /// Current clock phase set by `tick_clock` before each settle pass.
+    static POLL_PHASE: RefCell<PollPhase> = RefCell::new(PollPhase::PreEdge);
+}
+
+pub(crate) fn set_poll_phase(phase: PollPhase) {
+    POLL_PHASE.with(|cell| *cell.borrow_mut() = phase);
+}
+
+fn is_pre_edge() -> bool {
+    POLL_PHASE.with(|cell| *cell.borrow() == PollPhase::PreEdge)
 }
 
 pub(crate) struct EmitTargetGuard {
@@ -117,6 +136,36 @@ impl Future for DeltaYield {
 /// See [`DeltaYield`] for full semantics.
 pub fn delta_yield() -> DeltaYield {
     DeltaYield { yielded: false }
+}
+
+/// A future that blocks during post-edge settle and resolves at the start of
+/// the next pre-edge settle.
+///
+/// Unlike `delta_yield`, which resumes after exactly one delta pass regardless
+/// of clock phase, `PreEdgeBarrier` checks the executor's current phase on every
+/// poll. It returns `Pending` whenever the executor is in post-edge (even across
+/// multiple dirty-driven re-polls), and `Ready` the first time it is polled in
+/// pre-edge. This guarantees that the code after the barrier always executes with
+/// fresh inputs that were driven by the testbench before the current `tick_clock`
+/// call began.
+pub struct PreEdgeBarrier;
+
+impl Future for PreEdgeBarrier {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if is_pre_edge() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Return a future that suspends until the executor enters its pre-edge settle
+/// phase. Inject this at the end of every sequential module's main loop via
+/// `#[hardware(sequential)]` — the macro does this automatically.
+pub fn pre_edge_barrier() -> PreEdgeBarrier {
+    PreEdgeBarrier
 }
 
 /// A helper macro to spawn a child module's future and track the parent-child relationship in the executor.

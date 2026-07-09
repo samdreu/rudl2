@@ -38,3 +38,23 @@ path = "examples/combinational/priority_encode.rs"
 [[example]]
 name = "shift_register"
 path = "examples/sequential/shift_register.rs"
+
+[[example]]
+name = "pattern_detector"
+path = "examples/sequential/pattern_detector.rs"
+
+[[example]]
+name = "traffic_light_fsm"
+path = "examples/sequential/traffic_light_fsm.rs"
+
+[[example]]
+name = "pipeline_mac"
+path = "examples/sequential/pipeline_mac.rs"
+
+[[example]]
+name = "lfsr"
+path = "examples/sequential/lfsr.rs"
+
+[[example]]
+name = "dual_port_ram"
+path = "examples/memory/dual_port_ram.rs"

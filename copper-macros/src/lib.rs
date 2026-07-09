@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use std::collections::HashSet;
-use syn::{parse_macro_input, visit::Visit, Error, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{parse_macro_input, visit::Visit, visit_mut::VisitMut, Error, FnArg, ItemFn, Pat, ReturnType, Type};
 
 enum HardwareMode {
     Sequential,
@@ -50,6 +50,48 @@ impl<'ast, 'a> Visit<'ast> for TickAwaitVisitor<'a> {
     }
 }
 
+/// Returns true if `block` directly contains a `.tick().await` (does not recurse into
+/// nested `loop` blocks — those are handled independently by `LoopDeltaInjector`).
+fn block_has_tick_await_direct(block: &syn::Block) -> bool {
+    struct DirectTickFinder(bool);
+    impl<'ast> Visit<'ast> for DirectTickFinder {
+        fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
+            if let syn::Expr::MethodCall(method) = &*node.base {
+                if method.method == "tick" && method.args.is_empty() {
+                    self.0 = true;
+                }
+            }
+            syn::visit::visit_expr_await(self, node);
+        }
+        fn visit_expr_loop(&mut self, _node: &'ast syn::ExprLoop) {
+            // stop here — inner loops are processed independently
+        }
+    }
+    let mut finder = DirectTickFinder(false);
+    finder.visit_block(block);
+    finder.0
+}
+
+/// Walks a sequential function body and appends `::copper_sim::delta_yield().await;`
+/// to the end of every `loop` block that directly contains a `.tick().await`.
+/// This ensures the task suspends between post-tick output writes and the next
+/// pre-tick staging, so each pre-tick runs in the pre-edge settle phase with
+/// fresh inputs — matching real hardware's setup-time → clock-edge → propagation cycle.
+struct LoopDeltaInjector;
+
+impl VisitMut for LoopDeltaInjector {
+    fn visit_expr_loop_mut(&mut self, node: &mut syn::ExprLoop) {
+        let needs_delta = block_has_tick_await_direct(&node.body);
+        syn::visit_mut::visit_expr_loop_mut(self, node); // transform nested loops first
+        if needs_delta {
+            let barrier: syn::Stmt = syn::parse_quote! {
+                ::copper_sim::pre_edge_barrier().await;
+            };
+            node.body.stmts.push(barrier);
+        }
+    }
+}
+
 fn wrap_combinational(mut f: ItemFn) -> TokenStream {
     let body = &f.block;
     let new_body: syn::Block = syn::parse_quote! {
@@ -86,7 +128,11 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 
     match hardware_mode {
-        HardwareMode::Sequential => quote! { #input_fn }.into(),
+        HardwareMode::Sequential => {
+            let mut f = input_fn;
+            LoopDeltaInjector.visit_item_fn_mut(&mut f);
+            quote! { #f }.into()
+        }
         HardwareMode::Combinational => wrap_combinational(input_fn),
     }
 }
