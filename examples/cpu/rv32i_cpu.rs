@@ -186,8 +186,12 @@ async fn rv32i_cpu(
     halted: Out<Logic>,
     a0_out: Out<Bits<32>>,
 ) {
-    let imem    = Memory::<Bits<32>, 1, 0, MainClk, 2, 1>::from_contents(clk.clone(), program.read());
-    let dmem    = Memory::<Bits<32>, 1, 1, MainClk, 2, 1>::new(clk.clone(), 1024);
+    // Both imem and dmem are seeded from the same flat binary so that
+    // .rodata constants (e.g. bubblesort's array at 0xC0) are reachable
+    // via data loads, and the stack region (0xFD0-0xFFC) is zero-initialised.
+    let flat = { let mut v = program.read(); v.resize(1024, Bits::zero()); v };
+    let imem    = Memory::<Bits<32>, 1, 0, MainClk, 2, 1>::from_contents(clk.clone(), flat.clone());
+    let dmem    = Memory::<Bits<32>, 1, 1, MainClk, 2, 1>::from_contents(clk.clone(), flat);
     let regfile = Memory::<Bits<32>, 2, 1, MainClk, 1, 1>::new(clk.clone(), 32);
 
     let mut pc: Bits<32> = Bits::zero();
@@ -600,6 +604,35 @@ fn test_fibonacci() -> Vec<u32> {
     ]
 }
 
+fn test_bubblesort() -> Vec<u32> {
+    // Bubble-sort of [64,34,25,12,22,11,90,42,8,55]; returns sum = 363.
+    // Compiled: riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -O1
+    // Flat binary: .text at 0x000, .rodata (array) at 0x0C0, stack at 0xFD0-0xFFC.
+    // Memory is padded to 1024 words so the stack region is accessible.
+    let mut mem = vec![0u32; 1024];
+    let binary: &[u32] = &[
+        // .text
+        0x00001137, 0x008000ef, 0x00000073, 0xfd010113,
+        0x0c000793, 0x0007ae03, 0x0047a303, 0x0087a883,
+        0x00c7a803, 0x0107a503, 0x0147a583, 0x0187a603,
+        0x01c7a683, 0x0207a703, 0x01c12423, 0x00612623,
+        0x01112823, 0x01012a23, 0x00a12c23, 0x00b12e23,
+        0x02c12023, 0x02d12223, 0x02e12423, 0x0247a783,
+        0x02f12623, 0x00810593, 0x02c10613, 0x02c0006f,
+        0x00478793, 0x00c78e63, 0x0007a703, 0x0047a683,
+        0xfee6d8e3, 0x00d7a023, 0x00e7a223, 0xfe5ff06f,
+        0xffc60613, 0x00b60663, 0x00058793, 0xfddff06f,
+        0x02858713, 0x00000513, 0x0005a783, 0x00f50533,
+        0x00458593, 0xfee59ae3, 0x03010113, 0x00008067,
+        // [48] .rodata: {64, 34, 25, 12, 22, 11, 90, 42, 8, 55}
+        0x00000040, 0x00000022, 0x00000019, 0x0000000c,
+        0x00000016, 0x0000000b, 0x0000005a, 0x0000002a,
+        0x00000008, 0x00000037,
+    ];
+    for (i, &w) in binary.iter().enumerate() { mem[i] = w; }
+    mem
+}
+
 // ── Main Entry ─────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -617,6 +650,7 @@ fn main() {
         ("Negative: 10 + (-3)", test_negative_numbers(), 7),
         ("Zero: 0 + 42", test_zero_operations(), 42),
         ("Fibonacci: fib(10)", test_fibonacci(), 55),
+        ("Bubblesort: sort+sum 10 elements", test_bubblesort(), 363),
     ];
 
     let mut passed = 0;
@@ -624,7 +658,7 @@ fn main() {
 
     for (name, prog, expected) in tests {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_program(prog, 500)
+            run_program(prog, 5000)
         })) {
             Ok((result, cycles)) => {
                 if result == expected {
