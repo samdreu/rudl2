@@ -203,8 +203,10 @@ async fn rv32i_cpu_pipelined(
     halted: Out<Logic>,
     a0_out: Out<Bits<32>>,
 ) {
-    let imem = program.read();
-    let mut dmem = vec![Bits::<32>::zero(); 1024];
+    // Unified address space: instruction fetch and data loads/stores all hit
+    // the same Vec.  run_program pads it to 1024 words so the stack region
+    // (sp=0x1000, growing down) and any .rodata constants have room.
+    let mut memory = { let mut v = program.read(); v.resize(1024, Bits::zero()); v };
     let mut regs = [Bits::<32>::zero(); 32];
 
     let mut pc: Bits<32> = Bits::zero();
@@ -235,13 +237,13 @@ async fn rv32i_cpu_pipelined(
         // ── MEM ─────────────────────────────────────────────────────────────
         let mem_result: Bits<32> = if ex_mem.valid && ex_mem.is_load {
             let addr = (ex_mem.alu_result >> 2).as_usize();
-            if addr < dmem.len() { dmem[addr] } else { Bits::zero() }
+            if addr < memory.len() { memory[addr] } else { Bits::zero() }
         } else {
             Bits::zero()
         };
         if ex_mem.valid && ex_mem.is_store {
             let addr = (ex_mem.alu_result >> 2).as_usize();
-            if addr < dmem.len() { dmem[addr] = ex_mem.rs2_val; }
+            if addr < memory.len() { memory[addr] = ex_mem.rs2_val; }
         }
         let new_mem_wb = if ex_mem.valid {
             MEMWBReg {
@@ -406,7 +408,7 @@ async fn rv32i_cpu_pipelined(
             if_id  // hold
         } else {
             let idx   = (pc >> 2).as_usize();
-            let instr = if idx < imem.len() { imem[idx] } else { Bits::zero() };
+            let instr = if idx < memory.len() { memory[idx] } else { Bits::zero() };
             IFIDReg { valid: true, pc, instr }
         };
 
@@ -656,6 +658,35 @@ fn test_load_use_stall() -> Vec<u32> {
     ]
 }
 
+fn test_bubblesort() -> Vec<u32> {
+    // Bubble-sort of [64,34,25,12,22,11,90,42,8,55]; returns sum = 363.
+    // Compiled: riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -O1
+    // Flat binary: .text at 0x000, .rodata (array) at 0x0C0, stack at 0xFD0-0xFFC.
+    // Memory is padded to 1024 words so the stack region is accessible.
+    let mut mem = vec![0u32; 1024];
+    let binary: &[u32] = &[
+        // .text
+        0x00001137, 0x008000ef, 0x00000073, 0xfd010113,
+        0x0c000793, 0x0007ae03, 0x0047a303, 0x0087a883,
+        0x00c7a803, 0x0107a503, 0x0147a583, 0x0187a603,
+        0x01c7a683, 0x0207a703, 0x01c12423, 0x00612623,
+        0x01112823, 0x01012a23, 0x00a12c23, 0x00b12e23,
+        0x02c12023, 0x02d12223, 0x02e12423, 0x0247a783,
+        0x02f12623, 0x00810593, 0x02c10613, 0x02c0006f,
+        0x00478793, 0x00c78e63, 0x0007a703, 0x0047a683,
+        0xfee6d8e3, 0x00d7a023, 0x00e7a223, 0xfe5ff06f,
+        0xffc60613, 0x00b60663, 0x00058793, 0xfddff06f,
+        0x02858713, 0x00000513, 0x0005a783, 0x00f50533,
+        0x00458593, 0xfee59ae3, 0x03010113, 0x00008067,
+        // [48] .rodata: {64, 34, 25, 12, 22, 11, 90, 42, 8, 55}
+        0x00000040, 0x00000022, 0x00000019, 0x0000000c,
+        0x00000016, 0x0000000b, 0x0000005a, 0x0000002a,
+        0x00000008, 0x00000037,
+    ];
+    for (i, &w) in binary.iter().enumerate() { mem[i] = w; }
+    mem
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -676,6 +707,7 @@ fn main() {
         ("Forwarding: back-to-back RAW",      test_data_hazard_forwarding(),  3),
         ("Load-use stall",                    test_load_use_stall(),         43),
         ("Fibonacci: fib(10)",                test_fibonacci(),              55),
+        ("Bubblesort: sort+sum 10 elements", test_bubblesort(),            363),
     ];
 
     let mut passed = 0;
