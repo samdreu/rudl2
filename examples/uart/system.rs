@@ -143,57 +143,94 @@ fn spawn_uart(exec: &mut HardwareExecutor, clk: Clock<MainClk>) -> UartPorts {
 }
 
 // ── Testbench ─────────────────────────────────────────────────────────────────
+fn send_and_wait(
+    exec: &mut HardwareExecutor,
+    clk: &mut Clock<MainClk>,
+    uart: &UartPorts,
+    byte: u8,
+) -> Option<u8> {
+    uart.tx_byte.write(Bits::from_u8(byte));
+    uart.tx_start.write(Logic::One);
+    exec.tick_clock(clk);
+    uart.tx_start.write(Logic::Zero);
+
+    let mut received = None;
+    for _ in 0..CLKS_PER_BIT * 12 {
+        exec.tick_clock(clk);
+        if uart.rx_dv.read() == Logic::One && received.is_none() {
+            received = Some(uart.rx_byte.read().as_u128() as u8);
+        }
+    }
+    while uart.tx_busy.read() == Logic::One { exec.tick_clock(clk); }
+    received
+}
+
 fn main() {
     let mut clk  = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    // Instantiate the UART subsystem. main() never touches the serial wire.
-    let uart = spawn_uart(&mut exec, clk.clone());
-
-    let test_bytes: &[(&str, u8)] = &[
-        ("0x37 (ASCII '7')",   0x37),
-        ("0xAA (alternating)", 0xAA),
-        ("0xFF (all ones)",    0xFF),
-        ("0x00 (all zeros)",   0x00),
-        ("0x55 (alternating)", 0x55),
-    ];
-
-    println!("=== UART loopback (hierarchical TX+RX composition) ===");
-    println!("{:<24}  {:>8}  {:>8}  {}", "byte", "sent", "received", "");
+    // Two independent UART channels from the same module function.
+    // Each call to spawn_uart creates a fresh set of internal wires and futures;
+    // the Rust type system guarantees uart0's ports and uart1's ports are disjoint.
+    let uart0 = spawn_uart(&mut exec, clk.clone());
+    let uart1 = spawn_uart(&mut exec, clk.clone());
 
     let mut all_pass = true;
 
-    for &(label, byte) in test_bytes {
-        // Set up byte then pulse tx_start for one cycle
-        uart.tx_byte.write(Bits::from_u8(byte));
-        uart.tx_start.write(Logic::One);
-        exec.tick_clock(&mut clk);
-        uart.tx_start.write(Logic::Zero);
-
-        // Wait for rx_dv to pulse (one full 8N1 frame = ~10 * CLKS_PER_BIT cycles).
-        // Allow 12× for margin.
-        let mut received: Option<u8> = None;
-        for _ in 0..CLKS_PER_BIT * 12 {
-            exec.tick_clock(&mut clk);
-            if uart.rx_dv.read() == Logic::One && received.is_none() {
-                received = Some(uart.rx_byte.read().as_u128() as u8);
-            }
-        }
-
-        let pass = received == Some(byte);
+    // ── 1. Single-channel loopback ────────────────────────────────────────────
+    println!("=== Single-channel loopback (uart0) ===");
+    for &(label, byte) in &[
+        ("0x37", 0x37u8), ("0xAA", 0xAA), ("0xFF", 0xFF),
+    ] {
+        let recv = send_and_wait(&mut exec, &mut clk, &uart0, byte);
+        let pass = recv == Some(byte);
         if !pass { all_pass = false; }
-
-        println!("{:<24}  0x{:02X}      {:>8}  {}",
+        println!("  {}: 0x{:02X} → {}  {}",
             label, byte,
-            received.map_or("none".to_string(), |b| format!("0x{:02X}", b)),
+            recv.map_or("none".to_string(), |b| format!("0x{:02X}", b)),
             if pass { "✓" } else { "✗" });
-
-        // Wait for TX to return to idle before sending the next byte
-        while uart.tx_busy.read() == Logic::One {
-            exec.tick_clock(&mut clk);
-        }
     }
 
-    println!("\n{}", if all_pass { "✓ All bytes received correctly." } else { "✗ Mismatch detected." });
+    // ── 2. Dual-channel simultaneous transmission ─────────────────────────────
+    // Both channels transmit different bytes at the same time on the same clock.
+    // Bytes must arrive on the correct channel — no cross-contamination.
+    println!("\n=== Dual-channel simultaneous transmission ===");
+    println!("{:<12}  {:<12}  {}", "uart0", "uart1", "");
+
+    for &(b0, b1) in &[(0xAB_u8, 0xCD_u8), (0x12, 0x34), (0xFF, 0x00)] {
+        // Pulse both tx_starts in the same clock cycle
+        uart0.tx_byte.write(Bits::from_u8(b0));
+        uart0.tx_start.write(Logic::One);
+        uart1.tx_byte.write(Bits::from_u8(b1));
+        uart1.tx_start.write(Logic::One);
+        exec.tick_clock(&mut clk);
+        uart0.tx_start.write(Logic::Zero);
+        uart1.tx_start.write(Logic::Zero);
+
+        let mut recv0: Option<u8> = None;
+        let mut recv1: Option<u8> = None;
+        for _ in 0..CLKS_PER_BIT * 12 {
+            exec.tick_clock(&mut clk);
+            if uart0.rx_dv.read() == Logic::One && recv0.is_none() {
+                recv0 = Some(uart0.rx_byte.read().as_u128() as u8);
+            }
+            if uart1.rx_dv.read() == Logic::One && recv1.is_none() {
+                recv1 = Some(uart1.rx_byte.read().as_u128() as u8);
+            }
+        }
+        loop {
+            if uart0.tx_busy.read() == Logic::Zero && uart1.tx_busy.read() == Logic::Zero { break; }
+            exec.tick_clock(&mut clk);
+        }
+
+        let pass = recv0 == Some(b0) && recv1 == Some(b1);
+        if !pass { all_pass = false; }
+        println!("  0x{:02X} → {:4}  0x{:02X} → {:4}  {}",
+            b0, recv0.map_or("none".to_string(), |b| format!("0x{:02X}", b)),
+            b1, recv1.map_or("none".to_string(), |b| format!("0x{:02X}", b)),
+            if pass { "✓" } else { "✗" });
+    }
+
+    println!("\n{}", if all_pass { "✓ All tests passed." } else { "✗ One or more tests failed." });
     if !all_pass { std::process::exit(1); }
 }
