@@ -66,3 +66,7 @@ path = "examples/cpu/rv32i_cpu.rs"
 [[example]]
 name = "rv32i_cpu_pipelined"
 path = "examples/cpu/rv32i_cpu_pipelined.rs"
+
+[[example]]
+name = "uart_rx"
+path = "examples/uart/rx.rs"
