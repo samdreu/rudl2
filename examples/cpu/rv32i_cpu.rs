@@ -181,10 +181,10 @@ fn alu_exec_imm(a: Bits<32>, imm: Bits<32>, f3: Bits<3>, f7: Bits<7>) -> AluOutp
 #[hardware(sequential)]
 async fn rv32i_cpu(
     clk: Clock<MainClk>,
-    program: In<Vec<Bits<32>>>,
-    program_counter: Out<Bits<32>>,
-    halted: Out<Logic>,
-    a0_out: Out<Bits<32>>,
+    program: In<Vec<Bits<32>>, MainClk>,
+    program_counter: Out<Bits<32>, MainClk>,
+    halted: Out<Logic, MainClk>,
+    a0_out: Out<Bits<32>, MainClk>,
 ) {
     // Both imem and dmem are seeded from the same flat binary so that
     // .rodata constants (e.g. bubblesort's array at 0xC0) are reachable
@@ -422,10 +422,10 @@ fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (prog_out, prog_in)      = wire::<Vec<Bits<32>>, ()>(vec![]);
-    let (pc_out, _pc_in)         = wire::<Bits<32>, ()>(Bits::zero());
-    let (halted_out, halted_in)  = wire::<Logic, ()>(Logic::Zero);
-    let (a0_out, a0_in)          = wire::<Bits<32>, ()>(Bits::zero());
+    let (prog_out, prog_in)      = wire::<Vec<Bits<32>>, MainClk>(vec![]);
+    let (pc_out, _pc_in)         = wire::<Bits<32>, MainClk>(Bits::zero());
+    let (halted_out, halted_in)  = wire::<Logic, MainClk>(Logic::Zero);
+    let (a0_out, a0_in)          = wire::<Bits<32>, MainClk>(Bits::zero());
 
     prog_out.write(program_bits);
     exec.spawn(rv32i_cpu(clk.clone(), prog_in, pc_out, halted_out, a0_out));

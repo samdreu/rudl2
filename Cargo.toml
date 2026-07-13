@@ -70,3 +70,11 @@ path = "examples/cpu/rv32i_cpu_pipelined.rs"
 [[example]]
 name = "uart_rx"
 path = "examples/uart/rx.rs"
+
+[[example]]
+name = "uart_system"
+path = "examples/uart/system.rs"
+
+[[example]]
+name = "two_domain_counter"
+path = "examples/cdc/two_domain_counter.rs"

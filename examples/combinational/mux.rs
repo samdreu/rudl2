@@ -23,9 +23,9 @@ fn mux<
     const ELS_P: usize,
     const LG_ELS_LP: usize,
 > (
-    data_i: In<[Bits<WIDTH_P>; ELS_P]>,
-    sel_i: In<Bits<LG_ELS_LP>>,
-    data_o: Out<Bits<WIDTH_P>>,
+    data_i: In<[Bits<WIDTH_P>; ELS_P], ()>,
+    sel_i: In<Bits<LG_ELS_LP>, ()>,
+    data_o: Out<Bits<WIDTH_P>, ()>,
 ) {
     const { assert!(LG_ELS_LP == safe_clog2(ELS_P), "LG_ELS_LP must equal safe_clog2(ELS_P)") };
 

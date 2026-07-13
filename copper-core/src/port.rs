@@ -31,10 +31,15 @@ impl<T: PartialEq + Clone, D> Out<T, D> {
 }
 
 // Clone - multiple readers allowed
-#[derive(Clone)]
 pub struct In<T, D = ()> {
     inner: Arc<Mutex<T>>,
     _domain: PhantomData<D>
+}
+
+impl<T, D> Clone for In<T, D> {
+    fn clone(&self) -> Self {
+        In { inner: self.inner.clone(), _domain: PhantomData }
+    }
 }
 
 impl<T: Clone, D> In<T, D> {

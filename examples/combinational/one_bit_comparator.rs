@@ -4,7 +4,7 @@ use copper_sim::*;
 use copper_macros::hardware;
 
 #[hardware(combinational)]
-fn one_bit_comparator(i0: In<Logic>, i1: In<Logic>, eq: Out<Logic>) {
+fn one_bit_comparator(i0: In<Logic, ()>, i1: In<Logic, ()>, eq: Out<Logic, ()>) {
     let p0 = !i0.read() & !i1.read();
     let p1 = i0.read() & i1.read();
     eq.write(p0 | p1);

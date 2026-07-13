@@ -6,12 +6,12 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 async fn shift_register <const N: usize, const N_1: usize> (
-    d: In<Logic>,
+    d: In<Logic, MainClk>,
     clk: Clock<MainClk>,
-    en: In<Logic>,
-    dir: In<Logic>,
-    rstn: In<Logic>,
-    out: Out<Bits<N>>,
+    en: In<Logic, MainClk>,
+    dir: In<Logic, MainClk>,
+    rstn: In<Logic, MainClk>,
+    out: Out<Bits<N>, MainClk>,
 ) {
     const { assert!(N-1 == N_1, "N_1 must equal N-1") };
     let mut out_n = Bits::x();
@@ -49,11 +49,11 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (d_drv, d_in)       = wire::<Logic, ()>(Logic::Zero);
-    let (en_drv, en_in)     = wire::<Logic, ()>(Logic::Zero);
-    let (dir_drv, dir_in)   = wire::<Logic, ()>(Logic::Zero);
-    let (rstn_drv, rstn_in) = wire::<Logic, ()>(Logic::One);
-    let (out_out, out_obs)  = wire::<Bits<N>, ()>(Bits::zero());
+    let (d_drv, d_in)       = wire::<Logic, MainClk>(Logic::Zero);
+    let (en_drv, en_in)     = wire::<Logic, MainClk>(Logic::Zero);
+    let (dir_drv, dir_in)   = wire::<Logic, MainClk>(Logic::Zero);
+    let (rstn_drv, rstn_in) = wire::<Logic, MainClk>(Logic::One);
+    let (out_out, out_obs)  = wire::<Bits<N>, MainClk>(Bits::zero());
 
     let dh = out_out.dirty_handle();
     exec.spawn_wired(

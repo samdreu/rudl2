@@ -44,9 +44,9 @@ struct packet {
 
 async fn rx (
     clk: Clock<MainClk>,
-    rx_serial: In<Logic>,
-    rx_dv: Out<Logic>,
-    rx_byte: Out<Bits<8>>,
+    rx_serial: In<Logic, MainClk>,
+    rx_dv: Out<Logic, MainClk>,
+    rx_byte: Out<Bits<8>, MainClk>,
 ) {
 
     loop {
@@ -91,9 +91,9 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (serial_drv, serial_in) = wire::<Logic, ()>(Logic::One);
-    let (dv_out,     dv_obs)    = wire::<Logic, ()>(Logic::Zero);
-    let (byte_out,   byte_obs)  = wire::<Bits<8>, ()>(Bits::zero());
+    let (serial_drv, serial_in) = wire::<Logic, MainClk>(Logic::One);
+    let (dv_out,     dv_obs)    = wire::<Logic, MainClk>(Logic::Zero);
+    let (byte_out,   byte_obs)  = wire::<Bits<8>, MainClk>(Bits::zero());
 
     let dh_dv   = dv_out.dirty_handle();
     let dh_byte = byte_out.dirty_handle();

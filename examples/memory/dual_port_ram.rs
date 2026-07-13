@@ -11,14 +11,14 @@ impl ClockDomain for MainClk {}
 #[hardware(sequential)]
 async fn dual_port_ram (
     clk: Clock<MainClk>,
-    enable_a: In<Logic>,
-    enable_b: In<Logic>,
-    write_a: In<Logic>,
-    addr_a: In<Bits<8>>,
-    addr_b: In<Bits<8>>,
-    data_in_a: In<Bits<16>>,
-    data_out_a: Out<Bits<16>>,
-    data_out_b: Out<Bits<16>>
+    enable_a: In<Logic, MainClk>,
+    enable_b: In<Logic, MainClk>,
+    write_a: In<Logic, MainClk>,
+    addr_a: In<Bits<8>, MainClk>,
+    addr_b: In<Bits<8>, MainClk>,
+    data_in_a: In<Bits<16>, MainClk>,
+    data_out_a: Out<Bits<16>, MainClk>,
+    data_out_b: Out<Bits<16>, MainClk>
 ) {
     let memory = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256);
     let mut data: Bits<16> = Bits::zero();
@@ -46,14 +46,14 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (ena_drv,   ena_in)    = wire::<Logic,    ()>(Logic::Zero);
-    let (enb_drv,   enb_in)    = wire::<Logic,    ()>(Logic::Zero);
-    let (wea_drv,   wea_in)    = wire::<Logic,    ()>(Logic::Zero);
-    let (addra_drv, addra_in)  = wire::<Bits<8>,  ()>(Bits::zero());
-    let (addrb_drv, addrb_in)  = wire::<Bits<8>,  ()>(Bits::zero());
-    let (dia_drv,   dia_in)    = wire::<Bits<16>, ()>(Bits::zero());
-    let (doa_out,   _doa_obs)  = wire::<Bits<16>, ()>(Bits::zero());
-    let (dob_out,   dob_obs)   = wire::<Bits<16>, ()>(Bits::zero());
+    let (ena_drv,   ena_in)    = wire::<Logic,    MainClk>(Logic::Zero);
+    let (enb_drv,   enb_in)    = wire::<Logic,    MainClk>(Logic::Zero);
+    let (wea_drv,   wea_in)    = wire::<Logic,    MainClk>(Logic::Zero);
+    let (addra_drv, addra_in)  = wire::<Bits<8>,  MainClk>(Bits::zero());
+    let (addrb_drv, addrb_in)  = wire::<Bits<8>,  MainClk>(Bits::zero());
+    let (dia_drv,   dia_in)    = wire::<Bits<16>, MainClk>(Bits::zero());
+    let (doa_out,   _doa_obs)  = wire::<Bits<16>, MainClk>(Bits::zero());
+    let (dob_out,   dob_obs)   = wire::<Bits<16>, MainClk>(Bits::zero());
 
     let dh: DirtyHandle = dob_out.dirty_handle();
     exec.spawn_wired(
