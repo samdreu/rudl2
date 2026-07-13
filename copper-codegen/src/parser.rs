@@ -1,6 +1,6 @@
 use copper_core::frontend_ir::{
     ClockParamMeta, EnumVariant, ExprArray, ExprAssign, ExprAsync, ExprAwait, ExprBinary, ExprCall, ExprCast,
-    ExprField, ExprIf, ExprLet, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprMethodCall,
+    ExprBlock, ExprField, ExprIf, ExprLet, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprMethodCall,
     ExprRange, ExprReference, ExprRepeat, ExprReturn, ExprStmt, ExprType, ExprUnary, ExprWhile,
     ExprYield, FrontendClassification, FrontendModuleIR, FrontendSignature, ItemConst, ItemEnum,
     ItemMacro, ItemOther, ItemStmt, ItemStruct, ItemType, LocalStmt, RawParam, RawStmt, RawStmtKind,
@@ -328,6 +328,16 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
         Expr::Async(e) => ExprType::Async(ExprAsync {
             is_move: e.capture.is_some(),
             block: e.block.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
+                order,
+                kind: classify_raw_stmt_kind(stmt, hardware_fns),
+                text: quote!(#stmt).to_string(),
+                span: capture_source_span(stmt),
+            }).collect(),
+            span: capture_source_span(e),
+        }),
+
+        Expr::Block(e) => ExprType::Block(ExprBlock {
+            stmts: e.block.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
                 order,
                 kind: classify_raw_stmt_kind(stmt, hardware_fns),
                 text: quote!(#stmt).to_string(),
@@ -1680,8 +1690,8 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert!(if_expr.else_branch.is_some());
-                // The else branch is present and should be a literal
-                assert!(matches!(**if_expr.else_branch.as_ref().unwrap(), ExprType::Lit(_)));
+                // The else branch `else { 2 }` is parsed as a Block containing the literal
+                assert!(matches!(**if_expr.else_branch.as_ref().unwrap(), ExprType::Block(_)));
             }
             _ => panic!("expected if"),
         }

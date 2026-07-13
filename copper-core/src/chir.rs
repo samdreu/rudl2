@@ -28,7 +28,7 @@ pub enum CHIRPortDir {
 
 #[derive(Debug, Clone)]
 pub enum CHIRPortKind {
-    /// Clock — not a data signal; carries domain name for multi-clock future use.
+    /// Clock — not a data signal; carries domain name.
     Clock { domain: String },
     /// Data — a hardware-typed signal of known width.
     Data { ty: CHIRType },
@@ -36,8 +36,7 @@ pub enum CHIRPortKind {
 
 // ── Type system ───────────────────────────────────────────────────────────────
 
-/// Hardware-native types only. All Rust-runtime types (Arc, Mutex, etc.) are
-/// stripped in Phase B before this representation is constructed.
+/// Hardware-native types only. All Rust-runtime types are stripped in Phase B.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CHIRType {
     UInt { width: usize },
@@ -53,23 +52,13 @@ pub enum CHIRBody {
     Sequential(CHIRSeqBody),
 }
 
-/// Combinational module body: submodule instances, named wire values, output.
+/// Combinational module body.
+/// `stmts` holds Wire declarations for intermediates and PortWrite for outputs,
+/// in source order.
 #[derive(Debug, Clone)]
 pub struct CHIRCombBody {
-    /// #[hardware] submodule instantiations, in source order.
     pub submodules: Vec<CHIRSubmoduleInst>,
-    /// Named intermediate wire values, in computation order.
-    pub wires: Vec<CHIRWireDecl>,
-    /// Expression driving the output port.
-    pub output: CHIRExpr,
-}
-
-#[derive(Debug, Clone)]
-pub struct CHIRWireDecl {
-    pub name: String,
-    pub ty: CHIRType,
-    pub value: CHIRExpr,
-    pub span: SourceSpan,
+    pub stmts: Vec<CHIRStmt>,
 }
 
 /// Sequential module body: registers, submodule instances, and loop body.
@@ -79,11 +68,9 @@ pub struct CHIRSeqBody {
     pub clock: String,
     /// State registers — variables that live across a tick boundary.
     pub registers: Vec<CHIRRegDecl>,
-    /// #[hardware] submodule instantiations used in this module.
-    /// These are wired combinationally — their outputs are wires, not registers.
+    /// `#[hardware]` submodule instantiations used in this module.
     pub submodules: Vec<CHIRSubmoduleInst>,
     /// The infinite loop body containing one or more AwaitTick boundaries.
-    /// Phase C splits this at each AwaitTick to produce SHIR phases.
     pub loop_body: Vec<CHIRStmt>,
 }
 
@@ -98,23 +85,12 @@ pub struct CHIRRegDecl {
 
 // ── Submodule instantiation ───────────────────────────────────────────────────
 
-/// A #[hardware] function call site lowered to a module instantiation.
-///
-/// The call `let result = full_adder(a, b)` becomes:
-///   - A CHIRSubmoduleInst with a generated inst_name and output_wire name
-///   - All references to `result` in subsequent expressions replaced with
-///     Var(output_wire)
 #[derive(Debug, Clone)]
 pub struct CHIRSubmoduleInst {
-    /// Unique instance name within this module, e.g. "full_adder_0".
     pub inst_name: String,
-    /// The #[hardware] module being instantiated, e.g. "full_adder".
     pub module_name: String,
-    /// Input port connections: (port_name, driving_expr).
     pub inputs: Vec<(String, CHIRExpr)>,
-    /// Name of the wire carrying this instance's output in the parent module.
     pub output_wire: String,
-    /// Type of the output.
     pub output_ty: CHIRType,
     pub span: SourceSpan,
 }
@@ -138,15 +114,15 @@ pub enum CHIRStmt {
         span: SourceSpan,
     },
 
-    /// Drive the output port (from emit!()).
-    /// Semantics: the last Emit before an AwaitTick wins in that phase.
-    Emit {
+    /// Drive an output port — from `out_port.write(expr)`.
+    /// Can appear anywhere: flat, inside If, inside Match.
+    PortWrite {
+        port_name: String,
         value: CHIRExpr,
         span: SourceSpan,
     },
 
     /// Clock-edge boundary — from clk.tick().await.
-    /// Carries the clock name for future multi-clock support.
     AwaitTick {
         clock: String,
         span: SourceSpan,
@@ -168,6 +144,19 @@ pub enum CHIRStmt {
     },
 }
 
+impl CHIRStmt {
+    pub fn span(&self) -> &SourceSpan {
+        match self {
+            CHIRStmt::Wire { span, .. } => span,
+            CHIRStmt::Assign { span, .. } => span,
+            CHIRStmt::PortWrite { span, .. } => span,
+            CHIRStmt::AwaitTick { span, .. } => span,
+            CHIRStmt::If { span, .. } => span,
+            CHIRStmt::Match { span, .. } => span,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CHIRMatchArm {
     pub patterns: Vec<CHIRPattern>,
@@ -176,14 +165,11 @@ pub struct CHIRMatchArm {
     pub span: SourceSpan,
 }
 
-/// Patterns preserved from source. Tuple patterns are kept intact (not
-/// desugared to if/else chains) so Phase D can emit a Verilog `case` on a
-/// concatenated selector.
+/// Patterns preserved from source.
 #[derive(Debug, Clone)]
 pub enum CHIRPattern {
     Lit(CHIRLit),
     Wildcard,
-    /// Tuple pattern, e.g. (j, k) in a JK flip-flop match.
     Tuple(Vec<CHIRPattern>),
     EnumVariant { name: String, inner: Option<Box<CHIRPattern>> },
 }
@@ -192,46 +178,28 @@ pub enum CHIRPattern {
 
 #[derive(Debug, Clone)]
 pub enum CHIRExpr {
-    /// Variable reference — wire, register, or submodule output wire name.
     Var(String),
-
-    /// Literal constant.
     Lit(CHIRLit),
-
-    /// Binary operation.
     BinOp {
         left: Box<CHIRExpr>,
         op: CHIRBinOp,
         right: Box<CHIRExpr>,
     },
-
-    /// Unary operation.
     UnOp {
         op: CHIRUnOp,
         expr: Box<CHIRExpr>,
     },
-
-    /// Multiplexer (ternary) — lowered from if-as-expression.
     Mux {
         cond: Box<CHIRExpr>,
         then_val: Box<CHIRExpr>,
         else_val: Box<CHIRExpr>,
     },
-
-    /// Match-as-value (let x = match { ... }).
-    /// Distinct from CHIRStmt::Match which is used for side-effect statements.
     Case {
         scrutinee: Box<CHIRExpr>,
         arms: Vec<CHIRCaseArm>,
-        /// Default arm value (from `_ => expr`). Required if patterns are
-        /// non-exhaustive.
         default: Option<Box<CHIRExpr>>,
     },
-
-    /// Bit concatenation {a, b, c}.
     Concat(Vec<CHIRExpr>),
-
-    /// Bit slice [high:low] — both bounds are compile-time constants at CHIR level.
     Slice {
         expr: Box<CHIRExpr>,
         high: usize,
@@ -254,27 +222,20 @@ pub struct CHIRLit {
 
 #[derive(Debug, Clone)]
 pub enum CHIRBinOp {
-    // Arithmetic — wrapping flag is informational; hardware always wraps at width
     Add { wrapping: bool },
     Sub { wrapping: bool },
     Mul { wrapping: bool },
-
-    // Bitwise
     BitAnd,
     BitOr,
     BitXor,
     Shl,
     Shr,
-
-    // Comparison — always produce Bool
     Eq,
     Neq,
     Lt,
     Lte,
     Gt,
     Gte,
-
-    // Logical
     LogicalAnd,
     LogicalOr,
 }
@@ -293,41 +254,22 @@ pub enum CHIRUnOp {
 
 #[derive(Debug)]
 pub enum CHIRLowerError {
-    /// A Rust construct that cannot be mapped to hardware.
     UnsupportedConstruct {
         description: String,
         span: SourceSpan,
         suggested_rewrite: Option<String>,
     },
-
-    /// A type that cannot be resolved to a CHIRType.
     UnresolvableType {
         ty_text: String,
         span: SourceSpan,
     },
-
-    /// A variable is used as both a register and a wire in the same context.
     RegisterWireConflict {
         name: String,
         span: SourceSpan,
     },
-
-    /// AwaitTick found inside a conditional branch — not supported in Milestone 1.
     TickInsideBranch {
         span: SourceSpan,
     },
-
-    /// emit!() used in a module with no output port.
-    EmitWithoutOutput {
-        span: SourceSpan,
-    },
-
-    /// Sequential module has an output port but never calls emit!().
-    OutputWithoutEmit {
-        span: SourceSpan,
-    },
-
-    /// Width cannot be inferred; explicit annotation required.
     AmbiguousWidth {
         span: SourceSpan,
     },
@@ -344,10 +286,6 @@ impl std::fmt::Display for CHIRLowerError {
                 write!(f, "variable '{}' used as both register and wire", name),
             CHIRLowerError::TickInsideBranch { .. } =>
                 write!(f, "clk.tick().await inside a conditional branch is not supported"),
-            CHIRLowerError::EmitWithoutOutput { .. } =>
-                write!(f, "emit!() used in a module with no output port"),
-            CHIRLowerError::OutputWithoutEmit { .. } =>
-                write!(f, "module has an output port but never calls emit!()"),
             CHIRLowerError::AmbiguousWidth { .. } =>
                 write!(f, "cannot infer bit width; add an explicit type annotation"),
         }

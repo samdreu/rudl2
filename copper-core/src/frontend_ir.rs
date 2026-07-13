@@ -175,6 +175,7 @@ pub enum ExprType {
     Async(ExprAsync),
     Await(ExprAwait),
     Binary(ExprBinary),
+    Block(ExprBlock),
     Call(ExprCall),
     Cast(ExprCast),
     Field(ExprField),
@@ -191,6 +192,12 @@ pub enum ExprType {
     Unary(ExprUnary),
     While(ExprWhile),
     Yield(ExprYield),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprBlock {
+    pub stmts: Vec<RawStmt>,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

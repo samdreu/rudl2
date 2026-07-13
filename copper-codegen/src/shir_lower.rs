@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use copper_core::chir::{
-    CHIRBody, CHIRCaseArm, CHIRExpr, CHIRLit, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir,
-    CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRWireDecl,
+    CHIRBody, CHIRExpr, CHIRLit, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir,
+    CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType,
 };
 use copper_core::frontend_ir::SourceSpan;
 use copper_core::shir::{
     SHIRBody, SHIRCaseArm, SHIRCombBody, SHIRExpr, SHIRLit, SHIRLowerError, SHIRMatchArm,
-    SHIRModule, SHIROutputDrive, SHIRPattern, SHIRPhase, SHIRPhaseOutputArm, SHIRPort,
+    SHIRModule, SHIRPattern, SHIRPhase, SHIRPort,
     SHIRPortDir, SHIRPortKind, SHIRReg, SHIRRegUpdate, SHIRSeqBody, SHIRStmt,
-    SHIRSubmoduleInst, SHIRWire,
+    SHIRSubmoduleInst,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -60,17 +60,74 @@ fn lower_comb_body(
         .map(lower_submodule)
         .collect::<Result<_, _>>()?;
 
-    let wires = comb.wires.iter()
-        .map(|w| Ok(SHIRWire {
-            name: w.name.clone(),
-            ty: w.ty.clone(),
-            value: lower_expr(&w.value)?,
-        }))
-        .collect::<Result<Vec<_>, SHIRLowerError>>()?;
+    let stmts = lower_stmt_list(&comb.stmts, &std::collections::HashSet::new(), &HashMap::new())?;
 
-    let output_expr = lower_expr(&comb.output)?;
+    Ok(SHIRCombBody { submodules, stmts })
+}
 
-    Ok(SHIRCombBody { submodules, wires, output_expr })
+/// Lower a CHIR statement list into SHIR statements, handling wire promotion renames.
+/// Used in both comb body lowering and pre_edge lowering.
+fn lower_stmt_list(
+    stmts: &[CHIRStmt],
+    promoted_names: &std::collections::HashSet<String>,
+    renames: &HashMap<String, String>,
+) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            CHIRStmt::Wire { name, ty, value, .. } => {
+                out.push(SHIRStmt::Wire {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    value: rename_vars(lower_expr(value)?, renames),
+                });
+            }
+            CHIRStmt::PortWrite { port_name, value, .. } => {
+                out.push(SHIRStmt::PortDrive {
+                    port_name: port_name.clone(),
+                    value: rename_vars(lower_expr(value)?, renames),
+                });
+            }
+            CHIRStmt::If { condition, then_body, else_body, .. } => {
+                let then_stmts = lower_stmt_list(then_body, promoted_names, renames)?;
+                let else_stmts = else_body.as_ref()
+                    .map(|eb| lower_stmt_list(eb, promoted_names, renames))
+                    .transpose()?;
+                if !then_stmts.is_empty() || else_stmts.as_ref().map_or(false, |e| !e.is_empty()) {
+                    out.push(SHIRStmt::If {
+                        condition: rename_vars(lower_expr(condition)?, renames),
+                        then_stmts,
+                        else_stmts,
+                    });
+                }
+            }
+            CHIRStmt::Match { scrutinee, arms, .. } => {
+                let shir_arms = arms.iter()
+                    .map(|arm| {
+                        let stmts = lower_stmt_list(&arm.body, promoted_names, renames)?;
+                        Ok(SHIRMatchArm {
+                            patterns: arm.patterns.iter()
+                                .map(|p| lower_pattern(p))
+                                .collect::<Result<_, _>>()?,
+                            guard: arm.guard.as_ref()
+                                .map(|g| Ok(rename_vars(lower_expr(g)?, renames)))
+                                .transpose()?,
+                            stmts,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, SHIRLowerError>>()?;
+                if shir_arms.iter().any(|a| !a.stmts.is_empty()) {
+                    out.push(SHIRStmt::Match {
+                        scrutinee: rename_vars(lower_expr(scrutinee)?, renames),
+                        arms: shir_arms,
+                    });
+                }
+            }
+            // Assign, AwaitTick — not pre_edge statements
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 fn lower_submodule(sub: &CHIRSubmoduleInst) -> Result<SHIRSubmoduleInst, SHIRLowerError> {
@@ -103,30 +160,7 @@ fn lower_seq_body(
         return Err(SHIRLowerError::NoTick { span: module_span });
     }
 
-    // Step 3: Check for emit inside branches in any segment
-    for segment in &segments {
-        check_no_emit_in_branch(segment, module_span)?;
-    }
-
-    // Step 4: Determine if there's an output port
-    let has_output = false; // determined from ports — caller should pass this; we detect from emits
-
-    // Step 5: Detect all emits (flat top-level only)
-    // Each segment gets at most one emit.
-    // emit in seg K → output arm for phase K (or phase N-1 for trailing seg N)
-    let mut output_arms: Vec<(usize, SHIRExpr)> = Vec::new();
-    for (seg_idx, segment) in segments.iter().enumerate() {
-        let phase_idx = phase_for_segment(seg_idx, n_ticks);
-        if let Some(emit_expr) = extract_segment_emit(segment, module_span)? {
-            // Check for duplicate emit in same phase
-            if output_arms.iter().any(|(p, _)| *p == phase_idx) {
-                return Err(SHIRLowerError::MultipleEmits { span: module_span });
-            }
-            output_arms.push((phase_idx, emit_expr));
-        }
-    }
-
-    // Step 6: Build wire-to-segment map for register promotion analysis
+    // Step 3: Build wire-to-segment map for register promotion analysis
     // Maps wire name → segment index where it was declared
     let wire_segment: HashMap<String, usize> = segments.iter().enumerate()
         .flat_map(|(seg_idx, stmts)| {
@@ -278,15 +312,11 @@ fn lower_seq_body(
         });
     }
 
-    // Step 11: Build output drive
-    let output_drive = build_output_drive(output_arms, n_ticks, module_span)?;
-
     Ok(SHIRSeqBody {
         clock: seq.clock.clone(),
         registers,
         submodules,
         phases,
-        output_drive,
     })
 }
 
@@ -383,173 +413,17 @@ fn check_no_tick_in_branch(stmt: &CHIRStmt, span: SourceSpan) -> Result<(), SHIR
     }
 }
 
-fn check_no_emit_in_branch(stmts: &[CHIRStmt], span: SourceSpan) -> Result<(), SHIRLowerError> {
-    for stmt in stmts {
-        match stmt {
-            CHIRStmt::If { then_body, else_body, span: s, .. } => {
-                check_emit_absent(then_body, *s)?;
-                if let Some(eb) = else_body {
-                    check_emit_absent(eb, *s)?;
-                }
-            }
-            CHIRStmt::Match { arms, span: s, .. } => {
-                for arm in arms {
-                    check_emit_absent(&arm.body, *s)?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn check_emit_absent(stmts: &[CHIRStmt], span: SourceSpan) -> Result<(), SHIRLowerError> {
-    for stmt in stmts {
-        if matches!(stmt, CHIRStmt::Emit { .. }) {
-            return Err(SHIRLowerError::EmitInsideBranch { span });
-        }
-        match stmt {
-            CHIRStmt::If { then_body, else_body, span: s, .. } => {
-                check_emit_absent(then_body, *s)?;
-                if let Some(eb) = else_body { check_emit_absent(eb, *s)?; }
-            }
-            CHIRStmt::Match { arms, .. } => {
-                for arm in arms { check_emit_absent(&arm.body, span)?; }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-// ── Helpers: emit extraction ──────────────────────────────────────────────────
-
-/// Extract the flat top-level emit from a segment, if present.
-/// Returns `Err` if there are multiple emits.
-fn extract_segment_emit(
-    stmts: &[CHIRStmt],
-    span: SourceSpan,
-) -> Result<Option<SHIRExpr>, SHIRLowerError> {
-    let mut found: Option<SHIRExpr> = None;
-    for stmt in stmts {
-        if let CHIRStmt::Emit { value, .. } = stmt {
-            if found.is_some() {
-                return Err(SHIRLowerError::MultipleEmits { span });
-            }
-            found = Some(lower_expr(value)?);
-        }
-    }
-    Ok(found)
-}
-
-// ── Helpers: output drive ─────────────────────────────────────────────────────
-
-fn build_output_drive(
-    output_arms: Vec<(usize, SHIRExpr)>,
-    n_ticks: usize,
-    span: SourceSpan,
-) -> Result<Option<SHIROutputDrive>, SHIRLowerError> {
-    if output_arms.is_empty() {
-        return Ok(None);
-    }
-
-    if n_ticks == 1 {
-        // Single-tick: one emit, either PreEdge (seg_0) or PostEdge (seg_1)
-        let (phase_idx, expr) = output_arms.into_iter().next().unwrap();
-        // phase_idx encodes which segment the emit came from
-        // But we need to know which segment it was in for PreEdge vs PostEdge
-        // This is determined by the segment index, which equals phase_idx for seg_0
-        // and is n_ticks for trailing. We store segment index, not phase index.
-        // For single-tick: seg_0 emit → PreEdge, seg_1 emit → PostEdge
-        // phase_idx for seg_0 = 0, for seg_1 = phase_for_segment(1, 1) = 0 also.
-        // So we need to track segment index separately. Let's fix the approach:
-        // (see note in build_output_drive_from_segs)
-        //
-        // For now, we use the approach that the arms vector carries segment indices.
-        // The caller (lower_seq_body) passes phase indices. For single-tick,
-        // both seg_0 and seg_1 map to phase_0. We differentiate by checking
-        // if the emit was in the trailing segment (seg_n_ticks) which is PostEdge.
-        // This requires passing segment index, not phase index.
-        //
-        // We fix this by storing raw segment indices in output_arms.
-        // The phase_idx stored is actually the segment index in our current impl.
-        // For single-tick: seg_0=0 → PreEdge, seg_1=1 → PostEdge.
-        if phase_idx == 0 {
-            Ok(Some(SHIROutputDrive::PreEdge(expr)))
-        } else {
-            Ok(Some(SHIROutputDrive::PostEdge(expr)))
-        }
-    } else {
-        // Multi-tick: PhaseConditional
-        let arms: Vec<SHIRPhaseOutputArm> = output_arms.into_iter()
-            .map(|(phase_idx, value)| SHIRPhaseOutputArm { phase_idx, value })
-            .collect();
-        Ok(Some(SHIROutputDrive::PhaseConditional { arms, default: None }))
-    }
-}
-
 // ── Helpers: pre-edge statement lowering ──────────────────────────────────────
 
-/// Lower the wire/combinational statements from a segment into `SHIRStmt`s for `pre_edge`.
-/// Register assigns and emits are skipped (they go to post_edge or output_drive).
-/// `renames` maps promoted wire names to their `_r` register equivalents for the current phase.
+/// Lower the wire/port-drive/conditional statements from a segment into `SHIRStmt`s for `pre_edge`.
+/// Register assigns and AwaitTick are skipped (they go to post_edge).
+/// PortWrite → PortDrive (output port drives are allowed here, including inside branches).
 fn lower_pre_edge_stmts(
     stmts: &[CHIRStmt],
     promoted_names: &HashSet<String>,
     renames: &HashMap<String, String>,
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
-    let mut out = Vec::new();
-    for stmt in stmts {
-        match stmt {
-            CHIRStmt::Wire { name, ty, value, .. } => {
-                // Promoted wires still appear in pre_edge — they compute the current
-                // value which is then captured into a register at the phase edge.
-                out.push(SHIRStmt::Wire {
-                    name: name.clone(),
-                    ty: ty.clone(),
-                    value: rename_vars(lower_expr(value)?, renames),
-                });
-            }
-            CHIRStmt::If { condition, then_body, else_body, .. } => {
-                let then_stmts = lower_pre_edge_stmts(then_body, promoted_names, renames)?;
-                let else_stmts = else_body.as_ref()
-                    .map(|eb| lower_pre_edge_stmts(eb, promoted_names, renames))
-                    .transpose()?;
-                if !then_stmts.is_empty() || else_stmts.as_ref().map_or(false, |e| !e.is_empty()) {
-                    out.push(SHIRStmt::If {
-                        condition: rename_vars(lower_expr(condition)?, renames),
-                        then_stmts,
-                        else_stmts,
-                    });
-                }
-            }
-            CHIRStmt::Match { scrutinee, arms, .. } => {
-                let shir_arms = arms.iter()
-                    .map(|arm| {
-                        let stmts = lower_pre_edge_stmts(&arm.body, promoted_names, renames)?;
-                        Ok(SHIRMatchArm {
-                            patterns: arm.patterns.iter()
-                                .map(|p| lower_pattern(p))
-                                .collect::<Result<_, _>>()?,
-                            guard: arm.guard.as_ref()
-                                .map(|g| Ok(rename_vars(lower_expr(g)?, renames)))
-                                .transpose()?,
-                            stmts,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, SHIRLowerError>>()?;
-                if shir_arms.iter().any(|a| !a.stmts.is_empty()) {
-                    out.push(SHIRStmt::Match {
-                        scrutinee: rename_vars(lower_expr(scrutinee)?, renames),
-                        arms: shir_arms,
-                    });
-                }
-            }
-            // Assign, Emit, AwaitTick — not pre_edge statements
-            _ => {}
-        }
-    }
-    Ok(out)
+    lower_stmt_list(stmts, promoted_names, renames)
 }
 
 // ── Helpers: register update extraction ──────────────────────────────────────
@@ -769,7 +643,7 @@ fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
     match stmt {
         CHIRStmt::Wire { value, .. } => collect_expr_vars(value, visitor),
         CHIRStmt::Assign { value, .. } => collect_expr_vars(value, visitor),
-        CHIRStmt::Emit { value, .. } => collect_expr_vars(value, visitor),
+        CHIRStmt::PortWrite { value, .. } => collect_expr_vars(value, visitor),
         CHIRStmt::If { condition, then_body, else_body, .. } => {
             collect_expr_vars(condition, visitor);
             for s in then_body { collect_expr_vars_in_stmt(s, visitor); }
@@ -958,7 +832,7 @@ impl HasSpan for CHIRStmt {
         match self {
             CHIRStmt::Wire { span, .. } => span,
             CHIRStmt::Assign { span, .. } => span,
-            CHIRStmt::Emit { span, .. } => span,
+            CHIRStmt::PortWrite { span, .. } => span,
             CHIRStmt::AwaitTick { span, .. } => span,
             CHIRStmt::If { span, .. } => span,
             CHIRStmt::Match { span, .. } => span,
@@ -972,8 +846,8 @@ impl HasSpan for CHIRStmt {
 mod tests {
     use super::*;
     use copper_core::chir::{
-        CHIRBody, CHIRCombBody, CHIRLit, CHIRModule, CHIRPortDir, CHIRPortKind, CHIRSeqBody,
-        CHIRType, CHIRWireDecl,
+        CHIRBody, CHIRLit, CHIRModule, CHIRPortDir, CHIRPortKind, CHIRSeqBody,
+        CHIRType,
     };
     use copper_core::frontend_ir::SourceSpan;
 
@@ -1066,7 +940,14 @@ mod tests {
         assert_eq!(shir.name, "add");
         assert!(matches!(shir.body, SHIRBody::Combinational(_)));
         if let SHIRBody::Combinational(body) = &shir.body {
-            assert!(matches!(&body.output_expr, SHIRExpr::BinOp { .. }));
+            // Final expression `a + b` becomes PortDrive to "out"
+            assert_eq!(body.stmts.len(), 1);
+            if let SHIRStmt::PortDrive { port_name, value } = &body.stmts[0] {
+                assert_eq!(port_name, "out");
+                assert!(matches!(value, SHIRExpr::BinOp { .. }));
+            } else {
+                panic!("expected PortDrive");
+            }
         }
     }
 
@@ -1075,7 +956,12 @@ mod tests {
         let chir = make_chir("fn pass(a: u8) -> u8 { a }");
         let shir = lower_to_shir(&chir).unwrap();
         if let SHIRBody::Combinational(body) = &shir.body {
-            assert!(matches!(&body.output_expr, SHIRExpr::Var(_)));
+            assert_eq!(body.stmts.len(), 1);
+            if let SHIRStmt::PortDrive { value, .. } = &body.stmts[0] {
+                assert!(matches!(value, SHIRExpr::Var(_)));
+            } else {
+                panic!("expected PortDrive");
+            }
         } else {
             panic!("expected combinational");
         }
@@ -1105,23 +991,6 @@ mod tests {
             assert!(phase.post_edge.iter().any(|u| u.target == "count"));
         } else {
             panic!("expected sequential");
-        }
-    }
-
-    #[test]
-    fn test_lower_seq_emit_before_tick_is_pre_edge() {
-        // No output port, no emit → output_drive should be None
-        let chir = make_chir(
-            "async fn counter(clk: Clock<MainClk>) {
-                let mut count: u8 = 0u8;
-                loop {
-                    clk.tick().await;
-                }
-            }"
-        );
-        let shir = lower_to_shir(&chir).unwrap();
-        if let SHIRBody::Sequential(body) = &shir.body {
-            assert!(body.output_drive.is_none());
         }
     }
 
@@ -1265,26 +1134,6 @@ mod tests {
         }
     }
 
-    // ── Emit validation ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_emit_inside_branch_rejected() {
-        // Manually construct a CHIR module with emit inside an if branch
-        // This exercises the check_emit_absent validation
-        let stmts = vec![CHIRStmt::If {
-            condition: CHIRExpr::Var("cond".to_string()),
-            then_body: vec![CHIRStmt::Emit {
-                value: CHIRExpr::Var("count".to_string()),
-                span: span(),
-            }],
-            else_body: None,
-            span: span(),
-        }];
-        let result = check_emit_absent(&stmts[0..1], span());
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SHIRLowerError::EmitInsideBranch { .. }));
-    }
-
     // ── End-to-end ───────────────────────────────────────────────────────────
 
     #[test]
@@ -1380,14 +1229,13 @@ mod tests {
         // Two-tick module: step1 computed in phase_0, used in phase_1.
         // phase_1's expressions should reference step1_r, not step1.
         let chir = make_chir(
-            "async fn two_cycle_op(clk: Clock<MainClk>, input: u8) -> u8 {
+            "async fn two_cycle_op(clk: Clock<MainClk>, input: u8) {
                 let mut acc: u8 = 0u8;
                 loop {
                     clk.tick().await;
                     let step1: u8 = input.wrapping_add(1u8);
                     clk.tick().await;
                     acc = step1.wrapping_add(step1);
-                    emit!(acc);
                 }
             }"
         );

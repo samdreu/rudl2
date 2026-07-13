@@ -1,7 +1,7 @@
 use copper_core::chir::{
     CHIRBinOp, CHIRBody, CHIRCaseArm, CHIRCombBody, CHIRExpr, CHIRLit, CHIRLowerError,
     CHIRMatchArm, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
-    CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp, CHIRWireDecl,
+    CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp,
 };
 use copper_core::frontend_ir::{
     ExprType, FrontendClassification, FrontendModuleIR, RawStmt, RawStmtKind, SourceSpan,
@@ -169,6 +169,47 @@ fn lower_init_to_lit(expr: &ExprType) -> Option<CHIRLit> {
     }
 }
 
+// ── Port wrapper helpers ──────────────────────────────────────────────────────
+
+/// Extract inner type `T` from `In<T,D>` or `Out<T,D>`.
+/// `prefix` is `"In<"` or `"Out<"`, `compact` is the whitespace-stripped type text.
+fn strip_port_wrapper<'a>(prefix: &str, compact: &'a str) -> Option<&'a str> {
+    let after_open = compact.strip_prefix(prefix)?;
+    let content = outer_generic_content(after_open)?;
+    Some(first_comma_split(content))
+}
+
+/// Content before the first `>` at bracket depth 0 in `after_open`.
+/// "Logic,MainClk>" → "Logic,MainClk"
+/// "Bits<8>,MainClk>" → "Bits<8>,MainClk"
+fn outer_generic_content(after_open: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (i, c) in after_open.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth == 0 => return Some(&after_open[..i]),
+            '>' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Text before the first top-level comma in `s`.
+/// "T,D" → "T"   "Bits<8>,D" → "Bits<8>"
+fn first_comma_split(s: &str) -> &str {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return &s[..i],
+            _ => {}
+        }
+    }
+    s
+}
+
 // ── Port extraction ───────────────────────────────────────────────────────────
 
 fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> {
@@ -189,7 +230,24 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
                 kind: CHIRPortKind::Clock { domain },
                 span: param.span,
             });
+        } else if let Some(inner) = strip_port_wrapper("In<", &compact) {
+            let ty = resolve_type(inner, param.ty.span)?;
+            ports.push(CHIRPort {
+                name: param.name.clone(),
+                direction: CHIRPortDir::Input,
+                kind: CHIRPortKind::Data { ty },
+                span: param.span,
+            });
+        } else if let Some(inner) = strip_port_wrapper("Out<", &compact) {
+            let ty = resolve_type(inner, param.ty.span)?;
+            ports.push(CHIRPort {
+                name: param.name.clone(),
+                direction: CHIRPortDir::Output,
+                kind: CHIRPortKind::Data { ty },
+                span: param.span,
+            });
         } else {
+            // Plain type — input data port (for combinational modules and hardware submodules)
             let ty = resolve_type(&param.ty.ty_text, param.ty.span)?;
             ports.push(CHIRPort {
                 name: param.name.clone(),
@@ -200,6 +258,7 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
         }
     }
 
+    // Return type → output port named "out" (combinational-module style)
     if let Some(ret_ty) = &fir.signature.return_ty {
         let ty = resolve_type(&ret_ty.ty_text, ret_ty.span)?;
         ports.push(CHIRPort {
@@ -220,13 +279,19 @@ fn lower_comb_body(
     hardware_fns: &std::collections::HashSet<String>,
     registry: &ModuleRegistry,
 ) -> Result<CHIRCombBody, CHIRLowerError> {
+    let has_return = fir.signature.return_ty.is_some();
     let mut ctx = LowerCtx::new(hardware_fns, registry);
+    ctx.output_ports = fir.signature.params.iter()
+        .filter_map(|p| {
+            let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
+        })
+        .collect();
 
-    let mut wires = Vec::new();
-    let mut output_expr: Option<CHIRExpr> = None;
+    let mut stmts = Vec::new();
 
-    for stmt in &fir.raw_statements {
-        match &stmt.kind {
+    for raw_stmt in &fir.raw_statements {
+        match &raw_stmt.kind {
             RawStmtKind::Local(local) => {
                 if let Some(init) = &local.init {
                     let ty = match &local.ty {
@@ -234,7 +299,7 @@ fn lower_comb_body(
                         None => infer_type_from_expr(init, local.span)?,
                     };
                     let value = lower_expr(init, &mut ctx)?;
-                    wires.push(CHIRWireDecl {
+                    stmts.push(CHIRStmt::Wire {
                         name: local.name.clone(),
                         ty,
                         value,
@@ -242,23 +307,26 @@ fn lower_comb_body(
                     });
                 }
             }
-            RawStmtKind::Expr(expr_stmt) if !expr_stmt.has_semi => {
-                output_expr = Some(lower_expr(&expr_stmt.expr, &mut ctx)?);
+            RawStmtKind::Expr(expr_stmt) => {
+                if !expr_stmt.has_semi && has_return {
+                    // Final expression in return-type function → drive the "out" port
+                    let value = lower_expr(&expr_stmt.expr, &mut ctx)?;
+                    stmts.push(CHIRStmt::PortWrite {
+                        port_name: "out".to_string(),
+                        value,
+                        span: expr_stmt.span,
+                    });
+                } else {
+                    lower_expr_stmt(&expr_stmt.expr, raw_stmt.span, &mut ctx, &mut stmts)?;
+                }
             }
-            _ => {}
+            RawStmtKind::Item(_) => {}
         }
     }
 
-    let output = output_expr.ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
-        description: "combinational module has no output expression".to_string(),
-        span: fir.span,
-        suggested_rewrite: Some("add a final expression matching the return type".to_string()),
-    })?;
-
     Ok(CHIRCombBody {
         submodules: ctx.submodules,
-        wires,
-        output,
+        stmts,
     })
 }
 
@@ -324,6 +392,12 @@ fn lower_seq_body(
 
     let mut ctx = LowerCtx::new(hardware_fns, registry);
     ctx.clock_name = clock.clone();
+    ctx.output_ports = fir.signature.params.iter()
+        .filter_map(|p| {
+            let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
+        })
+        .collect();
 
     let loop_body = lower_stmts(loop_stmts, &mut ctx)?;
 
@@ -336,43 +410,12 @@ fn lower_seq_body(
         });
     }
 
-    // Validate: emit! used without an output port
-    let has_output_port = fir.signature.return_ty.is_some();
-    let has_emit = contains_emit(&loop_body);
-    if has_emit && !has_output_port {
-        return Err(CHIRLowerError::EmitWithoutOutput { span: fir.span });
-    }
-    if has_output_port && !has_emit {
-        return Err(CHIRLowerError::OutputWithoutEmit { span: fir.span });
-    }
-
     Ok(CHIRSeqBody {
         clock,
         registers,
         submodules: ctx.submodules,
         loop_body,
     })
-}
-
-fn contains_emit(stmts: &[CHIRStmt]) -> bool {
-    for stmt in stmts {
-        match stmt {
-            CHIRStmt::Emit { .. } => return true,
-            CHIRStmt::If { then_body, else_body, .. } => {
-                if contains_emit(then_body) { return true; }
-                if let Some(eb) = else_body {
-                    if contains_emit(eb) { return true; }
-                }
-            }
-            CHIRStmt::Match { arms, .. } => {
-                for arm in arms {
-                    if contains_emit(&arm.body) { return true; }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 // ── Lowering context ──────────────────────────────────────────────────────────
@@ -383,6 +426,8 @@ struct LowerCtx<'a> {
     submodules: Vec<CHIRSubmoduleInst>,
     inst_counters: std::collections::HashMap<String, usize>,
     clock_name: String,
+    /// Names of `Out<T,D>` ports — used to validate `.write()` targets.
+    output_ports: std::collections::HashSet<String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -396,6 +441,7 @@ impl<'a> LowerCtx<'a> {
             submodules: Vec::new(),
             inst_counters: std::collections::HashMap::new(),
             clock_name: String::new(),
+            output_ports: std::collections::HashSet::new(),
         }
     }
 
@@ -471,20 +517,30 @@ fn lower_expr_stmt(
             }
         }
 
-        ExprType::Lit(lit) if lit.text.starts_with("emit!") || lit.text.starts_with("emit !") => {
-            let inner = extract_emit_arg(&lit.text).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
-                description: "could not parse emit!() argument".to_string(),
-                span,
-                suggested_rewrite: None,
-            })?;
-            let value = lower_text_expr(&inner, span)?;
-            out.push(CHIRStmt::Emit { value, span });
+        // port.write(value) → PortWrite
+        ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
+            let port_name = match mc.receiver.as_ref() {
+                ExprType::Lit(lit) => lit.text.trim().to_string(),
+                _ => return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: "port.write() receiver must be a simple port name".to_string(),
+                    span,
+                    suggested_rewrite: None,
+                }),
+            };
+            let value = lower_expr(&mc.args[0], ctx)?;
+            out.push(CHIRStmt::PortWrite { port_name, value, span });
         }
 
         ExprType::Assign(assign) => {
             let target = extract_assign_target(&assign.left, span)?;
             let value = lower_expr(&assign.right, ctx)?;
             out.push(CHIRStmt::Assign { target, value, span });
+        }
+
+        ExprType::Block(block) => {
+            for stmt in &block.stmts {
+                lower_stmt(stmt, ctx, out)?;
+            }
         }
 
         ExprType::If(if_expr) => {
@@ -504,14 +560,28 @@ fn lower_expr_stmt(
                 let patterns = parse_or_patterns(&arm.pattern_text, span)?;
                 let guard = arm.guard.as_ref().map(|g| lower_expr(g, ctx)).transpose()?;
                 let body_stmts = match arm.body.as_ref() {
+                    ExprType::Block(block) => lower_stmts(&block.stmts, ctx)?,
                     ExprType::If(_) | ExprType::Match(_) | ExprType::Assign(_) => {
                         let mut v = Vec::new();
                         lower_expr_stmt(&arm.body, span, ctx, &mut v)?;
                         v
                     }
+                    ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
+                        let port_name = match mc.receiver.as_ref() {
+                            ExprType::Lit(lit) => lit.text.trim().to_string(),
+                            _ => return Err(CHIRLowerError::UnsupportedConstruct {
+                                description: "port.write() receiver must be a simple port name".to_string(),
+                                span,
+                                suggested_rewrite: None,
+                            }),
+                        };
+                        let value = lower_expr(&mc.args[0], ctx)?;
+                        vec![CHIRStmt::PortWrite { port_name, value, span }]
+                    }
                     other => {
-                        let chir = lower_expr(other, ctx)?;
-                        vec![CHIRStmt::Emit { value: chir, span }]
+                        // Expression body — evaluate and discard (may have side effects via submodule calls)
+                        let _ = lower_expr(other, ctx)?;
+                        vec![]
                     }
                 };
                 arms.push(CHIRMatchArm { patterns, guard, body: body_stmts, span });
@@ -545,6 +615,7 @@ fn lower_else_branch(
     ctx: &mut LowerCtx,
 ) -> Result<Vec<CHIRStmt>, CHIRLowerError> {
     match branch {
+        ExprType::Block(block) => lower_stmts(&block.stmts, ctx),
         ExprType::If(if_expr) => {
             let mut out = Vec::new();
             lower_expr_stmt(&ExprType::If(if_expr.clone()), span, ctx, &mut out)?;
@@ -555,9 +626,21 @@ fn lower_else_branch(
             let value = lower_expr(&a.right, ctx)?;
             Ok(vec![CHIRStmt::Assign { target, value, span }])
         }
+        ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
+            let port_name = match mc.receiver.as_ref() {
+                ExprType::Lit(lit) => lit.text.trim().to_string(),
+                _ => return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: "port.write() receiver must be a simple port name".to_string(),
+                    span,
+                    suggested_rewrite: None,
+                }),
+            };
+            let value = lower_expr(&mc.args[0], ctx)?;
+            Ok(vec![CHIRStmt::PortWrite { port_name, value, span }])
+        }
         other => {
-            let chir = lower_expr(other, ctx)?;
-            Ok(vec![CHIRStmt::Emit { value: chir, span }])
+            let _ = lower_expr(other, ctx)?;
+            Ok(vec![])
         }
     }
 }
@@ -744,6 +827,9 @@ fn lower_method_call(
     ctx: &mut LowerCtx,
 ) -> Result<CHIRExpr, CHIRLowerError> {
     match mc.method.as_str() {
+        // port.read() → the current value of the port (lowers to Var)
+        "read" if mc.args.is_empty() => lower_expr(&mc.receiver, ctx),
+
         "wrapping_add" if mc.args.len() == 1 => {
             let left = lower_expr(&mc.receiver, ctx)?;
             let right = lower_expr(&mc.args[0], ctx)?;
@@ -940,11 +1026,7 @@ fn validate_module(module: &CHIRModule) -> Result<(), CHIRLowerError> {
                 }
                 known.insert(sub.output_wire.clone());
             }
-            for wire in &body.wires {
-                validate_expr(&wire.value, &known, wire.span)?;
-                known.insert(wire.name.clone());
-            }
-            validate_expr(&body.output, &known, module.span)?;
+            validate_stmts(&body.stmts, &mut known, module.span)?;
         }
         CHIRBody::Sequential(body) => {
             for reg in &body.registers {
@@ -977,7 +1059,7 @@ fn validate_stmts(
             CHIRStmt::Assign { value, span: s, .. } => {
                 validate_expr(value, known, *s)?;
             }
-            CHIRStmt::Emit { value, span: s } => {
+            CHIRStmt::PortWrite { value, span: s, .. } => {
                 validate_expr(value, known, *s)?;
             }
             CHIRStmt::AwaitTick { .. } => {}
@@ -1061,16 +1143,6 @@ fn is_tick_await(base: &ExprType) -> bool {
         ExprType::MethodCall(mc) => mc.method == "tick" && mc.args.is_empty(),
         _ => false,
     }
-}
-
-/// Extract the argument text from `emit!(arg)` or `emit ! (arg)`.
-/// Strips trailing semicolons before matching.
-fn extract_emit_arg(text: &str) -> Option<String> {
-    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    // Strip trailing semicolons (macros captured as statements include them)
-    let compact = compact.trim_end_matches(';');
-    let inner = compact.strip_prefix("emit!(")?.strip_suffix(')')?;
-    Some(inner.to_string())
 }
 
 fn extract_assign_target(expr: &ExprType, span: SourceSpan) -> Result<String, CHIRLowerError> {
@@ -1417,7 +1489,7 @@ mod tests {
 
     #[test]
     fn test_ports_clock_detected_as_clock_kind() {
-        let fir = make_fir("async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) -> u8 {}");
+        let fir = make_fir("async fn counter(clk: Clock<MainClk>, data: In<u8, MainClk>) {}");
         let ports = lower_ports(&fir).unwrap();
         assert!(matches!(ports[0].kind, CHIRPortKind::Clock { .. }));
         assert_eq!(ports[0].name, "clk");
@@ -1425,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_ports_clock_domain_extracted() {
-        let fir = make_fir("async fn m(clk: Clock<MyDomain>, x: u8) -> u8 {}");
+        let fir = make_fir("async fn m(clk: Clock<MyDomain>, x: u8) {}");
         let ports = lower_ports(&fir).unwrap();
         match &ports[0].kind {
             CHIRPortKind::Clock { domain } => assert_eq!(domain, "MyDomain"),
@@ -1434,9 +1506,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ports_arc_mutex_input_stripped_to_data() {
-        let fir = make_fir("async fn m(clk: Clock<C>, data: Arc<Mutex<u8>>) -> u8 {}");
+    fn test_ports_in_wrapper_becomes_input() {
+        let fir = make_fir("async fn m(clk: Clock<C>, data: In<u8, C>) {}");
         let ports = lower_ports(&fir).unwrap();
+        assert!(matches!(ports[1].direction, CHIRPortDir::Input));
         match &ports[1].kind {
             CHIRPortKind::Data { ty } => assert_eq!(*ty, CHIRType::UInt { width: 8 }),
             _ => panic!("expected data port"),
@@ -1444,8 +1517,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ports_out_wrapper_becomes_output() {
+        let fir = make_fir("async fn m(clk: Clock<C>, result: Out<u16, C>) {}");
+        let ports = lower_ports(&fir).unwrap();
+        let out = ports.iter().find(|p| p.name == "result").unwrap();
+        assert!(matches!(out.direction, CHIRPortDir::Output));
+        assert!(matches!(out.kind, CHIRPortKind::Data { ty: CHIRType::UInt { width: 16 } }));
+    }
+
+    #[test]
     fn test_ports_return_type_becomes_output_port() {
-        let fir = make_fir("async fn m(clk: Clock<C>, x: u8) -> u16 {}");
+        let fir = make_fir("fn m(x: u8) -> u16 { x as u16 }");
         let ports = lower_ports(&fir).unwrap();
         let out = ports.iter().find(|p| p.name == "out").unwrap();
         assert!(matches!(out.direction, CHIRPortDir::Output));
@@ -1453,21 +1535,29 @@ mod tests {
     }
 
     #[test]
-    fn test_ports_no_return_no_output_port() {
-        let fir = make_fir("async fn m(clk: Clock<C>, x: u8) {}");
+    fn test_ports_no_out_params_no_output_port() {
+        let fir = make_fir("async fn m(clk: Clock<C>, x: In<u8, C>) {}");
         let ports = lower_ports(&fir).unwrap();
-        assert!(ports.iter().all(|p| p.name != "out"));
+        assert!(ports.iter().all(|p| !matches!(p.direction, CHIRPortDir::Output)));
     }
 
     #[test]
-    fn test_ports_input_before_output_ordering() {
-        let fir = make_fir("async fn m(clk: Clock<C>, a: u8, b: u16) -> u32 {}");
+    fn test_ports_in_out_ordering() {
+        let fir = make_fir("async fn m(clk: Clock<C>, a: In<u8, C>, b: Out<u16, C>) {}");
         let ports = lower_ports(&fir).unwrap();
-        assert!(matches!(ports[0].direction, CHIRPortDir::Input));
-        assert!(matches!(ports[1].direction, CHIRPortDir::Input));
-        assert!(matches!(ports[2].direction, CHIRPortDir::Input));
-        assert!(matches!(ports[3].direction, CHIRPortDir::Output));
-        assert_eq!(ports[3].name, "out");
+        assert!(matches!(ports[0].direction, CHIRPortDir::Input)); // clk
+        assert!(matches!(ports[1].direction, CHIRPortDir::Input)); // a
+        assert!(matches!(ports[2].direction, CHIRPortDir::Output)); // b
+    }
+
+    #[test]
+    fn test_ports_in_bits_generic_parsed() {
+        let fir = make_fir("async fn m(clk: Clock<C>, data: In<Bits<8>, C>) {}");
+        let ports = lower_ports(&fir).unwrap();
+        match &ports[1].kind {
+            CHIRPortKind::Data { ty } => assert_eq!(*ty, CHIRType::UInt { width: 8 }),
+            _ => panic!("expected data port"),
+        }
     }
 
     // ── Pattern parsing ──────────────────────────────────────────────────────
@@ -1683,24 +1773,6 @@ mod tests {
         ));
     }
 
-    // ── emit! extraction ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_extract_emit_arg_simple() {
-        assert_eq!(extract_emit_arg("emit!(count)"), Some("count".to_string()));
-    }
-
-    #[test]
-    fn test_extract_emit_arg_with_spaces() {
-        assert_eq!(extract_emit_arg("emit ! (count)"), Some("count".to_string()));
-    }
-
-    #[test]
-    fn test_extract_emit_arg_with_trailing_semicolon() {
-        // Macros captured as statements include trailing semicolons
-        assert_eq!(extract_emit_arg("emit!(count);"), Some("count".to_string()));
-    }
-
     // ── While loop rejection ─────────────────────────────────────────────────
 
     #[test]
@@ -1713,36 +1785,6 @@ mod tests {
         assert!(matches!(
             lower_seq_body(&fir, &no_hw(), &empty_registry()),
             Err(CHIRLowerError::UnsupportedConstruct { .. })
-        ));
-    }
-
-    // ── Emit validation ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_emit_without_output_port_returns_error() {
-        // emit!() in loop body but no return type → EmitWithoutOutput
-        let fir = make_fir(
-            "async fn m(clk: Clock<C>, x: u8) {
-                loop { emit!(x); clk.tick().await; }
-            }"
-        );
-        assert!(matches!(
-            lower_seq_body(&fir, &no_hw(), &empty_registry()),
-            Err(CHIRLowerError::EmitWithoutOutput { .. })
-        ));
-    }
-
-    #[test]
-    fn test_output_port_without_emit_returns_error() {
-        // Module has return type (output port) but no emit!() → OutputWithoutEmit
-        let fir = make_fir(
-            "async fn m(clk: Clock<C>, x: u8) -> u8 {
-                loop { clk.tick().await; }
-            }"
-        );
-        assert!(matches!(
-            lower_seq_body(&fir, &no_hw(), &empty_registry()),
-            Err(CHIRLowerError::OutputWithoutEmit { .. })
         ));
     }
 
@@ -1777,7 +1819,7 @@ mod tests {
     #[test]
     fn test_seq_body_extracts_clock_name() {
         let fir = make_fir(
-            "async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+            "async fn counter(clk: Clock<MainClk>, data: In<u8, MainClk>) {
                 let mut count: u8 = 0u8;
                 loop { clk.tick().await; }
             }"
@@ -1789,7 +1831,7 @@ mod tests {
     #[test]
     fn test_seq_body_detects_register_decl() {
         let fir = make_fir(
-            "async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+            "async fn counter(clk: Clock<MainClk>, data: In<u8, MainClk>) {
                 let mut count: u8 = 0u8;
                 loop { clk.tick().await; }
             }"
@@ -1803,7 +1845,7 @@ mod tests {
     #[test]
     fn test_seq_body_loop_contains_await_tick() {
         let fir = make_fir(
-            "async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+            "async fn counter(clk: Clock<MainClk>, data: In<u8, MainClk>) {
                 let mut count: u8 = 0u8;
                 loop {
                     count = count;
@@ -1819,7 +1861,7 @@ mod tests {
     #[test]
     fn test_seq_body_missing_loop_returns_error() {
         let fir = make_fir(
-            "async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+            "async fn counter(clk: Clock<MainClk>) {
                 let mut count: u8 = 0u8;
             }"
         );
@@ -1832,7 +1874,7 @@ mod tests {
     #[test]
     fn test_seq_body_missing_tick_returns_error() {
         let fir = make_fir(
-            "async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+            "async fn counter(clk: Clock<MainClk>) {
                 loop {
                     let x: u8 = 0u8;
                 }
@@ -1847,7 +1889,7 @@ mod tests {
     #[test]
     fn test_seq_body_multiple_ticks_all_captured() {
         let fir = make_fir(
-            "async fn two_phase(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) {
+            "async fn two_phase(clk: Clock<MainClk>) {
                 loop {
                     clk.tick().await;
                     clk.tick().await;
@@ -1866,7 +1908,7 @@ mod tests {
     #[test]
     fn test_lower_to_chir_sequential_module_name() {
         let fir = make_fir(
-            "async fn my_counter(clk: Clock<MainClk>, step: Arc<Mutex<u8>>) {
+            "async fn my_counter(clk: Clock<MainClk>, step: In<u8, MainClk>) {
                 let mut count: u8 = 0u8;
                 loop { clk.tick().await; }
             }"
@@ -1897,15 +1939,17 @@ mod tests {
 
     #[test]
     fn test_validate_undefined_variable_returns_error() {
-        // Build a module manually with an undefined Var reference
-        use copper_core::chir::{CHIRCombBody, CHIRWireDecl};
+        use copper_core::chir::CHIRCombBody;
         let module = CHIRModule {
             name: "test".to_string(),
             ports: vec![],
             body: CHIRBody::Combinational(CHIRCombBody {
                 submodules: vec![],
-                wires: vec![],
-                output: CHIRExpr::Var("undefined_var".to_string()),
+                stmts: vec![CHIRStmt::PortWrite {
+                    port_name: "out".to_string(),
+                    value: CHIRExpr::Var("undefined_var".to_string()),
+                    span: span(),
+                }],
             }),
             span: span(),
         };
@@ -1926,12 +1970,21 @@ mod tests {
                     direction: CHIRPortDir::Input,
                     kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
                     span: span(),
-                }
+                },
+                CHIRPort {
+                    name: "out".to_string(),
+                    direction: CHIRPortDir::Output,
+                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
+                    span: span(),
+                },
             ],
             body: CHIRBody::Combinational(CHIRCombBody {
                 submodules: vec![],
-                wires: vec![],
-                output: CHIRExpr::Var("a".to_string()),
+                stmts: vec![CHIRStmt::PortWrite {
+                    port_name: "out".to_string(),
+                    value: CHIRExpr::Var("a".to_string()),
+                    span: span(),
+                }],
             }),
             span: span(),
         };
@@ -1949,12 +2002,18 @@ mod tests {
                     direction: CHIRPortDir::Input,
                     kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
                     span: span(),
-                }
+                },
+                CHIRPort {
+                    name: "out".to_string(),
+                    direction: CHIRPortDir::Output,
+                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
+                    span: span(),
+                },
             ],
             body: CHIRBody::Combinational(CHIRCombBody {
                 submodules: vec![],
-                wires: vec![
-                    CHIRWireDecl {
+                stmts: vec![
+                    CHIRStmt::Wire {
                         name: "doubled".to_string(),
                         ty: CHIRType::UInt { width: 8 },
                         value: CHIRExpr::BinOp {
@@ -1963,9 +2022,13 @@ mod tests {
                             right: Box::new(CHIRExpr::Var("a".to_string())),
                         },
                         span: span(),
-                    }
+                    },
+                    CHIRStmt::PortWrite {
+                        port_name: "out".to_string(),
+                        value: CHIRExpr::Var("doubled".to_string()),
+                        span: span(),
+                    },
                 ],
-                output: CHIRExpr::Var("doubled".to_string()),
             }),
             span: span(),
         };
@@ -2150,7 +2213,14 @@ mod tests {
         assert!(port_names.contains(&"out"));
 
         if let CHIRBody::Combinational(body) = &module.body {
-            assert!(matches!(body.output, CHIRExpr::BinOp { op: CHIRBinOp::Add { .. }, .. }));
+            // Final expression `a + b` becomes PortWrite to "out"
+            assert_eq!(body.stmts.len(), 1);
+            if let CHIRStmt::PortWrite { port_name, value, .. } = &body.stmts[0] {
+                assert_eq!(port_name, "out");
+                assert!(matches!(value, CHIRExpr::BinOp { op: CHIRBinOp::Add { .. }, .. }));
+            } else {
+                panic!("expected PortWrite");
+            }
         } else {
             panic!("expected combinational body");
         }
@@ -2182,8 +2252,13 @@ mod tests {
             assert_eq!(sub.inputs[1].0, "b");
             assert_eq!(sub.output_ty, CHIRType::UInt { width: 8 });
 
-            // Output of top connects to the submodule output wire
-            assert!(matches!(&body.output, CHIRExpr::Var(name) if name == "full_adder_0_out"));
+            // The PortWrite drives "out" with the submodule output wire
+            if let CHIRStmt::PortWrite { port_name, value, .. } = body.stmts.last().unwrap() {
+                assert_eq!(port_name, "out");
+                assert!(matches!(value, CHIRExpr::Var(name) if name == "full_adder_0_out"));
+            } else {
+                panic!("expected PortWrite");
+            }
         } else {
             panic!("expected combinational body");
         }
