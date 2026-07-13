@@ -198,10 +198,10 @@ fn branch_taken(rv1: Bits<32>, rv2: Bits<32>, f3: usize) -> bool {
 #[hardware(sequential)]
 async fn rv32i_cpu_pipelined(
     clk: Clock<MainClk>,
-    program: In<Vec<Bits<32>>>,
-    program_counter: Out<Bits<32>>,
-    halted: Out<Logic>,
-    a0_out: Out<Bits<32>>,
+    program: In<Vec<Bits<32>>, MainClk>,
+    program_counter: Out<Bits<32>, MainClk>,
+    halted: Out<Logic, MainClk>,
+    a0_out: Out<Bits<32>, MainClk>,
 ) {
     // Unified address space: instruction fetch and data loads/stores all hit
     // the same Vec.  run_program pads it to 1024 words so the stack region
@@ -439,10 +439,10 @@ fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let mut clk  = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (prog_out, prog_in)     = wire::<Vec<Bits<32>>, ()>(vec![]);
-    let (pc_out,  _pc_in)       = wire::<Bits<32>, ()>(Bits::zero());
-    let (halt_out, halt_in)     = wire::<Logic, ()>(Logic::Zero);
-    let (a0_out,  a0_in)        = wire::<Bits<32>, ()>(Bits::zero());
+    let (prog_out, prog_in)     = wire::<Vec<Bits<32>>, MainClk>(vec![]);
+    let (pc_out,  _pc_in)       = wire::<Bits<32>, MainClk>(Bits::zero());
+    let (halt_out, halt_in)     = wire::<Logic, MainClk>(Logic::Zero);
+    let (a0_out,  a0_in)        = wire::<Bits<32>, MainClk>(Bits::zero());
 
     prog_out.write(program_bits);
     exec.spawn(rv32i_cpu_pipelined(clk.clone(), prog_in, pc_out, halt_out, a0_out));

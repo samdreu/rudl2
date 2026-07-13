@@ -190,6 +190,9 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
                     Some("Clock") => has_clock = true,
                     Some("In")    => has_in = true,
                     Some("Out")   => has_out = true,
+                    // Some("Vec")   => {
+                    //     // Handle Vec<In<T>> or Vec<Out<T>> if needed
+                    // }
                     _ => {
                         return Err(Error::new_spanned(
                             &pat_ty.ty,

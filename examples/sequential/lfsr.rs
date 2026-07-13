@@ -8,9 +8,9 @@ impl ClockDomain for MainClk {}
 // assuming width of 32 and initial value of 1
 async fn lfsr (
     clk: Clock<MainClk>,
-    reset_i: In<Logic>,
-    yumi_i: In<Logic>,
-    o: Out<Bits<32>>,
+    reset_i: In<Logic, MainClk>,
+    yumi_i: In<Logic, MainClk>,
+    o: Out<Bits<32>, MainClk>,
 ) {
     let xor_mask = Bits::from_u32((1 << 31) | (1 << 29) | (1 << 26) | (1 << 25));
     let mut state = Bits::from_u32(1);
@@ -35,9 +35,9 @@ fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (reset_i_drv, reset_i_in) = wire::<Logic, ()>(Logic::Zero);
-    let (yumi_i_drv, yumi_i_in) = wire::<Logic, ()>(Logic::Zero);
-    let (o_out, o_obs) = wire::<Bits<32>, ()>(Bits::from_u32(1));
+    let (reset_i_drv, reset_i_in) = wire::<Logic, MainClk>(Logic::Zero);
+    let (yumi_i_drv, yumi_i_in) = wire::<Logic, MainClk>(Logic::Zero);
+    let (o_out, o_obs) = wire::<Bits<32>, MainClk>(Bits::from_u32(1));
 
     let dh = o_out.dirty_handle();
     exec.spawn_wired(
