@@ -5,9 +5,22 @@ use crate::frontend_ir::SourceSpan;
 #[derive(Debug)]
 pub struct CHIRModule {
     pub name: String,
+    /// Module-level parameters (SystemVerilog `parameter`s). Empty until the
+    /// parametric-module work in M2; present now so parameters are additive
+    /// rather than a wide `usize -> Width` retrofit later. See
+    /// `TRANSPILATION_ROADMAP.md` decision #4 / task D1a.
+    pub params: Vec<ModuleParam>,
     pub ports: Vec<CHIRPort>,
     pub body: CHIRBody,
     pub span: SourceSpan,
+}
+
+/// A module-level parameter, e.g. `parameter N = 8`. `default` is the concrete
+/// value bound at the instantiation the transpiler was invoked on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleParam {
+    pub name: String,
+    pub default: Option<usize>,
 }
 
 // ── Ports ─────────────────────────────────────────────────────────────────────
@@ -39,9 +52,39 @@ pub enum CHIRPortKind {
 /// Hardware-native types only. All Rust-runtime types are stripped in Phase B.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CHIRType {
-    UInt { width: usize },
-    SInt { width: usize },
+    UInt { width: Width },
+    SInt { width: Width },
     Bool,
+}
+
+/// The bit width of a hardware value.
+///
+/// Today only `Concrete` is constructed — every current example is transpiled
+/// at concrete widths. The enum exists now so symbolic widths (`Bits<N>`) can be
+/// added in M2 as a new variant without re-typing the field across CHIR/SHIR/VLIR
+/// and their tests. See `TRANSPILATION_ROADMAP.md` decision #4 / task D1a.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Width {
+    /// A fully-resolved bit width.
+    Concrete(usize),
+    // M2: Param(String) — a `parameter N`
+    // M2: Sub(Box<Width>, usize) — e.g. `N - 1`
+}
+
+impl Width {
+    /// The resolved width. Panics on a non-concrete width — callers that can
+    /// legitimately encounter symbolic widths (M2+) must match explicitly.
+    pub fn concrete(&self) -> usize {
+        match self {
+            Width::Concrete(n) => *n,
+        }
+    }
+}
+
+impl From<usize> for Width {
+    fn from(n: usize) -> Self {
+        Width::Concrete(n)
+    }
 }
 
 // ── Module body ───────────────────────────────────────────────────────────────

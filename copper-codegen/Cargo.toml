@@ -3,6 +3,10 @@ name = "copper-codegen"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "copper-transpile"
+path = "src/main.rs"
+
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
 log = "0.4.29"

@@ -1,10 +1,11 @@
 use copper_core::chir::{
     CHIRBinOp, CHIRBody, CHIRCaseArm, CHIRCombBody, CHIRExpr, CHIRLit, CHIRLowerError,
     CHIRMatchArm, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
-    CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp,
+    CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
-    ExprType, FrontendClassification, FrontendModuleIR, RawStmt, RawStmtKind, SourceSpan,
+    ExprCall, ExprIndex, ExprType, FrontendClassification, FrontendModuleIR, RawStmt, RawStmtKind,
+    SourceSpan,
 };
 
 // ── Public type aliases ───────────────────────────────────────────────────────
@@ -33,6 +34,7 @@ pub fn lower_to_chir(
 
     let module = CHIRModule {
         name: fir.module_name.clone(),
+        params: Vec::new(),
         ports,
         body,
         span: fir.span,
@@ -54,19 +56,19 @@ pub fn resolve_type(ty_text: &str, span: SourceSpan) -> Result<CHIRType, CHIRLow
     }
 
     match compact.as_str() {
-        "u8"   => Ok(CHIRType::UInt { width: 8 }),
-        "u16"  => Ok(CHIRType::UInt { width: 16 }),
-        "u32"  => Ok(CHIRType::UInt { width: 32 }),
-        "u64"  => Ok(CHIRType::UInt { width: 64 }),
-        "u128" => Ok(CHIRType::UInt { width: 128 }),
-        "i8"   => Ok(CHIRType::SInt { width: 8 }),
-        "i16"  => Ok(CHIRType::SInt { width: 16 }),
-        "i32"  => Ok(CHIRType::SInt { width: 32 }),
-        "i64"  => Ok(CHIRType::SInt { width: 64 }),
-        "i128" => Ok(CHIRType::SInt { width: 128 }),
+        "u8"   => Ok(CHIRType::UInt { width: Width::Concrete(8) }),
+        "u16"  => Ok(CHIRType::UInt { width: Width::Concrete(16) }),
+        "u32"  => Ok(CHIRType::UInt { width: Width::Concrete(32) }),
+        "u64"  => Ok(CHIRType::UInt { width: Width::Concrete(64) }),
+        "u128" => Ok(CHIRType::UInt { width: Width::Concrete(128) }),
+        "i8"   => Ok(CHIRType::SInt { width: Width::Concrete(8) }),
+        "i16"  => Ok(CHIRType::SInt { width: Width::Concrete(16) }),
+        "i32"  => Ok(CHIRType::SInt { width: Width::Concrete(32) }),
+        "i64"  => Ok(CHIRType::SInt { width: Width::Concrete(64) }),
+        "i128" => Ok(CHIRType::SInt { width: Width::Concrete(128) }),
         "bool" => Ok(CHIRType::Bool),
-        "Bit"  => Ok(CHIRType::UInt { width: 1 }),
-        "Logic" => Ok(CHIRType::UInt { width: 1 }),
+        "Bit"  => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
+        "Logic" => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
         _ if compact.starts_with("Bits<") => parse_bits_type(&compact, span),
         _ => Err(CHIRLowerError::UnresolvableType {
             ty_text: ty_text.to_string(),
@@ -85,7 +87,7 @@ fn parse_bits_type(compact: &str, span: SourceSpan) -> Result<CHIRType, CHIRLowe
         .strip_prefix("Bits<")
         .and_then(|s| s.strip_suffix('>'));
     match inner.and_then(|s| s.parse::<usize>().ok()) {
-        Some(width) => Ok(CHIRType::UInt { width }),
+        Some(width) => Ok(CHIRType::UInt { width: Width::Concrete(width) }),
         None => Err(CHIRLowerError::UnresolvableType {
             ty_text: compact.to_string(),
             span,
@@ -95,15 +97,29 @@ fn parse_bits_type(compact: &str, span: SourceSpan) -> Result<CHIRType, CHIRLowe
 
 // ── Type inference from expressions ──────────────────────────────────────────
 
+/// A symbol table mapping in-scope names (ports, wires, registers) to their
+/// resolved hardware types. Used to infer widths of expressions that reference
+/// signals — e.g. `port.read()` or `wire & other`.
+type SymbolTable = std::collections::HashMap<String, CHIRType>;
+
 /// Infer `CHIRType` from an init expression when no explicit annotation exists.
 ///
 /// Handles:
-/// - Typed integer literals (`0u8`, `42u32`, `0x10i16`) → UInt/SInt
-/// - Boolean literals (`true`, `false`) → Bool
-/// - Cast expressions (`x as u8`) → resolve cast target type
+/// - Typed integer literals (`0u8`, `42u32`) and booleans
+/// - Cast expressions (`x as u8`) → cast target type
+/// - Signal references (`x`) and `x.read()` → the signal's declared type,
+///   looked up in `symbols` (this is what lets `Logic`/`Bits<N>` ports flow)
+/// - Unary ops (`!x`, `~x`, `-x`) → operand width
+/// - Binary ops: comparisons/logical (`==`, `<`, `&&`, …) → 1-bit `Bool`;
+///   arithmetic/bitwise/shift (`+`, `&`, `<<`, …) → operand width
+/// - `if`/`match` used as expressions → a branch's type
 ///
-/// Returns `AmbiguousWidth` for anything else.
-fn infer_type_from_expr(expr: &ExprType, span: SourceSpan) -> Result<CHIRType, CHIRLowerError> {
+/// Returns `AmbiguousWidth` when no width can be determined.
+fn infer_type_from_expr(
+    expr: &ExprType,
+    span: SourceSpan,
+    symbols: &SymbolTable,
+) -> Result<CHIRType, CHIRLowerError> {
     match expr {
         ExprType::Lit(lit) => {
             let compact: String = lit.text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -112,31 +128,148 @@ fn infer_type_from_expr(expr: &ExprType, span: SourceSpan) -> Result<CHIRType, C
             }
             match compact.as_str() {
                 "true" | "false" => return Ok(CHIRType::Bool),
+                "Logic::One" | "Logic::Zero" => {
+                    return Ok(CHIRType::UInt { width: Width::Concrete(1) })
+                }
                 _ => {}
+            }
+            // A bare identifier: resolve via the symbol table.
+            if is_ident(&compact) {
+                if let Some(ty) = symbols.get(&compact) {
+                    return Ok(ty.clone());
+                }
             }
             Err(CHIRLowerError::AmbiguousWidth { span })
         }
-        ExprType::Cast(cast) => {
-            resolve_type(&cast.target_ty.ty_text, cast.target_ty.span)
+        ExprType::Cast(cast) => resolve_type(&cast.target_ty.ty_text, cast.target_ty.span),
+        ExprType::Reference(r) => infer_type_from_expr(&r.expr, span, symbols),
+        ExprType::Unary(un) => infer_type_from_expr(&un.expr, span, symbols),
+        ExprType::Binary(bin) => {
+            if is_comparison_or_logical_op(&bin.op) {
+                Ok(CHIRType::Bool)
+            } else {
+                // Width follows the operands; try left, then right.
+                infer_type_from_expr(&bin.left, span, symbols)
+                    .or_else(|_| infer_type_from_expr(&bin.right, span, symbols))
+            }
         }
+        ExprType::MethodCall(mc) => match mc.method.as_str() {
+            // `.read()` on a port, and wrapping/lock/unwrap/clone wrappers, all
+            // carry the width of their receiver.
+            "read" | "lock" | "unwrap" | "clone" | "wrapping_add" | "wrapping_sub"
+            | "wrapping_mul" => infer_type_from_expr(&mc.receiver, span, symbols),
+            "as_bool" => Ok(CHIRType::Bool),
+            _ => infer_type_from_expr(&mc.receiver, span, symbols),
+        },
+        ExprType::Call(call) => infer_type_from_call(call, span),
+        // A single-bit index `x[i]` is 1-bit.
+        ExprType::Index(_) => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
+        ExprType::If(if_expr) => match &if_expr.else_branch {
+            Some(else_br) => infer_type_from_expr(else_br, span, symbols),
+            None => Err(CHIRLowerError::AmbiguousWidth { span }),
+        },
+        ExprType::Match(m) => m
+            .arms
+            .first()
+            .map(|a| infer_type_from_expr(&a.body, span, symbols))
+            .unwrap_or(Err(CHIRLowerError::AmbiguousWidth { span })),
+        // A block's type is its tail expression's type.
+        ExprType::Block(b) => b
+            .stmts
+            .iter()
+            .rev()
+            .find_map(|s| match &s.kind {
+                RawStmtKind::Expr(es) if !es.has_semi => Some(&es.expr),
+                _ => None,
+            })
+            .map(|e| infer_type_from_expr(e, span, symbols))
+            .unwrap_or(Err(CHIRLowerError::AmbiguousWidth { span })),
         _ => Err(CHIRLowerError::AmbiguousWidth { span }),
     }
+}
+
+/// True for operators that always produce a 1-bit boolean result.
+fn is_comparison_or_logical_op(op: &str) -> bool {
+    matches!(op, "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||")
+}
+
+/// The whitespace-stripped callee path of a call, e.g. `"Bits::from_u32"`.
+fn call_path(call: &ExprCall) -> Option<String> {
+    match &*call.func {
+        ExprType::Lit(lit) => Some(lit.text.chars().filter(|c| !c.is_whitespace()).collect()),
+        _ => None,
+    }
+}
+
+/// If `path` is a `Bits`-style value constructor, return its declared bit width.
+/// An explicit turbofish (`Bits::<8>::from_u8`) wins; otherwise the `from_uNN`
+/// name implies an NN-bit value (`from_u32` → 32) — the width the constructor
+/// names for its source value.
+fn constructor_width(path: &str) -> Option<usize> {
+    if let Some(w) = width_from_turbofish(path) {
+        return Some(w);
+    }
+    for (name, w) in [
+        ("from_u128", 128usize),
+        ("from_u64", 64),
+        ("from_u32", 32),
+        ("from_u16", 16),
+        ("from_u8", 8),
+    ] {
+        if path.ends_with(name) {
+            return Some(w);
+        }
+    }
+    None
+}
+
+/// Extract `N` from a turbofish segment, e.g. `Bits::<8>::from_u8` → `8`.
+fn width_from_turbofish(path: &str) -> Option<usize> {
+    let start = path.find("::<")? + 3;
+    let rest = &path[start..];
+    let end = rest.find('>')?;
+    rest[..end].trim().parse::<usize>().ok()
+}
+
+/// Infer the type of a constructor-style call such as `Bits::from_u32(x)`.
+fn infer_type_from_call(call: &ExprCall, span: SourceSpan) -> Result<CHIRType, CHIRLowerError> {
+    match call_path(call).as_deref().and_then(constructor_width) {
+        Some(w) => Ok(CHIRType::UInt { width: Width::Concrete(w) }),
+        None => Err(CHIRLowerError::AmbiguousWidth { span }),
+    }
+}
+
+/// Build a symbol table of a module's data ports (`In<T,D>` / `Out<T,D>`) mapping
+/// port name → inner hardware type. Clock ports are excluded.
+fn build_port_symbols(fir: &FrontendModuleIR) -> SymbolTable {
+    let mut symbols = SymbolTable::new();
+    for p in &fir.signature.params {
+        let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+        let inner = strip_port_wrapper("In<", &compact)
+            .or_else(|| strip_port_wrapper("Out<", &compact));
+        if let Some(inner) = inner {
+            if let Ok(ty) = resolve_type(inner, p.span) {
+                symbols.insert(p.name.clone(), ty);
+            }
+        }
+    }
+    symbols
 }
 
 /// Returns `Some(CHIRType)` if the literal text has an explicit Rust integer suffix.
 fn infer_type_from_suffix(compact: &str) -> Option<CHIRType> {
     let suffixes: &[(&str, CHIRType)] = &[
-        ("u128", CHIRType::UInt { width: 128 }),
-        ("u64",  CHIRType::UInt { width: 64 }),
-        ("u32",  CHIRType::UInt { width: 32 }),
-        ("u16",  CHIRType::UInt { width: 16 }),
-        ("u8",   CHIRType::UInt { width: 8 }),
-        ("i128", CHIRType::SInt { width: 128 }),
-        ("i64",  CHIRType::SInt { width: 64 }),
-        ("i32",  CHIRType::SInt { width: 32 }),
-        ("i16",  CHIRType::SInt { width: 16 }),
-        ("i8",   CHIRType::SInt { width: 8 }),
-        ("usize", CHIRType::UInt { width: 64 }),
+        ("u128", CHIRType::UInt { width: Width::Concrete(128) }),
+        ("u64",  CHIRType::UInt { width: Width::Concrete(64) }),
+        ("u32",  CHIRType::UInt { width: Width::Concrete(32) }),
+        ("u16",  CHIRType::UInt { width: Width::Concrete(16) }),
+        ("u8",   CHIRType::UInt { width: Width::Concrete(8) }),
+        ("i128", CHIRType::SInt { width: Width::Concrete(128) }),
+        ("i64",  CHIRType::SInt { width: Width::Concrete(64) }),
+        ("i32",  CHIRType::SInt { width: Width::Concrete(32) }),
+        ("i16",  CHIRType::SInt { width: Width::Concrete(16) }),
+        ("i8",   CHIRType::SInt { width: Width::Concrete(8) }),
+        ("usize", CHIRType::UInt { width: Width::Concrete(64) }),
     ];
     for (suffix, ty) in suffixes {
         if let Some(base) = compact.strip_suffix(suffix) {
@@ -156,7 +289,7 @@ fn lower_init_to_lit(expr: &ExprType) -> Option<CHIRLit> {
             let compact: String = lit.text.chars().filter(|c| !c.is_whitespace()).collect();
             if let Some((value, _)) = parse_int_literal(&compact) {
                 let ty = infer_type_from_suffix(&compact)
-                    .unwrap_or(CHIRType::UInt { width: 64 });
+                    .unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
                 return Some(CHIRLit { ty, value });
             }
             match compact.as_str() {
@@ -287,6 +420,7 @@ fn lower_comb_body(
             if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
         })
         .collect();
+    ctx.symbols = build_port_symbols(fir);
 
     let mut stmts = Vec::new();
 
@@ -296,9 +430,10 @@ fn lower_comb_body(
                 if let Some(init) = &local.init {
                     let ty = match &local.ty {
                         Some(t) => resolve_type(&t.ty_text, t.span)?,
-                        None => infer_type_from_expr(init, local.span)?,
+                        None => infer_type_from_expr(init, local.span, &ctx.symbols)?,
                     };
                     let value = lower_expr(init, &mut ctx)?;
+                    ctx.symbols.insert(local.name.clone(), ty.clone());
                     stmts.push(CHIRStmt::Wire {
                         name: local.name.clone(),
                         ty,
@@ -347,15 +482,23 @@ fn lower_seq_body(
 
     let mut registers = Vec::new();
     let mut loop_body_stmts: Option<&[RawStmt]> = None;
+    // Pre-loop non-`mut` `let`s: combinational constants/wires available in the
+    // loop body. Collected here, lowered once the context exists, and prepended
+    // to the loop body. Stored as (name, type, init expr, span).
+    let mut pre_loop_wires: Vec<(String, CHIRType, &ExprType, SourceSpan)> = Vec::new();
+    // Seeded with the module's ports so pre-loop register inits that reference
+    // ports (or later registers) can infer their width.
+    let mut symbols = build_port_symbols(fir);
 
     for stmt in &fir.raw_statements {
         match &stmt.kind {
             RawStmtKind::Local(local) if local.is_mut => {
                 let ty = match (&local.ty, &local.init) {
                     (Some(t), _) => resolve_type(&t.ty_text, t.span)?,
-                    (None, Some(init)) => infer_type_from_expr(init, local.span)?,
+                    (None, Some(init)) => infer_type_from_expr(init, local.span, &symbols)?,
                     (None, None) => return Err(CHIRLowerError::AmbiguousWidth { span: local.span }),
                 };
+                symbols.insert(local.name.clone(), ty.clone());
                 let init = local.init.as_ref().and_then(lower_init_to_lit);
                 registers.push(CHIRRegDecl {
                     name: local.name.clone(),
@@ -363,6 +506,18 @@ fn lower_seq_body(
                     init,
                     span: local.span,
                 });
+            }
+            RawStmtKind::Local(local) => {
+                // Pre-loop non-`mut` `let` → a combinational wire (often a
+                // constant) visible throughout the loop body.
+                if let Some(init) = &local.init {
+                    let ty = match &local.ty {
+                        Some(t) => resolve_type(&t.ty_text, t.span)?,
+                        None => infer_type_from_expr(init, local.span, &symbols)?,
+                    };
+                    symbols.insert(local.name.clone(), ty.clone());
+                    pre_loop_wires.push((local.name.clone(), ty, init, local.span));
+                }
             }
             RawStmtKind::Expr(expr_stmt) => {
                 match &expr_stmt.expr {
@@ -398,8 +553,21 @@ fn lower_seq_body(
             if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
         })
         .collect();
+    ctx.symbols = symbols;
 
-    let loop_body = lower_stmts(loop_stmts, &mut ctx)?;
+    // Emit pre-loop wires first so they are declared before any use, then the
+    // loop body itself.
+    let mut loop_body = Vec::new();
+    for (name, ty, init, span) in &pre_loop_wires {
+        let value = lower_expr(init, &mut ctx)?;
+        loop_body.push(CHIRStmt::Wire {
+            name: name.clone(),
+            ty: ty.clone(),
+            value,
+            span: *span,
+        });
+    }
+    loop_body.extend(lower_stmts(loop_stmts, &mut ctx)?);
 
     let has_tick = loop_body.iter().any(|s| matches!(s, CHIRStmt::AwaitTick { .. }));
     if !has_tick {
@@ -428,6 +596,8 @@ struct LowerCtx<'a> {
     clock_name: String,
     /// Names of `Out<T,D>` ports — used to validate `.write()` targets.
     output_ports: std::collections::HashSet<String>,
+    /// In-scope names (ports, wires, registers) → type, for width inference.
+    symbols: SymbolTable,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -442,6 +612,7 @@ impl<'a> LowerCtx<'a> {
             inst_counters: std::collections::HashMap::new(),
             clock_name: String::new(),
             output_ports: std::collections::HashSet::new(),
+            symbols: SymbolTable::new(),
         }
     }
 
@@ -474,9 +645,10 @@ fn lower_stmt(
             if let Some(init) = &local.init {
                 let ty = match &local.ty {
                     Some(t) => resolve_type(&t.ty_text, t.span)?,
-                    None => infer_type_from_expr(init, local.span)?,
+                    None => infer_type_from_expr(init, local.span, &ctx.symbols)?,
                 };
                 let value = lower_expr(init, ctx)?;
+                ctx.symbols.insert(local.name.clone(), ty.clone());
                 out.push(CHIRStmt::Wire {
                     name: local.name.clone(),
                     ty,
@@ -716,6 +888,10 @@ pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRL
         ExprType::Call(call) => {
             if call.is_hardware_module {
                 lower_hardware_call(call, ctx)
+            } else if let Some(width) = call_path(call).as_deref().and_then(constructor_width) {
+                // `Bits::from_u32(x)` etc. — the value is the argument,
+                // reinterpreted as a `width`-bit value.
+                lower_bits_constructor(call, width, ctx)
             } else {
                 Err(CHIRLowerError::UnsupportedConstruct {
                     description: "non-hardware function calls cannot appear in hardware expressions; add #[hardware]".to_string(),
@@ -746,11 +922,85 @@ pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRL
             }
         }
 
+        ExprType::Index(idx) => lower_index(idx, ctx),
+
+        // A block used as an expression (e.g. an `if`/`else` branch) evaluates to
+        // its tail expression.
+        ExprType::Block(b) => extract_block_expr_value(&b.stmts, b.span, ctx),
+
         other => Err(CHIRLowerError::UnsupportedConstruct {
             description: format!("expression type not supported in hardware: {:?}", std::mem::discriminant(other)),
             span: SourceSpan::default(),
             suggested_rewrite: None,
         }),
+    }
+}
+
+/// Lower a `Bits`-style value constructor (`Bits::from_u32(x)`): the result is
+/// its single argument reinterpreted as a `width`-bit value. A bare literal
+/// argument adopts the constructor width so downstream widths stay exact.
+fn lower_bits_constructor(
+    call: &ExprCall,
+    width: usize,
+    ctx: &mut LowerCtx,
+) -> Result<CHIRExpr, CHIRLowerError> {
+    let arg = call.args.first().ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: "value constructor requires one argument".to_string(),
+        span: call.span,
+        suggested_rewrite: None,
+    })?;
+    let lowered = lower_expr(arg, ctx)?;
+    // The argument is a `width`-bit value (Rust infers its literals as the
+    // constructor's source type, e.g. `u32`), so retype its literals to match.
+    Ok(retype_literals(lowered, width))
+}
+
+/// Set every bare literal in an arithmetic/bitwise expression tree to `width`
+/// bits. Used to give a constructor argument (`Bits::from_u32(1 << 31 | …)`) the
+/// constructor's width so it does not overflow into the default literal width.
+fn retype_literals(expr: CHIRExpr, width: usize) -> CHIRExpr {
+    match expr {
+        CHIRExpr::Lit(lit) => CHIRExpr::Lit(CHIRLit {
+            ty: CHIRType::UInt { width: Width::Concrete(width) },
+            value: lit.value,
+        }),
+        CHIRExpr::BinOp { left, op, right } => CHIRExpr::BinOp {
+            left: Box::new(retype_literals(*left, width)),
+            op,
+            right: Box::new(retype_literals(*right, width)),
+        },
+        CHIRExpr::UnOp { op, expr } => CHIRExpr::UnOp {
+            op,
+            expr: Box::new(retype_literals(*expr, width)),
+        },
+        // Named signals and structural ops already carry their own widths.
+        other => other,
+    }
+}
+
+/// Lower a bit-index `base[i]` to a single-bit slice. The index must be a
+/// compile-time constant (variable indices require loop unrolling, which is a
+/// separate lowering step).
+fn lower_index(idx: &ExprIndex, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
+    let base = lower_expr(&idx.base, ctx)?;
+    let bit = eval_const_usize(&idx.index).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: "bit index must be a compile-time constant".to_string(),
+        span: idx.span,
+        suggested_rewrite: Some("use a literal index, or unroll the loop so the index is constant".to_string()),
+    })?;
+    Ok(CHIRExpr::Slice { expr: Box::new(base), high: bit, low: bit })
+}
+
+/// Evaluate an expression to a constant `usize`, for use as a bit index.
+/// Currently only integer literals; extended to loop-variable substitution when
+/// `for`-loop unrolling lands.
+fn eval_const_usize(expr: &ExprType) -> Option<usize> {
+    match expr {
+        ExprType::Lit(lit) => {
+            let compact: String = lit.text.chars().filter(|c| !c.is_whitespace()).collect();
+            parse_int_literal(&compact).map(|(v, _)| v as usize)
+        }
+        _ => None,
     }
 }
 
@@ -762,13 +1012,16 @@ fn lower_lit_expr(text: &str, span: SourceSpan) -> Result<CHIRExpr, CHIRLowerErr
     }
 
     if let Some((value, _)) = parse_int_literal(&compact) {
-        let ty = infer_type_from_suffix(&compact).unwrap_or(CHIRType::UInt { width: 64 });
+        let ty = infer_type_from_suffix(&compact).unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
         return Ok(CHIRExpr::Lit(CHIRLit { ty, value }));
     }
 
     match compact.as_str() {
         "true"  => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::Bool, value: 1 })),
         "false" => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::Bool, value: 0 })),
+        // 4-state single-bit constants → 1-bit literals.
+        "Logic::One"  => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(1) }, value: 1 })),
+        "Logic::Zero" => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(1) }, value: 0 })),
         _ => {}
     }
 
@@ -827,8 +1080,9 @@ fn lower_method_call(
     ctx: &mut LowerCtx,
 ) -> Result<CHIRExpr, CHIRLowerError> {
     match mc.method.as_str() {
-        // port.read() → the current value of the port (lowers to Var)
-        "read" if mc.args.is_empty() => lower_expr(&mc.receiver, ctx),
+        // Value passthroughs (simulation-only conversions on already-hardware
+        // values): `port.read()`, `logic.as_bool()`. Lower to the receiver.
+        "read" | "as_bool" if mc.args.is_empty() => lower_expr(&mc.receiver, ctx),
 
         "wrapping_add" if mc.args.len() == 1 => {
             let left = lower_expr(&mc.receiver, ctx)?;
@@ -915,7 +1169,7 @@ fn lower_hardware_call(
         let output_ty = callee.signature.return_ty.as_ref()
             .map(|rt| resolve_type(&rt.ty_text, rt.span))
             .transpose()?
-            .unwrap_or(CHIRType::UInt { width: 1 });
+            .unwrap_or(CHIRType::UInt { width: Width::Concrete(1) });
 
         (inputs, output_ty)
     } else {
@@ -925,7 +1179,7 @@ fn lower_hardware_call(
             let expr = lower_expr(arg, ctx)?;
             inputs.push((format!("arg{}", i), expr));
         }
-        (inputs, CHIRType::UInt { width: 8 })
+        (inputs, CHIRType::UInt { width: Width::Concrete(8) })
     };
 
     ctx.submodules.push(CHIRSubmoduleInst {
@@ -958,7 +1212,7 @@ pub fn parse_pattern(text: &str, span: SourceSpan) -> Result<CHIRPattern, CHIRLo
     }
 
     if let Some((value, _)) = parse_int_literal(s) {
-        let ty = infer_type_from_suffix(s).unwrap_or(CHIRType::UInt { width: 64 });
+        let ty = infer_type_from_suffix(s).unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
         return Ok(CHIRPattern::Lit(CHIRLit { ty, value }));
     }
 
@@ -1299,20 +1553,20 @@ mod tests {
 
     #[test]
     fn test_resolve_primitive_uint_types() {
-        assert_eq!(resolve_type("u8",   span()).unwrap(), CHIRType::UInt { width: 8   });
-        assert_eq!(resolve_type("u16",  span()).unwrap(), CHIRType::UInt { width: 16  });
-        assert_eq!(resolve_type("u32",  span()).unwrap(), CHIRType::UInt { width: 32  });
-        assert_eq!(resolve_type("u64",  span()).unwrap(), CHIRType::UInt { width: 64  });
-        assert_eq!(resolve_type("u128", span()).unwrap(), CHIRType::UInt { width: 128 });
+        assert_eq!(resolve_type("u8",   span()).unwrap(), CHIRType::UInt { width: Width::Concrete(8) });
+        assert_eq!(resolve_type("u16",  span()).unwrap(), CHIRType::UInt { width: Width::Concrete(16) });
+        assert_eq!(resolve_type("u32",  span()).unwrap(), CHIRType::UInt { width: Width::Concrete(32) });
+        assert_eq!(resolve_type("u64",  span()).unwrap(), CHIRType::UInt { width: Width::Concrete(64) });
+        assert_eq!(resolve_type("u128", span()).unwrap(), CHIRType::UInt { width: Width::Concrete(128) });
     }
 
     #[test]
     fn test_resolve_primitive_sint_types() {
-        assert_eq!(resolve_type("i8",   span()).unwrap(), CHIRType::SInt { width: 8   });
-        assert_eq!(resolve_type("i16",  span()).unwrap(), CHIRType::SInt { width: 16  });
-        assert_eq!(resolve_type("i32",  span()).unwrap(), CHIRType::SInt { width: 32  });
-        assert_eq!(resolve_type("i64",  span()).unwrap(), CHIRType::SInt { width: 64  });
-        assert_eq!(resolve_type("i128", span()).unwrap(), CHIRType::SInt { width: 128 });
+        assert_eq!(resolve_type("i8",   span()).unwrap(), CHIRType::SInt { width: Width::Concrete(8) });
+        assert_eq!(resolve_type("i16",  span()).unwrap(), CHIRType::SInt { width: Width::Concrete(16) });
+        assert_eq!(resolve_type("i32",  span()).unwrap(), CHIRType::SInt { width: Width::Concrete(32) });
+        assert_eq!(resolve_type("i64",  span()).unwrap(), CHIRType::SInt { width: Width::Concrete(64) });
+        assert_eq!(resolve_type("i128", span()).unwrap(), CHIRType::SInt { width: Width::Concrete(128) });
     }
 
     #[test]
@@ -1322,21 +1576,21 @@ mod tests {
 
     #[test]
     fn test_resolve_bit_and_logic() {
-        assert_eq!(resolve_type("Bit",   span()).unwrap(), CHIRType::UInt { width: 1 });
-        assert_eq!(resolve_type("Logic", span()).unwrap(), CHIRType::UInt { width: 1 });
+        assert_eq!(resolve_type("Bit",   span()).unwrap(), CHIRType::UInt { width: Width::Concrete(1) });
+        assert_eq!(resolve_type("Logic", span()).unwrap(), CHIRType::UInt { width: Width::Concrete(1) });
     }
 
     #[test]
     fn test_resolve_bits_n() {
-        assert_eq!(resolve_type("Bits<8>",  span()).unwrap(), CHIRType::UInt { width: 8  });
-        assert_eq!(resolve_type("Bits<16>", span()).unwrap(), CHIRType::UInt { width: 16 });
-        assert_eq!(resolve_type("Bits<1>",  span()).unwrap(), CHIRType::UInt { width: 1  });
+        assert_eq!(resolve_type("Bits<8>",  span()).unwrap(), CHIRType::UInt { width: Width::Concrete(8) });
+        assert_eq!(resolve_type("Bits<16>", span()).unwrap(), CHIRType::UInt { width: Width::Concrete(16) });
+        assert_eq!(resolve_type("Bits<1>",  span()).unwrap(), CHIRType::UInt { width: Width::Concrete(1) });
     }
 
     #[test]
     fn test_resolve_arc_mutex_strips_wrapper() {
-        assert_eq!(resolve_type("Arc<Mutex<u8>>",  span()).unwrap(), CHIRType::UInt { width: 8  });
-        assert_eq!(resolve_type("Arc<Mutex<u32>>", span()).unwrap(), CHIRType::UInt { width: 32 });
+        assert_eq!(resolve_type("Arc<Mutex<u8>>",  span()).unwrap(), CHIRType::UInt { width: Width::Concrete(8) });
+        assert_eq!(resolve_type("Arc<Mutex<u32>>", span()).unwrap(), CHIRType::UInt { width: Width::Concrete(32) });
         assert_eq!(resolve_type("Arc<Mutex<bool>>", span()).unwrap(), CHIRType::Bool);
     }
 
@@ -1344,7 +1598,7 @@ mod tests {
     fn test_resolve_arc_mutex_with_whitespace() {
         assert_eq!(
             resolve_type("Arc< Mutex< u8 > >", span()).unwrap(),
-            CHIRType::UInt { width: 8 }
+            CHIRType::UInt { width: Width::Concrete(8) }
         );
     }
 
@@ -1376,15 +1630,15 @@ mod tests {
 
     #[test]
     fn test_infer_type_from_suffix_uint() {
-        assert_eq!(infer_type_from_suffix("0u8"),   Some(CHIRType::UInt { width: 8 }));
-        assert_eq!(infer_type_from_suffix("42u32"),  Some(CHIRType::UInt { width: 32 }));
-        assert_eq!(infer_type_from_suffix("10u64"),  Some(CHIRType::UInt { width: 64 }));
+        assert_eq!(infer_type_from_suffix("0u8"),   Some(CHIRType::UInt { width: Width::Concrete(8) }));
+        assert_eq!(infer_type_from_suffix("42u32"),  Some(CHIRType::UInt { width: Width::Concrete(32) }));
+        assert_eq!(infer_type_from_suffix("10u64"),  Some(CHIRType::UInt { width: Width::Concrete(64) }));
     }
 
     #[test]
     fn test_infer_type_from_suffix_sint() {
-        assert_eq!(infer_type_from_suffix("0i8"),   Some(CHIRType::SInt { width: 8 }));
-        assert_eq!(infer_type_from_suffix("42i16"),  Some(CHIRType::SInt { width: 16 }));
+        assert_eq!(infer_type_from_suffix("0i8"),   Some(CHIRType::SInt { width: Width::Concrete(8) }));
+        assert_eq!(infer_type_from_suffix("42i16"),  Some(CHIRType::SInt { width: Width::Concrete(16) }));
     }
 
     #[test]
@@ -1397,14 +1651,14 @@ mod tests {
     fn test_infer_type_from_expr_typed_literal() {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "0u8".to_string(), span: span() });
-        assert_eq!(infer_type_from_expr(&expr, span()).unwrap(), CHIRType::UInt { width: 8 });
+        assert_eq!(infer_type_from_expr(&expr, span(), &SymbolTable::new()).unwrap(), CHIRType::UInt { width: Width::Concrete(8) });
     }
 
     #[test]
     fn test_infer_type_from_expr_bool_literal() {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "true".to_string(), span: span() });
-        assert_eq!(infer_type_from_expr(&expr, span()).unwrap(), CHIRType::Bool);
+        assert_eq!(infer_type_from_expr(&expr, span(), &SymbolTable::new()).unwrap(), CHIRType::Bool);
     }
 
     #[test]
@@ -1412,7 +1666,7 @@ mod tests {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "42".to_string(), span: span() });
         assert!(matches!(
-            infer_type_from_expr(&expr, span()),
+            infer_type_from_expr(&expr, span(), &SymbolTable::new()),
             Err(CHIRLowerError::AmbiguousWidth { .. })
         ));
     }
@@ -1427,6 +1681,142 @@ mod tests {
         assert!(matches!(module.body, CHIRBody::Combinational(_)));
     }
 
+    /// Helper: find the inferred type of wire `name` in a combinational module.
+    fn comb_wire_type(src: &str, name: &str) -> CHIRType {
+        let fir = make_fir(src);
+        let module = lower_to_chir(&fir, &no_hw(), &empty_registry()).unwrap();
+        let body = match &module.body {
+            CHIRBody::Combinational(b) => b,
+            _ => panic!("expected combinational body"),
+        };
+        body.stmts
+            .iter()
+            .find_map(|s| match s {
+                CHIRStmt::Wire { name: n, ty, .. } if n == name => Some(ty.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("wire '{name}' not found"))
+    }
+
+    #[test]
+    fn infers_logic_read_and_bitand_as_one_bit() {
+        // `.read()` on a `Logic` port + bitwise `&` → 1-bit. Previously ambiguous.
+        let ty = comb_wire_type(
+            "fn f(a: In<Logic, ()>, b: In<Logic, ()>, o: Out<Logic, ()>) \
+             { let w = a.read() & b.read(); o.write(w); }",
+            "w",
+        );
+        assert_eq!(ty, CHIRType::UInt { width: Width::Concrete(1) });
+    }
+
+    #[test]
+    fn infers_read_of_bits_port_width() {
+        // `.read()` on a `Bits<16>` port carries its width through a bitwise op.
+        let ty = comb_wire_type(
+            "fn f(a: In<Bits<16>, ()>, b: In<Bits<16>, ()>, o: Out<Bits<16>, ()>) \
+             { let w = a.read() | b.read(); o.write(w); }",
+            "w",
+        );
+        assert_eq!(ty, CHIRType::UInt { width: Width::Concrete(16) });
+    }
+
+    #[test]
+    fn infers_comparison_as_bool() {
+        // A comparison is 1-bit boolean regardless of operand width.
+        let ty = comb_wire_type(
+            "fn f(a: In<u8, ()>, b: In<u8, ()>, o: Out<bool, ()>) \
+             { let c = a.read() == b.read(); o.write(c); }",
+            "c",
+        );
+        assert_eq!(ty, CHIRType::Bool);
+    }
+
+    #[test]
+    fn as_bool_is_stripped_in_condition() {
+        // `x.read().as_bool()` as an `if` condition (the lfsr form) must lower
+        // without error — as_bool is a simulation-only conversion on an
+        // already-1-bit value.
+        let fir = make_fir_hw(
+            "async fn m(clk: Clock<C>, en: In<Logic, C>, d: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r = Bits::from_u8(0);
+                loop {
+                    o.write(r);
+                    clk.tick().await;
+                    if en.read().as_bool() { r = d.read(); }
+                }
+            }",
+            &no_hw(),
+        );
+        let module = lower_to_chir(&fir, &no_hw(), &empty_registry());
+        assert!(module.is_ok(), "as_bool should lower: {:?}", module.err());
+    }
+
+    #[test]
+    fn lowers_bit_index_to_single_bit_slice() {
+        // `d.read()[3]` → 1-bit slice `Slice { high: 3, low: 3 }`.
+        let fir = make_fir("fn f(d: In<Bits<8>, ()>, o: Out<Logic, ()>) { let w = d.read()[3]; o.write(w); }");
+        let module = lower_to_chir(&fir, &no_hw(), &empty_registry()).unwrap();
+        let body = match &module.body {
+            CHIRBody::Combinational(b) => b,
+            _ => panic!("expected combinational body"),
+        };
+        let (ty, value) = body.stmts.iter().find_map(|s| match s {
+            CHIRStmt::Wire { name, ty, value, .. } if name == "w" => Some((ty.clone(), value.clone())),
+            _ => None,
+        }).expect("wire w");
+        assert_eq!(ty, CHIRType::UInt { width: Width::Concrete(1) });
+        assert!(matches!(value, CHIRExpr::Slice { high: 3, low: 3, .. }), "got {value:?}");
+    }
+
+    #[test]
+    fn non_constant_bit_index_is_rejected() {
+        // A variable index needs loop unrolling first; must error, not miscompile.
+        let fir = make_fir("fn f(d: In<Bits<8>, ()>, i: In<u8, ()>, o: Out<Logic, ()>) { let w = d.read()[i.read() as usize]; o.write(w); }");
+        let result = lower_to_chir(&fir, &no_hw(), &empty_registry());
+        assert!(result.is_err(), "variable index should be rejected");
+    }
+
+    #[test]
+    fn constructor_width_from_name_and_turbofish() {
+        assert_eq!(constructor_width("Bits::from_u32"), Some(32));
+        assert_eq!(constructor_width("Bits::from_u8"), Some(8));
+        assert_eq!(constructor_width("Bits::from_u128"), Some(128));
+        // Turbofish width is explicit and wins.
+        assert_eq!(constructor_width("Bits::<16>::from_u8"), Some(16));
+        assert_eq!(constructor_width("Bits::zero"), None);
+    }
+
+    #[test]
+    fn infers_bits_constructor_width() {
+        // `Bits::from_u16(..)` with no annotation → 16-bit wire (previously the
+        // parser mis-extracted `Bits::from_u16` as a type and failed).
+        let ty = comb_wire_type(
+            "fn f(o: Out<Bits<16>, ()>) { let w = Bits::from_u16(5); o.write(w); }",
+            "w",
+        );
+        assert_eq!(ty, CHIRType::UInt { width: Width::Concrete(16) });
+    }
+
+    #[test]
+    fn lowers_bits_constructor_to_widthed_literal() {
+        // The constructor lowers to its argument, retyped to the constructor
+        // width — so `Bits::from_u8(5)` becomes an 8-bit literal `5`.
+        let fir = make_fir("fn f(o: Out<Bits<8>, ()>) { let w = Bits::from_u8(5); o.write(w); }");
+        let module = lower_to_chir(&fir, &no_hw(), &empty_registry()).unwrap();
+        let body = match &module.body {
+            CHIRBody::Combinational(b) => b,
+            _ => panic!("expected combinational body"),
+        };
+        let value = body.stmts.iter().find_map(|s| match s {
+            CHIRStmt::Wire { name, value, .. } if name == "w" => Some(value.clone()),
+            _ => None,
+        }).expect("wire w");
+        assert!(matches!(
+            value,
+            CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 5 })
+        ));
+    }
+
     // ── Register init lowering ────────────────────────────────────────────────
 
     #[test]
@@ -1435,7 +1825,7 @@ mod tests {
         let expr = ExprType::Lit(ExprLit { text: "0u8".to_string(), span: span() });
         let lit = lower_init_to_lit(&expr).unwrap();
         assert_eq!(lit.value, 0);
-        assert_eq!(lit.ty, CHIRType::UInt { width: 8 });
+        assert_eq!(lit.ty, CHIRType::UInt { width: Width::Concrete(8) });
     }
 
     #[test]
@@ -1482,7 +1872,7 @@ mod tests {
             }"
         );
         let body = lower_seq_body(&fir, &no_hw(), &empty_registry()).unwrap();
-        assert_eq!(body.registers[0].ty, CHIRType::UInt { width: 16 });
+        assert_eq!(body.registers[0].ty, CHIRType::UInt { width: Width::Concrete(16) });
     }
 
     // ── Port extraction ──────────────────────────────────────────────────────
@@ -1511,7 +1901,7 @@ mod tests {
         let ports = lower_ports(&fir).unwrap();
         assert!(matches!(ports[1].direction, CHIRPortDir::Input));
         match &ports[1].kind {
-            CHIRPortKind::Data { ty } => assert_eq!(*ty, CHIRType::UInt { width: 8 }),
+            CHIRPortKind::Data { ty } => assert_eq!(*ty, CHIRType::UInt { width: Width::Concrete(8) }),
             _ => panic!("expected data port"),
         }
     }
@@ -1522,7 +1912,7 @@ mod tests {
         let ports = lower_ports(&fir).unwrap();
         let out = ports.iter().find(|p| p.name == "result").unwrap();
         assert!(matches!(out.direction, CHIRPortDir::Output));
-        assert!(matches!(out.kind, CHIRPortKind::Data { ty: CHIRType::UInt { width: 16 } }));
+        assert!(matches!(out.kind, CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(16) } }));
     }
 
     #[test]
@@ -1531,7 +1921,7 @@ mod tests {
         let ports = lower_ports(&fir).unwrap();
         let out = ports.iter().find(|p| p.name == "out").unwrap();
         assert!(matches!(out.direction, CHIRPortDir::Output));
-        assert!(matches!(out.kind, CHIRPortKind::Data { ty: CHIRType::UInt { width: 16 } }));
+        assert!(matches!(out.kind, CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(16) } }));
     }
 
     #[test]
@@ -1555,7 +1945,7 @@ mod tests {
         let fir = make_fir("async fn m(clk: Clock<C>, data: In<Bits<8>, C>) {}");
         let ports = lower_ports(&fir).unwrap();
         match &ports[1].kind {
-            CHIRPortKind::Data { ty } => assert_eq!(*ty, CHIRType::UInt { width: 8 }),
+            CHIRPortKind::Data { ty } => assert_eq!(*ty, CHIRType::UInt { width: Width::Concrete(8) }),
             _ => panic!("expected data port"),
         }
     }
@@ -1580,7 +1970,7 @@ mod tests {
         match parse_pattern("42u8", span()).unwrap() {
             CHIRPattern::Lit(lit) => {
                 assert_eq!(lit.value, 42);
-                assert_eq!(lit.ty, CHIRType::UInt { width: 8 });
+                assert_eq!(lit.ty, CHIRType::UInt { width: Width::Concrete(8) });
             }
             _ => panic!("expected lit"),
         }
@@ -1839,7 +2229,7 @@ mod tests {
         let body = lower_seq_body(&fir, &no_hw(), &empty_registry()).unwrap();
         assert_eq!(body.registers.len(), 1);
         assert_eq!(body.registers[0].name, "count");
-        assert_eq!(body.registers[0].ty, CHIRType::UInt { width: 8 });
+        assert_eq!(body.registers[0].ty, CHIRType::UInt { width: Width::Concrete(8) });
     }
 
     #[test]
@@ -1942,6 +2332,7 @@ mod tests {
         use copper_core::chir::CHIRCombBody;
         let module = CHIRModule {
             name: "test".to_string(),
+            params: vec![],
             ports: vec![],
             body: CHIRBody::Combinational(CHIRCombBody {
                 submodules: vec![],
@@ -1964,17 +2355,18 @@ mod tests {
         use copper_core::chir::CHIRCombBody;
         let module = CHIRModule {
             name: "test".to_string(),
+            params: vec![],
             ports: vec![
                 CHIRPort {
                     name: "a".to_string(),
                     direction: CHIRPortDir::Input,
-                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
+                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
                     span: span(),
                 },
                 CHIRPort {
                     name: "out".to_string(),
                     direction: CHIRPortDir::Output,
-                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
+                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
                     span: span(),
                 },
             ],
@@ -1996,17 +2388,18 @@ mod tests {
         use copper_core::chir::CHIRCombBody;
         let module = CHIRModule {
             name: "test".to_string(),
+            params: vec![],
             ports: vec![
                 CHIRPort {
                     name: "a".to_string(),
                     direction: CHIRPortDir::Input,
-                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
+                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
                     span: span(),
                 },
                 CHIRPort {
                     name: "out".to_string(),
                     direction: CHIRPortDir::Output,
-                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: 8 } },
+                    kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
                     span: span(),
                 },
             ],
@@ -2015,7 +2408,7 @@ mod tests {
                 stmts: vec![
                     CHIRStmt::Wire {
                         name: "doubled".to_string(),
-                        ty: CHIRType::UInt { width: 8 },
+                        ty: CHIRType::UInt { width: Width::Concrete(8) },
                         value: CHIRExpr::BinOp {
                             left: Box::new(CHIRExpr::Var("a".to_string())),
                             op: CHIRBinOp::Add { wrapping: false },
@@ -2059,7 +2452,7 @@ mod tests {
             assert_eq!(sub.inputs[0].0, "a");
             assert_eq!(sub.inputs[1].0, "b");
             // Output type from callee return type (u8)
-            assert_eq!(sub.output_ty, CHIRType::UInt { width: 8 });
+            assert_eq!(sub.output_ty, CHIRType::UInt { width: Width::Concrete(8) });
         } else {
             panic!("expected combinational body");
         }
@@ -2091,7 +2484,7 @@ mod tests {
         );
         let module = lower_to_chir(&caller_fir, &hw(&["adder"]), &registry).unwrap();
         if let CHIRBody::Combinational(body) = &module.body {
-            assert_eq!(body.submodules[0].output_ty, CHIRType::UInt { width: 16 });
+            assert_eq!(body.submodules[0].output_ty, CHIRType::UInt { width: Width::Concrete(16) });
         } else {
             panic!("expected combinational body");
         }
@@ -2180,7 +2573,7 @@ mod tests {
             assert_eq!(body.clock, "clk");
             assert_eq!(body.registers.len(), 1);
             assert_eq!(body.registers[0].name, "count");
-            assert_eq!(body.registers[0].ty, CHIRType::UInt { width: 8 });
+            assert_eq!(body.registers[0].ty, CHIRType::UInt { width: Width::Concrete(8) });
             // Init value: 0u8
             assert_eq!(body.registers[0].init.as_ref().unwrap().value, 0);
 
@@ -2250,7 +2643,7 @@ mod tests {
             assert_eq!(sub.inputs.len(), 2);
             assert_eq!(sub.inputs[0].0, "a");
             assert_eq!(sub.inputs[1].0, "b");
-            assert_eq!(sub.output_ty, CHIRType::UInt { width: 8 });
+            assert_eq!(sub.output_ty, CHIRType::UInt { width: Width::Concrete(8) });
 
             // The PortWrite drives "out" with the submodule output wire
             if let CHIRStmt::PortWrite { port_name, value, .. } = body.stmts.last().unwrap() {

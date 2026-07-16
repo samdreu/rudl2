@@ -1,6 +1,6 @@
 use copper_core::frontend_ir::{
     ClockParamMeta, EnumVariant, ExprArray, ExprAssign, ExprAsync, ExprAwait, ExprBinary, ExprCall, ExprCast,
-    ExprBlock, ExprField, ExprIf, ExprLet, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprMethodCall,
+    ExprBlock, ExprField, ExprIf, ExprIndex, ExprLet, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprMethodCall,
     ExprRange, ExprReference, ExprRepeat, ExprReturn, ExprStmt, ExprType, ExprUnary, ExprWhile,
     ExprYield, FrontendClassification, FrontendModuleIR, FrontendSignature, ItemConst, ItemEnum,
     ItemMacro, ItemOther, ItemStmt, ItemStruct, ItemType, LocalStmt, RawParam, RawStmt, RawStmtKind,
@@ -33,6 +33,8 @@ impl std::fmt::Display for LowerError {
 
 pub struct IRBuilder;
 
+// Is this a NO-OP rn?
+// TODO: Remove
 impl IRBuilder {
     pub fn from_ast(_design_fn: &ItemFn, ports: Vec<Port>) -> Result<ModuleIR, LowerError> {
         Ok(ModuleIR {
@@ -44,6 +46,7 @@ impl IRBuilder {
     }
 }
 
+// grabs the frontend IR from the parsed rust function and returns it
 pub fn capture_frontend_ir(design_fn: &ItemFn, hardware_fns: &std::collections::HashSet<String>) -> Result<FrontendModuleIR, LowerError> {
     let signature = capture_signature(design_fn);
     let clocks = capture_clock_metadata(design_fn);
@@ -60,6 +63,9 @@ pub fn capture_frontend_ir(design_fn: &ItemFn, hardware_fns: &std::collections::
     })
 }
 
+// Captures the signature information from the design function
+// This includes the parameter names, types, and return type (if any).
+// (There should be no return types)
 fn capture_signature(design_fn: &ItemFn) -> FrontendSignature {
     let mut params = Vec::new();
 
@@ -391,6 +397,16 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             span: capture_source_span(e),
         }),
 
+        Expr::Index(e) => ExprType::Index(ExprIndex {
+            base: Box::new(parse_expr_type(&e.expr, hardware_fns)),
+            index: Box::new(parse_expr_type(&e.index, hardware_fns)),
+            span: capture_source_span(e),
+        }),
+
+        // Parentheses carry no semantics — unwrap to the inner expression.
+        // (Emission re-parenthesizes fully, so grouping is never lost.)
+        Expr::Paren(e) => parse_expr_type(&e.expr, hardware_fns),
+
         Expr::If(e) => ExprType::If(ExprIf {
             condition: Box::new(parse_expr_type(&e.cond, hardware_fns)),
             then_block: e.then_branch.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
@@ -559,21 +575,16 @@ fn infer_local_type_hint_from_init(local: &syn::Local) -> Option<RawTypeRef> {
     let expr = &*init.expr;
 
     match expr {
-        // let x = Bits::<8>::from_u128(0)
-        syn::Expr::Call(call) => match &*call.func {
-            syn::Expr::Path(p) => Some(RawTypeRef {
-                ty_text: p.path.to_token_stream().to_string(),
-                span: capture_source_span(p),
-            }),
-            _ => None,
-        },
-
-        // let x = foo as T
+        // let x = foo as T — the cast target is a genuine type annotation.
         syn::Expr::Cast(cast) => Some(RawTypeRef {
             ty_text: cast.ty.to_token_stream().to_string(),
             span: capture_source_span(&*cast.ty),
         }),
 
+        // A constructor call like `Bits::from_u32(1)` is NOT a type: its callee
+        // path (`Bits::from_u32`) does not resolve as a type. Its width is
+        // inferred in CHIR from the constructor name / turbofish — see
+        // `chir_lower::infer_type_from_call`.
         _ => None,
     }
 }
@@ -747,9 +758,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_stmt_infers_type_hint_from_init_when_no_explicit_type() {
+    fn test_parse_local_stmt_constructor_call_yields_no_type_hint() {
+        // A constructor call is not a type annotation: the parser must NOT
+        // extract the callee path as a type. Width is inferred later in CHIR.
         let local = parse_local_from_stmt(parse_quote! {
-            let mut count = Bits::<8>::from_u128(0);
+            let mut count = Bits::from_u32(1);
         });
 
         let kind = parse_local_stmt(&local, &Default::default());
@@ -757,8 +770,11 @@ mod tests {
             RawStmtKind::Local(local_stmt) => {
                 assert!(local_stmt.is_mut);
                 assert_eq!(local_stmt.name, "count");
-                let ty = local_stmt.ty.expect("inferred type hint should be captured");
-                assert_eq!(compact_ws(&ty.ty_text), "Bits::<8>::from_u128");
+                assert!(
+                    local_stmt.ty.is_none(),
+                    "constructor call must not produce a type hint, got {:?}",
+                    local_stmt.ty
+                );
             }
             _ => panic!("expected local stmt"),
         }
@@ -1262,6 +1278,16 @@ mod tests {
                 assert!(matches!(*await_expr.base, ExprType::Lit(_)));
             }
             _ => panic!("expected await"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_paren_unwraps_to_inner() {
+        // `(a >> 1)` must parse to the inner binary, not a raw `Lit` fallback.
+        let expr: Expr = parse_quote!((a >> 1));
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Binary(bin) => assert_eq!(bin.op, ">>"),
+            other => panic!("expected inner binary, got {other:?}"),
         }
     }
 

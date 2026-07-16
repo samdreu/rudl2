@@ -179,6 +179,7 @@ pub enum ExprType {
     Call(ExprCall),
     Cast(ExprCast),
     Field(ExprField),
+    Index(ExprIndex),
     If(ExprIf),
     Let(ExprLet),
     Lit(ExprLit),
@@ -255,6 +256,14 @@ pub struct ExprCast {
 pub struct ExprField {
     pub base: Box<ExprType>,
     pub member: String,
+    pub span: SourceSpan,
+}
+
+/// Index expression: `base[index]` (e.g. bit selection `state[0]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprIndex {
+    pub base: Box<ExprType>,
+    pub index: Box<ExprType>,
     pub span: SourceSpan,
 }
 

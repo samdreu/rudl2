@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use copper_core::chir::{
     CHIRBody, CHIRExpr, CHIRLit, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir,
-    CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType,
+    CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, Width,
 };
 use copper_core::frontend_ir::SourceSpan;
 use copper_core::shir::{
@@ -295,7 +295,7 @@ fn lower_seq_body(
             post_edge.push(SHIRRegUpdate {
                 target: "phase_r".to_string(),
                 next_value: SHIRExpr::Lit(SHIRLit {
-                    ty: CHIRType::UInt { width: phase_width },
+                    ty: CHIRType::UInt { width: Width::Concrete(phase_width) },
                     value: next_phase as u128,
                 }),
             });
@@ -307,8 +307,8 @@ fn lower_seq_body(
         let phase_width = phase_register_width(n_ticks);
         registers.push(SHIRReg {
             name: "phase_r".to_string(),
-            ty: CHIRType::UInt { width: phase_width },
-            init: Some(SHIRLit { ty: CHIRType::UInt { width: phase_width }, value: 0 }),
+            ty: CHIRType::UInt { width: Width::Concrete(phase_width) },
+            init: Some(SHIRLit { ty: CHIRType::UInt { width: Width::Concrete(phase_width) }, value: 0 }),
         });
     }
 
@@ -847,7 +847,7 @@ mod tests {
     use super::*;
     use copper_core::chir::{
         CHIRBody, CHIRLit, CHIRModule, CHIRPortDir, CHIRPortKind, CHIRSeqBody,
-        CHIRType,
+        CHIRType, Width,
     };
     use copper_core::frontend_ir::SourceSpan;
 
@@ -888,13 +888,13 @@ mod tests {
         let stmts = vec![
             CHIRStmt::Assign {
                 target: "x".to_string(),
-                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 0 }),
+                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 0 }),
                 span: span(),
             },
             CHIRStmt::AwaitTick { clock: "clk".to_string(), span: span() },
             CHIRStmt::Assign {
                 target: "x".to_string(),
-                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 1 }),
+                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 1 }),
                 span: span(),
             },
         ];
@@ -1074,7 +1074,7 @@ mod tests {
             condition: CHIRExpr::Var("cond".to_string()),
             then_body: vec![CHIRStmt::Assign {
                 target: "count".to_string(),
-                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 0 }),
+                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 0 }),
                 span: span(),
             }],
             else_body: None,
@@ -1083,7 +1083,7 @@ mod tests {
 
         let regs = vec![CHIRRegDecl {
             name: "count".to_string(),
-            ty: CHIRType::UInt { width: 8 },
+            ty: CHIRType::UInt { width: Width::Concrete(8) },
             init: None,
             span: span(),
         }];
@@ -1106,12 +1106,12 @@ mod tests {
             condition: CHIRExpr::Var("cond".to_string()),
             then_body: vec![CHIRStmt::Assign {
                 target: "x".to_string(),
-                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 1 }),
+                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 1 }),
                 span: span(),
             }],
             else_body: Some(vec![CHIRStmt::Assign {
                 target: "x".to_string(),
-                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 2 }),
+                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 2 }),
                 span: span(),
             }]),
             span: span(),
@@ -1119,7 +1119,7 @@ mod tests {
 
         let regs = vec![CHIRRegDecl {
             name: "x".to_string(),
-            ty: CHIRType::UInt { width: 8 },
+            ty: CHIRType::UInt { width: Width::Concrete(8) },
             init: None,
             span: span(),
         }];
@@ -1182,7 +1182,7 @@ mod tests {
                 value: CHIRExpr::BinOp {
                     left: Box::new(CHIRExpr::Var("input".to_string())),
                     op: copper_core::chir::CHIRBinOp::Add { wrapping: true },
-                    right: Box::new(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 1 })),
+                    right: Box::new(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 1 })),
                 },
                 span: span(),
             },
@@ -1197,8 +1197,8 @@ mod tests {
             },
         ];
         let regs = vec![
-            CHIRRegDecl { name: "stage1_r".to_string(), ty: CHIRType::UInt { width: 8 }, init: None, span: span() },
-            CHIRRegDecl { name: "stage2_r".to_string(), ty: CHIRType::UInt { width: 8 }, init: None, span: span() },
+            CHIRRegDecl { name: "stage1_r".to_string(), ty: CHIRType::UInt { width: Width::Concrete(8) }, init: None, span: span() },
+            CHIRRegDecl { name: "stage2_r".to_string(), ty: CHIRType::UInt { width: Width::Concrete(8) }, init: None, span: span() },
         ];
         let promoted = std::collections::HashSet::new();
         let updates = extract_reg_updates(&stmts, &regs, &promoted, span(), &HashMap::new()).unwrap();
@@ -1267,7 +1267,7 @@ mod tests {
         let stmts = vec![
             CHIRStmt::Assign {
                 target: "R".to_string(),
-                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 5 }),
+                value: CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 5 }),
                 span: span(),
             },
             CHIRStmt::If {
@@ -1277,7 +1277,7 @@ mod tests {
                     value: CHIRExpr::BinOp {
                         left: Box::new(CHIRExpr::Var("R".to_string())),
                         op: copper_core::chir::CHIRBinOp::Add { wrapping: false },
-                        right: Box::new(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: 8 }, value: 1 })),
+                        right: Box::new(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(8) }, value: 1 })),
                     },
                     span: span(),
                 }],
@@ -1285,7 +1285,7 @@ mod tests {
                 span: span(),
             },
         ];
-        let regs = vec![CHIRRegDecl { name: "R".to_string(), ty: CHIRType::UInt { width: 8 }, init: None, span: span() }];
+        let regs = vec![CHIRRegDecl { name: "R".to_string(), ty: CHIRType::UInt { width: Width::Concrete(8) }, init: None, span: span() }];
         let promoted = std::collections::HashSet::new();
         let updates = extract_reg_updates(&stmts, &regs, &promoted, span(), &HashMap::new()).unwrap();
 
