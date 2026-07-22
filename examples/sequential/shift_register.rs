@@ -1,10 +1,12 @@
 use copper_core::types::{Bits, Logic, Clock, ClockDomain};
 use copper_core::port::{In, Out, wire};
+use copper_macros::hardware;
 use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
+#[hardware(sequential)]
 async fn shift_register <const N: usize, const N_1: usize> (
     d: In<Logic, MainClk>,
     clk: Clock<MainClk>,

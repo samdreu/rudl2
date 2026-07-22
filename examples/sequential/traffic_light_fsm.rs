@@ -1,5 +1,6 @@
 use copper_core::types::{Logic, Clock, ClockDomain};
 use copper_core::port::{In, Out, wire};
+use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
 struct MainClk;
@@ -16,6 +17,7 @@ enum Phase {
     RedYellow,
 }
 
+#[hardware(sequential)]
 async fn traffic_light(
     clk: Clock<MainClk>,
     request: In<Logic, MainClk>,

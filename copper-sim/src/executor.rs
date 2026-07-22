@@ -466,6 +466,8 @@ impl HardwareExecutor {
     /// This includes a pre-edge settle phase where all tasks are polled to allow combinational logic to run, 
     /// then the clock is advanced, and then a post-edge settle phase where tasks are polled again to allow sequential logic to update based on the new clock edge.
     pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
+        crate::synced_read::bump_call_id();
+
         crate::set_poll_phase(crate::PollPhase::PreEdge);
         self.poll_tasks();
 

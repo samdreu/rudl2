@@ -17,6 +17,9 @@ pub mod executor;
 
 pub use executor::{HardwareExecutor, ModuleInfo};
 
+#[doc(hidden)]
+pub mod synced_read;
+
 /// Which phase of the clock cycle `tick_clock` is currently executing.
 /// Set by the executor before each `poll_tasks()` call so that phase-aware futures
 /// (`PreEdgeBarrier`) can determine whether to block or proceed.

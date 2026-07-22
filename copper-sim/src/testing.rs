@@ -15,41 +15,54 @@ use crate::verification::{SimulationTrace, CycleData, verify_with_verilator_trac
 ///
 /// # Cycle-level recording (simple)
 /// ```rust,no_run
+/// # use copper_sim::{HardwareTest, SimulationTrace};
+/// # use copper_core::Logic;
+/// # let expected = SimulationTrace::new();
 /// let mut test = HardwareTest::new("inverter")
 ///     .with_verilog("verilog/inverter.v")
 ///     .with_waveform("waveforms/inverter.vcd");
 ///
-/// for (i, &input) in inputs.iter().enumerate() {
-///     let output = inverter(Bit(input));
-///     test.record_cycle(i + 1, &[("bit", &[input])], &[("out", &[output.0])]);
+/// for (i, &input) in [Logic::Zero, Logic::One].iter().enumerate() {
+///     let output = if input == Logic::Zero { Logic::One } else { Logic::Zero };
+///     test.record_cycle(i + 1, &[("bit", &[input])], &[("out", &[output])]);
 /// }
 /// test.finish_with_expected(&expected).assert_passed();
 /// ```
 ///
 /// # Phased recording (pre/post clock edge)
 /// ```rust,no_run
+/// # use copper_sim::{HardwareTest, HardwareExecutor};
+/// # use copper_core::{Clock, ClockDomain, Logic};
+/// # use copper_core::port::wire;
+/// # struct MainClk; impl ClockDomain for MainClk {}
+/// # let mut clk = Clock::<MainClk>::new();
+/// # let mut exec = HardwareExecutor::new();
+/// # let pattern: Vec<(Logic, Logic)> = vec![];
+/// # let (j_drv, _j_in) = wire::<Logic, MainClk>(Logic::Zero);
+/// # let (k_drv, _k_in) = wire::<Logic, MainClk>(Logic::Zero);
+/// # let (_q_drv, q_obs) = wire::<Logic, MainClk>(Logic::Zero);
 /// let mut test = HardwareTest::new("jk_ff")
 ///     .with_verilog("verilog/jk_ff.v")
 ///     .with_phased_waveform("waveforms/jk_ff_phased.vcd")
 ///     .with_verilator_waveform("waveforms/jk_ff_verilator.vcd");
 ///
-/// for (cycle, (jv, kv)) in pattern.iter().enumerate() {
-///     *j.lock().unwrap() = *jv;
-///     *k.lock().unwrap() = *kv;
+/// for (cycle, &(jv, kv)) in pattern.iter().enumerate() {
+///     j_drv.write(jv);
+///     k_drv.write(kv);
 ///
 ///     exec.poll_tasks();
-///     let q_pre = *out.lock().unwrap();
+///     let q_pre = q_obs.read();
 ///
 ///     exec.advance(&mut clk);
 ///     exec.poll_tasks();
-///     let q_post = *out.lock().unwrap();
+///     let q_post = q_obs.read();
 ///
 ///     // Record inputs + pre/post outputs. Also populates actual_trace for Verilator.
 ///     test.record_cycle_phased(
 ///         cycle,
-///         &[("j", &[jv.0]), ("k", &[kv.0])],  // inputs
-///         &[("q", &[q_pre.0])],                  // pre-clock-edge outputs
-///         &[("q", &[q_post.0])],                 // post-clock-edge outputs
+///         &[("j", &[jv]), ("k", &[kv])],  // inputs
+///         &[("q", &[q_pre])],             // pre-clock-edge outputs
+///         &[("q", &[q_post])],            // post-clock-edge outputs
 ///     );
 /// }
 /// test.finish().assert_passed();
@@ -419,7 +432,9 @@ fn compare_traces(actual: &SimulationTrace, expected: &SimulationTrace) -> Resul
 /// Build a `CycleData` from slice references. Useful for constructing expected traces.
 ///
 /// # Example
-/// ```rust,no_run
+/// ```rust
+/// # use copper_sim::{SimulationTrace, make_cycle};
+/// # use copper_core::Logic;
 /// let expected = SimulationTrace::from_cycles(vec![
 ///     make_cycle(1, &[("bit", &[Logic::Zero])], &[("out", &[Logic::One])]),
 ///     make_cycle(2, &[("bit", &[Logic::One])],  &[("out", &[Logic::Zero])]),

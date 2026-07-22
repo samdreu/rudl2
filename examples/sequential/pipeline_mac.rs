@@ -9,6 +9,7 @@
 
 use copper_core::types::{Bits, Clock, ClockDomain};
 use copper_core::port::{In, Out, wire};
+use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
 struct MainClk;
@@ -27,6 +28,7 @@ impl ClockDomain for MainClk {}
 #[derive(Clone, Copy)]
 enum Stage { Load, Mul, Out }
 
+#[hardware(sequential)]
 async fn mac_fsm(
     clk: Clock<MainClk>,
     a: In<Bits<8>, MainClk>,
@@ -73,6 +75,7 @@ async fn mac_fsm(
 // No State enum. No explicit register declarations beyond the computation.
 // The data flow reads top-to-bottom in the order it executes.
 // ─────────────────────────────────────────────────────────────────────────────
+#[hardware(sequential)]
 async fn mac_pipeline(
     clk: Clock<MainClk>,
     a: In<Bits<8>, MainClk>,

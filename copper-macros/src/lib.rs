@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use std::collections::HashSet;
 use syn::{parse_macro_input, visit::Visit, visit_mut::VisitMut, Error, FnArg, ItemFn, Pat, ReturnType, Type};
 
@@ -50,46 +50,208 @@ impl<'ast, 'a> Visit<'ast> for TickAwaitVisitor<'a> {
     }
 }
 
-/// Returns true if `block` directly contains a `.tick().await` (does not recurse into
-/// nested `loop` blocks — those are handled independently by `LoopDeltaInjector`).
-fn block_has_tick_await_direct(block: &syn::Block) -> bool {
-    struct DirectTickFinder(bool);
-    impl<'ast> Visit<'ast> for DirectTickFinder {
-        fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
-            if let syn::Expr::MethodCall(method) = &*node.base {
-                if method.method == "tick" && method.args.is_empty() {
-                    self.0 = true;
-                }
+/// Finds a direct `.tick().await` in a block or statement — does not recurse into
+/// nested `loop` blocks (those are handled independently by `LoopDeltaInjector`).
+struct DirectTickFinder(bool);
+
+impl<'ast> Visit<'ast> for DirectTickFinder {
+    fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
+        if let syn::Expr::MethodCall(method) = &*node.base {
+            if method.method == "tick" && method.args.is_empty() {
+                self.0 = true;
             }
-            syn::visit::visit_expr_await(self, node);
         }
-        fn visit_expr_loop(&mut self, _node: &'ast syn::ExprLoop) {
-            // stop here — inner loops are processed independently
-        }
+        syn::visit::visit_expr_await(self, node);
     }
+    fn visit_expr_loop(&mut self, _node: &'ast syn::ExprLoop) {
+        // stop here — inner loops are processed independently
+    }
+}
+
+/// Returns true if `block` directly contains a `.tick().await`.
+fn block_has_tick_await_direct(block: &syn::Block) -> bool {
     let mut finder = DirectTickFinder(false);
     finder.visit_block(block);
     finder.0
 }
 
-/// Walks a sequential function body and appends `::copper_sim::delta_yield().await;`
-/// to the end of every `loop` block that directly contains a `.tick().await`.
-/// This ensures the task suspends between post-tick output writes and the next
-/// pre-tick staging, so each pre-tick runs in the pre-edge settle phase with
-/// fresh inputs — matching real hardware's setup-time → clock-edge → propagation cycle.
-struct LoopDeltaInjector;
+/// Returns the names of every `In<T, D>`-typed parameter, in declaration order.
+fn in_param_names(sig: &syn::Signature) -> Vec<String> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_ty) = arg {
+                if outer_type_name(&pat_ty.ty).as_deref() == Some("In") {
+                    if let Pat::Ident(pi) = &*pat_ty.pat {
+                        return Some(pi.ident.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .collect()
+}
 
-impl VisitMut for LoopDeltaInjector {
-    fn visit_expr_loop_mut(&mut self, node: &mut syn::ExprLoop) {
-        let needs_delta = block_has_tick_await_direct(&node.body);
-        syn::visit_mut::visit_expr_loop_mut(self, node); // transform nested loops first
-        if needs_delta {
-            let barrier: syn::Stmt = syn::parse_quote! {
-                ::copper_sim::pre_edge_barrier().await;
-            };
-            node.body.stmts.push(barrier);
+/// Checks every `In<T, D>` parameter is used *only* as the direct receiver of
+/// a zero-arg `.read()` call — e.g. `step.read()` — anywhere else it appears
+/// (through a `.clone()`, a reassignment to a new binding, passed to a helper
+/// function, stored in a collection, etc.) is a pattern the per-read freshness
+/// check (`SyncedReadRewriter`, below) cannot place correctly, since it can
+/// only rewrite call sites it can see directly in this function's own body.
+/// Rather than silently leaving such a read unprotected, this is a hard
+/// compile error: `#[hardware(sequential)]`'s guarantee (a read only ever
+/// blocks when it would otherwise race a testbench-driven update from a
+/// premature loop iteration) requires knowing about every read.
+///
+/// Returns every offending identifier so the caller can report all of them at
+/// once, not just the first.
+fn find_unprotectable_in_uses(block: &syn::Block, in_params: &HashSet<String>) -> Vec<syn::Ident> {
+    struct Finder<'a> {
+        in_params: &'a HashSet<String>,
+        found: Vec<syn::Ident>,
+    }
+
+    impl<'a, 'ast> Visit<'ast> for Finder<'a> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let is_recognized_read = node.method == "read"
+                && node.args.is_empty()
+                && matches!(&*node.receiver, syn::Expr::Path(p)
+                    if p.path.get_ident().is_some_and(|id| self.in_params.contains(&id.to_string())));
+
+            if !is_recognized_read {
+                // Not the pattern we rewrite — its receiver is fair game for
+                // being an unprotectable use (e.g. `a.clone().read()`: this
+                // outer call isn't recognized, so we walk into `a.clone()`,
+                // whose *own* receiver `a` is a bare path and gets caught by
+                // visit_expr_path below).
+                self.visit_expr(&node.receiver);
+            }
+            for arg in &node.args {
+                self.visit_expr(arg);
+            }
+        }
+
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(ident) = node.path.get_ident() {
+                if self.in_params.contains(&ident.to_string()) {
+                    self.found.push(ident.clone());
+                    return;
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
         }
     }
+
+    let mut finder = Finder { in_params, found: Vec::new() };
+    finder.visit_block(block);
+    finder.found
+}
+
+/// Increments a hidden `__copper_wrap` counter at the top of every `loop`
+/// block that directly contains a `.tick().await`. `__copper_wrap` is
+/// function-scoped (declared once, by the caller, before this runs) and never
+/// reset — even loops entered many times (e.g. a "wait for ready" loop nested
+/// inside an outer per-instruction loop) just keep counting up, which is what
+/// keeps `SyncedReadTracker`'s "has this port's reader wrapped since its last
+/// success" check correct on re-entry: a counter that reset per-entry could
+/// go backwards relative to a tracker's last-seen value and block a read that
+/// should succeed immediately.
+struct WrapCounterInjector;
+
+impl VisitMut for WrapCounterInjector {
+    fn visit_expr_loop_mut(&mut self, node: &mut syn::ExprLoop) {
+        let needs_wrap = block_has_tick_await_direct(&node.body);
+        syn::visit_mut::visit_expr_loop_mut(self, node); // nested loops handled independently
+        if needs_wrap {
+            let incr: syn::Stmt = syn::parse_quote! { __copper_wrap += 1; };
+            node.body.stmts.insert(0, incr);
+        }
+    }
+}
+
+/// Rewrites every `<param>.read()` call — for `<param>` one of this function's
+/// `In<T, D>` parameters — into a call through the per-port freshness check,
+/// using that parameter's hidden tracker and the enclosing loop's
+/// `__copper_wrap` counter. Only call after confirming (via
+/// `find_unprotectable_in_uses`) that every use of every `In` parameter is one
+/// of these recognized call sites.
+struct SyncedReadRewriter<'a> {
+    in_params: &'a HashSet<String>,
+}
+
+impl<'a> VisitMut for SyncedReadRewriter<'a> {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        syn::visit_mut::visit_expr_mut(self, expr);
+
+        let matched_name = if let syn::Expr::MethodCall(mc) = &*expr {
+            (mc.method == "read" && mc.args.is_empty())
+                .then(|| match &*mc.receiver {
+                    syn::Expr::Path(p) => p.path.get_ident().map(|id| id.to_string()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|name| self.in_params.contains(name))
+        } else {
+            None
+        };
+
+        if let Some(name) = matched_name {
+            let port_ident = format_ident!("{}", name);
+            let tracker_ident = format_ident!("__copper_tracker_{}", name);
+            *expr = syn::parse_quote! {
+                ::copper_sim::synced_read::__private::synced_read(
+                    &#port_ident, &#tracker_ident, __copper_wrap,
+                ).await
+            };
+        }
+    }
+}
+
+/// Injects the per-read freshness check into a `#[hardware(sequential)]`
+/// function body: a hidden wrap counter, one hidden tracker per `In<T, D>`
+/// parameter, and a rewrite of every recognized `.read()` call site to go
+/// through them. No-op if the function has no `In` parameters at all — a
+/// free-running module has nothing to protect. Returns an error (without
+/// modifying `f`) if any `In` parameter is used in a way that can't be
+/// rewritten — see `find_unprotectable_in_uses`.
+fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
+    let in_params: HashSet<String> = in_param_names(&f.sig).into_iter().collect();
+    if in_params.is_empty() {
+        return Ok(());
+    }
+
+    let bad = find_unprotectable_in_uses(&f.block, &in_params);
+    if !bad.is_empty() {
+        let mut iter = bad.into_iter();
+        let mut err = Error::new_spanned(
+            &iter.next().unwrap(),
+            "this `In<T, D>` parameter is used in a way #[hardware(sequential)] can't verify \
+             is protected against stale/premature reads — only `<param>.read()`, called \
+             directly on the parameter with no intervening `.clone()`, reassignment, or \
+             indirection, is supported. Read it directly at each place it's needed instead.",
+        );
+        for ident in iter {
+            err.combine(Error::new_spanned(
+                &ident,
+                "...and here (same parameter, same restriction)",
+            ));
+        }
+        return Err(err);
+    }
+
+    let mut wrap_decl: Vec<syn::Stmt> = vec![syn::parse_quote! { let mut __copper_wrap: u64 = 0; }];
+    for name in &in_params {
+        let tracker_ident = format_ident!("__copper_tracker_{}", name);
+        wrap_decl.push(syn::parse_quote! {
+            let #tracker_ident = ::copper_sim::synced_read::__private::ReadTracker::new();
+        });
+    }
+    f.block.stmts.splice(0..0, wrap_decl);
+
+    WrapCounterInjector.visit_block_mut(&mut f.block);
+    SyncedReadRewriter { in_params: &in_params }.visit_block_mut(&mut f.block);
+
+    Ok(())
 }
 
 fn wrap_combinational(mut f: ItemFn) -> TokenStream {
@@ -130,7 +292,9 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
     match hardware_mode {
         HardwareMode::Sequential => {
             let mut f = input_fn;
-            LoopDeltaInjector.visit_item_fn_mut(&mut f);
+            if let Err(err) = inject_synced_reads(&mut f) {
+                return err.to_compile_error().into();
+            }
             quote! { #f }.into()
         }
         HardwareMode::Combinational => wrap_combinational(input_fn),
@@ -163,9 +327,8 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         }
     }
 
-    // Walk parameters: enforce types and track presence of Clock / In / Out
+    // Walk parameters: enforce types and track presence of Clock / Out
     let mut has_clock = false;
-    let mut has_in = false;
     let mut has_out = false;
 
     for arg in &input_fn.sig.inputs {
@@ -188,7 +351,7 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
                 // All parameters must be Clock<D>, In<T>, or Out<T>
                 match outer_type_name(&pat_ty.ty).as_deref() {
                     Some("Clock") => has_clock = true,
-                    Some("In")    => has_in = true,
+                    Some("In")    => {}
                     Some("Out")   => has_out = true,
                     // Some("Vec")   => {
                     //     // Handle Vec<In<T>> or Vec<Out<T>> if needed
@@ -220,13 +383,9 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         ));
     }
 
-    // Both modes must have at least one In<T> and one Out<T>
-    if !has_in {
-        return Err(Error::new_spanned(
-            &input_fn.sig,
-            "hardware functions must have at least one In<T> parameter",
-        ));
-    }
+    // Both modes must have at least one Out<T>. In<T> is not required — a
+    // free-running module (e.g. a counter with no reset/enable) legitimately
+    // has no inputs at all.
     if !has_out {
         return Err(Error::new_spanned(
             &input_fn.sig,
@@ -328,11 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn requires_at_least_one_in() {
+    fn allows_missing_in() {
+        // A free-running module (no reset/enable) legitimately has no In<T>.
         let f: syn::ItemFn = parse_quote! {
-            async fn counter(clk: Clock<MainClk>, out: Out<u8>) { loop {} }
+            async fn counter(clk: Clock<MainClk>, out: Out<u8>) { loop { clk.tick().await; } }
         };
-        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_err());
+        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_ok());
     }
 
     #[test]

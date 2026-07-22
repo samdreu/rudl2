@@ -1,5 +1,6 @@
 use copper_core::{Bits, Clock, ClockDomain, Logic};
 use copper_core::port::{wire, In, Out};
+use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
 // ── Clock domains ─────────────────────────────────────────────────────────────
@@ -17,6 +18,7 @@ impl ClockDomain for ClkSlow {}
 // Increments every ClkFast tick. `latched` goes high once count reaches 8
 // (bit 3 first sets) and stays high — modelling a "threshold crossed" condition
 // that needs to propagate safely to the slow domain.
+#[hardware(sequential)]
 async fn fast_counter(
     clk: Clock<ClkFast>,
     count_out: Out<Bits<8>, ClkFast>,
@@ -46,6 +48,7 @@ async fn fast_counter(
 //   //      found `In<Logic, ClkFast>`
 //
 // The synchronizer is the *only* legal path from ClkFast to ClkSlow.
+#[hardware(sequential)]
 async fn sync_2ff<SrcD: ClockDomain>(
     clk: Clock<ClkSlow>,
     d: In<Logic, SrcD>,    // generic: accepts any source domain
@@ -66,6 +69,7 @@ async fn sync_2ff<SrcD: ClockDomain>(
 }
 
 // ── Consumer: reads the synchronized flag in the slow domain ──────────────────
+#[hardware(sequential)]
 async fn slow_consumer(
     clk: Clock<ClkSlow>,
     flag_in: In<Logic, ClkSlow>,

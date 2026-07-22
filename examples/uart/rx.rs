@@ -42,6 +42,7 @@ struct packet {
     stop: Logic,
 }
 
+#[hardware(sequential)]
 async fn rx (
     clk: Clock<MainClk>,
     rx_serial: In<Logic, MainClk>,

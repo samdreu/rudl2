@@ -15,6 +15,7 @@
 
 use copper_core::{Bits, Clock, ClockDomain, Logic};
 use copper_core::port::{wire, In, Out};
+use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
 struct MainClk;
@@ -25,6 +26,7 @@ const CLKS_PER_BIT: usize = 434; // 50 MHz / 115200 baud
 // ── TX ────────────────────────────────────────────────────────────────────────
 // Serializes one 8N1 frame (start + 8 data bits LSB-first + stop) each time
 // tx_start pulses high. tx_busy is high for the duration of the frame.
+#[hardware(sequential)]
 async fn uart_tx(
     clk: Clock<MainClk>,
     tx_byte:   In<Bits<8>, MainClk>,
@@ -62,6 +64,7 @@ async fn uart_tx(
 // ── RX ────────────────────────────────────────────────────────────────────────
 // Same module as examples/uart/rx.rs. Duplicated here because Cargo examples
 // are standalone binaries; in the Copper module system these would be imports.
+#[hardware(sequential)]
 async fn uart_rx(
     clk: Clock<MainClk>,
     rx_serial: In<Logic, MainClk>,

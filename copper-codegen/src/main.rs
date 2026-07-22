@@ -1,9 +1,10 @@
 //! `copper-transpile` — Milestone-1 CLI driver.
 //!
-//! Reads a Rust source file, finds `#[hardware]` modules (or functions with a
-//! hardware signature: `Clock<D>` / `In<T,D>` / `Out<T,D>` params), and emits
+//! Reads a Rust source file, finds `#[hardware]` modules, and emits
 //! SystemVerilog for one of them via the full FIR → CHIR → SHIR → VLIR → text
-//! pipeline.
+//! pipeline. A function with a hardware signature (`Clock<D>` / `In<T,D>` /
+//! `Out<T,D>` params) but no `#[hardware(...)]` attribute is an error, not a
+//! silently-detected module.
 //!
 //! Usage:
 //!   copper-transpile <input.rs> [-o <out.sv>] [--module <name>] [--profile <p>]
