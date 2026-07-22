@@ -204,8 +204,21 @@ pub enum SHIRLowerError {
     UnsupportedConstruct { description: String, span: SourceSpan },
 }
 
+impl SHIRLowerError {
+    pub fn span(&self) -> &SourceSpan {
+        match self {
+            SHIRLowerError::TickInsideBranch { span } => span,
+            SHIRLowerError::NoTick { span } => span,
+            SHIRLowerError::CrossClockTick { span, .. } => span,
+            SHIRLowerError::UnsupportedConstruct { span, .. } => span,
+        }
+    }
+}
+
 impl std::fmt::Display for SHIRLowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let span = self.span();
+        write!(f, "{}:{}: ", span.start_line, span.start_col)?;
         match self {
             SHIRLowerError::TickInsideBranch { .. } =>
                 write!(f, "clk.tick().await inside a conditional branch is not supported"),

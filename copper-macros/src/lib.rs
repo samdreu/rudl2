@@ -6,6 +6,17 @@ use syn::{parse_macro_input, visit::Visit, visit_mut::VisitMut, Error, FnArg, It
 enum HardwareMode {
     Sequential,
     Combinational,
+    /// A clock-domain synchronizer: behaves like `Sequential` but is the
+    /// sanctioned domain-crossing point, so it is *exempt* from the CDC check and
+    /// may declare a foreign-domain input. See `sync_2ff` and `copper-core/src/cdc.rs`.
+    Synchronizer,
+}
+
+impl HardwareMode {
+    /// Modes that are clocked, async, tick-bearing loops (everything but comb).
+    fn is_sequential_like(&self) -> bool {
+        matches!(self, HardwareMode::Sequential | HardwareMode::Synchronizer)
+    }
 }
 
 fn parse_hardware_mode(args: TokenStream) -> Result<HardwareMode, Error> {
@@ -13,9 +24,10 @@ fn parse_hardware_mode(args: TokenStream) -> Result<HardwareMode, Error> {
     match text.as_str() {
         "sequential" => Ok(HardwareMode::Sequential),
         "combinational" => Ok(HardwareMode::Combinational),
+        "synchronizer" => Ok(HardwareMode::Synchronizer),
         _ => Err(Error::new(
             proc_macro2::Span::call_site(),
-            "Unsupported #[hardware(...)] argument. Supported: sequential, combinational",
+            "Unsupported #[hardware(...)] argument. Supported: sequential, combinational, synchronizer",
         )),
     }
 }
@@ -28,6 +40,122 @@ fn outer_type_name(ty: &Type) -> Option<String> {
         None
     }
 }
+
+// ── Clock-domain-crossing (CDC) enforcement ─────────────────────────────────
+//
+// A regular `#[hardware(sequential)]` module is single-domain: every port must be
+// in the module's own clock domain. A signal from another domain may only be
+// brought in through a *synchronizer* — a `#[hardware(synchronizer)]` module such
+// as the library `sync_2ff`, which is exempt from this rule. Combined with the
+// phantom-domain types (which already reject wiring a foreign wire into a native
+// port), this makes every clock-domain crossing a real, honest synchronizer
+// module and forbids crossing domains implicitly inside ordinary logic. See the
+// audit in `copper-core/src/cdc.rs`.
+
+mod cdc_check {
+    use super::*;
+
+/// The domain type name at the end of a generic type, but only when there are at
+/// least `min_args` type arguments. Returns `None` for a non-`Path` domain (e.g.
+/// the `()` unit domain) or too few arguments.
+///
+/// Used two ways: `Clock<D>` has one type arg (`min_args = 1` → the domain),
+/// while `In<T, D>` / `Out<T, D>` need two (`min_args = 2` → the *last* is the
+/// domain). A one-argument `In<T>` therefore carries the *default* `()` domain,
+/// not an explicit one, and is treated as domain-agnostic.
+fn type_domain_at(ty: &Type, min_args: usize) -> Option<String> {
+    let Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(ab) = &seg.arguments else { return None };
+    let type_args: Vec<&Type> = ab
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            syn::GenericArgument::Type(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    if type_args.len() < min_args {
+        return None;
+    }
+    match type_args.last() {
+        Some(Type::Path(p)) => p.path.segments.last().map(|s| s.ident.to_string()),
+        _ => None, // e.g. a `()` unit domain
+    }
+}
+
+/// Domain of a `Clock<D>` (its single type argument).
+fn clock_domain(ty: &Type) -> Option<String> {
+    type_domain_at(ty, 1)
+}
+
+/// *Explicit* domain of an `In<T, D>` / `Out<T, D>` — `None` when the domain is
+/// left default (`In<T>` → `()`), which is not considered a crossing.
+fn port_domain(ty: &Type) -> Option<String> {
+    type_domain_at(ty, 2)
+}
+
+fn param_ident(a: &FnArg) -> Option<String> {
+    if let FnArg::Typed(pt) = a {
+        if let Pat::Ident(pi) = &*pt.pat {
+            return Some(pi.ident.to_string());
+        }
+    }
+    None
+}
+
+/// Reject foreign-domain ports on a regular sequential module (signature-level).
+///
+/// Not called for `#[hardware(synchronizer)]` modules — those are the sanctioned
+/// crossing points and may declare a foreign-domain input.
+pub(crate) fn check_cdc(f: &ItemFn) -> Result<(), Error> {
+    // Native domain = the module's clock domain.
+    let clocks: Vec<String> = f
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            FnArg::Typed(pt) if outer_type_name(&pt.ty).as_deref() == Some("Clock") => {
+                clock_domain(&pt.ty)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Multi-clock: a module with several clocks has no single native domain;
+    // richer analysis (which crossing belongs to which edge) is out of scope, so
+    // skip rather than guess.
+    let native = match clocks.as_slice() {
+        [d] => d.clone(),
+        _ => return Ok(()),
+    };
+
+    for a in &f.sig.inputs {
+        let FnArg::Typed(pt) = a else { continue };
+        let outer = outer_type_name(&pt.ty);
+        let Some(kind) = (match outer.as_deref() {
+            Some("In") => Some("input"),
+            Some("Out") => Some("output"),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if let Some(d) = port_domain(&pt.ty) {
+            if d != native {
+                let name = param_ident(a).unwrap_or_default();
+                return Err(Error::new_spanned(a, format!(
+                    "clock-domain crossing: {kind} `{name}` is in domain `{d}`, but this module is \
+                     clocked on `{native}`. A regular module may not cross clock domains — bring \
+                     the signal across with a synchronizer (`copper::sync_2ff`, or your own \
+                     `#[hardware(synchronizer)]` module), then use its output in this domain.",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+} // mod cdc_check
 
 /// Visits an async fn body and records which clock parameter names have a `.tick().await` call.
 struct TickAwaitVisitor<'a> {
@@ -290,7 +418,14 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 
     match hardware_mode {
-        HardwareMode::Sequential => {
+        HardwareMode::Sequential | HardwareMode::Synchronizer => {
+            // Regular sequential modules must be single-domain; synchronizers are
+            // the sanctioned crossing point and are exempt.
+            if matches!(hardware_mode, HardwareMode::Sequential) {
+                if let Err(err) = cdc_check::check_cdc(&input_fn) {
+                    return err.to_compile_error().into();
+                }
+            }
             let mut f = input_fn;
             if let Err(err) = inject_synced_reads(&mut f) {
                 return err.to_compile_error().into();
@@ -304,7 +439,7 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
 /// Validates a hardware function based on its signature and hardware mode.
 fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Result<(), Error> {
     // Sequential must be async; combinational must not be async (the macro adds async)
-    if input_fn.sig.asyncness.is_none() && matches!(hardware_mode, HardwareMode::Sequential) {
+    if input_fn.sig.asyncness.is_none() && hardware_mode.is_sequential_like() {
         return Err(Error::new_spanned(
             &input_fn.sig,
             "#[hardware(sequential)] can only be applied to async functions",
@@ -368,7 +503,7 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
     }
 
     // Sequential must have at least one Clock parameter
-    if matches!(hardware_mode, HardwareMode::Sequential) && !has_clock {
+    if hardware_mode.is_sequential_like() && !has_clock {
         return Err(Error::new_spanned(
             &input_fn.sig,
             "#[hardware(sequential)] must have at least one Clock<D> parameter",
@@ -393,8 +528,8 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         ));
     }
 
-    // Sequential: every Clock<D> parameter must have at least one `name.tick().await` in the body.
-    if matches!(hardware_mode, HardwareMode::Sequential) {
+    // Sequential-like: every Clock<D> parameter must have at least one `name.tick().await` in the body.
+    if hardware_mode.is_sequential_like() {
         let clock_names: HashSet<String> = input_fn.sig.inputs.iter()
             .filter_map(|arg| {
                 if let FnArg::Typed(pat_ty) = arg {
@@ -435,8 +570,70 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use super::cdc_check::check_cdc;
     use super::{validate_hardware_fn, HardwareMode};
     use syn::parse_quote;
+
+    // ── CDC enforcement (check_cdc — signature-level) ───────────────────────
+    //
+    // A regular sequential module must be single-domain; foreign-domain crossings
+    // go through a `#[hardware(synchronizer)]` module (which is not passed to
+    // `check_cdc` at all). So the check is purely: reject any foreign-domain port.
+
+    #[test]
+    fn cdc_accepts_native_only_module() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, step: In<Bits<8>, Slow>, q: Out<Bits<8>, Slow>) {
+                let mut c = Bits::zero();
+                loop { q.write(c); clk.tick().await; c = c + step.read(); }
+            }
+        };
+        assert!(check_cdc(&f).is_ok());
+    }
+
+    #[test]
+    fn cdc_rejects_foreign_input() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, fast: In<Logic, Fast>, q: Out<Logic, Slow>) {
+                loop { q.write(fast.read()); clk.tick().await; }
+            }
+        };
+        assert!(check_cdc(&f).is_err());
+    }
+
+    #[test]
+    fn cdc_rejects_foreign_output() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, d: In<Logic, Slow>, fq: Out<Logic, Fast>) {
+                loop { fq.write(d.read()); clk.tick().await; }
+            }
+        };
+        assert!(check_cdc(&f).is_err());
+    }
+
+    #[test]
+    fn cdc_accepts_foreign_generic_domain_input_is_still_foreign() {
+        // A generic source domain `Src` differs from the concrete clock domain, so
+        // it is foreign — a regular module still may not take it directly. (Only a
+        // synchronizer may, and synchronizers are never passed to `check_cdc`.)
+        let f: syn::ItemFn = parse_quote! {
+            async fn m<Src>(clk: Clock<Slow>, d: In<Logic, Src>, q: Out<Logic, Slow>) {
+                loop { q.write(d.read()); clk.tick().await; }
+            }
+        };
+        assert!(check_cdc(&f).is_err());
+    }
+
+    #[test]
+    fn cdc_skips_multiclock_modules() {
+        // Two clocks → no unambiguous native domain → not checked here.
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(cf: Clock<Fast>, cs: Clock<Slow>, fast: In<Logic, Fast>, q: Out<Logic, Slow>) {
+                loop { q.write(fast.read()); cf.tick().await; cs.tick().await; }
+            }
+        };
+        assert!(check_cdc(&f).is_ok());
+    }
 
     #[test]
     fn sequential_must_be_async() {
