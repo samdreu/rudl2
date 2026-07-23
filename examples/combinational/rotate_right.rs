@@ -1,5 +1,7 @@
+use copper_core::port::*;
 use copper_core::types::*;
 use copper_sim::*;
+use copper_macros::hardware;
 
 const fn safe_clog2(n: usize) -> usize {
     match n {
@@ -15,25 +17,37 @@ const fn safe_clog2(n: usize) -> usize {
     }
 }
 
+#[hardware(combinational)]
 fn rotate_right<const N: usize, const N_LOG: usize>(
-    data_i: Bits<N>,
-    rot_i: Bits<N_LOG>,
-) -> Bits<N> {
+    data_i: In<Bits<N>, ()>,
+    rot_i: In<Bits<N_LOG>, ()>,
+    o: Out<Bits<N>, ()>,
+) {
     const { assert!(N_LOG == safe_clog2(N), "N_LOG must equal safe_clog2(N)") };
 
-    let mut o = Bits::zero();
-    let rot = rot_i.as_u128() as usize;
+    let data = data_i.read();
+    let rot = rot_i.read().as_u128() as usize;
 
+    let mut o_val = Bits::zero();
     for i in 0..N {
-        o[i] = data_i[(i + rot) % N];
+        o_val[i] = data[(i + rot) % N];
     }
 
-    o
+    o.write(o_val);
 }
 
 fn main() {
     const N: usize = 8;
     const N_LOG: usize = safe_clog2(N); // 3
+
+    let mut exec = HardwareExecutor::new();
+
+    let (data_drv, data_in) = wire::<Bits<N>, ()>(Bits::zero());
+    let (rot_drv, rot_in) = wire::<Bits<N_LOG>, ()>(Bits::zero());
+    let (o_out, o_obs) = wire::<Bits<N>, ()>(Bits::zero());
+
+    let dh = o_out.dirty_handle();
+    exec.spawn_wired(rotate_right::<N, N_LOG>(data_in, rot_in, o_out), vec![dh]);
 
     let mut test = HardwareTest::new("bsg_rotate_right")
         .with_verilog("examples/combinational/sv/rotate_right.sv")
@@ -51,11 +65,13 @@ fn main() {
     ];
 
     for (i, &(data, rot, _expected)) in cases.iter().enumerate() {
-        let result = rotate_right::<N, N_LOG>(data, rot);
+        data_drv.write(data);
+        rot_drv.write(rot);
+        exec.poll_tasks();
         test.record_cycle(
             i,
             &[("data_i", data.as_array()), ("rot_i", rot.as_array())],
-            &[("o", result.as_array())],
+            &[("o", o_obs.read().as_array())],
         );
     }
 

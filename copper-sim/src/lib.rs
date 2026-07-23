@@ -1,10 +1,8 @@
 use copper_core::Module;
-use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 pub mod verification;
@@ -15,7 +13,7 @@ pub use testing::{HardwareTest, TestResult, make_cycle};
 
 pub mod executor;
 
-pub use executor::{HardwareExecutor, ModuleInfo};
+pub use executor::{HardwareExecutor, HardwareModule, ModuleInfo};
 
 #[doc(hidden)]
 pub mod synced_read;
@@ -30,11 +28,6 @@ pub(crate) enum PollPhase {
 }
 
 thread_local! {
-    static CURRENT_EMIT_TARGET: RefCell<Option<Arc<dyn Any + Send + Sync>>> = RefCell::new(None);
-    /// Set to true by `emit_to_current` whenever a value is written.
-    /// Reset to false by `push_emit_target` before each task poll so each poll starts clean.
-    /// Read by the executor after each poll to decide whether another delta cycle is needed.
-    static CURRENT_EMIT_DIRTY: RefCell<bool> = RefCell::new(false);
     /// Current clock phase set by `tick_clock` before each settle pass.
     static POLL_PHASE: RefCell<PollPhase> = RefCell::new(PollPhase::PreEdge);
 }
@@ -47,64 +40,6 @@ fn is_pre_edge() -> bool {
     POLL_PHASE.with(|cell| *cell.borrow() == PollPhase::PreEdge)
 }
 
-pub(crate) struct EmitTargetGuard {
-    previous: Option<Arc<dyn Any + Send + Sync>>,
-}
-
-impl Drop for EmitTargetGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        CURRENT_EMIT_TARGET.with(|cell| {
-            *cell.borrow_mut() = previous;
-        });
-    }
-}
-
-pub(crate) fn push_emit_target(target: Option<Arc<dyn Any + Send + Sync>>) -> EmitTargetGuard {
-    // Clear the dirty flag so the upcoming poll starts with a clean slate.
-    CURRENT_EMIT_DIRTY.with(|cell| *cell.borrow_mut() = false);
-
-    let previous = CURRENT_EMIT_TARGET.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        std::mem::replace(&mut *slot, target)
-    });
-    EmitTargetGuard { previous }
-}
-
-/// Read and reset the dirty flag that `emit_to_current` sets.
-/// Returns true if the most recent task poll called `emit!` at least once.
-pub(crate) fn take_emit_dirty() -> bool {
-    CURRENT_EMIT_DIRTY.with(|cell| {
-        let dirty = *cell.borrow();
-        *cell.borrow_mut() = false;
-        dirty
-    })
-}
-
-pub fn emit_to_current<T>(value: T)
-where
-    T: PartialEq + Send + 'static,
-{
-    CURRENT_EMIT_TARGET.with(|cell| {
-        let target = cell
-            .borrow()
-            .as_ref()
-            .cloned()
-            .expect("emit!(value) called without a bound function-typed output");
-
-        let typed = Arc::downcast::<Mutex<T>>(target)
-            .expect("emit!(value) type mismatch for currently bound function-typed output");
-        let mut guard = typed.lock().unwrap();
-        // Only mark dirty when the value actually changes. This prevents modules
-        // that unconditionally call emit! with the same value from preventing the
-        // delta-cycle loop from reaching a fixed point.
-        if *guard != value {
-            *guard = value;
-            CURRENT_EMIT_DIRTY.with(|cell| *cell.borrow_mut() = true);
-        }
-    });
-}
-
 /// A future that suspends for exactly one delta cycle, then resumes.
 ///
 /// On the first poll it returns `Pending`, allowing other tasks in the same
@@ -113,10 +48,10 @@ where
 ///
 /// This is the building block for writing purely combinational modules that
 /// re-evaluate every delta cycle instead of every clock edge.  It is also
-/// what makes the delta-cycle limitation observable: a module that calls
-/// `emit!` unconditionally before `delta_yield().await` will mark the signal
-/// dirty on *every* pass, preventing the executor from ever detecting a fixed
-/// point and causing it to panic at `MAX_DELTA_CYCLES`.
+/// what makes the delta-cycle limitation observable: a module that drives an
+/// output to a new value unconditionally before `delta_yield().await` will mark
+/// the signal dirty on *every* pass, preventing the executor from ever detecting
+/// a fixed point and causing it to panic at the oscillation threshold.
 pub struct DeltaYield {
     yielded: bool,
 }
@@ -182,15 +117,6 @@ macro_rules! spawn_child {
     }};
 }
 
-/// A macro for emitting values to output ports in function-typed modules.
-/// This provides a clearer API for sequential modules that emit outputs each cycle.
-#[macro_export]
-macro_rules! emit {
-    ($value:expr) => {{
-        $crate::emit_to_current($value);
-    }};
-}
-
 /// A simple simulator struct that can run a hardware module and track its state over time. 
 /// This is a very basic implementation and can be extended with features like waveform generation, VCD dumping, etc.
 pub struct Simulator<M: Module> {
@@ -251,11 +177,3 @@ impl<M: Module> Simulator<M> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[should_panic(expected = "emit!(value) called without a bound function-typed output")]
-    fn emit_without_bound_target_panics() {
-        crate::emit!(1u8);
-    }
-}

@@ -35,38 +35,19 @@ async fn fast_counter(
     }
 }
 
-// ── Two-flip-flop synchronizer ────────────────────────────────────────────────
-// Standard metastability mitigation: two cascaded flip-flops clocked by the
-// *destination* domain. The input `d` is generic over any source domain —
-// passing a ClkFast-tagged wire here is safe because this is the designated
-// crossing point. Passing it directly to slow_consumer is a compile error:
-//
-//   // CDC violation — does NOT compile:
-//   slow_consumer(clk_slow.clone(), flag_to_sync, consumer_port);
-//   // error[E0308]: mismatched types
-//   //   expected `In<Logic, ClkSlow>`
-//   //      found `In<Logic, ClkFast>`
-//
-// The synchronizer is the *only* legal path from ClkFast to ClkSlow.
-#[hardware(sequential)]
-async fn sync_2ff<SrcD: ClockDomain>(
-    clk: Clock<ClkSlow>,
-    d: In<Logic, SrcD>,    // generic: accepts any source domain
-    q: Out<Logic, ClkSlow>,
-) {
-    let mut ff1 = Logic::Zero;
-    let mut ff2 = Logic::Zero;
-    loop {
-        q.write(ff2);
-        clk.tick().await;
-        // Assignment order matters: ff2 captures the OLD value of ff1 because
-        // ff1 has not yet been reassigned in this segment. Reversing the two
-        // lines would cause ff2 to see the NEW ff1 via sequential forwarding,
-        // which would collapse the two flip-flops into one — wrong for a sync.
-        ff2 = ff1;
-        ff1 = d.read();
-    }
-}
+// ── Crossing ClkFast → ClkSlow ────────────────────────────────────────────────
+// The crossing goes through the library synchronizer `copper::sync_2ff` — two
+// flip-flops clocked by the *destination* domain. It accepts a signal tagged with
+// any source domain because it is the designated crossing point. Two things make
+// an *un*synchronized crossing impossible:
+//   1. The phantom domain types: passing the ClkFast wire directly to a ClkSlow
+//      module is a compile error —
+//        // slow_consumer(clk_slow.clone(), flag_to_sync, consumer_port);
+//        // error[E0308]: expected `In<Logic, ClkSlow>`, found `In<Logic, ClkFast>`
+//   2. The CDC check in `#[hardware(sequential)]`: a regular module may not even
+//      *declare* a foreign-domain port. Only a `#[hardware(synchronizer)]` module
+//      (like `sync_2ff`) may, so hand-rolling an ad-hoc crossing won't compile.
+use copper::sync_2ff;
 
 // ── Consumer: reads the synchronized flag in the slow domain ──────────────────
 #[hardware(sequential)]

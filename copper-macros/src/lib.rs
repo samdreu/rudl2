@@ -157,6 +157,54 @@ pub(crate) fn check_cdc(f: &ItemFn) -> Result<(), Error> {
 
 } // mod cdc_check
 
+// ── Clocks are provided, not constructed ────────────────────────────────────
+//
+// A hardware module receives its `Clock<D>` as a parameter; it may not create a
+// new one. A fabricated clock is a distinct instance that the testbench never
+// advances, so a module ticking it would hang — and, more importantly, a clock
+// is a real signal you are handed, not something logic conjures. This closes
+// "Gap 2" from the CDC audit. Enforced at the macro (the only place that knows a
+// function body is a module body); testbenches, which are not `#[hardware]`,
+// still create clocks normally. Cloning a clock parameter stays legal — a clone
+// shares the same real clock, which is how you pass it to a submodule.
+
+/// Flags a call whose path constructs a `Clock` — `Clock::new()`,
+/// `Clock::<D>::new()`, `…::Clock::default()`.
+struct ClockConstruction {
+    found: Option<proc_macro2::Span>,
+}
+
+impl<'ast> Visit<'ast> for ClockConstruction {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*call.func {
+            let segs = &p.path.segments;
+            if segs.len() >= 2 {
+                let last = segs[segs.len() - 1].ident.to_string();
+                let owner = segs[segs.len() - 2].ident.to_string();
+                if owner == "Clock" && (last == "new" || last == "default") && self.found.is_none() {
+                    self.found = Some(syn::spanned::Spanned::span(call));
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// Reject any clock construction inside a hardware module body.
+pub(crate) fn check_no_clock_construction(f: &ItemFn) -> Result<(), Error> {
+    let mut v = ClockConstruction { found: None };
+    v.visit_block(f.block.as_ref());
+    match v.found {
+        Some(span) => Err(Error::new(
+            span,
+            "a hardware module may not create a clock — clocks are provided as parameters. \
+             A fabricated clock is never driven, so the module would hang. To clock a submodule, \
+             pass a clone of a clock parameter (`clk.clone()`).",
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Visits an async fn body and records which clock parameter names have a `.tick().await` call.
 struct TickAwaitVisitor<'a> {
     clock_names: &'a HashSet<String>,
@@ -176,6 +224,16 @@ impl<'ast, 'a> Visit<'ast> for TickAwaitVisitor<'a> {
         }
         syn::visit::visit_expr_await(self, node);
     }
+}
+
+/// True if the function body has a top-level `loop { … }`. A sequential module
+/// runs forever, so its body must be an infinite loop (optionally preceded by
+/// `let` declarations for registers/constants). A labelled loop counts too.
+fn has_top_level_loop(block: &syn::Block) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|s| matches!(s, syn::Stmt::Expr(syn::Expr::Loop(_), _)))
 }
 
 /// Finds a direct `.tick().await` in a block or statement — does not recurse into
@@ -382,7 +440,7 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
     Ok(())
 }
 
-fn wrap_combinational(mut f: ItemFn) -> TokenStream {
+fn wrap_combinational(mut f: ItemFn) -> ItemFn {
     let body = &f.block;
     let new_body: syn::Block = syn::parse_quote! {
         {
@@ -396,7 +454,28 @@ fn wrap_combinational(mut f: ItemFn) -> TokenStream {
         span: proc_macro2::Span::call_site(),
     });
     f.block = Box::new(new_body);
-    quote! { #f }.into()
+    f
+}
+
+/// Turn a transformed `async fn m(params) { body }` into
+/// `fn m(params) -> HardwareModule<impl Future<Output = ()>>
+///  { HardwareModule::__new(async move { body }) }`.
+///
+/// This is what makes `#[hardware]` mandatory: a module's value is now a
+/// `HardwareModule`, the only thing the executor's spawn APIs accept. A bare
+/// `async fn` produces a plain `Future` and cannot be spawned — you can't forget
+/// the attribute.
+fn wrap_in_module(f: &mut ItemFn) {
+    let body = f.block.clone();
+    f.sig.asyncness = None;
+    f.sig.output = syn::parse_quote! {
+        -> ::copper_sim::HardwareModule<impl ::core::future::Future<Output = ()>>
+    };
+    f.block = Box::new(syn::parse_quote! {
+        {
+            ::copper_sim::HardwareModule::__new(async move #body)
+        }
+    });
 }
 
 /// #[hardware] macro for defining hardware modules
@@ -417,6 +496,11 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
         return err.to_compile_error().into();
     }
 
+    // A module receives its clocks; it may not construct them (all modes).
+    if let Err(err) = check_no_clock_construction(&input_fn) {
+        return err.to_compile_error().into();
+    }
+
     match hardware_mode {
         HardwareMode::Sequential | HardwareMode::Synchronizer => {
             // Regular sequential modules must be single-domain; synchronizers are
@@ -430,9 +514,14 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             if let Err(err) = inject_synced_reads(&mut f) {
                 return err.to_compile_error().into();
             }
+            wrap_in_module(&mut f);
             quote! { #f }.into()
         }
-        HardwareMode::Combinational => wrap_combinational(input_fn),
+        HardwareMode::Combinational => {
+            let mut f = wrap_combinational(input_fn);
+            wrap_in_module(&mut f);
+            quote! { #f }.into()
+        }
     }
 }
 
@@ -563,7 +652,16 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         }
     }
 
-    // TODO: for sequential functions, verify the body contains a top-level infinite loop
+    // Sequential-like: the body must be a top-level infinite `loop` (the user
+    // writes it — for combinational, the macro adds the loop). Without it, CHIR
+    // rejects the module later; catch it here with a clearer, earlier message.
+    if hardware_mode.is_sequential_like() && !has_top_level_loop(&input_fn.block) {
+        return Err(Error::new_spanned(
+            &input_fn.sig,
+            "#[hardware(sequential)] body must be a top-level `loop { … clk.tick().await; }` \
+             — a hardware module runs forever, so its body is an infinite loop",
+        ));
+    }
 
     Ok(())
 }
@@ -571,8 +669,56 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
 #[cfg(test)]
 mod tests {
     use super::cdc_check::check_cdc;
-    use super::{validate_hardware_fn, HardwareMode};
+    use super::{check_no_clock_construction, validate_hardware_fn, HardwareMode};
     use syn::parse_quote;
+
+    // ── Clocks are provided, not constructed (Gap 2) ────────────────────────
+
+    #[test]
+    fn clock_construction_rejected_new() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, q: Out<Logic, Slow>) {
+                let sneaky = Clock::<Fast>::new();
+                loop { q.write(Logic::Zero); sneaky.tick().await; clk.tick().await; }
+            }
+        };
+        assert!(check_no_clock_construction(&f).is_err());
+    }
+
+    #[test]
+    fn clock_construction_rejected_default() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, q: Out<Logic, Slow>) {
+                let sneaky: Clock<Fast> = Clock::default();
+                loop { q.write(Logic::Zero); clk.tick().await; let _ = &sneaky; }
+            }
+        };
+        assert!(check_no_clock_construction(&f).is_err());
+    }
+
+    #[test]
+    fn clock_clone_is_allowed() {
+        // Cloning a clock parameter (to pass to a submodule) shares the same real
+        // clock and must stay legal.
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, q: Out<Logic, Slow>) {
+                let child_clk = clk.clone();
+                loop { q.write(Logic::Zero); clk.tick().await; let _ = &child_clk; }
+            }
+        };
+        assert!(check_no_clock_construction(&f).is_ok());
+    }
+
+    #[test]
+    fn no_clock_construction_in_normal_module() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<Slow>, step: In<Bits<8>, Slow>, q: Out<Bits<8>, Slow>) {
+                let mut c = Bits::zero();
+                loop { q.write(c); clk.tick().await; c = c + step.read(); }
+            }
+        };
+        assert!(check_no_clock_construction(&f).is_ok());
+    }
 
     // ── CDC enforcement (check_cdc — signature-level) ───────────────────────
     //
@@ -716,6 +862,51 @@ mod tests {
             async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) { loop {} }
         };
         assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_err());
+    }
+
+    #[test]
+    fn sequential_missing_top_level_loop() {
+        // Has a tick but no `loop` — a straight-line sequential body is rejected.
+        let f: syn::ItemFn = parse_quote! {
+            async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) {
+                clk.tick().await;
+            }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_err());
+    }
+
+    #[test]
+    fn sequential_loop_after_lets_is_ok() {
+        // Pre-loop `let` declarations before the top-level loop are fine.
+        let f: syn::ItemFn = parse_quote! {
+            async fn counter(clk: Clock<MainClk>, input: In<u8>, out: Out<u8>) {
+                let mut c = 0u8;
+                loop { out.write(c); clk.tick().await; c = c + 1; }
+            }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_ok());
+    }
+
+    #[test]
+    fn synchronizer_requires_top_level_loop() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn s(clk: Clock<Slow>, d: In<Logic, Fast>, q: Out<Logic, Slow>) {
+                q.write(d.read()); clk.tick().await;
+            }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Synchronizer).is_err());
+    }
+
+    #[test]
+    fn combinational_needs_no_loop() {
+        // Combinational modules have no user-written loop (the macro adds it), so
+        // the loop check must not apply to them.
+        let f: syn::ItemFn = parse_quote! {
+            fn gate(a: In<Logic>, b: In<Logic>, out: Out<Logic>) {
+                out.write(a.read());
+            }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Combinational).is_ok());
     }
 
     #[test]

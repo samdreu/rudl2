@@ -44,34 +44,40 @@ impl MemoryBackedFifo {
         }
     }
 
+    /// One clock cycle of a synchronous-read FIFO built on the pipelined
+    /// `Memory` (READ_LAT = WRITE_LAT = 1, ReadFirst).
+    ///
+    /// Timing (matches `verilog/fifo_mem_new.v`): control flags come from the
+    /// pre-edge count; memory write + a read of the current `read_ptr` are staged
+    /// this cycle and take effect at the posedge (`clock.advance()`); `dout` is
+    /// the *registered* read output, i.e. `mem[read_ptr]` captured at that edge
+    /// (ReadFirst → the value before this cycle's write commits). Outputs are
+    /// sampled after the edge, matching the Verilator testbench.
     fn cycle(&mut self, wr_en: bool, rd_en: bool, din: u8) -> FifoOutputs {
         let can_write = wr_en && self.count < Self::DEPTH;
         let can_read = rd_en && self.count > 0;
 
+        // Stage memory ops using the current (pre-edge) pointers.
         if can_write {
             self.mem.write_port::<0>().write(self.write_ptr, din);
+        }
+        self.mem.read_port::<0>().read(self.read_ptr);
+
+        // Advance control registers — these take effect at the posedge.
+        if can_write {
             self.write_ptr = (self.write_ptr + 1) % Self::DEPTH;
         }
-
         if can_read {
             self.read_ptr = (self.read_ptr + 1) % Self::DEPTH;
         }
+        self.count = self.count + can_write as usize - can_read as usize;
 
-        self.count += can_write as usize;
-        self.count -= can_read as usize;
-
-        self.clock.advance();
+        self.clock.advance(); // posedge: write commits, read is captured
 
         let empty = self.count == 0;
         let full = self.count == Self::DEPTH;
-        let dout = if empty {
-            0
-        } else {
-            self.mem.read_port::<0>().read(self.read_ptr)
-        };
-
         FifoOutputs {
-            dout,
+            dout: self.mem.read_port::<0>().data(),
             empty,
             full,
             valid: !empty,

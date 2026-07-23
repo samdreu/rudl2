@@ -1,11 +1,16 @@
+//! Module-composition tests: combinational logic as plain functions, sequential
+//! modules spawned as a tracked hierarchy (`spawn_child` / `module_info`) and as
+//! peers (`spawn`). Uses the current `In<T,D>` / `Out<T,D>` wire port model.
+
+use copper_core::port::{wire, In, Out};
 use copper_core::{Clock, ClockDomain};
 use copper_macros::hardware;
-use copper_sim::{HardwareExecutor, spawn_child};
-use std::sync::{Arc, Mutex};
+use copper_sim::{spawn_child, HardwareExecutor};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
+// Combinational logic is just plain Rust functions — no hardware wrapper needed.
 fn add_one(x: u8) -> u8 {
     x.wrapping_add(1)
 }
@@ -18,35 +23,38 @@ fn affine_mix(x: u8) -> u8 {
     double(add_one(x))
 }
 
-#[hardware]
-async fn stage_add_one(clk: Clock<MainClk>, input: Arc<Mutex<u8>>, output: Arc<Mutex<u8>>) {
+// A registered pipeline stage: drives `output` with the previous cycle's value,
+// then latches `add_one(input)` into its register.
+#[hardware(sequential)]
+async fn stage_add_one(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
     loop {
         clk.tick().await;
-        *output.lock().unwrap() = reg;
-        let in_val = *input.lock().unwrap();
-        reg = add_one(in_val);
+        output.write(reg);
+        reg = add_one(input.read());
     }
 }
 
-#[hardware]
-async fn stage_double(clk: Clock<MainClk>, input: Arc<Mutex<u8>>, output: Arc<Mutex<u8>>) {
+#[hardware(sequential)]
+async fn stage_double(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
     loop {
         clk.tick().await;
-        *output.lock().unwrap() = reg;
-        let in_val = *input.lock().unwrap();
-        reg = double(in_val);
+        output.write(reg);
+        reg = double(input.read());
     }
 }
 
-#[hardware]
-async fn counter_by(clk: Clock<MainClk>, step: u8, output: Arc<Mutex<u8>>) {
+// `step` is a compile-time constant (a module parameter in hardware), so it is a
+// const generic rather than a runtime port — which also lets it be a `#[hardware]`
+// module (the macro requires ports to be `Clock`/`In`/`Out`).
+#[hardware(sequential)]
+async fn counter_by<const STEP: u8>(clk: Clock<MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
     loop {
         clk.tick().await;
-        *output.lock().unwrap() = reg;
-        reg = reg.wrapping_add(step);
+        output.write(reg);
+        reg = reg.wrapping_add(STEP);
     }
 }
 
@@ -63,30 +71,32 @@ fn sequential_modules_spawn_with_spawn_child() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let in_data = Arc::new(Mutex::new(0u8));
-    let wire = Arc::new(Mutex::new(0u8));
-    let out_data = Arc::new(Mutex::new(0u8));
+    // in_data → stage_add_one → mid → stage_double → out_data
+    let (in_drv, in_port) = wire::<u8, MainClk>(0);
+    let (mid_out, mid_in) = wire::<u8, MainClk>(0);
+    let (out_drv, out_obs) = wire::<u8, MainClk>(0);
 
     spawn_child!(
         exec,
         "pipeline",
         "stage_add_one",
-        stage_add_one(clk.clone(), Arc::clone(&in_data), Arc::clone(&wire))
+        stage_add_one(clk.clone(), in_port, mid_out)
     );
     spawn_child!(
         exec,
         "pipeline",
         "stage_double",
-        stage_double(clk.clone(), Arc::clone(&wire), Arc::clone(&out_data))
+        stage_double(clk.clone(), mid_in, out_drv)
     );
 
+    // Two-stage registered pipeline: affine_mix has a 2-cycle latency.
     let inputs = [3u8, 7, 11, 1];
     let expected_outputs = [0u8, 0, 8, 16];
 
     for (input, expected) in inputs.iter().zip(expected_outputs.iter()) {
-        *in_data.lock().unwrap() = *input;
+        in_drv.write(*input);
         exec.tick_clock(&mut clk);
-        let observed = *out_data.lock().unwrap();
+        let observed = out_obs.read();
         assert_eq!(observed, *expected, "cycle {}", clk.cycle());
     }
 
@@ -111,20 +121,20 @@ fn peer_modules_continue_using_exec_spawn() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let out1 = Arc::new(Mutex::new(0u8));
-    let out2 = Arc::new(Mutex::new(0u8));
-    let out3 = Arc::new(Mutex::new(0u8));
+    let (out1_drv, out1_obs) = wire::<u8, MainClk>(0);
+    let (out2_drv, out2_obs) = wire::<u8, MainClk>(0);
+    let (out3_drv, out3_obs) = wire::<u8, MainClk>(0);
 
-    exec.spawn(counter_by(clk.clone(), 1, Arc::clone(&out1)));
-    exec.spawn(counter_by(clk.clone(), 2, Arc::clone(&out2)));
-    exec.spawn(counter_by(clk.clone(), 5, Arc::clone(&out3)));
+    exec.spawn(counter_by::<1>(clk.clone(), out1_drv));
+    exec.spawn(counter_by::<2>(clk.clone(), out2_drv));
+    exec.spawn(counter_by::<5>(clk.clone(), out3_drv));
 
     let expected = [(0u8, 0u8, 0u8), (1, 2, 5), (2, 4, 10), (3, 6, 15)];
 
     for (exp1, exp2, exp3) in expected {
         exec.tick_clock(&mut clk);
-        assert_eq!(*out1.lock().unwrap(), exp1, "counter1 cycle {}", clk.cycle());
-        assert_eq!(*out2.lock().unwrap(), exp2, "counter2 cycle {}", clk.cycle());
-        assert_eq!(*out3.lock().unwrap(), exp3, "counter3 cycle {}", clk.cycle());
+        assert_eq!(out1_obs.read(), exp1, "counter1 cycle {}", clk.cycle());
+        assert_eq!(out2_obs.read(), exp2, "counter2 cycle {}", clk.cycle());
+        assert_eq!(out3_obs.read(), exp3, "counter3 cycle {}", clk.cycle());
     }
 }

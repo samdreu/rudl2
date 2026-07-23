@@ -1,5 +1,7 @@
+use copper_core::port::*;
 use copper_core::types::*;
 use copper_sim::*;
+use copper_macros::hardware;
 
 const fn safe_clog2(n: usize) -> usize {
     match n {
@@ -15,30 +17,41 @@ const fn safe_clog2(n: usize) -> usize {
     }
 }
 
-
+#[hardware(combinational)]
 fn priority_encode<const N: usize, const N_LOG: usize>(
-    inputs: Bits<N>,
-) -> (Bits<N_LOG>, Logic) {
+    inputs: In<Bits<N>, ()>,
+    result: Out<Bits<N_LOG>, ()>,
+    valid: Out<Logic, ()>,
+) {
     const { assert!(N_LOG == safe_clog2(N), "N_LOG must equal safe_clog2(N)") };
 
-    let mut result = Bits::zero();
-    let mut valid = Logic::Zero;
+    let in_val = inputs.read();
+    let mut res = Bits::zero();
+    let mut v = Logic::Zero;
 
     for i in 0..N {
-        if inputs[i] == Logic::One {
-            result = Bits::from_usize(i);
-            valid = Logic::One;
+        if in_val[i] == Logic::One {
+            res = Bits::from_usize(i);
+            v = Logic::One;
         }
     }
 
-    (result, valid)
+    result.write(res);
+    valid.write(v);
 }
-
-
 
 fn main() {
     const N: usize = 8;
     const N_LOG: usize = safe_clog2(N); // 3
+
+    let mut exec = HardwareExecutor::new();
+
+    let (in_drv, in_wire) = wire::<Bits<N>, ()>(Bits::zero());
+    let (result_out, result_obs) = wire::<Bits<N_LOG>, ()>(Bits::zero());
+    let (valid_out, valid_obs) = wire::<Logic, ()>(Logic::Zero);
+
+    let dhs = vec![result_out.dirty_handle(), valid_out.dirty_handle()];
+    exec.spawn_wired(priority_encode::<N, N_LOG>(in_wire, result_out, valid_out), dhs);
 
     let mut test = HardwareTest::new("priority_encode")
         .with_verilog("examples/combinational/sv/priority_encode.sv")
@@ -57,11 +70,12 @@ fn main() {
     ];
 
     for (i, &(inputs, _exp_result, _exp_valid)) in cases.iter().enumerate() {
-        let (result, valid) = priority_encode::<N, N_LOG>(inputs);
+        in_drv.write(inputs);
+        exec.poll_tasks();
         test.record_cycle(
             i,
             &[("inputs", inputs.as_array())],
-            &[("result", result.as_array()), ("valid", &[valid])],
+            &[("result", result_obs.read().as_array()), ("valid", &[valid_obs.read()])],
         );
     }
 

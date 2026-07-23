@@ -5,6 +5,7 @@ pub mod memory;
 pub mod port;
 pub mod shir;
 pub mod vlir;
+pub mod cdc;
 pub mod types;
 
 pub use ir::{ModuleIR};
