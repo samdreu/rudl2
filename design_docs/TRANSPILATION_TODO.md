@@ -1,11 +1,19 @@
 # Copper TODO / Audit Checklist
 
-Working list as of 2026-07-21. Covers the **transpilation pipeline** (by phase) and
+Working list as of 2026-07-23. Covers the **transpilation pipeline** (by phase) and
 the **language frontend** (macro, port model, simulator API).
 Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decisions),
 [TRANSPILATION_COVERAGE_MAP.md](TRANSPILATION_COVERAGE_MAP.md) (examples → features).
 
 **P0** = emits wrong hardware, fix first. **P1** = gap with a known shape. **P2** = cleanup.
+
+> **2026-07-23 status.** This branch now sits on `fix/frontend` (macro/CDC/sim
+> hardening — barrier removal, synced-reads, `synchronizer` mode). Two bodies of
+> work landed on top: **Phase A FIR capture** (#1–#7a — the FIR now losslessly
+> represents the whole example set) and the first **Phase B CHIR consumption**
+> increments (free-fn + impl-assoc-fn inlining, struct lowering, match-as-value,
+> Option `unwrap_or`). See the Phase A audit (§ below) and the *CHIR consumption
+> progress* note under Phase B. Workspace: 453 tests, 0 failures.
 
 ---
 
@@ -67,6 +75,33 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
       into the same phase's pre-edge, port drives keep their timing. Worth a second look.
 
 ## Phase B — CHIR
+
+### CHIR consumption progress (2026-07-23)
+
+The first increments that *consume* the file-scope items captured in #7a, plus
+the value-lowering they need. All in `chir_lower.rs`; full detail (scope,
+limitations, per-item deferrals) lives under Phase A's **#7b+** list. Ordered as
+implemented:
+
+1. **Free-fn inlining** (`2318abe`) — `lower_expr`'s `Call` arm inlines calls to
+   file-scope free fns by substitution (params→args, `let`-folding into the tail);
+   nested calls inline recursively; recursion rejected.
+2. **Impl associated-fn inlining** (`e4363dd`) — same inliner, extended to
+   receiver-less impl methods keyed `Type::method` (e.g. `Opcode::from_bits`).
+3. **Struct lowering** (`12c099d`) — a struct-valued `let` binds one wire per
+   field (`<base>_<field>`), directly or through one level of inlining; field
+   access already matched that naming.
+4. **Match-as-value** (`bc977d4`) — was largely present (`case` / `Mux`-chain);
+   fixed a lone `_` arm against a tuple scrutinee.
+5. **Option `unwrap_or`** (`30cd790`) — fold `Some(v)`→v / `None`→default in a
+   visible producer, then lower as match-as-value.
+
+**Net:** the inline → struct → match → `unwrap_or` stack composes, so
+`alu_exec_*`-shaped bodies and `BranchCond::from_bits(f3).unwrap_or(Beq)` (the CPU
+BRANCH arm) lower end-to-end. **What still gates a full `decode`/CPU:** the `?`
+operator + cross-fn validity threading, `match { Some(d)=>d, None=>panic!() }`
+(panic is unsynthesizable), and let-bound Option `Var`s (need a materialized
+valid-bit representation) — all under **#7b+ item 3** and **#4** below.
 
 - [ ] **P1 — Unary `!` on a multi-bit value** emits SV logical-`!` (1-bit reduce)
       instead of bitwise `~`. Correct for 1-bit `Logic`, wrong for `Bits<N>`. Needs
@@ -472,7 +507,7 @@ model, and the simulator API.
 
 ## Verification you can lean on while auditing
 
-- `cargo test --workspace` — 406 tests, currently 0 failures.
+- `cargo test --workspace` — 453 tests, currently 0 failures.
 - 4 modules behaviorally verified sim-vs-Verilog: `counter`, `lfsr`,
   `pattern_detector`, `traffic_light_fsm` (see `tests/common/mod.rs`).
 - Golden tests pin exact emitted text for the counter, the `Logic` comb module,

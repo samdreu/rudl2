@@ -1,12 +1,23 @@
 # Copper Transpilation Roadmap (Actionable Plan)
 
-**Status date:** 2026-07-14
+**Status date:** 2026-07-23 (was 2026-07-14).
 **Author:** working plan derived from a review of the current code + design docs.
 **Relationship to `TRANSPILATION_PLAN.md`:** that document holds the architecture
 and the accepted decision log and is still the source of truth for *why* the
 pipeline is shaped the way it is. This document is the *what-to-do-next*: it
 reflects the code as it actually exists today and lays out the concrete path to
 end-to-end Rust → SystemVerilog.
+
+> **2026-07-23 update.** Since this doc was written the branch was rebased onto
+> `fix/frontend` and two bodies of work landed (see
+> [TRANSPILATION_TODO.md](TRANSPILATION_TODO.md) for the authoritative status):
+> **Phase A FIR capture** is complete (the FIR losslessly represents the whole
+> example set — turbofish, hardware mode, generics, const/try/macro, file-scope
+> items), and the first **Phase B CHIR consumption** increments landed (free-fn +
+> impl-assoc-fn inlining, struct lowering, match-as-value, Option `unwrap_or`).
+> The `alu_exec_*` and BranchCond CPU fragments now lower; full `decode`/CPU is
+> gated on Option `?` + the valid-bit representation. Sections below predate this
+> and describe the pre-capture state — treat the TODO as current.
 
 ---
 
