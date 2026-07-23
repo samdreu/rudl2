@@ -15,7 +15,7 @@ use copper_core::shir::{
     SHIRRegUpdate, SHIRSeqBody, SHIRStmt, SHIRSubmoduleInst,
 };
 use copper_core::vlir::{
-    VLIRAlwaysFF, VLIRBinOp, VLIRBody, VLIRCombBody, VLIRCombPhase, VLIRContinuousAssign, VLIRExpr,
+    VLIRAlwaysFF, VLIRBinOp, VLIRCaseArm, VLIRBody, VLIRCombBody, VLIRCombPhase, VLIRContinuousAssign, VLIRExpr,
     VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind, VLIRRegDecl, VLIRSeqBody, VLIRStmt,
     VLIRSubmoduleInst, VLIRUnOp,
 };
@@ -33,6 +33,10 @@ pub enum VLIRLowerError {
     NestedCaseExpr,
     /// A non-concrete width reached Phase D — parametric widths are M2.
     SymbolicWidthUnsupported,
+    /// A combinational signal is assigned on some control paths but not all, which
+    /// would infer a latch. Copper exists to make this class of bug impossible, so
+    /// it is rejected rather than emitted.
+    LatchInferred { signals: Vec<String> },
 }
 
 impl std::fmt::Display for VLIRLowerError {
@@ -46,6 +50,14 @@ impl std::fmt::Display for VLIRLowerError {
                 write!(f, "match-as-expression nested inside another expression is not yet implemented"),
             VLIRLowerError::SymbolicWidthUnsupported =>
                 write!(f, "parametric/symbolic bit widths are not yet implemented (M2)"),
+            VLIRLowerError::LatchInferred { signals } =>
+                write!(
+                    f,
+                    "would infer a latch: {} assigned on some control paths but not all. \
+                     Assign on every path (add the missing branch/`_` arm), or make it a \
+                     register by assigning it every cycle",
+                    signals.join(", ")
+                ),
         }
     }
 }
@@ -98,6 +110,7 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
 fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
     let submodules = c.submodules.iter().map(|s| lower_submodule(s, leg)).collect::<LowerResult<_>>()?;
     let (comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg)?;
+    check_no_latches(&comb_stmts)?;
     Ok(VLIRCombBody { submodules, comb_stmts, output_assigns })
 }
 
@@ -138,6 +151,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
         } else {
             None
         };
+        check_no_latches(&stmts)?;
         comb_phases.push(VLIRCombPhase { phase_guard, stmts });
 
         // Register updates -> always_ff non-blocking assigns, guarded by phase
@@ -231,12 +245,10 @@ fn lower_flat_stmts(
                 target: leg.get(port_name),
                 value: lower_expr(value, leg)?,
             }),
+            // Conditional structures — including ones that drive output ports
+            // (a Moore output). These lower into `always_comb`, where the port is
+            // assigned on every path, so no latch is inferred.
             SHIRStmt::If { .. } | SHIRStmt::Match { .. } => {
-                // Only conditional *wire* logic is supported here; a conditional
-                // that drives an output port is deferred (M2). Detect that.
-                if let Some(port) = first_port_drive(s) {
-                    return Err(VLIRLowerError::ConditionalOutputUnsupported { port });
-                }
                 comb.push(lower_comb_stmt(s, leg)?);
             }
         }
@@ -252,9 +264,12 @@ fn lower_comb_stmt(s: &SHIRStmt, leg: &Legalizer) -> LowerResult<VLIRStmt> {
             width: width_of(ty),
             value: lower_expr(value, leg)?,
         }),
-        SHIRStmt::PortDrive { port_name, .. } => {
-            Err(VLIRLowerError::ConditionalOutputUnsupported { port: port_name.clone() })
-        }
+        // A port driven inside a conditional becomes a blocking assign in
+        // `always_comb` (the port is a `logic` output, assigned on every path).
+        SHIRStmt::PortDrive { port_name, value } => Ok(VLIRStmt::PortAssign {
+            port_name: leg.get(port_name),
+            value: lower_expr(value, leg)?,
+        }),
         SHIRStmt::If { condition, then_stmts, else_stmts } => Ok(VLIRStmt::If {
             condition: lower_expr(condition, leg)?,
             then_stmts: then_stmts.iter().map(|s| lower_comb_stmt(s, leg)).collect::<LowerResult<_>>()?,
@@ -263,7 +278,71 @@ fn lower_comb_stmt(s: &SHIRStmt, leg: &Legalizer) -> LowerResult<VLIRStmt> {
                 None => None,
             },
         }),
-        SHIRStmt::Match { .. } => Err(VLIRLowerError::TuplePatternUnsupported),
+        SHIRStmt::Match { scrutinee, arms } => {
+            let selector = lower_expr(scrutinee, leg)?;
+            let mut case_arms = Vec::new();
+            let mut default = None;
+            for arm in arms {
+                let stmts = arm
+                    .stmts
+                    .iter()
+                    .map(|s| lower_comb_stmt(s, leg))
+                    .collect::<LowerResult<Vec<_>>>()?;
+                // A bare wildcard arm becomes the `default` case.
+                if arm.patterns.len() == 1
+                    && matches!(arm.patterns[0], copper_core::shir::SHIRPattern::Wildcard)
+                    && arm.guard.is_none()
+                {
+                    default = Some(stmts);
+                } else {
+                    for p in &arm.patterns {
+                        case_arms.push(VLIRCaseArm {
+                            selector_value: pattern_to_selector(p)?,
+                            stmts: stmts
+                                .iter()
+                                .map(|s| clone_comb_stmt(s))
+                                .collect::<Vec<_>>(),
+                        });
+                    }
+                }
+            }
+            Ok(VLIRStmt::Case { selector, arms: case_arms, default })
+        }
+    }
+}
+
+/// Structural clone for a lowered combinational statement (VLIR statements are
+/// not `Clone` because they are normally moved; or-patterns need one arm body
+/// duplicated per pattern).
+fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
+    match s {
+        VLIRStmt::WireAssign { name, width, value } => VLIRStmt::WireAssign {
+            name: name.clone(),
+            width: width.clone(),
+            value: value.clone(),
+        },
+        VLIRStmt::PortAssign { port_name, value } => VLIRStmt::PortAssign {
+            port_name: port_name.clone(),
+            value: value.clone(),
+        },
+        VLIRStmt::If { condition, then_stmts, else_stmts } => VLIRStmt::If {
+            condition: condition.clone(),
+            then_stmts: then_stmts.iter().map(clone_comb_stmt).collect(),
+            else_stmts: else_stmts
+                .as_ref()
+                .map(|e| e.iter().map(clone_comb_stmt).collect()),
+        },
+        VLIRStmt::Case { selector, arms, default } => VLIRStmt::Case {
+            selector: selector.clone(),
+            arms: arms
+                .iter()
+                .map(|a| VLIRCaseArm {
+                    selector_value: a.selector_value.clone(),
+                    stmts: a.stmts.iter().map(clone_comb_stmt).collect(),
+                })
+                .collect(),
+            default: default.as_ref().map(|d| d.iter().map(clone_comb_stmt).collect()),
+        },
     }
 }
 
@@ -330,9 +409,36 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer) -> LowerResult<VLIRExpr> {
             // bare comparison literal (SV zero-extends). Kept minimal here.
             right: Box::new(VLIRExpr::Lit { width: Width::Concrete(32), value: *idx as u128 }),
         },
-        // A case used as a sub-expression must be lifted by the caller; reaching
-        // here means it was nested, which we do not handle yet.
-        SHIRExpr::Case { .. } => return Err(VLIRLowerError::NestedCaseExpr),
+        // A case used as a sub-expression (e.g. `Mux(cond, x, Case{…})` produced
+        // by flattening `if … else { match … }`) becomes a ternary chain, which
+        // composes anywhere an expression is allowed. A case at the *top* of a
+        // register update is lifted to a `case` statement instead — see
+        // `lower_reg_updates`.
+        SHIRExpr::Case { scrutinee, arms, default } => {
+            let sel = lower_expr(scrutinee, leg)?;
+            let mut result = lower_expr(default, leg)?;
+            // Fold from the last arm backwards so earlier arms take priority.
+            for arm in arms.iter().rev() {
+                let mut cond = VLIRExpr::BinOp {
+                    left: Box::new(sel.clone()),
+                    op: VLIRBinOp::Eq,
+                    right: Box::new(pattern_to_selector(&arm.pattern)?),
+                };
+                if let Some(g) = &arm.guard {
+                    cond = VLIRExpr::BinOp {
+                        left: Box::new(cond),
+                        op: VLIRBinOp::LogicalAnd,
+                        right: Box::new(lower_expr(g, leg)?),
+                    };
+                }
+                result = VLIRExpr::Ternary {
+                    cond: Box::new(cond),
+                    then_val: Box::new(lower_expr(&arm.value, leg)?),
+                    else_val: Box::new(result),
+                };
+            }
+            result
+        }
     })
 }
 
@@ -379,13 +485,158 @@ fn pattern_to_selector(p: &copper_core::shir::SHIRPattern) -> LowerResult<VLIREx
     use copper_core::shir::SHIRPattern;
     match p {
         SHIRPattern::Lit(lit) => Ok(lower_lit(lit)),
-        SHIRPattern::Tuple(_) => Err(VLIRLowerError::TuplePatternUnsupported),
+        // Tuple pattern → a single concatenated literal matching the `Concat`
+        // scrutinee (VLIR_DESIGN §Pass 2). First element is most-significant.
+        SHIRPattern::Tuple(_) => {
+            let (width, value) = flatten_tuple_pattern(p)?;
+            Ok(VLIRExpr::Lit { width: Width::Concrete(width), value })
+        }
         // Wildcard / enum-variant selectors are handled via the case `default`
         // arm or enum encoding, not implemented for M1's scalar cases.
         SHIRPattern::Wildcard | SHIRPattern::EnumVariant { .. } => {
             Err(VLIRLowerError::TuplePatternUnsupported)
         }
     }
+}
+
+/// Flatten a (possibly nested) tuple pattern of literals into `(width, value)`,
+/// first element most-significant. A wildcard *inside* a tuple has no single
+/// selector value, so it is rejected rather than silently mis-matched.
+fn flatten_tuple_pattern(p: &copper_core::shir::SHIRPattern) -> LowerResult<(usize, u128)> {
+    use copper_core::shir::SHIRPattern;
+    match p {
+        SHIRPattern::Lit(lit) => Ok((width_of(&lit.ty).concrete(), lit.value)),
+        SHIRPattern::Tuple(elems) => {
+            let mut width = 0usize;
+            let mut value = 0u128;
+            for e in elems {
+                let (w, v) = flatten_tuple_pattern(e)?;
+                value = (value << w) | (v & mask_for(w));
+                width += w;
+            }
+            Ok((width, value))
+        }
+        SHIRPattern::Wildcard | SHIRPattern::EnumVariant { .. } => {
+            Err(VLIRLowerError::TuplePatternUnsupported)
+        }
+    }
+}
+
+fn mask_for(width: usize) -> u128 {
+    if width >= 128 { u128::MAX } else { (1u128 << width) - 1 }
+}
+
+// ── Latch checking ──────────────────────────────────────────────────────────
+
+/// Signals assigned on *every* path through `stmts`.
+fn assigned_on_all_paths(stmts: &[VLIRStmt]) -> HashSet<String> {
+    let mut all = HashSet::new();
+    for s in stmts {
+        match s {
+            VLIRStmt::WireAssign { name, .. } => {
+                all.insert(name.clone());
+            }
+            VLIRStmt::PortAssign { port_name, .. } => {
+                all.insert(port_name.clone());
+            }
+            // Without an `else`, the then-branch may be skipped entirely.
+            VLIRStmt::If { then_stmts, else_stmts: Some(e), .. } => {
+                let both: HashSet<String> = assigned_on_all_paths(then_stmts)
+                    .intersection(&assigned_on_all_paths(e))
+                    .cloned()
+                    .collect();
+                all.extend(both);
+            }
+            VLIRStmt::If { else_stmts: None, .. } => {}
+            VLIRStmt::Case { arms, default, .. } => {
+                // A `case` covers every path if it has a `default`, or if its arm
+                // labels enumerate all 2^width selector values (e.g. four arms on
+                // a 2-bit enum selector) — otherwise some value hits no arm.
+                let complete = default.is_some() || case_is_exhaustive(arms);
+                if complete {
+                    let mut common: Option<HashSet<String>> =
+                        default.as_ref().map(|d| assigned_on_all_paths(d));
+                    for a in arms {
+                        let s = assigned_on_all_paths(&a.stmts);
+                        common = Some(match common {
+                            None => s,
+                            Some(c) => c.intersection(&s).cloned().collect(),
+                        });
+                    }
+                    all.extend(common.unwrap_or_default());
+                }
+            }
+        }
+    }
+    all
+}
+
+/// True when a `default`-less `case`'s arm labels enumerate every value the
+/// selector can take (all `2^width` of them), making it complete.
+fn case_is_exhaustive(arms: &[VLIRCaseArm]) -> bool {
+    let mut values = HashSet::new();
+    let mut width: Option<usize> = None;
+    for a in arms {
+        match &a.selector_value {
+            VLIRExpr::Lit { width: w, value } => {
+                let wc = w.concrete();
+                if *width.get_or_insert(wc) != wc {
+                    return false; // inconsistent label widths — be conservative
+                }
+                values.insert(*value);
+            }
+            _ => return false, // non-literal label: cannot reason about coverage
+        }
+    }
+    match width {
+        Some(w) if w < 64 => values.len() as u128 == 1u128 << w,
+        _ => false,
+    }
+}
+
+/// Signals assigned on *at least one* path through `stmts`.
+fn assigned_on_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
+    let mut any = HashSet::new();
+    for s in stmts {
+        match s {
+            VLIRStmt::WireAssign { name, .. } => {
+                any.insert(name.clone());
+            }
+            VLIRStmt::PortAssign { port_name, .. } => {
+                any.insert(port_name.clone());
+            }
+            VLIRStmt::If { then_stmts, else_stmts, .. } => {
+                any.extend(assigned_on_any_path(then_stmts));
+                if let Some(e) = else_stmts {
+                    any.extend(assigned_on_any_path(e));
+                }
+            }
+            VLIRStmt::Case { arms, default, .. } => {
+                for a in arms {
+                    any.extend(assigned_on_any_path(&a.stmts));
+                }
+                if let Some(d) = default {
+                    any.extend(assigned_on_any_path(d));
+                }
+            }
+        }
+    }
+    any
+}
+
+/// Reject any combinational block that would infer a latch — a signal assigned
+/// on some control paths but not all. Copper's premise is that this class of bug
+/// should be impossible to express, so it is an error, not a silent emission.
+fn check_no_latches(stmts: &[VLIRStmt]) -> LowerResult<()> {
+    let mut latched: Vec<String> = assigned_on_any_path(stmts)
+        .difference(&assigned_on_all_paths(stmts))
+        .cloned()
+        .collect();
+    if latched.is_empty() {
+        return Ok(());
+    }
+    latched.sort(); // deterministic diagnostics
+    Err(VLIRLowerError::LatchInferred { signals: latched })
 }
 
 // ── Width helper ────────────────────────────────────────────────────────────
@@ -693,7 +944,7 @@ module m (
     logic [7:0] r;
 
     always_ff @(posedge clk) begin
-        r <= (sel ? ((d >> 64'd1) ^ r) : (d >> 64'd1));
+        r <= (sel ? ((d >> 8'd1) ^ r) : (d >> 8'd1));
     end
 
     assign o = r;
@@ -701,6 +952,166 @@ module m (
 endmodule
 ";
         assert_eq!(transpile(src), expected);
+    }
+
+    /// Enum-as-state: variants encode to concrete values, the enum register is
+    /// sized to hold them, `match` becomes a `case`, and a conditional (Moore)
+    /// output lowers into `always_comb` with an assignment on every path.
+    #[test]
+    fn enum_state_machine_golden_output() {
+        let src = r#"
+            enum State { IDLE = 0, RUN = 1, DONE = 2 }
+
+            #[hardware(sequential)]
+            async fn fsm(clk: Clock<MainClk>, o: Out<Logic, MainClk>) {
+                let mut state = State::IDLE;
+                loop {
+                    if state == State::DONE {
+                        o.write(Logic::One);
+                    } else {
+                        o.write(Logic::Zero);
+                    }
+                    clk.tick().await;
+                    state = match state {
+                        State::IDLE => State::RUN,
+                        State::RUN => State::DONE,
+                        _ => State::IDLE,
+                    };
+                }
+            }
+        "#;
+        let expected = "\
+module fsm (
+    input  logic clk,
+    output logic o
+);
+
+    logic [1:0] state;
+
+    always_comb begin
+        if ((state == 2'd2)) begin
+            o = 1'b1;
+        end else begin
+            o = 1'b0;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        case (state)
+            2'd0: begin
+                state <= 2'd1;
+            end
+            2'd1: begin
+                state <= 2'd2;
+            end
+            default: begin
+                state <= 2'd0;
+            end
+        endcase
+    end
+
+endmodule
+";
+        // Uses transpile_source so the file-scope `enum State` is injected.
+        let sv = crate::transpile_source(src, None, &EmitConfig::default()).expect("transpile");
+        assert_eq!(sv, expected);
+    }
+
+    /// Tuple patterns encode to a single concatenated selector value, first
+    /// element most-significant — matching the `Concat` scrutinee.
+    #[test]
+    fn tuple_pattern_concat_encoding() {
+        use copper_core::chir::CHIRType;
+        use copper_core::shir::{SHIRLit, SHIRPattern};
+        let lit = |w: usize, v: u128| {
+            SHIRPattern::Lit(SHIRLit { ty: CHIRType::UInt { width: Width::Concrete(w) }, value: v })
+        };
+
+        // (State=2 :: 3 bits, in=0 :: 1 bit) -> {010, 0} = 4'd4
+        let p = SHIRPattern::Tuple(vec![lit(3, 2), lit(1, 0)]);
+        match pattern_to_selector(&p).expect("selector") {
+            VLIRExpr::Lit { width, value } => {
+                assert_eq!(width, Width::Concrete(4));
+                assert_eq!(value, 4);
+            }
+            other => panic!("expected literal selector, got {other:?}"),
+        }
+
+        // (State=5 :: 3 bits, in=1 :: 1 bit) -> {101, 1} = 4'd11
+        let p = SHIRPattern::Tuple(vec![lit(3, 5), lit(1, 1)]);
+        match pattern_to_selector(&p).expect("selector") {
+            VLIRExpr::Lit { value, .. } => assert_eq!(value, 11),
+            other => panic!("expected literal selector, got {other:?}"),
+        }
+
+        // A wildcard inside a tuple has no single selector value → rejected.
+        let p = SHIRPattern::Tuple(vec![lit(3, 1), SHIRPattern::Wildcard]);
+        assert!(pattern_to_selector(&p).is_err());
+    }
+
+    /// Latch inference is rejected, not emitted. Copper's premise is that this
+    /// class of bug should be impossible to express, so a combinational signal
+    /// assigned on only some control paths is a hard error.
+    #[test]
+    fn partial_conditional_assignment_is_rejected_as_latch() {
+        // `out` is written only in the `Stage::Out` arm — the other stages leave
+        // it unassigned, which in `always_comb` would infer a latch.
+        let src = r#"
+            enum Stage { Load = 0, Mul = 1, Out = 2 }
+
+            #[hardware(sequential)]
+            async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, out: Out<Bits<8>, MainClk>) {
+                let mut stage = Stage::Load;
+                let mut acc: Bits<8> = Bits::from_lit::<0>();
+                loop {
+                    match stage {
+                        Stage::Load => { acc = a.read(); stage = Stage::Mul; }
+                        Stage::Mul => { stage = Stage::Out; }
+                        _ => { out.write(acc); stage = Stage::Load; }
+                    }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        let err = crate::transpile_source(src, None, &EmitConfig::default())
+            .expect_err("a partially-assigned combinational output must be rejected");
+        assert!(
+            err.contains("latch"),
+            "expected a latch diagnostic, got: {err}"
+        );
+    }
+
+    /// ...but a `case` whose arms cover every value of the selector is complete,
+    /// so it must NOT be flagged (this is the traffic-light Moore-output shape:
+    /// four arms over a 2-bit enum, no `default`).
+    #[test]
+    fn exhaustive_case_is_not_flagged_as_latch() {
+        let src = r#"
+            enum P { A = 0, B = 1, C = 2, D = 3 }
+
+            #[hardware(sequential)]
+            async fn m(clk: Clock<MainClk>, o: Out<Logic, MainClk>) {
+                let mut p = P::A;
+                loop {
+                    match p {
+                        P::A => { o.write(Logic::Zero); }
+                        P::B => { o.write(Logic::One); }
+                        P::C => { o.write(Logic::Zero); }
+                        P::D => { o.write(Logic::One); }
+                    }
+                    clk.tick().await;
+                    p = match p {
+                        P::A => P::B,
+                        P::B => P::C,
+                        P::C => P::D,
+                        _ => P::A,
+                    };
+                }
+            }
+        "#;
+        let sv = crate::transpile_source(src, None, &EmitConfig::default())
+            .expect("an exhaustive case assigns on every path");
+        assert!(sv.contains("always_comb"));
     }
 
     /// The deferred-feature guards produce errors, not wrong Verilog.

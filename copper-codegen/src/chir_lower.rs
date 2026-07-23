@@ -119,59 +119,51 @@ fn infer_type_from_expr(
     expr: &ExprType,
     span: SourceSpan,
     symbols: &SymbolTable,
+    enums: &EnumRegistry,
 ) -> Result<CHIRType, CHIRLowerError> {
     match expr {
-        ExprType::Lit(lit) => {
-            let compact: String = lit.text.chars().filter(|c| !c.is_whitespace()).collect();
-            if let Some(ty) = infer_type_from_suffix(&compact) {
-                return Ok(ty);
-            }
-            match compact.as_str() {
-                "true" | "false" => return Ok(CHIRType::Bool),
-                "Logic::One" | "Logic::Zero" => {
-                    return Ok(CHIRType::UInt { width: Width::Concrete(1) })
-                }
-                _ => {}
-            }
-            // A bare identifier: resolve via the symbol table.
-            if is_ident(&compact) {
-                if let Some(ty) = symbols.get(&compact) {
-                    return Ok(ty.clone());
-                }
-            }
-            Err(CHIRLowerError::AmbiguousWidth { span })
-        }
+        ExprType::Lit(lit) => infer_type_from_text(&lit.text, span, symbols, enums),
+        ExprType::Path(path) => infer_type_from_text(&path.path_text, span, symbols, enums),
         ExprType::Cast(cast) => resolve_type(&cast.target_ty.ty_text, cast.target_ty.span),
-        ExprType::Reference(r) => infer_type_from_expr(&r.expr, span, symbols),
-        ExprType::Unary(un) => infer_type_from_expr(&un.expr, span, symbols),
+        ExprType::Reference(r) => infer_type_from_expr(&r.expr, span, symbols, enums),
+        ExprType::Unary(un) => infer_type_from_expr(&un.expr, span, symbols, enums),
         ExprType::Binary(bin) => {
             if is_comparison_or_logical_op(&bin.op) {
                 Ok(CHIRType::Bool)
             } else {
                 // Width follows the operands; try left, then right.
-                infer_type_from_expr(&bin.left, span, symbols)
-                    .or_else(|_| infer_type_from_expr(&bin.right, span, symbols))
+                infer_type_from_expr(&bin.left, span, symbols, enums)
+                    .or_else(|_| infer_type_from_expr(&bin.right, span, symbols, enums))
             }
         }
         ExprType::MethodCall(mc) => match mc.method.as_str() {
             // `.read()` on a port, and wrapping/lock/unwrap/clone wrappers, all
             // carry the width of their receiver.
             "read" | "lock" | "unwrap" | "clone" | "wrapping_add" | "wrapping_sub"
-            | "wrapping_mul" => infer_type_from_expr(&mc.receiver, span, symbols),
+            | "wrapping_mul" | "as_u8" | "as_u16" | "as_u32" | "as_u64" | "as_u128"
+            | "as_usize" | "as_bits" => infer_type_from_expr(&mc.receiver, span, symbols, enums),
             "as_bool" => Ok(CHIRType::Bool),
-            _ => infer_type_from_expr(&mc.receiver, span, symbols),
+            _ => infer_type_from_expr(&mc.receiver, span, symbols, enums),
         },
         ExprType::Call(call) => infer_type_from_call(call, span),
         // A single-bit index `x[i]` is 1-bit.
         ExprType::Index(_) => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
+        // A tuple is the concatenation of its elements.
+        ExprType::Tuple(t) => {
+            let mut total = 0usize;
+            for e in &t.elements {
+                total += width_of_type(&infer_type_from_expr(e, span, symbols, enums)?);
+            }
+            Ok(CHIRType::UInt { width: Width::Concrete(total) })
+        }
         ExprType::If(if_expr) => match &if_expr.else_branch {
-            Some(else_br) => infer_type_from_expr(else_br, span, symbols),
+            Some(else_br) => infer_type_from_expr(else_br, span, symbols, enums),
             None => Err(CHIRLowerError::AmbiguousWidth { span }),
         },
         ExprType::Match(m) => m
             .arms
             .first()
-            .map(|a| infer_type_from_expr(&a.body, span, symbols))
+            .map(|a| infer_type_from_expr(&a.body, span, symbols, enums))
             .unwrap_or(Err(CHIRLowerError::AmbiguousWidth { span })),
         // A block's type is its tail expression's type.
         ExprType::Block(b) => b
@@ -182,10 +174,39 @@ fn infer_type_from_expr(
                 RawStmtKind::Expr(es) if !es.has_semi => Some(&es.expr),
                 _ => None,
             })
-            .map(|e| infer_type_from_expr(e, span, symbols))
+            .map(|e| infer_type_from_expr(e, span, symbols, enums))
             .unwrap_or(Err(CHIRLowerError::AmbiguousWidth { span })),
         _ => Err(CHIRLowerError::AmbiguousWidth { span }),
     }
+}
+
+fn infer_type_from_text(
+    text: &str,
+    span: SourceSpan,
+    symbols: &SymbolTable,
+    enums: &EnumRegistry,
+) -> Result<CHIRType, CHIRLowerError> {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(ty) = infer_type_from_suffix(&compact) {
+        return Ok(ty);
+    }
+    match compact.as_str() {
+        "true" | "false" => return Ok(CHIRType::Bool),
+        "Logic::One" | "Logic::Zero" => {
+            return Ok(CHIRType::UInt { width: Width::Concrete(1) })
+        }
+        _ => {}
+    }
+    if is_ident(&compact) {
+        if let Some(ty) = symbols.get(&compact) {
+            return Ok(ty.clone());
+        }
+    }
+    // An enum variant path (`State::IDLE`) carries its enum's width.
+    if let Some((ty, _)) = resolve_enum_path(&compact, enums) {
+        return Ok(ty);
+    }
+    Err(CHIRLowerError::AmbiguousWidth { span })
 }
 
 /// True for operators that always produce a 1-bit boolean result.
@@ -197,6 +218,7 @@ fn is_comparison_or_logical_op(op: &str) -> bool {
 fn call_path(call: &ExprCall) -> Option<String> {
     match &*call.func {
         ExprType::Lit(lit) => Some(lit.text.chars().filter(|c| !c.is_whitespace()).collect()),
+        ExprType::Path(path) => Some(path.path_text.chars().filter(|c| !c.is_whitespace()).collect()),
         _ => None,
     }
 }
@@ -206,8 +228,34 @@ fn call_path(call: &ExprCall) -> Option<String> {
 /// name implies an NN-bit value (`from_u32` → 32) — the width the constructor
 /// names for its source value.
 fn constructor_width(path: &str) -> Option<usize> {
-    if let Some(w) = width_from_turbofish(path) {
-        return Some(w);
+    match classify_value_ctor(path) {
+        Some(ValueCtor::FromInt { width }) => Some(width),
+        _ => None,
+    }
+}
+
+/// A `Bits`-style value constructor, and how its value and width are determined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValueCtor {
+    /// `Bits::from_u32(x)` / `Bits::<8>::from_u8(x)` — the value is the single
+    /// argument, at a width named by the constructor (or the type turbofish).
+    FromInt { width: usize },
+    /// A zero-argument constructor with a fixed value whose *width comes from
+    /// context*: `Bits::from_lit::<V>()` (value V) and `Bits::zero()` (0).
+    Const { value: u128 },
+}
+
+/// Classify a constructor call path.
+///
+/// The turbofish position matters: a **trailing** one is a method const-parameter
+/// (a value — `Bits::from_lit::<1>`), while one **earlier** in the path is the
+/// type's width (`Bits::<8>::from_u8`).
+fn classify_value_ctor(path: &str) -> Option<ValueCtor> {
+    if path.contains("from_lit") {
+        return trailing_const_param(path).map(|value| ValueCtor::Const { value });
+    }
+    if path.ends_with("::zero") || path == "zero" {
+        return Some(ValueCtor::Const { value: 0 });
     }
     for (name, w) in [
         ("from_u128", 128usize),
@@ -217,10 +265,33 @@ fn constructor_width(path: &str) -> Option<usize> {
         ("from_u8", 8),
     ] {
         if path.ends_with(name) {
-            return Some(w);
+            // An explicit type turbofish overrides the name's implied width.
+            return Some(ValueCtor::FromInt {
+                width: type_turbofish_width(path).unwrap_or(w),
+            });
         }
     }
     None
+}
+
+/// Value of a **trailing** method const-parameter: `Bits::from_lit::<3>` → 3.
+fn trailing_const_param(path: &str) -> Option<u128> {
+    if !path.ends_with('>') {
+        return None;
+    }
+    let start = path.rfind("::<")? + 3;
+    let rest = &path[start..];
+    let end = rest.find('>')?;
+    rest[..end].trim().parse::<u128>().ok()
+}
+
+/// Width from a **type** turbofish: `Bits::<8>::from_u8` → 8. Returns `None` when
+/// the turbofish is trailing, since that is a method const-parameter, not a width.
+fn type_turbofish_width(path: &str) -> Option<usize> {
+    if path.ends_with('>') {
+        return None;
+    }
+    width_from_turbofish(path)
 }
 
 /// Extract `N` from a turbofish segment, e.g. `Bits::<8>::from_u8` → `8`.
@@ -237,6 +308,75 @@ fn infer_type_from_call(call: &ExprCall, span: SourceSpan) -> Result<CHIRType, C
         Some(w) => Ok(CHIRType::UInt { width: Width::Concrete(w) }),
         None => Err(CHIRLowerError::AmbiguousWidth { span }),
     }
+}
+
+// ── Enum encoding ─────────────────────────────────────────────────────────────
+
+/// A hardware encoding for a Rust enum used as state: each variant maps to a
+/// concrete value, and the enum occupies enough bits to hold the largest one.
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub width: usize,
+    /// Variant name → encoded value.
+    pub variants: std::collections::HashMap<String, u128>,
+}
+
+/// Enum name → its encoding.
+pub type EnumRegistry = std::collections::HashMap<String, EnumDef>;
+
+/// Build encodings for every enum visible to a module.
+///
+/// Variants use their explicit discriminant when given (`IDLE = 0`), otherwise
+/// they continue sequentially from the previous variant — matching Rust's own
+/// discriminant rules. Width is the bits needed for the largest value (min 1).
+fn build_enum_registry(fir: &FrontendModuleIR) -> EnumRegistry {
+    let mut registry = EnumRegistry::new();
+    for item in &fir.enums {
+        let mut variants = std::collections::HashMap::new();
+        let mut next: u128 = 0;
+        let mut max: u128 = 0;
+        for v in &item.variants {
+            let value = v
+                .discriminant
+                .as_ref()
+                .and_then(|d| {
+                    let compact: String = d.chars().filter(|c| !c.is_whitespace()).collect();
+                    parse_int_literal(&compact).map(|(val, _)| val)
+                })
+                .unwrap_or(next);
+            variants.insert(v.name.clone(), value);
+            max = max.max(value);
+            next = value + 1;
+        }
+        registry.insert(item.name.clone(), EnumDef { width: bits_for(max), variants });
+    }
+    registry
+}
+
+/// The bit width of a resolved hardware type.
+fn width_of_type(ty: &CHIRType) -> usize {
+    match ty {
+        CHIRType::UInt { width } | CHIRType::SInt { width } => width.concrete(),
+        CHIRType::Bool => 1,
+    }
+}
+
+/// Number of bits needed to represent values `0..=max` (minimum 1).
+fn bits_for(max: u128) -> usize {
+    let mut bits = 1;
+    while max >= (1u128 << bits) {
+        bits += 1;
+    }
+    bits
+}
+
+/// Resolve a path like `State::IDLE` against the enum registry, returning the
+/// enum's hardware type and the variant's encoded value.
+fn resolve_enum_path(path: &str, enums: &EnumRegistry) -> Option<(CHIRType, u128)> {
+    let (enum_name, variant) = path.rsplit_once("::")?;
+    let def = enums.get(enum_name)?;
+    let value = *def.variants.get(variant)?;
+    Some((CHIRType::UInt { width: Width::Concrete(def.width) }, value))
 }
 
 /// Build a symbol table of a module's data ports (`In<T,D>` / `Out<T,D>`) mapping
@@ -283,23 +423,33 @@ fn infer_type_from_suffix(compact: &str) -> Option<CHIRType> {
 
 /// Try to lower a simple init expression to a `CHIRLit`.
 /// Returns `None` for complex expressions (variable references, binary ops, etc.).
-fn lower_init_to_lit(expr: &ExprType) -> Option<CHIRLit> {
-    match expr {
-        ExprType::Lit(lit) => {
-            let compact: String = lit.text.chars().filter(|c| !c.is_whitespace()).collect();
-            if let Some((value, _)) = parse_int_literal(&compact) {
-                let ty = infer_type_from_suffix(&compact)
-                    .unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
-                return Some(CHIRLit { ty, value });
-            }
-            match compact.as_str() {
-                "true"  => Some(CHIRLit { ty: CHIRType::Bool, value: 1 }),
-                "false" => Some(CHIRLit { ty: CHIRType::Bool, value: 0 }),
-                _ => None,
-            }
-        }
-        _ => None,
+fn lower_init_to_lit(expr: &ExprType, enums: &EnumRegistry) -> Option<CHIRLit> {
+    let compact: String = match expr {
+        ExprType::Lit(lit) => lit.text.chars().filter(|c| !c.is_whitespace()).collect(),
+        ExprType::Path(p) => p.path_text.chars().filter(|c| !c.is_whitespace()).collect(),
+        _ => return None,
+    };
+
+    if let Some((value, _)) = parse_int_literal(&compact) {
+        let ty = infer_type_from_suffix(&compact)
+            .unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
+        return Some(CHIRLit { ty, value });
     }
+
+    match compact.as_str() {
+        "true" => return Some(CHIRLit { ty: CHIRType::Bool, value: 1 }),
+        "false" => return Some(CHIRLit { ty: CHIRType::Bool, value: 0 }),
+        "Logic::One" => {
+            return Some(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(1) }, value: 1 })
+        }
+        "Logic::Zero" => {
+            return Some(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(1) }, value: 0 })
+        }
+        _ => {}
+    }
+
+    // An enum variant path (`State::IDLE`) → its encoded reset value.
+    resolve_enum_path(&compact, enums).map(|(ty, value)| CHIRLit { ty, value })
 }
 
 // ── Port wrapper helpers ──────────────────────────────────────────────────────
@@ -421,6 +571,7 @@ fn lower_comb_body(
         })
         .collect();
     ctx.symbols = build_port_symbols(fir);
+    ctx.enums = build_enum_registry(fir);
 
     let mut stmts = Vec::new();
 
@@ -430,7 +581,7 @@ fn lower_comb_body(
                 if let Some(init) = &local.init {
                     let ty = match &local.ty {
                         Some(t) => resolve_type(&t.ty_text, t.span)?,
-                        None => infer_type_from_expr(init, local.span, &ctx.symbols)?,
+                        None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
                     };
                     let value = lower_expr(init, &mut ctx)?;
                     ctx.symbols.insert(local.name.clone(), ty.clone());
@@ -489,17 +640,18 @@ fn lower_seq_body(
     // Seeded with the module's ports so pre-loop register inits that reference
     // ports (or later registers) can infer their width.
     let mut symbols = build_port_symbols(fir);
+    let enums = build_enum_registry(fir);
 
     for stmt in &fir.raw_statements {
         match &stmt.kind {
             RawStmtKind::Local(local) if local.is_mut => {
                 let ty = match (&local.ty, &local.init) {
                     (Some(t), _) => resolve_type(&t.ty_text, t.span)?,
-                    (None, Some(init)) => infer_type_from_expr(init, local.span, &symbols)?,
+                    (None, Some(init)) => infer_type_from_expr(init, local.span, &symbols, &enums)?,
                     (None, None) => return Err(CHIRLowerError::AmbiguousWidth { span: local.span }),
                 };
                 symbols.insert(local.name.clone(), ty.clone());
-                let init = local.init.as_ref().and_then(lower_init_to_lit);
+                let init = local.init.as_ref().and_then(|e| lower_init_to_lit(e, &enums));
                 registers.push(CHIRRegDecl {
                     name: local.name.clone(),
                     ty,
@@ -513,7 +665,7 @@ fn lower_seq_body(
                 if let Some(init) = &local.init {
                     let ty = match &local.ty {
                         Some(t) => resolve_type(&t.ty_text, t.span)?,
-                        None => infer_type_from_expr(init, local.span, &symbols)?,
+                        None => infer_type_from_expr(init, local.span, &symbols, &enums)?,
                     };
                     symbols.insert(local.name.clone(), ty.clone());
                     pre_loop_wires.push((local.name.clone(), ty, init, local.span));
@@ -554,6 +706,7 @@ fn lower_seq_body(
         })
         .collect();
     ctx.symbols = symbols;
+    ctx.enums = enums;
 
     // Emit pre-loop wires first so they are declared before any use, then the
     // loop body itself.
@@ -598,6 +751,12 @@ struct LowerCtx<'a> {
     output_ports: std::collections::HashSet<String>,
     /// In-scope names (ports, wires, registers) → type, for width inference.
     symbols: SymbolTable,
+    /// Enum encodings visible to this module.
+    enums: EnumRegistry,
+    /// Match-arm pattern bindings in scope: binder name → the scrutinee element
+    /// it names (e.g. `t` in `(Phase::Yellow, t, _)` → `timer`). Populated only
+    /// while lowering that arm's guard and body.
+    bindings: std::collections::HashMap<String, CHIRExpr>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -613,6 +772,8 @@ impl<'a> LowerCtx<'a> {
             clock_name: String::new(),
             output_ports: std::collections::HashSet::new(),
             symbols: SymbolTable::new(),
+            enums: EnumRegistry::new(),
+            bindings: std::collections::HashMap::new(),
         }
     }
 
@@ -645,7 +806,7 @@ fn lower_stmt(
             if let Some(init) = &local.init {
                 let ty = match &local.ty {
                     Some(t) => resolve_type(&t.ty_text, t.span)?,
-                    None => infer_type_from_expr(init, local.span, &ctx.symbols)?,
+                    None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
                 };
                 let value = lower_expr(init, ctx)?;
                 ctx.symbols.insert(local.name.clone(), ty.clone());
@@ -693,6 +854,7 @@ fn lower_expr_stmt(
         ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
             let port_name = match mc.receiver.as_ref() {
                 ExprType::Lit(lit) => lit.text.trim().to_string(),
+                ExprType::Path(p) => p.path_text.trim().to_string(),
                 _ => return Err(CHIRLowerError::UnsupportedConstruct {
                     description: "port.write() receiver must be a simple port name".to_string(),
                     span,
@@ -704,8 +866,49 @@ fn lower_expr_stmt(
         }
 
         ExprType::Assign(assign) => {
+            // Tuple destructuring: `(a, b) = rhs` becomes one assignment per
+            // element, each taking the corresponding projection of `rhs`.
+            //
+            // A Rust tuple assignment is *simultaneous*: the whole right-hand
+            // side is evaluated before either target is updated. Emitting the
+            // assignments directly would break that — Phase C forwards a
+            // register's new value to later assignments in the same segment, so
+            // `(phase, timer) = match (phase, …)` would compute `timer` from the
+            // *new* phase. So every projection is first evaluated into a wire
+            // (all of which see the pre-assignment values), and only then are the
+            // registers assigned from those wires.
+            if let ExprType::Tuple(lhs) = assign.left.as_ref() {
+                let mut pending = Vec::new();
+                for (idx, target_expr) in lhs.elements.iter().enumerate() {
+                    let target = extract_assign_target(target_expr, span)?;
+                    let projected = project_tuple_element(&assign.right, idx, span)?;
+                    let value = lower_expr(&projected, ctx)?;
+                    let ty = ctx.symbols.get(&target).cloned().ok_or_else(|| {
+                        CHIRLowerError::UnsupportedConstruct {
+                            description: format!(
+                                "cannot determine the type of tuple assignment target '{target}'"
+                            ),
+                            span,
+                            suggested_rewrite: None,
+                        }
+                    })?;
+                    let value = retype_default_literals_in_values(value, width_of_type(&ty));
+                    let tmp = format!("{target}_next_val");
+                    ctx.symbols.insert(tmp.clone(), ty.clone());
+                    out.push(CHIRStmt::Wire { name: tmp.clone(), ty, value, span });
+                    pending.push((target, tmp));
+                }
+                for (target, tmp) in pending {
+                    out.push(CHIRStmt::Assign { target, value: CHIRExpr::Var(tmp), span });
+                }
+                return Ok(());
+            }
             let target = extract_assign_target(&assign.left, span)?;
-            let value = lower_expr(&assign.right, ctx)?;
+            let mut value = lower_expr(&assign.right, ctx)?;
+            // Propagate the target's width into untyped literals on the RHS.
+            if let Some(ty) = ctx.symbols.get(&target) {
+                value = retype_default_literals_in_values(value, width_of_type(ty));
+            }
             out.push(CHIRStmt::Assign { target, value, span });
         }
 
@@ -729,7 +932,7 @@ fn lower_expr_stmt(
             let scrutinee = lower_expr(&match_expr.scrutinee, ctx)?;
             let mut arms = Vec::new();
             for arm in &match_expr.arms {
-                let patterns = parse_or_patterns(&arm.pattern_text, span)?;
+                let patterns = parse_or_patterns(&arm.pattern_text, span, &ctx.enums)?;
                 let guard = arm.guard.as_ref().map(|g| lower_expr(g, ctx)).transpose()?;
                 let body_stmts = match arm.body.as_ref() {
                     ExprType::Block(block) => lower_stmts(&block.stmts, ctx)?,
@@ -741,6 +944,7 @@ fn lower_expr_stmt(
                     ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
                         let port_name = match mc.receiver.as_ref() {
                             ExprType::Lit(lit) => lit.text.trim().to_string(),
+                            ExprType::Path(p) => p.path_text.trim().to_string(),
                             _ => return Err(CHIRLowerError::UnsupportedConstruct {
                                 description: "port.write() receiver must be a simple port name".to_string(),
                                 span,
@@ -801,6 +1005,7 @@ fn lower_else_branch(
         ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
             let port_name = match mc.receiver.as_ref() {
                 ExprType::Lit(lit) => lit.text.trim().to_string(),
+                ExprType::Path(p) => p.path_text.trim().to_string(),
                 _ => return Err(CHIRLowerError::UnsupportedConstruct {
                     description: "port.write() receiver must be a simple port name".to_string(),
                     span,
@@ -821,12 +1026,17 @@ fn lower_else_branch(
 
 pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
     match expr {
-        ExprType::Lit(lit) => lower_lit_expr(&lit.text, lit.span),
+        ExprType::Lit(lit) => lower_name_or_lit(&lit.text, lit.span, ctx),
+        ExprType::Path(path) => lower_name_or_lit(&path.path_text, path.span, ctx),
 
         ExprType::Binary(bin) => {
             let left = lower_expr(&bin.left, ctx)?;
             let right = lower_expr(&bin.right, ctx)?;
             let op = lower_binop(&bin.op, bin.span)?;
+            // An untyped integer literal takes the width of the other operand,
+            // so `timer < 1` compares at the register's width rather than the
+            // default literal width (which would widen the whole expression).
+            let (left, right) = balance_binop_literals(left, right, ctx);
             Ok(CHIRExpr::BinOp {
                 left: Box::new(left),
                 op,
@@ -862,8 +1072,14 @@ pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRL
             let scrutinee = lower_expr(&match_expr.scrutinee, ctx)?;
             let mut arms = Vec::new();
             let mut default = None;
+            // Arms with guards, binders, or partial wildcards cannot be a `case`
+            // over a single concatenated selector — those lower to a condition
+            // chain instead (see `lower_match_as_chain`).
+            if !match_expr_is_case_compatible(match_expr, ctx)? {
+                return lower_match_as_chain(match_expr, ctx);
+            }
             for arm in &match_expr.arms {
-                let patterns = parse_or_patterns(&arm.pattern_text, match_expr.span)?;
+                let patterns = parse_or_patterns(&arm.pattern_text, match_expr.span, &ctx.enums)?;
                 let guard = arm.guard.as_ref().map(|g| lower_expr(g, ctx)).transpose()?;
                 let value = lower_expr(&arm.body, ctx)?;
                 // Wildcard with no guard → default arm
@@ -888,10 +1104,19 @@ pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRL
         ExprType::Call(call) => {
             if call.is_hardware_module {
                 lower_hardware_call(call, ctx)
-            } else if let Some(width) = call_path(call).as_deref().and_then(constructor_width) {
-                // `Bits::from_u32(x)` etc. — the value is the argument,
-                // reinterpreted as a `width`-bit value.
-                lower_bits_constructor(call, width, ctx)
+            } else if let Some(ctor) = call_path(call).as_deref().and_then(classify_value_ctor) {
+                match ctor {
+                    // `Bits::from_u32(x)` — the value is the argument,
+                    // reinterpreted as a `width`-bit value.
+                    ValueCtor::FromInt { width } => lower_bits_constructor(call, width, ctx),
+                    // `Bits::from_lit::<1>()` / `Bits::zero()` — a fixed value at
+                    // the default literal width, so the surrounding assignment or
+                    // operand determines the final width.
+                    ValueCtor::Const { value } => Ok(CHIRExpr::Lit(CHIRLit {
+                        ty: CHIRType::UInt { width: Width::Concrete(DEFAULT_LIT_WIDTH) },
+                        value,
+                    })),
+                }
             } else {
                 Err(CHIRLowerError::UnsupportedConstruct {
                     description: "non-hardware function calls cannot appear in hardware expressions; add #[hardware]".to_string(),
@@ -923,6 +1148,18 @@ pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRL
         }
 
         ExprType::Index(idx) => lower_index(idx, ctx),
+
+        // A tuple value (e.g. a `match (a, b)` scrutinee) is the bit
+        // concatenation of its elements, first element most-significant —
+        // matching how tuple *patterns* are encoded in Phase D.
+        ExprType::Tuple(t) => {
+            let parts = t
+                .elements
+                .iter()
+                .map(|e| lower_expr(e, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CHIRExpr::Concat(parts))
+        }
 
         // A block used as an expression (e.g. an `if`/`else` branch) evaluates to
         // its tail expression.
@@ -978,6 +1215,439 @@ fn retype_literals(expr: CHIRExpr, width: usize) -> CHIRExpr {
     }
 }
 
+// ── Match-arm pattern elements (B2: bindings / guards / partial wildcards) ────
+
+/// One element of a match arm's pattern, positioned against the scrutinee.
+/// A tuple pattern yields one per tuple position; a scalar pattern yields one.
+#[derive(Debug, Clone)]
+enum PatElem {
+    /// A concrete value — contributes an equality test on that position.
+    Lit(CHIRLit),
+    /// `_` — matches anything, contributes no condition.
+    Wildcard,
+    /// A binder (`t`) — contributes no condition, but names that position so the
+    /// arm's guard and body can refer to it.
+    Bind(String),
+}
+
+/// Parse one pattern alternative into positional elements.
+fn parse_pattern_elems(
+    text: &str,
+    span: SourceSpan,
+    enums: &EnumRegistry,
+) -> Result<Vec<PatElem>, CHIRLowerError> {
+    let s = text.trim();
+    if s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        return split_top_level_commas(inner)
+            .iter()
+            .map(|p| parse_pattern_elem(p.trim(), span, enums))
+            .collect();
+    }
+    Ok(vec![parse_pattern_elem(s, span, enums)?])
+}
+
+fn parse_pattern_elem(
+    s: &str,
+    span: SourceSpan,
+    enums: &EnumRegistry,
+) -> Result<PatElem, CHIRLowerError> {
+    if s == "_" {
+        return Ok(PatElem::Wildcard);
+    }
+    // Reuse the scalar pattern parser for literals / enum paths / `Logic::*`.
+    match parse_pattern(s, span, enums)? {
+        CHIRPattern::Lit(lit) => return Ok(PatElem::Lit(lit)),
+        CHIRPattern::EnumVariant { name, .. } => {
+            // A bare variant name (no enum prefix): resolve it if exactly one
+            // enum declares it.
+            let mut found = None;
+            for def in enums.values() {
+                if let Some(v) = def.variants.get(&name) {
+                    if found.is_some() {
+                        found = None;
+                        break;
+                    }
+                    found = Some(CHIRLit {
+                        ty: CHIRType::UInt { width: Width::Concrete(def.width) },
+                        value: *v,
+                    });
+                }
+            }
+            if let Some(lit) = found {
+                return Ok(PatElem::Lit(lit));
+            }
+        }
+        _ => {}
+    }
+    // A lowercase identifier in pattern position is a binder.
+    if is_ident(s) && s.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+        return Ok(PatElem::Bind(s.to_string()));
+    }
+    Ok(PatElem::Wildcard)
+}
+
+/// Split a pattern on top-level `|` alternatives.
+fn split_top_level_pipes(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '|' if depth == 0 => {
+                out.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// The scrutinee's positional element expressions (a tuple matches positionally).
+fn scrutinee_elements(scrutinee: &ExprType) -> Vec<&ExprType> {
+    match scrutinee {
+        ExprType::Tuple(t) => t.elements.iter().collect(),
+        other => vec![other],
+    }
+}
+
+/// True when every arm can be a `case` label: no guards, and each alternative is
+/// either all-literal (a concrete selector value) or a whole-pattern wildcard
+/// (the `default`). Binders and partial wildcards disqualify it.
+fn match_expr_is_case_compatible(
+    m: &copper_core::frontend_ir::ExprMatch,
+    ctx: &LowerCtx,
+) -> Result<bool, CHIRLowerError> {
+    for arm in &m.arms {
+        if arm.guard.is_some() {
+            return Ok(false);
+        }
+        for alt in split_top_level_pipes(&arm.pattern_text) {
+            let elems = parse_pattern_elems(&alt, m.span, &ctx.enums)?;
+            let all_lit = elems.iter().all(|e| matches!(e, PatElem::Lit(_)));
+            let whole_wildcard = elems.len() == 1 && matches!(elems[0], PatElem::Wildcard);
+            if !all_lit && !whole_wildcard {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Lower a match to a priority chain of muxes: each arm contributes a condition
+/// built from its *literal* positions (wildcards constrain nothing), plus its
+/// guard; binders name scrutinee elements for use in the guard and body.
+///
+/// This is the general form — it handles guards, pattern bindings, and partial
+/// wildcards, which a concatenated-selector `case` cannot express.
+fn lower_match_as_chain(
+    m: &copper_core::frontend_ir::ExprMatch,
+    ctx: &mut LowerCtx,
+) -> Result<CHIRExpr, CHIRLowerError> {
+    let span = m.span;
+    let scrut_elems = scrutinee_elements(&m.scrutinee);
+    let mut result: Option<CHIRExpr> = None;
+
+    // Build back-to-front so earlier arms take priority.
+    for arm in m.arms.iter().rev() {
+        let alts = split_top_level_pipes(&arm.pattern_text);
+        let mut alt_conds: Vec<Option<CHIRExpr>> = Vec::new();
+        let mut bindings: std::collections::HashMap<String, CHIRExpr> =
+            std::collections::HashMap::new();
+        let mut has_binder = false;
+
+        for alt in &alts {
+            let elems = parse_pattern_elems(alt, span, &ctx.enums)?;
+            if elems.len() != scrut_elems.len() {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "match arm pattern has {} element(s) but the scrutinee has {}",
+                        elems.len(),
+                        scrut_elems.len()
+                    ),
+                    span,
+                    suggested_rewrite: None,
+                });
+            }
+            let mut alt_cond: Option<CHIRExpr> = None;
+            for (i, e) in elems.iter().enumerate() {
+                match e {
+                    PatElem::Lit(lit) => {
+                        let sc = lower_expr(scrut_elems[i], ctx)?;
+                        alt_cond = and_cond(
+                            alt_cond,
+                            CHIRExpr::BinOp {
+                                left: Box::new(sc),
+                                op: CHIRBinOp::Eq,
+                                right: Box::new(CHIRExpr::Lit(lit.clone())),
+                            },
+                        );
+                    }
+                    PatElem::Wildcard => {}
+                    PatElem::Bind(name) => {
+                        has_binder = true;
+                        let sc = lower_expr(scrut_elems[i], ctx)?;
+                        bindings.insert(name.clone(), sc);
+                    }
+                }
+            }
+            alt_conds.push(alt_cond);
+        }
+
+        if alts.len() > 1 && has_binder {
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: "or-patterns combined with a pattern binding are not supported"
+                    .to_string(),
+                span,
+                suggested_rewrite: Some("split the alternatives into separate arms".to_string()),
+            });
+        }
+
+        // An unconditional alternative makes the whole arm unconditional;
+        // otherwise OR the alternatives together.
+        let arm_cond = if alt_conds.iter().any(|c| c.is_none()) {
+            None
+        } else {
+            alt_conds.into_iter().flatten().reduce(|a, b| CHIRExpr::BinOp {
+                left: Box::new(a),
+                op: CHIRBinOp::LogicalOr,
+                right: Box::new(b),
+            })
+        };
+
+        // Lower the guard and body with this arm's bindings in scope.
+        let saved = std::mem::replace(&mut ctx.bindings, bindings);
+        let guard = arm.guard.as_ref().map(|g| lower_expr(g, ctx)).transpose()?;
+        let value = lower_expr(&arm.body, ctx)?;
+        ctx.bindings = saved;
+
+        let full_cond = match (arm_cond, guard) {
+            (None, None) => None,
+            (Some(c), None) => Some(c),
+            (None, Some(g)) => Some(g),
+            (Some(c), Some(g)) => Some(CHIRExpr::BinOp {
+                left: Box::new(c),
+                op: CHIRBinOp::LogicalAnd,
+                right: Box::new(g),
+            }),
+        };
+
+        result = Some(match (result.take(), full_cond) {
+            // The last arm (processed first) is the fallback. Rust has already
+            // proven the match exhaustive, so if no earlier arm matches this one
+            // must — its pattern condition is implied and can be dropped. That
+            // is what lets an enum-exhaustive match with no `_` arm work.
+            (None, _) => {
+                if arm.guard.is_some() {
+                    return Err(CHIRLowerError::UnsupportedConstruct {
+                        description: "the final match arm is guarded, so no branch is \
+                                      guaranteed to produce a value"
+                            .to_string(),
+                        span,
+                        suggested_rewrite: Some("add an unguarded `_ => …` arm".to_string()),
+                    });
+                }
+                value
+            }
+            // An unconditional arm replaces the fallback (later arms are dead).
+            (Some(_), None) => value,
+            (Some(prev), Some(cond)) => CHIRExpr::Mux {
+                cond: Box::new(cond),
+                then_val: Box::new(value),
+                else_val: Box::new(prev),
+            },
+        });
+    }
+
+    result.ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: "match has no arms".to_string(),
+        span,
+        suggested_rewrite: None,
+    })
+}
+
+/// The width an untyped integer literal falls back to when nothing constrains it.
+const DEFAULT_LIT_WIDTH: usize = 64;
+
+/// Give a bare (default-width) integer literal operand the width of the other
+/// side of a binary operation. Without this, `timer < 1` on an 8-bit register
+/// compares at 64 bits and Verilator reports a width-expansion warning.
+fn balance_binop_literals(left: CHIRExpr, right: CHIRExpr, ctx: &LowerCtx) -> (CHIRExpr, CHIRExpr) {
+    let is_default_lit = |e: &CHIRExpr| {
+        matches!(e, CHIRExpr::Lit(l)
+            if l.ty == CHIRType::UInt { width: Width::Concrete(DEFAULT_LIT_WIDTH) })
+    };
+    let other_width = |e: &CHIRExpr| {
+        width_of_chir_expr(e, ctx).filter(|w| *w != DEFAULT_LIT_WIDTH)
+    };
+
+    if is_default_lit(&right) && !is_default_lit(&left) {
+        if let Some(w) = other_width(&left) {
+            return (left, retype_literals(right, w));
+        }
+    }
+    if is_default_lit(&left) && !is_default_lit(&right) {
+        if let Some(w) = other_width(&right) {
+            return (retype_literals(left, w), right);
+        }
+    }
+    (left, right)
+}
+
+/// Retype untyped (default-width) literals sitting in *value* positions to
+/// `width`, propagating an assignment target's width into its right-hand side.
+///
+/// Conditions and match scrutinees are deliberately left alone: in
+/// `phase == 2'd0 ? 0 : …` the `2'd0` is comparing a 2-bit register and must keep
+/// its own width, while the `0` result belongs to the assignment target.
+fn retype_default_literals_in_values(e: CHIRExpr, width: usize) -> CHIRExpr {
+    let recurse = |x: Box<CHIRExpr>| Box::new(retype_default_literals_in_values(*x, width));
+    match e {
+        CHIRExpr::Lit(l)
+            if l.ty == CHIRType::UInt { width: Width::Concrete(DEFAULT_LIT_WIDTH) } =>
+        {
+            CHIRExpr::Lit(CHIRLit {
+                ty: CHIRType::UInt { width: Width::Concrete(width) },
+                value: l.value,
+            })
+        }
+        CHIRExpr::Mux { cond, then_val, else_val } => CHIRExpr::Mux {
+            cond, // a condition, not a value
+            then_val: recurse(then_val),
+            else_val: recurse(else_val),
+        },
+        CHIRExpr::Case { scrutinee, arms, default } => CHIRExpr::Case {
+            scrutinee, // a selector, not a value
+            arms: arms
+                .into_iter()
+                .map(|a| CHIRCaseArm {
+                    pattern: a.pattern,
+                    guard: a.guard,
+                    value: retype_default_literals_in_values(a.value, width),
+                })
+                .collect(),
+            default: default.map(recurse),
+        },
+        CHIRExpr::BinOp { left, op, right } => CHIRExpr::BinOp {
+            left: recurse(left),
+            op,
+            right: recurse(right),
+        },
+        other => other,
+    }
+}
+
+/// Best-effort width of an already-lowered expression, resolved against the
+/// in-scope signal types. Measuring the *lowered* form matters because pattern
+/// bindings have been substituted by then (`t` → `timer`).
+fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
+    match e {
+        CHIRExpr::Var(name) => ctx.symbols.get(name).map(width_of_type),
+        CHIRExpr::Lit(l) => Some(width_of_type(&l.ty)),
+        CHIRExpr::BinOp { left, right, .. } => {
+            width_of_chir_expr(left, ctx).or_else(|| width_of_chir_expr(right, ctx))
+        }
+        CHIRExpr::UnOp { expr, .. } => width_of_chir_expr(expr, ctx),
+        CHIRExpr::Mux { then_val, else_val, .. } => {
+            width_of_chir_expr(then_val, ctx).or_else(|| width_of_chir_expr(else_val, ctx))
+        }
+        CHIRExpr::Slice { high, low, .. } => Some(high - low + 1),
+        CHIRExpr::Concat(parts) => {
+            parts.iter().map(|p| width_of_chir_expr(p, ctx)).sum::<Option<usize>>()
+        }
+        CHIRExpr::Case { arms, default, .. } => arms
+            .first()
+            .and_then(|a| width_of_chir_expr(&a.value, ctx))
+            .or_else(|| default.as_ref().and_then(|d| width_of_chir_expr(d, ctx))),
+    }
+}
+
+/// Combine two optional conditions with `&&`.
+fn and_cond(acc: Option<CHIRExpr>, next: CHIRExpr) -> Option<CHIRExpr> {
+    Some(match acc {
+        None => next,
+        Some(prev) => CHIRExpr::BinOp {
+            left: Box::new(prev),
+            op: CHIRBinOp::LogicalAnd,
+            right: Box::new(next),
+        },
+    })
+}
+
+/// Project element `idx` out of a tuple-valued expression, for lowering a tuple
+/// destructuring assignment into one assignment per element.
+///
+/// A tuple literal projects directly; `match`/`if` are pushed through so each
+/// element gets its own conditional expression (e.g.
+/// `(a, b) = match s { p => (x, y) }` → `a = match s { p => x }`,
+/// `b = match s { p => y }`).
+fn project_tuple_element(
+    expr: &ExprType,
+    idx: usize,
+    span: SourceSpan,
+) -> Result<ExprType, CHIRLowerError> {
+    match expr {
+        ExprType::Tuple(t) => t.elements.get(idx).cloned().ok_or_else(|| {
+            CHIRLowerError::UnsupportedConstruct {
+                description: format!(
+                    "tuple has {} elements; cannot project element {}",
+                    t.elements.len(),
+                    idx
+                ),
+                span,
+                suggested_rewrite: None,
+            }
+        }),
+        ExprType::Match(m) => {
+            let mut projected = m.clone();
+            for arm in &mut projected.arms {
+                let inner = project_tuple_element(&arm.body, idx, span)?;
+                arm.body = Box::new(inner);
+            }
+            Ok(ExprType::Match(projected))
+        }
+        ExprType::If(f) => {
+            let mut projected = f.clone();
+            if let Some(else_br) = &f.else_branch {
+                let inner = project_tuple_element(else_br, idx, span)?;
+                projected.else_branch = Some(Box::new(inner));
+            }
+            Ok(ExprType::If(projected))
+        }
+        ExprType::Block(b) => {
+            // Project the block's tail expression.
+            let tail = b
+                .stmts
+                .iter()
+                .rev()
+                .find_map(|s| match &s.kind {
+                    RawStmtKind::Expr(es) if !es.has_semi => Some(&es.expr),
+                    _ => None,
+                })
+                .ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+                    description: "block used as a tuple value has no tail expression".to_string(),
+                    span,
+                    suggested_rewrite: None,
+                })?;
+            project_tuple_element(tail, idx, span)
+        }
+        other => Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "cannot destructure element {idx} from this expression: {:?}",
+                std::mem::discriminant(other)
+            ),
+            span,
+            suggested_rewrite: Some(
+                "assign each element separately, or return a tuple literal / match on one".to_string(),
+            ),
+        }),
+    }
+}
+
 /// Lower a bit-index `base[i]` to a single-bit slice. The index must be a
 /// compile-time constant (variable indices require loop unrolling, which is a
 /// separate lowering step).
@@ -1004,7 +1674,26 @@ fn eval_const_usize(expr: &ExprType) -> Option<usize> {
     }
 }
 
-fn lower_lit_expr(text: &str, span: SourceSpan) -> Result<CHIRExpr, CHIRLowerError> {
+/// Lower an identifier-or-literal, resolving match-arm pattern bindings first so
+/// a binder (`t`) becomes the scrutinee element it names rather than a dangling
+/// signal reference.
+fn lower_name_or_lit(
+    text: &str,
+    span: SourceSpan,
+    ctx: &LowerCtx,
+) -> Result<CHIRExpr, CHIRLowerError> {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(bound) = ctx.bindings.get(&compact) {
+        return Ok(bound.clone());
+    }
+    lower_lit_expr(text, span, &ctx.enums)
+}
+
+fn lower_lit_expr(
+    text: &str,
+    span: SourceSpan,
+    enums: &EnumRegistry,
+) -> Result<CHIRExpr, CHIRLowerError> {
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
 
     if is_ident(&compact) {
@@ -1025,6 +1714,11 @@ fn lower_lit_expr(text: &str, span: SourceSpan) -> Result<CHIRExpr, CHIRLowerErr
         _ => {}
     }
 
+    // An enum variant path (`State::IDLE`) → its encoded value.
+    if let Some((ty, value)) = resolve_enum_path(&compact, enums) {
+        return Ok(CHIRExpr::Lit(CHIRLit { ty, value }));
+    }
+
     Err(CHIRLowerError::UnsupportedConstruct {
         description: format!("cannot lower literal: {}", text),
         span,
@@ -1032,8 +1726,12 @@ fn lower_lit_expr(text: &str, span: SourceSpan) -> Result<CHIRExpr, CHIRLowerErr
     })
 }
 
-fn lower_text_expr(text: &str, span: SourceSpan) -> Result<CHIRExpr, CHIRLowerError> {
-    lower_lit_expr(text.trim(), span)
+fn lower_text_expr(
+    text: &str,
+    span: SourceSpan,
+    enums: &EnumRegistry,
+) -> Result<CHIRExpr, CHIRLowerError> {
+    lower_lit_expr(text.trim(), span, enums)
 }
 
 fn lower_binop(op: &str, span: SourceSpan) -> Result<CHIRBinOp, CHIRLowerError> {
@@ -1082,7 +1780,12 @@ fn lower_method_call(
     match mc.method.as_str() {
         // Value passthroughs (simulation-only conversions on already-hardware
         // values): `port.read()`, `logic.as_bool()`. Lower to the receiver.
-        "read" | "as_bool" if mc.args.is_empty() => lower_expr(&mc.receiver, ctx),
+        "read" | "as_bool" | "as_u8" | "as_u16" | "as_u32" | "as_u64" | "as_u128"
+        | "as_usize" | "as_bits"
+            if mc.args.is_empty() =>
+        {
+            lower_expr(&mc.receiver, ctx)
+        }
 
         "wrapping_add" if mc.args.len() == 1 => {
             let left = lower_expr(&mc.receiver, ctx)?;
@@ -1124,7 +1827,7 @@ fn lower_method_call(
                 )),
             })
         }
-        "lock" | "unwrap" => lower_expr(&mc.receiver, ctx),
+        "lock" | "unwrap" | "clone" => lower_expr(&mc.receiver, ctx),
         _ => Err(CHIRLowerError::UnsupportedConstruct {
             description: format!("method `{}` is not supported in hardware expressions", mc.method),
             span: mc.span,
@@ -1139,6 +1842,7 @@ fn lower_hardware_call(
 ) -> Result<CHIRExpr, CHIRLowerError> {
     let module_name = match call.func.as_ref() {
         ExprType::Lit(lit) => lit.text.trim().to_string(),
+        ExprType::Path(p) => p.path_text.trim().to_string(),
         _ => return Err(CHIRLowerError::UnsupportedConstruct {
             description: "hardware module call with non-identifier callee".to_string(),
             span: call.span,
@@ -1197,7 +1901,11 @@ fn lower_hardware_call(
 // ── Pattern parsing ───────────────────────────────────────────────────────────
 
 /// Parse a `pattern_text` string into a single `CHIRPattern`.
-pub fn parse_pattern(text: &str, span: SourceSpan) -> Result<CHIRPattern, CHIRLowerError> {
+pub fn parse_pattern(
+    text: &str,
+    span: SourceSpan,
+    enums: &EnumRegistry,
+) -> Result<CHIRPattern, CHIRLowerError> {
     let s = text.trim();
 
     if s == "_" {
@@ -1207,7 +1915,8 @@ pub fn parse_pattern(text: &str, span: SourceSpan) -> Result<CHIRPattern, CHIRLo
     if s.starts_with('(') && s.ends_with(')') {
         let inner = &s[1..s.len() - 1];
         let parts = split_top_level_commas(inner);
-        let sub: Result<Vec<_>, _> = parts.iter().map(|p| parse_pattern(p.trim(), span)).collect();
+        let sub: Result<Vec<_>, _> =
+            parts.iter().map(|p| parse_pattern(p.trim(), span, enums)).collect();
         return Ok(CHIRPattern::Tuple(sub?));
     }
 
@@ -1220,6 +1929,28 @@ pub fn parse_pattern(text: &str, span: SourceSpan) -> Result<CHIRPattern, CHIRLo
         "true"  => return Ok(CHIRPattern::Lit(CHIRLit { ty: CHIRType::Bool, value: 1 })),
         "false" => return Ok(CHIRPattern::Lit(CHIRLit { ty: CHIRType::Bool, value: 0 })),
         _ => {}
+    }
+
+    // Path patterns: `Logic::One` / `Logic::Zero`, and enum variants, all match
+    // against a concrete encoded value.
+    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    match compact.as_str() {
+        "Logic::One" => {
+            return Ok(CHIRPattern::Lit(CHIRLit {
+                ty: CHIRType::UInt { width: Width::Concrete(1) },
+                value: 1,
+            }))
+        }
+        "Logic::Zero" => {
+            return Ok(CHIRPattern::Lit(CHIRLit {
+                ty: CHIRType::UInt { width: Width::Concrete(1) },
+                value: 0,
+            }))
+        }
+        _ => {}
+    }
+    if let Some((ty, value)) = resolve_enum_path(&compact, enums) {
+        return Ok(CHIRPattern::Lit(CHIRLit { ty, value }));
     }
 
     if is_ident(s) {
@@ -1240,18 +1971,18 @@ pub fn parse_pattern(text: &str, span: SourceSpan) -> Result<CHIRPattern, CHIRLo
 ///
 /// `1 | 2` → `[Lit(1), Lit(2)]`
 /// `_`     → `[Wildcard]`
-pub fn parse_or_patterns(text: &str, span: SourceSpan) -> Result<Vec<CHIRPattern>, CHIRLowerError> {
+pub fn parse_or_patterns(text: &str, span: SourceSpan, enums: &EnumRegistry) -> Result<Vec<CHIRPattern>, CHIRLowerError> {
     let mut patterns = Vec::new();
     let mut remaining = text.trim();
 
     loop {
         match find_top_level_pipe(remaining) {
             Some(idx) => {
-                patterns.push(parse_pattern(&remaining[..idx], span)?);
+                patterns.push(parse_pattern(&remaining[..idx], span, enums)?);
                 remaining = remaining[idx + 1..].trim_start();
             }
             None => {
-                patterns.push(parse_pattern(remaining, span)?);
+                patterns.push(parse_pattern(remaining, span, enums)?);
                 break;
             }
         }
@@ -1400,24 +2131,25 @@ fn is_tick_await(base: &ExprType) -> bool {
 }
 
 fn extract_assign_target(expr: &ExprType, span: SourceSpan) -> Result<String, CHIRLowerError> {
-    match expr {
-        ExprType::Lit(lit) => {
-            let name = lit.text.trim().to_string();
-            if is_ident(&name) {
-                Ok(name)
-            } else {
-                Err(CHIRLowerError::UnsupportedConstruct {
-                    description: format!("invalid assignment target: {}", name),
-                    span,
-                    suggested_rewrite: None,
-                })
-            }
+    let name = match expr {
+        ExprType::Lit(lit) => lit.text.trim().to_string(),
+        ExprType::Path(p) => p.path_text.trim().to_string(),
+        _ => {
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: "complex assignment targets not supported".to_string(),
+                span,
+                suggested_rewrite: None,
+            })
         }
-        _ => Err(CHIRLowerError::UnsupportedConstruct {
-            description: "complex assignment targets not supported".to_string(),
+    };
+    if is_ident(&name) {
+        Ok(name)
+    } else {
+        Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!("invalid assignment target: {}", name),
             span,
             suggested_rewrite: None,
-        }),
+        })
     }
 }
 
@@ -1651,14 +2383,14 @@ mod tests {
     fn test_infer_type_from_expr_typed_literal() {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "0u8".to_string(), span: span() });
-        assert_eq!(infer_type_from_expr(&expr, span(), &SymbolTable::new()).unwrap(), CHIRType::UInt { width: Width::Concrete(8) });
+        assert_eq!(infer_type_from_expr(&expr, span(), &SymbolTable::new(), &EnumRegistry::new()).unwrap(), CHIRType::UInt { width: Width::Concrete(8) });
     }
 
     #[test]
     fn test_infer_type_from_expr_bool_literal() {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "true".to_string(), span: span() });
-        assert_eq!(infer_type_from_expr(&expr, span(), &SymbolTable::new()).unwrap(), CHIRType::Bool);
+        assert_eq!(infer_type_from_expr(&expr, span(), &SymbolTable::new(), &EnumRegistry::new()).unwrap(), CHIRType::Bool);
     }
 
     #[test]
@@ -1666,7 +2398,7 @@ mod tests {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "42".to_string(), span: span() });
         assert!(matches!(
-            infer_type_from_expr(&expr, span(), &SymbolTable::new()),
+            infer_type_from_expr(&expr, span(), &SymbolTable::new(), &EnumRegistry::new()),
             Err(CHIRLowerError::AmbiguousWidth { .. })
         ));
     }
@@ -1777,6 +2509,49 @@ mod tests {
     }
 
     #[test]
+    fn enum_width_sizing() {
+        assert_eq!(bits_for(0), 1);
+        assert_eq!(bits_for(1), 1);
+        assert_eq!(bits_for(2), 2);
+        assert_eq!(bits_for(3), 2);
+        assert_eq!(bits_for(4), 3);
+        assert_eq!(bits_for(6), 3); // pattern_detector's 7-variant State
+        assert_eq!(bits_for(255), 8);
+    }
+
+    #[test]
+    fn enum_registry_encodes_variants() {
+        use copper_core::frontend_ir::{EnumVariant, ItemEnum};
+        // Explicit discriminants are honored; unannotated variants continue
+        // sequentially from the previous one (Rust's own rule).
+        let mk = |name: &str, d: Option<&str>| EnumVariant {
+            name: name.to_string(),
+            discriminant: d.map(|s| s.to_string()),
+            span: span(),
+        };
+        let mut fir = make_fir("fn f(o: Out<Logic, ()>) { o.write(Logic::Zero); }");
+        fir.enums = vec![ItemEnum {
+            name: "State".to_string(),
+            variants: vec![mk("A", Some("0")), mk("B", None), mk("C", Some("5"))],
+            attrs: vec![],
+            span: span(),
+        }];
+
+        let reg = build_enum_registry(&fir);
+        let def = reg.get("State").expect("State enum");
+        assert_eq!(def.variants["A"], 0);
+        assert_eq!(def.variants["B"], 1); // continues from A
+        assert_eq!(def.variants["C"], 5);
+        assert_eq!(def.width, 3); // must hold 5
+
+        // Path resolution yields the enum's type and the variant value.
+        let (ty, value) = resolve_enum_path("State::C", &reg).expect("resolve");
+        assert_eq!(ty, CHIRType::UInt { width: Width::Concrete(3) });
+        assert_eq!(value, 5);
+        assert!(resolve_enum_path("State::MISSING", &reg).is_none());
+    }
+
+    #[test]
     fn constructor_width_from_name_and_turbofish() {
         assert_eq!(constructor_width("Bits::from_u32"), Some(32));
         assert_eq!(constructor_width("Bits::from_u8"), Some(8));
@@ -1823,7 +2598,7 @@ mod tests {
     fn test_lower_init_to_lit_typed_integer() {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "0u8".to_string(), span: span() });
-        let lit = lower_init_to_lit(&expr).unwrap();
+        let lit = lower_init_to_lit(&expr, &EnumRegistry::new()).unwrap();
         assert_eq!(lit.value, 0);
         assert_eq!(lit.ty, CHIRType::UInt { width: Width::Concrete(8) });
     }
@@ -1832,7 +2607,7 @@ mod tests {
     fn test_lower_init_to_lit_bool_true() {
         use copper_core::frontend_ir::ExprLit;
         let expr = ExprType::Lit(ExprLit { text: "true".to_string(), span: span() });
-        let lit = lower_init_to_lit(&expr).unwrap();
+        let lit = lower_init_to_lit(&expr, &EnumRegistry::new()).unwrap();
         assert_eq!(lit.ty, CHIRType::Bool);
         assert_eq!(lit.value, 1);
     }
@@ -1846,7 +2621,7 @@ mod tests {
             right: Box::new(ExprType::Lit(ExprLit { text: "b".to_string(), span: span() })),
             span: span(),
         });
-        assert!(lower_init_to_lit(&expr).is_none());
+        assert!(lower_init_to_lit(&expr, &EnumRegistry::new()).is_none());
     }
 
     #[test]
@@ -1954,12 +2729,12 @@ mod tests {
 
     #[test]
     fn test_parse_pattern_wildcard() {
-        assert!(matches!(parse_pattern("_", span()).unwrap(), CHIRPattern::Wildcard));
+        assert!(matches!(parse_pattern("_", span(), &EnumRegistry::new()).unwrap(), CHIRPattern::Wildcard));
     }
 
     #[test]
     fn test_parse_pattern_integer_literal() {
-        match parse_pattern("0", span()).unwrap() {
+        match parse_pattern("0", span(), &EnumRegistry::new()).unwrap() {
             CHIRPattern::Lit(lit) => assert_eq!(lit.value, 0),
             _ => panic!("expected lit"),
         }
@@ -1967,7 +2742,7 @@ mod tests {
 
     #[test]
     fn test_parse_pattern_integer_with_suffix() {
-        match parse_pattern("42u8", span()).unwrap() {
+        match parse_pattern("42u8", span(), &EnumRegistry::new()).unwrap() {
             CHIRPattern::Lit(lit) => {
                 assert_eq!(lit.value, 42);
                 assert_eq!(lit.ty, CHIRType::UInt { width: Width::Concrete(8) });
@@ -1979,7 +2754,7 @@ mod tests {
     #[test]
     fn test_parse_pattern_bool_true() {
         assert!(matches!(
-            parse_pattern("true", span()).unwrap(),
+            parse_pattern("true", span(), &EnumRegistry::new()).unwrap(),
             CHIRPattern::Lit(CHIRLit { ty: CHIRType::Bool, value: 1 })
         ));
     }
@@ -1987,14 +2762,14 @@ mod tests {
     #[test]
     fn test_parse_pattern_bool_false() {
         assert!(matches!(
-            parse_pattern("false", span()).unwrap(),
+            parse_pattern("false", span(), &EnumRegistry::new()).unwrap(),
             CHIRPattern::Lit(CHIRLit { ty: CHIRType::Bool, value: 0 })
         ));
     }
 
     #[test]
     fn test_parse_pattern_tuple_two_elements() {
-        match parse_pattern("(0 , 1)", span()).unwrap() {
+        match parse_pattern("(0 , 1)", span(), &EnumRegistry::new()).unwrap() {
             CHIRPattern::Tuple(parts) => {
                 assert_eq!(parts.len(), 2);
                 assert!(matches!(parts[0], CHIRPattern::Lit(_)));
@@ -2006,7 +2781,7 @@ mod tests {
 
     #[test]
     fn test_parse_pattern_tuple_wildcard_elements() {
-        match parse_pattern("(_, _)", span()).unwrap() {
+        match parse_pattern("(_, _)", span(), &EnumRegistry::new()).unwrap() {
             CHIRPattern::Tuple(parts) => {
                 assert_eq!(parts.len(), 2);
                 assert!(matches!(parts[0], CHIRPattern::Wildcard));
@@ -2018,7 +2793,7 @@ mod tests {
 
     #[test]
     fn test_parse_pattern_enum_variant_uppercase() {
-        match parse_pattern("Ready", span()).unwrap() {
+        match parse_pattern("Ready", span(), &EnumRegistry::new()).unwrap() {
             CHIRPattern::EnumVariant { name, inner: None } => assert_eq!(name, "Ready"),
             _ => panic!("expected enum variant"),
         }
@@ -2026,19 +2801,19 @@ mod tests {
 
     #[test]
     fn test_parse_pattern_lowercase_binding_is_wildcard() {
-        assert!(matches!(parse_pattern("x", span()).unwrap(), CHIRPattern::Wildcard));
+        assert!(matches!(parse_pattern("x", span(), &EnumRegistry::new()).unwrap(), CHIRPattern::Wildcard));
     }
 
     #[test]
     fn test_parse_or_patterns_single() {
-        let patterns = parse_or_patterns("1", span()).unwrap();
+        let patterns = parse_or_patterns("1", span(), &EnumRegistry::new()).unwrap();
         assert_eq!(patterns.len(), 1);
         assert!(matches!(patterns[0], CHIRPattern::Lit(CHIRLit { value: 1, .. })));
     }
 
     #[test]
     fn test_parse_or_patterns_two_alternatives() {
-        let patterns = parse_or_patterns("1 | 2", span()).unwrap();
+        let patterns = parse_or_patterns("1 | 2", span(), &EnumRegistry::new()).unwrap();
         assert_eq!(patterns.len(), 2);
         assert!(matches!(patterns[0], CHIRPattern::Lit(CHIRLit { value: 1, .. })));
         assert!(matches!(patterns[1], CHIRPattern::Lit(CHIRLit { value: 2, .. })));
@@ -2046,13 +2821,13 @@ mod tests {
 
     #[test]
     fn test_parse_or_patterns_three_alternatives() {
-        let patterns = parse_or_patterns("0 | 1 | 2", span()).unwrap();
+        let patterns = parse_or_patterns("0 | 1 | 2", span(), &EnumRegistry::new()).unwrap();
         assert_eq!(patterns.len(), 3);
     }
 
     #[test]
     fn test_parse_or_patterns_wildcard_alone() {
-        let patterns = parse_or_patterns("_", span()).unwrap();
+        let patterns = parse_or_patterns("_", span(), &EnumRegistry::new()).unwrap();
         assert_eq!(patterns.len(), 1);
         assert!(matches!(patterns[0], CHIRPattern::Wildcard));
     }
@@ -2187,6 +2962,7 @@ mod tests {
             receiver: Box::new(ExprType::Lit(ExprLit { text: "clk".to_string(), span: span() })),
             method: "tick".to_string(),
             args: vec![],
+            turbofish: vec![],
             span: span(),
         });
         assert!(is_tick_await(&mc));
@@ -2199,6 +2975,7 @@ mod tests {
             receiver: Box::new(ExprType::Lit(ExprLit { text: "clk".to_string(), span: span() })),
             method: "reset".to_string(),
             args: vec![],
+            turbofish: vec![],
             span: span(),
         });
         assert!(!is_tick_await(&mc));
