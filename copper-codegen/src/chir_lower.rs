@@ -143,6 +143,11 @@ fn infer_type_from_expr(
             | "wrapping_mul" | "as_u8" | "as_u16" | "as_u32" | "as_u64" | "as_u128"
             | "as_usize" | "as_bits" => infer_type_from_expr(&mc.receiver, span, symbols, enums),
             "as_bool" => Ok(CHIRType::Bool),
+            // `opt.unwrap_or(default)` has the type of its default value (which is
+            // a concrete hardware value); the Option payload has the same type.
+            "unwrap_or" if mc.args.len() == 1 => {
+                infer_type_from_expr(&mc.args[0], span, symbols, enums)
+            }
             _ => infer_type_from_expr(&mc.receiver, span, symbols, enums),
         },
         ExprType::Call(call) => infer_type_from_call(call, span),
@@ -444,6 +449,74 @@ fn subst_in_stmts(stmts: &mut [RawStmt], subst: &std::collections::HashMap<Strin
             RawStmtKind::Expr(es) => subst_in_place(&mut es.expr, subst),
             RawStmtKind::Item(_) => {}
         }
+    }
+}
+
+// ── Option lowering (milestone 3, increment 1: unwrap_or) ──────────────────────
+
+/// Rewrite an `Option`-producing expression `opt` so it yields `opt.unwrap_or(
+/// default)` directly as a plain hardware value: `Some(v)` becomes `v` and
+/// `None` becomes `default`. Sees through one level of free-fn inlining (so
+/// `Type::from_bits(x).unwrap_or(d)` works). The producer must be visible as a
+/// `Some`/`None`/`match` (or `if`) — a `let`-bound Option `Var` would need a
+/// materialized valid-bit representation and is a later increment.
+fn rewrite_option_unwrap_or(
+    opt: &ExprType,
+    default: &ExprType,
+    ctx: &LowerCtx,
+) -> Result<ExprType, CHIRLowerError> {
+    // See through a call to a file-scope fn that produces the Option.
+    let inlined;
+    let e: &ExprType = match opt {
+        ExprType::Call(call) => match call_path(call).and_then(|n| ctx.fns.get(&n).cloned()) {
+            Some(f) => {
+                inlined = build_inlined_expr(&f, &call.args, call.span)?;
+                &inlined
+            }
+            None => opt,
+        },
+        _ => opt,
+    };
+
+    match e {
+        // `Some(v)` → v
+        ExprType::Call(c)
+            if call_path(c).as_deref() == Some("Some") && c.args.len() == 1 =>
+        {
+            Ok(c.args[0].clone())
+        }
+        // `None` → default
+        ExprType::Path(p) if p.path_text.split_whitespace().collect::<String>() == "None" => {
+            Ok(default.clone())
+        }
+        // `match … { arm => Some(v) | None, … }` → rewrite each arm's body.
+        ExprType::Match(m) => {
+            let mut out = m.clone();
+            for arm in &mut out.arms {
+                let body = rewrite_option_unwrap_or(&arm.body, default, ctx)?;
+                arm.body = Box::new(body);
+            }
+            Ok(ExprType::Match(out))
+        }
+        _ => Err(CHIRLowerError::UnsupportedConstruct {
+            description: "unwrap_or is only supported when the Option is a visible \
+                          Some/None/match (e.g. an inlined `from_bits`); a let-bound \
+                          Option value is not yet supported"
+                .to_string(),
+            span: opt_span(opt),
+            suggested_rewrite: None,
+        }),
+    }
+}
+
+/// Best-effort span for an expression, for diagnostics.
+fn opt_span(e: &ExprType) -> SourceSpan {
+    match e {
+        ExprType::Call(c) => c.span,
+        ExprType::Path(p) => p.span,
+        ExprType::Match(m) => m.span,
+        ExprType::MethodCall(m) => m.span,
+        _ => SourceSpan::default(),
     }
 }
 
@@ -2158,6 +2231,16 @@ fn lower_method_call(
     ctx: &mut LowerCtx,
 ) -> Result<CHIRExpr, CHIRLowerError> {
     match mc.method.as_str() {
+        // `opt.unwrap_or(default)` — the Option value in hardware is the payload
+        // when `Some`, the default when `None`. When the producer is visible (a
+        // `Some`/`None`/`match`, e.g. an inlined `from_bits`), fold it in: rewrite
+        // `Some(v)` → v and `None` → default, then lower as a value. (Option
+        // milestone increment 1 — see `?`/panic-unwrap for the cross-fn cases.)
+        "unwrap_or" if mc.args.len() == 1 => {
+            let rewritten = rewrite_option_unwrap_or(&mc.receiver, &mc.args[0], ctx)?;
+            lower_expr(&rewritten, ctx)
+        }
+
         // Value passthroughs (simulation-only conversions on already-hardware
         // values): `port.read()`, `logic.as_bool()`. Lower to the receiver.
         "read" | "as_bool" | "as_u8" | "as_u16" | "as_u32" | "as_u64" | "as_u128"
@@ -4099,6 +4182,77 @@ mod tests {
             _ => false,
         };
         assert!(r_is_mux, "expected wire `r` to be a Mux chain");
+    }
+
+    // ── Option: unwrap_or (milestone 3, increment 1) ──────────────────────────
+
+    #[test]
+    fn option_unwrap_or_on_inlined_free_fn() {
+        // `classify(x).unwrap_or(d)` where classify returns Option via Some/None
+        // arms → folds to `match x { .. => v, _ => d }` and lowers.
+        let module = "#[hardware(combinational)] \
+                      fn m(sel: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let c: Bits<8> = classify(sel.read()).unwrap_or(Bits::from_lit::<0>()); \
+                          out.write(c); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_fns = capture_fns(
+            "fn classify(op: Bits<8>) -> Option<Bits<8>> { \
+                 match op.as_usize() { \
+                     0 => Some(Bits::from_lit::<10>()), \
+                     1 => Some(Bits::from_lit::<20>()), \
+                     _ => None, \
+                 } \
+             }",
+        );
+        let res = lower_to_chir(&fir, &no_hw(), &empty_registry());
+        assert!(res.is_ok(), "unwrap_or on inlined Option fn should lower: {:?}", res.err());
+    }
+
+    #[test]
+    fn option_unwrap_or_infers_type_from_default() {
+        // No annotation on `c`: its type comes from the unwrap_or default.
+        let module = "#[hardware(combinational)] \
+                      fn m(sel: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let c = classify(sel.read()).unwrap_or(Bits::from_u8(0)); \
+                          out.write(c); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_fns = capture_fns(
+            "fn classify(op: Bits<8>) -> Option<Bits<8>> { \
+                 match op.as_usize() { 0 => Some(Bits::from_u8(10)), _ => None } \
+             }",
+        );
+        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_ok());
+    }
+
+    #[test]
+    fn option_unwrap_or_direct_some_and_none() {
+        // `Some(a).unwrap_or(b)` → a ;  `None.unwrap_or(b)` → b.
+        let some_mod = "#[hardware(combinational)] \
+                        fn m(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                            out.write(Some(a.read()).unwrap_or(b.read())); \
+                        }";
+        let none_mod = "#[hardware(combinational)] \
+                        fn m(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                            out.write(None.unwrap_or(b.read())); \
+                        }";
+        assert!(lower_to_chir(&make_fir_hw(some_mod, &no_hw()), &no_hw(), &empty_registry()).is_ok());
+        assert!(lower_to_chir(&make_fir_hw(none_mod, &no_hw()), &no_hw(), &empty_registry()).is_ok());
+    }
+
+    #[test]
+    fn option_unwrap_or_on_let_bound_option_is_rejected() {
+        // The Option producer isn't visible (it's a `Var`) → not yet supported.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let o = mk(a.read()); \
+                          out.write(o.unwrap_or(Bits::from_u8(0))); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        // `mk` isn't registered, so `o` stays an opaque var; unwrap_or can't fold.
+        let _ = &mut fir;
+        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_err());
     }
 
     #[test]
