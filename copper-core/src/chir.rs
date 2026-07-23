@@ -318,8 +318,22 @@ pub enum CHIRLowerError {
     },
 }
 
+impl CHIRLowerError {
+    pub fn span(&self) -> &SourceSpan {
+        match self {
+            CHIRLowerError::UnsupportedConstruct { span, .. } => span,
+            CHIRLowerError::UnresolvableType { span, .. } => span,
+            CHIRLowerError::RegisterWireConflict { span, .. } => span,
+            CHIRLowerError::TickInsideBranch { span } => span,
+            CHIRLowerError::AmbiguousWidth { span } => span,
+        }
+    }
+}
+
 impl std::fmt::Display for CHIRLowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let span = self.span();
+        write!(f, "{}:{}: ", span.start_line, span.start_col)?;
         match self {
             CHIRLowerError::UnsupportedConstruct { description, .. } =>
                 write!(f, "unsupported construct: {}", description),
