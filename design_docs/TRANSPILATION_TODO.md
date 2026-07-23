@@ -203,9 +203,16 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
      arg-count mismatch and non-`let` statements before the tail. So `sign_ext_*`-
      shaped helpers inline end-to-end; `decode`/`alu_exec_*` still need the layers
      below (they use `?` / match-as-value / struct returns). **Limitations:** no
-     shadowing tracking in `substitute_expr` (pure helpers don't rely on it); impl
-     **methods** not yet inlined (only free fns — `build_fn_registry` filters to
-     `receiver.is_none()`). 6 tests.
+     shadowing tracking in `substitute_expr` (pure helpers don't rely on it).
+     **Increment 2 done (2026-07-23) — impl associated fns.** `build_fn_registry`
+     now also registers receiver-less impl-block methods under their qualified
+     name (`Opcode::from_bits`), the exact string `call_path` yields for a
+     `Type::method(args)` call — so the existing inliner handles them with no
+     dispatch change. Covers the `from_bits`-shaped calls used by the CPU
+     (mechanism-wise; they still need `?`/match-as-value to fully lower). Still
+     deferred: **instance** methods (`self`-receiver, called via
+     `receiver.method(..)`) — need self-binding + receiver-type disambiguation; no
+     example uses them in a hardware body. 6 + 3 tests.
   2. **Struct lowering** (wire bundles; field access → select; construction →
      per-field assign).
   3. **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`, so

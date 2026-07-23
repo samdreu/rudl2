@@ -586,14 +586,31 @@ fn build_enum_registry(fir: &FrontendModuleIR) -> EnumRegistry {
     registry
 }
 
-/// Registry of file-scope free functions available for inlining (#7b): only
-/// receiver-less functions (methods/associated fns are a later increment).
+/// Registry of functions available for inlining (#7b), by the name a call site
+/// uses to reach them:
+/// - file-scope free fns, keyed by bare name (`sign_ext_i`);
+/// - impl-block **associated** fns, keyed by qualified name (`Opcode::from_bits`)
+///   — the form `call_path` yields for a `Type::method(args)` call.
+/// Only receiver-less functions are registered; inlining a `self`-taking instance
+/// method (called via `receiver.method(..)`) is a later increment.
 fn build_fn_registry(fir: &FrontendModuleIR) -> std::collections::HashMap<String, FrontendFnIR> {
-    fir.file_fns
+    let mut fns: std::collections::HashMap<String, FrontendFnIR> = fir
+        .file_fns
         .iter()
         .filter(|f| f.receiver.is_none())
         .map(|f| (f.name.clone(), f.clone()))
-        .collect()
+        .collect();
+
+    for imp in &fir.file_impls {
+        // `self_ty` is raw type text; a plain type name is what a `Type::method`
+        // call path uses. Skip anything more complex (generics, references).
+        let self_ty: String = imp.self_ty.chars().filter(|c| !c.is_whitespace()).collect();
+        for m in imp.methods.iter().filter(|m| m.receiver.is_none()) {
+            fns.insert(format!("{self_ty}::{}", m.name), m.clone());
+        }
+    }
+
+    fns
 }
 
 /// The bit width of a resolved hardware type.
@@ -3806,5 +3823,52 @@ mod tests {
                       }";
         let fir = make_fir_hw(module, &no_hw()); // no file_fns injected
         assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_err());
+    }
+
+    // ── Impl-method (associated fn) inlining (#7b increment 2) ────────────────
+
+    fn capture_impls(file_src: &str) -> Vec<copper_core::frontend_ir::FrontendImplIR> {
+        let file: syn::File = syn::parse_str(file_src).unwrap();
+        crate::parser::capture_file_scope(&file, &no_hw()).impls
+    }
+
+    #[test]
+    fn fn_registry_keys_assoc_fns_by_qualified_name() {
+        let mut fir = make_fir_hw(
+            "#[hardware(combinational)] fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) {}",
+            &no_hw(),
+        );
+        fir.file_impls = capture_impls("impl Opcode { fn from_bits(op: Bits<8>) -> Bits<8> { op } }");
+        let reg = build_fn_registry(&fir);
+        // Reachable under the same `Type::method` path a call site uses.
+        assert!(reg.contains_key("Opcode::from_bits"));
+        assert!(!reg.contains_key("from_bits"));
+    }
+
+    #[test]
+    fn inline_impl_associated_fn_end_to_end() {
+        // `Doubler::double(a.read())` inlines its impl-block associated fn.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          out.write(Doubler::double(a.read())); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_impls = capture_impls("impl Doubler { fn double(x: Bits<8>) -> Bits<8> { x + x } }");
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry())
+            .expect("associated-fn call should inline and lower");
+        assert!(matches!(chir.body, CHIRBody::Combinational(_)));
+    }
+
+    #[test]
+    fn instance_methods_are_not_registered_for_inlining() {
+        // A `&self` method is not an associated fn; it is not (yet) inlinable.
+        let mut fir = make_fir_hw(
+            "#[hardware(combinational)] fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) {}",
+            &no_hw(),
+        );
+        fir.file_impls = capture_impls("impl Foo { fn get(&self) -> Bits<8> { x } }");
+        let reg = build_fn_registry(&fir);
+        assert!(!reg.contains_key("Foo::get"));
+        assert!(!reg.contains_key("get"));
     }
 }
