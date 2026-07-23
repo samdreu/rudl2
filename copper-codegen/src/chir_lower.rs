@@ -4,8 +4,8 @@ use copper_core::chir::{
     CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
-    ExprCall, ExprIndex, ExprType, FrontendClassification, FrontendFnIR, FrontendModuleIR, RawStmt,
-    RawStmtKind, SourceSpan,
+    ExprCall, ExprIndex, ExprStruct, ExprType, FrontendClassification, FrontendFnIR,
+    FrontendModuleIR, ItemStruct, LocalStmt, RawStmt, RawStmtKind, SourceSpan,
 };
 
 // ── Public type aliases ───────────────────────────────────────────────────────
@@ -613,6 +613,15 @@ fn build_fn_registry(fir: &FrontendModuleIR) -> std::collections::HashMap<String
     fns
 }
 
+/// Registry of file-scope struct definitions by name, for struct lowering
+/// (milestone 2). A struct-valued binding becomes one wire per field.
+fn build_struct_registry(fir: &FrontendModuleIR) -> std::collections::HashMap<String, ItemStruct> {
+    fir.file_structs
+        .iter()
+        .map(|s| (s.name.clone(), s.clone()))
+        .collect()
+}
+
 /// The bit width of a resolved hardware type.
 fn width_of_type(ty: &CHIRType) -> usize {
     match ty {
@@ -833,26 +842,14 @@ fn lower_comb_body(
     ctx.symbols = build_port_symbols(fir);
     ctx.enums = build_enum_registry(fir);
     ctx.fns = build_fn_registry(fir);
+    ctx.structs = build_struct_registry(fir);
 
     let mut stmts = Vec::new();
 
     for raw_stmt in &fir.raw_statements {
         match &raw_stmt.kind {
             RawStmtKind::Local(local) => {
-                if let Some(init) = &local.init {
-                    let ty = match &local.ty {
-                        Some(t) => resolve_type(&t.ty_text, t.span)?,
-                        None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
-                    };
-                    let value = lower_expr(init, &mut ctx)?;
-                    ctx.symbols.insert(local.name.clone(), ty.clone());
-                    stmts.push(CHIRStmt::Wire {
-                        name: local.name.clone(),
-                        ty,
-                        value,
-                        span: local.span,
-                    });
-                }
+                lower_local_binding(local, &mut ctx, &mut stmts)?;
             }
             RawStmtKind::Expr(expr_stmt) => {
                 if !expr_stmt.has_semi && has_return {
@@ -969,6 +966,7 @@ fn lower_seq_body(
     ctx.symbols = symbols;
     ctx.enums = enums;
     ctx.fns = build_fn_registry(fir);
+    ctx.structs = build_struct_registry(fir);
 
     // Emit pre-loop wires first so they are declared before any use, then the
     // loop body itself.
@@ -1024,6 +1022,9 @@ struct LowerCtx<'a> {
     fns: std::collections::HashMap<String, FrontendFnIR>,
     /// Free-fn names currently being inlined, to detect (and reject) recursion.
     inlining: std::collections::HashSet<String>,
+    /// File-scope struct definitions by name, for struct lowering (milestone 2):
+    /// a struct value binds one wire per field (`<base>_<field>`).
+    structs: std::collections::HashMap<String, ItemStruct>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1043,6 +1044,7 @@ impl<'a> LowerCtx<'a> {
             bindings: std::collections::HashMap::new(),
             fns: std::collections::HashMap::new(),
             inlining: std::collections::HashSet::new(),
+            structs: std::collections::HashMap::new(),
         }
     }
 
@@ -1065,28 +1067,127 @@ fn lower_stmts(stmts: &[RawStmt], ctx: &mut LowerCtx) -> Result<Vec<CHIRStmt>, C
     Ok(out)
 }
 
+// ── Local bindings (scalar + struct, milestone 2) ─────────────────────────────
+
+/// Lower a `let` binding. A struct value (a struct literal, or a call that
+/// inlines to one) binds one wire per field — `<base>_<field>` — matching the
+/// name that field access (`base.field`) already lowers to. Everything else is a
+/// single scalar wire.
+fn lower_local_binding(
+    local: &LocalStmt,
+    ctx: &mut LowerCtx,
+    out: &mut Vec<CHIRStmt>,
+) -> Result<(), CHIRLowerError> {
+    let Some(init) = &local.init else { return Ok(()) };
+
+    if let Some(s) = resolve_struct_literal(init, ctx)? {
+        return lower_struct_binding(&local.name, &s, ctx, out);
+    }
+
+    let ty = match &local.ty {
+        Some(t) => resolve_type(&t.ty_text, t.span)?,
+        None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
+    };
+    let value = lower_expr(init, ctx)?;
+    ctx.symbols.insert(local.name.clone(), ty.clone());
+    out.push(CHIRStmt::Wire {
+        name: local.name.clone(),
+        ty,
+        value,
+        span: local.span,
+    });
+    Ok(())
+}
+
+/// If `init` denotes a struct value — a struct literal, or a call to a
+/// file-scope fn that inlines to one (`alu_exec_reg(..)` → `AluOutput { .. }`) —
+/// return that literal. Inlines one level to see through a call.
+fn resolve_struct_literal(
+    init: &ExprType,
+    ctx: &LowerCtx,
+) -> Result<Option<ExprStruct>, CHIRLowerError> {
+    let inlined;
+    let candidate: &ExprType = match init {
+        ExprType::Call(call) => match call_path(call).and_then(|n| ctx.fns.get(&n).cloned()) {
+            Some(fn_ir) => {
+                inlined = build_inlined_expr(&fn_ir, &call.args, call.span)?;
+                &inlined
+            }
+            None => init,
+        },
+        _ => init,
+    };
+
+    match candidate {
+        ExprType::Struct(s) => {
+            let name: String = s.path_text.chars().filter(|c| !c.is_whitespace()).collect();
+            Ok(ctx.structs.contains_key(&name).then(|| s.clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Bind a struct literal as one wire per field: `<base>_<field> = <field value>`.
+fn lower_struct_binding(
+    base: &str,
+    s: &ExprStruct,
+    ctx: &mut LowerCtx,
+    out: &mut Vec<CHIRStmt>,
+) -> Result<(), CHIRLowerError> {
+    if s.rest.is_some() {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: "struct functional update (`..rest`) is not supported in hardware".to_string(),
+            span: s.span,
+            suggested_rewrite: None,
+        });
+    }
+    let struct_name: String = s.path_text.chars().filter(|c| !c.is_whitespace()).collect();
+    for field in &s.fields {
+        let wire_name = format!("{base}_{}", field.member);
+        let ty = resolve_field_type(&struct_name, &field.member, &field.expr, field.span, ctx)?;
+        let value = lower_expr(&field.expr, ctx)?;
+        ctx.symbols.insert(wire_name.clone(), ty.clone());
+        out.push(CHIRStmt::Wire {
+            name: wire_name,
+            ty,
+            value,
+            span: field.span,
+        });
+    }
+    Ok(())
+}
+
+/// The hardware type of struct field `field`: prefer the declared field type
+/// (resolving `Bits`/primitives directly, or an enum name to its encoding
+/// width), falling back to inferring from the field's value expression.
+fn resolve_field_type(
+    struct_name: &str,
+    field: &str,
+    value: &ExprType,
+    span: SourceSpan,
+    ctx: &LowerCtx,
+) -> Result<CHIRType, CHIRLowerError> {
+    if let Some(def) = ctx.structs.get(struct_name) {
+        if let Some(f) = def.fields.iter().find(|f| f.name == field) {
+            let text: String = f.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Ok(t) = resolve_type(&text, f.ty.span) {
+                return Ok(t);
+            }
+            if let Some(enum_def) = ctx.enums.get(&text) {
+                return Ok(CHIRType::UInt { width: Width::Concrete(enum_def.width) });
+            }
+        }
+    }
+    infer_type_from_expr(value, span, &ctx.symbols, &ctx.enums)
+}
+
 fn lower_stmt(
     stmt: &RawStmt,
     ctx: &mut LowerCtx,
     out: &mut Vec<CHIRStmt>,
 ) -> Result<(), CHIRLowerError> {
     match &stmt.kind {
-        RawStmtKind::Local(local) => {
-            if let Some(init) = &local.init {
-                let ty = match &local.ty {
-                    Some(t) => resolve_type(&t.ty_text, t.span)?,
-                    None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
-                };
-                let value = lower_expr(init, ctx)?;
-                ctx.symbols.insert(local.name.clone(), ty.clone());
-                out.push(CHIRStmt::Wire {
-                    name: local.name.clone(),
-                    ty,
-                    value,
-                    span: local.span,
-                });
-            }
-        }
+        RawStmtKind::Local(local) => lower_local_binding(local, ctx, out)?,
 
         RawStmtKind::Expr(expr_stmt) => {
             lower_expr_stmt(&expr_stmt.expr, stmt.span, ctx, out)?;
@@ -3870,5 +3971,94 @@ mod tests {
         let reg = build_fn_registry(&fir);
         assert!(!reg.contains_key("Foo::get"));
         assert!(!reg.contains_key("get"));
+    }
+
+    // ── Struct lowering (milestone 2) ─────────────────────────────────────────
+
+    fn capture_structs(file_src: &str) -> Vec<ItemStruct> {
+        let file: syn::File = syn::parse_str(file_src).unwrap();
+        crate::parser::capture_file_scope(&file, &no_hw()).structs
+    }
+
+    /// Collect the wire names a combinational body declares, in order.
+    fn comb_wire_names(fir: &FrontendModuleIR) -> Vec<String> {
+        let chir = lower_to_chir(fir, &no_hw(), &empty_registry()).expect("lowers");
+        match chir.body {
+            CHIRBody::Combinational(b) => b
+                .stmts
+                .iter()
+                .filter_map(|s| match s {
+                    CHIRStmt::Wire { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("expected combinational body"),
+        }
+    }
+
+    #[test]
+    fn struct_binding_emits_one_wire_per_field() {
+        // `let p = Point { x: a.read(), y: b.read() }` → wires `p_x`, `p_y`.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let p = Point { x: a.read(), y: b.read() }; \
+                          out.write(p.x); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_structs = capture_structs("struct Point { x: Bits<8>, y: Bits<8> }");
+        let wires = comb_wire_names(&fir);
+        assert!(wires.contains(&"p_x".to_string()), "wires: {wires:?}");
+        assert!(wires.contains(&"p_y".to_string()), "wires: {wires:?}");
+    }
+
+    #[test]
+    fn struct_field_access_reads_the_field_wire() {
+        // `out.write(p.y)` must drive from wire `p_y`, not a scalar `p`.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let p = Point { x: a.read(), y: b.read() }; \
+                          out.write(p.y); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_structs = capture_structs("struct Point { x: Bits<8>, y: Bits<8> }");
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry()).expect("lowers");
+        let drives_p_y = match chir.body {
+            CHIRBody::Combinational(b) => b.stmts.iter().any(|s| matches!(
+                s, CHIRStmt::PortWrite { value: CHIRExpr::Var(v), .. } if v == "p_y")),
+            _ => false,
+        };
+        assert!(drives_p_y, "expected out driven from p_y");
+    }
+
+    #[test]
+    fn struct_returning_helper_inlines_into_field_wires() {
+        // `let p = make(a.read())` where `make` returns a `Point { .. }` literal
+        // must still produce per-field wires (inline-through-call).
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let p = make(a.read()); \
+                          out.write(p.x); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_structs = capture_structs("struct Point { x: Bits<8>, y: Bits<8> }");
+        fir.file_fns =
+            capture_fns("fn make(v: Bits<8>) -> Point { Point { x: v, y: v } }");
+        let wires = comb_wire_names(&fir);
+        assert!(wires.contains(&"p_x".to_string()), "wires: {wires:?}");
+        assert!(wires.contains(&"p_y".to_string()), "wires: {wires:?}");
+    }
+
+    #[test]
+    fn struct_field_type_falls_back_to_enum_width() {
+        // A field typed as an enum resolves to the enum's encoding width.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let p = Wrap { inner: a.read() }; \
+                          out.write(p.inner); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_structs = capture_structs("struct Wrap { inner: Bits<8> }");
+        // Should lower without an ambiguous-width error.
+        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_ok());
     }
 }

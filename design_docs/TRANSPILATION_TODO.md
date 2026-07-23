@@ -213,8 +213,19 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
      deferred: **instance** methods (`self`-receiver, called via
      `receiver.method(..)`) — need self-binding + receiver-type disambiguation; no
      example uses them in a hardware body. 6 + 3 tests.
-  2. **Struct lowering** (wire bundles; field access → select; construction →
-     per-field assign).
+  2. [~] **Struct lowering** — **increment 1 done (2026-07-23).** A struct-valued
+     `let` binds one wire per field (`<base>_<field>`), matching the name field
+     access already lowers to (`base.field` → `base_field` var). `lower_stmt` and
+     `lower_comb_body` route `let`s through a shared `lower_local_binding`;
+     `resolve_struct_literal` recognizes a struct literal directly *or* through one
+     level of free-fn inlining (so `let x = make(..)` where `make` returns a struct
+     works); `resolve_field_type` types each field from the struct def (Bits/prim,
+     or enum→width) with a value-inference fallback. Struct/enum registries added to
+     `LowerCtx` (`build_struct_registry`). 4 tests. **Deferred:** `usize`/`isize`
+     field types (fall to inference; `rd: usize`-style fields not yet), `..rest`
+     functional update (rejected), nested structs, struct in match/if arms, and
+     struct bindings in the sequential *pre-loop* scope (`lower_seq_body` collects
+     those separately — not yet struct-aware).
   3. **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`, so
      this needs a real design decision (compile-time resolution of pure decoders
      vs. valid-bit lowering). Likely gates the CPU regardless of capture.
