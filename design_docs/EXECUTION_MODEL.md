@@ -40,12 +40,12 @@ Items are ordered by dependency — earlier items unblock later ones.
 
 ---
 
-### 4. Logic Type Cleanup
+### 4. Logic and Bits Types
 
-- [ ] Remove `Bit`. It is a newtype wrapper around `Logic` that adds no semantic distinction — `Logic` already represents a single bit. All operator overloading (`Not`, `BitAnd`, `BitOr`, `BitXor`) and convenience methods (`from_bool`, `as_bool`, `is_valid`) move to `Logic` directly. All `Bit` call sites migrate to `Logic`.
+- [ ] Use `Logic` for single-bit hardware signals. It is the single-bit hardware type in Copper and carries the three-state semantics needed for control signals that may become `X`.
 - [ ] Add tests for the three-state logic system covering all base operations (`&`, `|`, `^`, `!`) with X inputs. The conservative propagation rules (`One & X = X`, `Zero & X = Zero`, `One | X = One`, `Zero | X = X`) must be verified exhaustively — all nine input combinations for each binary operation.
 - [ ] Add tests for multi-bit operations on `Bits<N>`: arithmetic, bitwise, shifts, and X propagation through each. Pay particular attention to addition: `Bits<N>` addition is wrapping integer arithmetic, but what should happen when one or more input bits are X? The current implementation converts to `u128` via `as_u128` before adding, which silently drops X bits. The correct hardware behavior is that any X input bit produces an X output — the entire sum is unknown when any input bit is unknown.
-- [ ] Decide on `Z` (high-impedance). IEEE 1364-2005 defines four states: `0`, `1`, `X`, `Z`. `Bit`'s doc comment already mentions Z but it is absent from `Logic`. Required for tri-state buses and bidirectional ports; not needed for purely synchronous FPGA-targeted designs. Tracked under item 6 (`MultiDriver`).
+- [ ] Decide on `Z` (high-impedance). IEEE 1364-2005 defines four states: `0`, `1`, `X`, `Z`. `Logic` does not currently include Z. Required for tri-state buses and bidirectional ports; not needed for purely synchronous FPGA-targeted designs. Tracked under item 6 (`MultiDriver`).
 
 **Implications.** The multi-bit add problem is the most significant. Current `Bits<N>` arithmetic calls `as_u128()` which maps X to 0 before adding. This means `X + 1 = 1` in simulation, which is wrong — the correct result is X (unknown). Any test that relies on arithmetic results after X propagation may be silently producing incorrect simulation values. This needs to be fixed before the logic type is used for synthesis verification.
 
@@ -144,13 +144,13 @@ pub enum Logic {
 }
 ```
 
-IEEE 1364-2005 (Verilog) defines a fourth state, `Z` (high-impedance), representing a net that is not being driven — a floating wire, a disabled tri-state buffer, or a bus with all drivers turned off. Copper does not currently implement `Z`. This is a known gap: the comment on `Bit` at [`types.rs:22`](../copper-core/src/types.rs#L22) mentions four states but `Z` is absent from the `Logic` enum. For most FPGA-targeted synchronous digital logic this does not matter — FPGA fabrics do not expose tri-state routing internally, only at I/O pads — but designs involving bidirectional buses or tri-state buffers cannot be modeled correctly without it.
+IEEE 1364-2005 (Verilog) defines a fourth state, `Z` (high-impedance), representing a net that is not being driven — a floating wire, a disabled tri-state buffer, or a bus with all drivers turned off. Copper does not currently implement `Z`. This is a known gap: `Logic` currently models only `0`, `1`, and `X`. For most FPGA-targeted synchronous digital logic this does not matter — FPGA fabrics do not expose tri-state routing internally, only at I/O pads — but designs involving bidirectional buses or tri-state buffers cannot be modeled correctly without it.
 
 `X` is not an error state — it is a valid simulation value meaning "could be zero or one." It propagates through combinational logic according to conservative rules: `One & X = X`, `Zero & X = Zero`, `One | X = One`, `Zero | X = X`. This matches the behavior of commercial Verilog simulators for the unknown state.
 
-`Bit` is a newtype wrapper around `Logic` with operator overloading (`Not`, `BitAnd`, `BitOr`, `BitXor`) and convenience methods (`from_bool`, `as_bool`, `is_valid`). It adds no semantic distinction — `Logic` is already a single bit, and everything `Bit` provides could live on `Logic` directly. `Bit` is a candidate for removal; all call sites would migrate to `Logic`.
+`Logic` is the single-bit hardware type. It carries the three-state semantics needed for control signals that may become `X`, and it is the right choice for 1-bit hardware ports, enables, flags, and comparators.
 
-`Bits<N>` is a compile-time fixed-width bit vector backed by `[Logic; N]`. Width is encoded in the type, so a `Bits<8>` and a `Bits<16>` are distinct types and cannot be connected by accident. Arithmetic operations (`+`, `-`, `&`, `|`, `^`, `!`, shifts) are defined on `Bits<N>` with wrapping semantics and X propagation.
+`Bits<N>` is a compile-time fixed-width bit vector backed by `[Logic; N]`. Width is encoded in the type, so a `Bits<8>` and a `Bits<16>` are distinct types and cannot be connected by accident. Arithmetic operations (`+`, `-`, `&`, `|`, `^`, `!`, shifts) are defined on `Bits<N>` with wrapping semantics and X propagation. Use it for counters, addresses, buses, ALU results, and any other data path that should have an explicit bit width.
 
 See [`copper-core/src/types.rs`](../copper-core/src/types.rs) for the full set of trait implementations.
 
@@ -165,7 +165,7 @@ pub trait HasUnknown {
 }
 ```
 
-Implemented for `Logic`, `Bit`, `Bits<N>`, and tuples of those up to four elements. The executor uses this to inject X into an oscillating combinational loop rather than panicking — see [Section 7.5](#75-x-propagation).
+Implemented for `Logic`, `Bits<N>`, and tuples of those up to four elements. The executor uses this to inject X into an oscillating combinational loop rather than panicking — see [Section 7.5](#75-x-propagation).
 
 ---
 
@@ -281,7 +281,7 @@ The control flow here encodes timing directly:
 Multiple `clk.tick().await` calls in a single loop body model multi-cycle behavior naturally. Each `.await` is a separate clock edge boundary. Intermediate local variables between two `.await` points are pipeline registers: they are stored in the generated `Future` struct and survive across polls.
 
 ```rust
-async fn two_stage(clk: Clock<MainClk>, input: SignalHandle<u32>) -> u32 {
+async fn two_stage(clk: Clock<MainClk>, input: SignalHandle<Bits<32>>) -> Bits<32> {
     loop {
         let a   = read_signal(input);       // not a register: consumed before .await
         let mid = expensive_stage_one(a);   // register: lives across the first .await
@@ -467,9 +467,9 @@ impl<T> Copy  for SignalHandle<T> {}
 impl<T> Clone for SignalHandle<T> { fn clone(&self) -> Self { *self } }
 ```
 
-It carries no ownership, no reference count, and no allocation. It is `Copy`, so modules accept it by value with no cloning. Passing `write_en: SignalHandle<Bit>` to a module costs nothing more than passing a `usize`.
+It carries no ownership, no reference count, and no allocation. It is `Copy`, so modules accept it by value with no cloning. Passing `write_en: SignalHandle<Logic>` or `data_in: SignalHandle<Bits<8>>` to a module costs nothing more than passing a `usize`.
 
-The phantom type `PhantomData<T>` ensures that you cannot read a `SignalHandle<Bit>` slot as `SignalHandle<u8>` — the type mismatch is a compile error, not a runtime panic.
+The phantom type `PhantomData<T>` ensures that you cannot read a `SignalHandle<Logic>` slot as `SignalHandle<Bits<8>>` — the type mismatch is a compile error, not a runtime panic.
 
 Two free functions provide signal access from within module bodies:
 
@@ -489,7 +489,7 @@ Every signal — whether driven by a module or by the testbench — is registere
 ```rust
 let write_en = exec.register_signal("write_en", Logic::Zero);
 let read_en  = exec.register_signal("read_en",  Logic::Zero);
-let data_in  = exec.register_signal("data_in",  Bits::<8>::from_u128(0));
+let data_in  = exec.register_signal("data_in",  Bits::<8>::from_lit::<0>());
 let fifo_out = exec.register_signal("fifo_out", initial);
 
 exec.spawn(fifo(clk.clone(), In::new(write_en), In::new(read_en), In::new(data_in), Out::new(fifo_out)));
@@ -499,7 +499,7 @@ The testbench drives input signals between ticks and reads outputs directly via 
 
 ```rust
 exec.drive(write_en, Logic::One);
-exec.drive(data_in,  Bits::from_u128(42));
+exec.drive(data_in,  Bits::from_lit::<42>());
 exec.tick_clock(&mut clk);
 let result = exec.read(fifo_out);
 ```

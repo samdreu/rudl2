@@ -17,6 +17,8 @@ Copper maps Rust async concepts directly onto hardware concepts:
 
 The executor runs all module futures in lockstep — every module sees the same cycle counter and advances together.
 
+**Type convention:** Use `Logic` and `Bits<N>` for hardware-facing signals and state. Use `bool` or primitive integers only when the value is host-side, testbench-only, or intentionally two-state and widthless.
+
 ---
 
 ## Clock and Clock Domain
@@ -416,13 +418,13 @@ async fn registered_pipeline(clk: Clock<MainClk>, in_data: Arc<Mutex<u8>>) -> u8
 
 ```rust
 #[hardware(function_typed)]
-async fn mealy_101(clk: Clock<MainClk>, in_bit: Arc<Mutex<Bit>>) -> Bit {
+async fn mealy_101(clk: Clock<MainClk>, in_bit: Arc<Mutex<Logic>>) -> Logic {
     let mut state = State::S0;
     loop {
         let input = *in_bit.lock().unwrap();
         let output = match (state, input.0) {
-            (State::S2, Logic::One) => Bit::ONE,
-            _ => Bit::ZERO,
+            (State::S2, Logic::One) => Logic::One,
+            _ => Logic::Zero,
         };
         emit!(output);               // output depends on current state + input
         clk.tick().await;

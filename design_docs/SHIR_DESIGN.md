@@ -401,15 +401,15 @@ assign out = count;
 
 **Source:**
 ```rust
-async fn jk_ff(j: Arc<Mutex<Bit>>, k: Arc<Mutex<Bit>>, clk: Clock<MainClk>) -> Bit {
-    let mut q: Bit = Bit::ZERO;
+async fn jk_ff(j: Arc<Mutex<Logic>>, k: Arc<Mutex<Logic>>, clk: Clock<MainClk>) -> Logic {
+  let mut q: Logic = Logic::Zero;
     loop {
         match (*j.lock().unwrap(), *k.lock().unwrap()) {
-            (Bit::ZERO, Bit::ZERO) => {}
-            (Bit::ZERO, Bit::ONE)  => { q = Bit::ZERO; }
-            (Bit::ONE,  Bit::ZERO) => { q = Bit::ONE; }
-            (Bit::ONE,  Bit::ONE)  => { q = if q == Bit::ZERO { Bit::ONE } else { Bit::ZERO }; }
-            _ => { q = Bit::X; }
+      (Logic::Zero, Logic::Zero) => {}
+      (Logic::Zero, Logic::One)  => { q = Logic::Zero; }
+      (Logic::One,  Logic::Zero) => { q = Logic::One; }
+      (Logic::One,  Logic::One)  => { q = if q == Logic::Zero { Logic::One } else { Logic::Zero }; }
+      _ => { q = Logic::X; }
         }
         emit!(q);
         clk.tick().await;

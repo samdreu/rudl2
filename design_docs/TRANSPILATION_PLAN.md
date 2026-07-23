@@ -202,7 +202,7 @@ pub type ModuleRegistry = HashMap<String, FrontendModuleIR>;
 ```
 
 **Type Resolution:**
-- All primitives: `u8`..`u128`, `i8`..`i128`, `bool`, `Bit`, `Logic`, `Bits<N>`
+- All primitives: `u8`..`u128`, `i8`..`i128`, `bool`, `Logic`, `Bits<N>`
 - `Arc<Mutex<T>>` → strips wrapper, resolves inner type
 - Type inference from init expressions: typed literals (`0u8`), cast expressions (`x as u8`), booleans
 - Hard error (`AmbiguousWidth`) for unresolvable types — no silent coercions

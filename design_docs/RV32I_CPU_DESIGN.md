@@ -4,6 +4,8 @@
 
 A simple, non-pipelined RV32I CPU implementation demonstrating how Copper HDL can model complex hardware in pure Rust with cycle-accurate semantics.
 
+**Type convention:** The architectural examples below use Rust primitives for readability, but hardware-facing signals should use `Logic` and `Bits<N>` in Copper code. Use primitives like `u32` only for host-side simulation state or testbench data that never escapes into the hardware boundary.
+
 **Key Features:**
 - **Non-pipelined execution:** Fetch → Decode → Execute → Memory → Writeback in a single cycle
 - **RV32I subset:** 13 instructions for arithmetic, logic, memory, and control flow

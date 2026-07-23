@@ -4,6 +4,8 @@
 
 The CPU never assumes fixed memory latencies. Instead, it uses **ready/valid handshaking** (like real hardware):
 
+**Type convention:** The examples below use `u32` because they describe the current CPU model and its host-side memory interface, but hardware-facing Copper code should prefer `Logic` and `Bits<N>` for signals and datapaths.
+
 ```
 CPU: Issue request → Poll is_ready() → When ready, capture data
 Memory: Accept request → Process → Signal is_ready() → Provide data

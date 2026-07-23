@@ -105,7 +105,7 @@ pub struct RawParam {
 }
 
 pub struct RawTypeRef {
-    pub ty_text: String,   // e.g. "Arc < Mutex < u8 > >", "Clock < MainClk >", "u8"
+    pub ty_text: String,   // e.g. "Arc < Mutex < Logic > >", "Clock < MainClk >", "Bits < 8 >"
     pub span: SourceSpan,
 }
 ```
@@ -346,7 +346,7 @@ Sequential modules receive mutable inputs wrapped in `Arc<Mutex<T>>`. These appe
 
 ```
 "Arc < Mutex < u8 > >"
-"Arc < Mutex < Bit > >"
+"Arc < Mutex < Logic > >"
 ```
 
 Phase A preserves these verbatim. Phase B is responsible for stripping the wrapper and resolving `T` to a `CHIRType` data port. The rule is: if `ty_text` whitespace-stripped starts with `Arc<Mutex<`, extract the inner type. Access patterns (`*x.lock().unwrap()`) inside the body are `ExprMethodCall` chains that Phase B also normalizes away — they have no hardware meaning, only simulation meaning.
@@ -383,7 +383,7 @@ pub struct SourceSpan {
 
 Stable, portable, proc-macro-independent. Carries through all IR phases for diagnostics and optional source-location comments in emitted Verilog.
 
-**Implementation status: stub.** `capture_source_span` currently returns `SourceSpan::default()` (all zeros) for all nodes. Conversion from `syn::Span` to line/column requires the `"span-locations"` feature on `proc-macro2`. This must be implemented before Phase B diagnostics include meaningful source locations. Until then, all spans in FIR are `{0, 0, 0, 0}` and Invariant 2 below is not currently enforced.
+**Implementation status: real.** `capture_source_span` converts `syn::Spanned::span()` to line/column via `proc-macro2`'s `"span-locations"` feature (enabled on `copper-codegen`'s dependency). `CHIRLowerError` and `SHIRLowerError` (`copper-core/src/chir.rs`, `copper-core/src/shir.rs`) now print `line:col:` prefixes derived from these spans instead of dropping them.
 
 ---
 
@@ -391,7 +391,7 @@ Stable, portable, proc-macro-independent. Carries through all IR phases for diag
 
 These are explicit non-goals:
 
-- **Generics and const generics** (`Bits<N>` has `N` preserved only as text in `ty_text`)
+- **Generics and const generics** (`Bits<N>` has `N` preserved only as text in `ty_text`; hardware-facing values should still use `Logic` and `Bits<N>` rather than primitive integers)
 - **Trait method dispatch** — a method call is captured as `ExprMethodCall`; which trait it comes from is not resolved
 - **Lifetimes** — not relevant to hardware, ignored
 - **`use` statements at module top level** — outside the function body, not captured
@@ -406,7 +406,7 @@ These are explicit non-goals:
 These hold for all output produced by `capture_frontend_ir`:
 
 1. `raw_statements` is in source order (`order` field is 0-indexed position)
-2. Every `SourceSpan` has `start_line <= end_line` and valid column values — **currently not enforced**: `capture_source_span` is a stub returning all zeros; this invariant becomes active once span locations are implemented
+2. Every `SourceSpan` has `start_line <= end_line` and valid column values
 3. `classification` is `AsyncSequentialFn` if and only if `design_fn.sig.asyncness.is_some()`
 4. `clocks` contains exactly the parameters whose type text (whitespace-stripped) begins with `Clock<`
 5. No `syn` types appear anywhere in the output

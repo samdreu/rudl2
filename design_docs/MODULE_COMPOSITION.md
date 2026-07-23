@@ -1,5 +1,7 @@
 # Module Composition in Copper HDL
 
+**Type convention:** New hardware-facing code should use `Logic` and `Bits<N>` at module boundaries. The `Arc<Mutex<T>>` examples below describe the older raw signal style and remain useful for understanding composition, but they should be read as legacy patterns rather than the preferred new-code interface.
+
 ## Current Status
 
 **What Works Today:**
@@ -326,7 +328,7 @@ async fn pipeline(clk: Clock<MainClk>, in_data: Arc<Mutex<u8>>, out_data: Arc<Mu
    - Rust const generics: `async fn child<const N: usize>(...)`
    
 4. **How to reset child modules?**
-   - Add reset signal as explicit input: `reset: Arc<Mutex<Bit>>`
+    - Add reset signal as explicit input: `reset: Arc<Mutex<Logic>>`
 
 ## Next Steps
 

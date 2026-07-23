@@ -4,6 +4,8 @@
 
 The copper HDL now includes automatic verification against Verilator to ensure that the Rust simulation matches the Verilog output.
 
+**Type convention:** Verification examples use primitive integers and `Logic` vectors because they describe the host-side test harness. In Copper hardware modules, prefer `Logic` and `Bits<N>` for actual signals and datapaths.
+
 ## How It Works
 
 1. **Simulation Trace**: As you run your Rust simulation, you record the inputs and outputs at each cycle into a `SimulationTrace`

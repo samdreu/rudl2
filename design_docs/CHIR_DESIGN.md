@@ -434,7 +434,7 @@ Phase B is responsible for mapping Copper source types to `CHIRType`. The rules:
 | `u8`, `u16`, `u32`, `u64`, `u128` | `UInt { width: 8/16/32/64/128 }` |
 | `i8`, `i16`, `i32`, `i64`, `i128` | `SInt { width: 8/16/32/64/128 }` |
 | `bool` | `Bool` |
-| `Bit` | `UInt { width: 1 }` |
+| `Logic` | `UInt { width: 1 }` |
 | `Bits<N>` | `UInt { width: N }` |
 | `Logic` | `UInt { width: 1 }` (X becomes simulation-only) |
 | `Arc<Mutex<T>>` | Resolved to the `T` type (Arc/Mutex stripped) |

@@ -14,7 +14,7 @@ graph LR
     Clock[Clock]
     TickFuture[ClockTick]
     Mem[Memory]
-    Logic[Logic / Bit / Bits]
+    Logic[Logic / Bits]
     Unknown[HasUnknown]
   end
 

@@ -12,17 +12,19 @@ The fundamental distinction in synchronous digital design is whether a piece of 
 
 Copper encodes this distinction in the suspension primitive a module uses.
 
+**Type convention:** For hardware-facing values, prefer `Logic` and `Bits<N>` over Rust primitives. Use primitives like `u8` or `u32` only for host-side bookkeeping, testbench code, or other values that never become signals.
+
 ### Sequential: `clk.tick().await`
 
 A sequential module suspends on a clock edge. Its local variables persist across the suspension — they become registers in the generated hardware (or fields in the Rust `Future` struct in simulation).
 
 ```rust
 async fn counter(clk: Clock<MainClk>, out: Out<Bits<8>>) {
-    let mut count = Bits::<8>::from_u128(0);   // register: persists across .await
+    let mut count = Bits::<8>::from_lit::<0>(); // register: persists across .await
     loop {
         out.write(count);
         clk.tick().await;                       // suspend until next rising edge
-        count = count + Bits::from_u128(1);     // update register after edge
+        count = count + Bits::from_lit::<1>();   // update register after edge
     }
 }
 ```
@@ -45,9 +47,9 @@ The `clk.tick().await` is the rising edge. Everything before it in the loop body
 The simplest and preferred form. Combinational logic inside a module is a plain synchronous function called within the sequential loop body. No `async`, no `.await`, no delta cycles.
 
 ```rust
-fn add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }
+fn add(a: Bits<8>, b: Bits<8>) -> Bits<8> { a + b }
 
-async fn adder_reg(clk: Clock<MainClk>, a: In<u8>, b: In<u8>, out: Out<u8>) {
+async fn adder_reg(clk: Clock<MainClk>, a: In<Bits<8>>, b: In<Bits<8>>, out: Out<Bits<8>>) {
     loop {
         out.write(add(a.read(), b.read()));   // combinational, inline
         clk.tick().await;
@@ -72,7 +74,7 @@ The function re-evaluates every time the loop body runs. There is no separate ta
 When combinational logic must be a **separate named module** — connecting two signals, visible in waveforms, or reused across designs — it is written as an async task that re-evaluates every delta cycle using `delta_yield().await` instead of `clk.tick().await`.
 
 ```rust
-async fn doubler(input: In<u8>, out: Out<u8>) {
+async fn doubler(input: In<Bits<8>>, out: Out<Bits<8>>) {
     loop {
         out.write(input.read().wrapping_mul(2));
         delta_yield().await;    // yield for one delta cycle, then re-evaluate

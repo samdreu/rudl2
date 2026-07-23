@@ -47,9 +47,6 @@ classDiagram
 
   %% types
   class Logic
-  class Bit {
-    +Logic value
-  }
   class Bits
   class Clock
 
@@ -69,7 +66,6 @@ classDiagram
   RawStmt --> RawStmtKind : kind
   RawStmt --> SourceSpan : spans
 
-  Bit --> Logic : uses
   Bits --> Logic : uses
   Memory --> Clock : uses
 

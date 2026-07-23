@@ -12,16 +12,18 @@ Three principles guide every design decision in Copper:
 
 3. **Abstraction shouldn't cost you hardware quality.** High-level constructs (async/await FSMs, phantom-type clock domains, const-generic bit widths) must compile to the same hardware as hand-written Verilog. Zero-cost means zero gap between what you write and what you get.
 
+**Type convention:** Use `Logic` for single-bit hardware signals, `Bits<N>` for width-bearing hardware values, `bool` only for simple two-state control where `X` does not matter, and Rust primitives (`u32`, `i32`, `usize`, etc.) for host-side or testbench-only data. If a value crosses into hardware, prefer `Logic` or `Bits<N>`.
+
 **Anti-goals:** Copper is not trying to be "Verilog with better syntax" — that would just be a more comfortable way to write the same bugs. And "runs fast" is not a primary goal: correctness and safety come first.
 
 ## What Makes Copper Different?
 
 Traditional HDLs like Verilog and VHDL were designed in the 1980s before modern type theory and programming language advances. Copper leverages Rust's unique features to prevent common hardware design mistakes at compile time:
 
-- **Ownership-Based CDC Safety**: First HDL to use ownership semantics for compile-time clock domain crossing verification
+- **Typed Clock Domains (CDC safety)**: clock domains are phantom types on every signal and clock, so an unsynchronized cross-domain connection is a *compile error*. Regular modules are single-domain by construction; every domain crossing must go through an explicit synchronizer (`sync_2ff`, a `#[hardware(synchronizer)]` module), so a crossing can never be hidden. This localizes and makes every crossing explicit — it does not verify a synchronizer's internal timing.
 - **Async/Await State Machines**: Write FSMs naturally with async/await—no manual state enumeration
 - **Function-Typed Modules**: Ports inferred from function signatures—no explicit port declarations
-- **Type-Driven Hardware**: Phantom types for clock domains, const generics for bit widths
+- **Type-Driven Hardware**: `Logic`/`Bits<N>` for hardware values, phantom types for clock domains, const generics for bit widths
 - **Unified Simulation/Synthesis**: Same code runs in cycle-accurate Rust simulator and compiles to Verilog
 
 ## Quick Start
@@ -112,7 +114,7 @@ Copper includes various examples demonstrating different features:
 
 Copper is organized into several crates:
 
-- **copper-core**: Core type system (`Bit`, `Bits<N>`, `Clock<Domain>`)
+- **copper-core**: Core type system (`Logic`, `Bits<N>`, `Clock<Domain>`)
 - **copper-sim**: Cycle-accurate simulation runtime and executor
 - **copper-macros**: Procedural macros (`#[hardware]`, etc.)
 - **copper-codegen**: Verilog code generation backend
@@ -125,17 +127,26 @@ Copper is in active development for academic publication (targeting PLDI 2027). 
 - ✅ Async/await executor with lockstep simulation
 - ✅ Function-typed modules with implicit outputs
 - ✅ Comprehensive examples and test suite
-- ⏳ Verilog code generation (in progress)
+- 🚧 Verilog code generation — full `FIR → CHIR → SHIR → VLIR → SystemVerilog`
+  pipeline landed; `copper-transpile` CLI emits Verilator-lint-clean output.
+  Two examples (`counter`, `lfsr`) are verified behaviorally equivalent to the
+  Copper simulation under Verilator. Widening front-end feature coverage (const
+  generics, arrays, for-loops, LHS bit-assignment) is ongoing — see
+  [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md).
 - ⏳ Clock domain crossing safety verification
 - ⏳ Formal semantics and correctness proofs
 
-See [PROGRESS.md](PROGRESS.md) for detailed development tracking.
+See [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) for the current
+transpilation status, progress log, and notes; [PROGRESS.md](PROGRESS.md) for
+detailed development tracking.
 
 ## Documentation
 
 ### Transpilation Pipeline
 
-- [TRANSPILATION_PLAN.md](TRANSPILATION_PLAN.md) - Overall pipeline architecture and decision log
+- [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) - **Current status, progress log, decisions, and notes (canonical)**
+- [TRANSPILATION_COVERAGE_MAP.md](TRANSPILATION_COVERAGE_MAP.md) - Which examples force which features, and the dependency-ordered order of attack toward the RV32I capstone
+- [TRANSPILATION_PLAN.md](TRANSPILATION_PLAN.md) - Original pipeline architecture and decision log (⚠️ predates the In/Out port model)
 - [ASYNC_AWAIT_SEMANTICS.md](ASYNC_AWAIT_SEMANTICS.md) - Clock/tick/emit runtime semantics (canonical reference)
 - [FIR_DESIGN.md](FIR_DESIGN.md) - Phase A: Frontend IR capture from Rust AST ✅
 - [CHIR_DESIGN.md](CHIR_DESIGN.md) - Phase B: Canonical Hardware IR semantic lowering ✅
