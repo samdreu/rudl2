@@ -1,0 +1,29 @@
+$timescale 1ps $end
+$scope module one_bit_comparator $end
+$var wire 1 ! i0 $end
+$var wire 1 " i1 $end
+$var wire 1 # eq $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+b0 !
+b0 "
+b1 #
+$end
+#0
+b0 !
+b0 "
+b1 #
+#1
+b0 !
+b1 "
+b0 #
+#2
+b1 !
+b0 "
+b0 #
+#3
+b1 !
+b1 "
+b1 #

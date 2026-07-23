@@ -1,0 +1,41 @@
+$timescale 1ps $end
+$scope module bsg_rotate_right $end
+$var wire 8 ! data_i $end
+$var wire 3 " rot_i $end
+$var wire 8 # o $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+b10110001 !
+b001 "
+b11011000 #
+$end
+#0
+b10110001 !
+b001 "
+b11011000 #
+#1
+b10110001 !
+b011 "
+b00110110 #
+#2
+b10110001 !
+b100 "
+b00011011 #
+#3
+b11111111 !
+b101 "
+b11111111 #
+#4
+b00000001 !
+b001 "
+b10000000 #
+#5
+b10000000 !
+b111 "
+b00000001 #
+#6
+b10110001 !
+b000 "
+b10110001 #

@@ -1,0 +1,45 @@
+$timescale 1ps $end
+$scope module priority_encode $end
+$var wire 8 ! inputs $end
+$var wire 3 " result $end
+$var wire 1 # valid $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+b00000000 !
+b000 "
+b0 #
+$end
+#0
+b00000000 !
+b000 "
+b0 #
+#1
+b00000001 !
+b000 "
+b1 #
+#2
+b00000010 !
+b001 "
+b1 #
+#3
+b10000000 !
+b111 "
+b1 #
+#4
+b00000011 !
+b001 "
+b1 #
+#5
+b00110000 !
+b101 "
+b1 #
+#6
+b10000001 !
+b111 "
+b1 #
+#7
+b11111111 !
+b111 "
+b1 #
