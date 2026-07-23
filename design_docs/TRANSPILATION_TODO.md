@@ -226,6 +226,16 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
      functional update (rejected), nested structs, struct in match/if arms, and
      struct bindings in the sequential *pre-loop* scope (`lower_seq_body` collects
      those separately — not yet struct-aware).
+  - [x] **Match-as-value — done (2026-07-23).** Was already largely implemented:
+     `lower_expr`'s `Match` arm produces `CHIRExpr::Case` (all-literal / whole-
+     wildcard patterns) or `lower_match_as_chain` → a `Mux` chain (guards, binders,
+     partial wildcards, or-patterns, tuple scrutinees). The one gap found probing
+     the `alu_exec_*` shape: a lone `_` arm against a **tuple** scrutinee was
+     rejected on an element-count check (`parse_pattern_elems("_")` is 1 elem, the
+     tuple 2). Fixed — a whole-pattern `_` is now unconditional regardless of
+     scrutinee arity. So `alu_exec_reg`/`alu_exec_imm`-shaped `let r = match (t) {
+     .. }` (partial-wildcard arms, if-expr arm bodies, trailing `_`) now lowers.
+     2 tests; golden e2e unchanged.
   3. **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`, so
      this needs a real design decision (compile-time resolution of pure decoders
      vs. valid-bit lowering). Likely gates the CPU regardless of capture.

@@ -1735,7 +1735,11 @@ fn lower_match_as_chain(
 
         for alt in &alts {
             let elems = parse_pattern_elems(alt, span, &ctx.enums)?;
-            if elems.len() != scrut_elems.len() {
+            // A lone `_` matches the whole scrutinee regardless of its arity
+            // (`match (a, b) { _ => .. }`), so it is unconditional. Only when the
+            // pattern is a tuple must its arity match the scrutinee's.
+            let whole_wildcard = elems.len() == 1 && matches!(elems[0], PatElem::Wildcard);
+            if !whole_wildcard && elems.len() != scrut_elems.len() {
                 return Err(CHIRLowerError::UnsupportedConstruct {
                     description: format!(
                         "match arm pattern has {} element(s) but the scrutinee has {}",
@@ -1748,6 +1752,9 @@ fn lower_match_as_chain(
             }
             let mut alt_cond: Option<CHIRExpr> = None;
             for (i, e) in elems.iter().enumerate() {
+                if whole_wildcard {
+                    break; // unconditional; no per-element conditions
+                }
                 match e {
                     PatElem::Lit(lit) => {
                         let sc = lower_expr(scrut_elems[i], ctx)?;
@@ -4046,6 +4053,52 @@ mod tests {
         let wires = comb_wire_names(&fir);
         assert!(wires.contains(&"p_x".to_string()), "wires: {wires:?}");
         assert!(wires.contains(&"p_y".to_string()), "wires: {wires:?}");
+    }
+
+    // ── Match-as-value (match in expression position) ─────────────────────────
+
+    #[test]
+    fn match_as_value_alu_shape_lowers() {
+        // alu_exec-shaped: `let r = match (tuple) { partial-wildcard arms }` with
+        // value arms, one an if-expression, and a trailing `_` over the tuple.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, sel: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let r: Bits<8> = match (sel.read().as_usize(), a.read().as_usize()) { \
+                              (0, 0) => a.read(), \
+                              (1, _) => b.read(), \
+                              (2, _) => if a.read() == b.read() { a.read() } else { b.read() }, \
+                              _      => Bits::from_lit::<0>(), \
+                          }; \
+                          out.write(r); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        let res = lower_to_chir(&fir, &no_hw(), &empty_registry());
+        assert!(res.is_ok(), "alu-shaped match-as-value should lower: {:?}", res.err());
+    }
+
+    #[test]
+    fn match_as_value_lone_wildcard_matches_tuple_scrutinee() {
+        // A bare `_` arm matches a tuple scrutinee regardless of arity. The
+        // partial-wildcard arm `(0, _)` forces the Mux-chain path (not `case`),
+        // so this exercises the arity fix directly: `_` must not be rejected on an
+        // element-count check, and the value lowers to a `Mux` chain.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let r: Bits<8> = match (a.read().as_usize(), b.read().as_usize()) { \
+                              (0, _) => a.read(), \
+                              _      => b.read(), \
+                          }; \
+                          out.write(r); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry()).expect("lowers");
+        // The match binds `let r`, so the Mux is the value of wire `r`.
+        let r_is_mux = match chir.body {
+            CHIRBody::Combinational(b) => b.stmts.iter().any(|s| matches!(
+                s, CHIRStmt::Wire { name, value: CHIRExpr::Mux { .. }, .. } if name == "r")),
+            _ => false,
+        };
+        assert!(r_is_mux, "expected wire `r` to be a Mux chain");
     }
 
     #[test]
