@@ -1,8 +1,8 @@
-error: function_typed inputs must be read-only; remove `mut`
- --> tests/ui/fail/function_typed_mut_input.rs:9:42
-  |
-9 | async fn bad_module(clk: Clock<MainClk>, mut input: u8) -> u8 {
-  |                                          ^^^^^^^^^
+error: hardware function parameters must be Clock<D>, In<T>, or Out<T>
+  --> tests/ui/fail/function_typed_mut_input.rs:10:46
+   |
+10 | async fn counter(clk: Clock<MainClk>, input: u8, out: Out<u8>) {
+   |                                              ^^
 
 warning: unused import: `Clock`
  --> tests/ui/fail/function_typed_mut_input.rs:1:19
@@ -11,3 +11,9 @@ warning: unused import: `Clock`
   |                   ^^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `In` and `Out`
+ --> tests/ui/fail/function_typed_mut_input.rs:2:25
+  |
+2 | use copper_core::port::{In, Out};
+  |                         ^^  ^^^
