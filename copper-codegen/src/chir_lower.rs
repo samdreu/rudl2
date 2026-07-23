@@ -4,8 +4,8 @@ use copper_core::chir::{
     CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
-    ExprCall, ExprIndex, ExprType, FrontendClassification, FrontendModuleIR, RawStmt, RawStmtKind,
-    SourceSpan,
+    ExprCall, ExprIndex, ExprType, FrontendClassification, FrontendFnIR, FrontendModuleIR, RawStmt,
+    RawStmtKind, SourceSpan,
 };
 
 // ── Public type aliases ───────────────────────────────────────────────────────
@@ -223,6 +223,239 @@ fn call_path(call: &ExprCall) -> Option<String> {
     }
 }
 
+// ── Free-function inlining (#7b) ───────────────────────────────────────────────
+
+/// Inline a call to a file-scope free function. Substitutes arguments for
+/// parameters, folds the body's `let` bindings into the tail expression, then
+/// lowers the result. Nested helper calls (e.g. `decode` → `sign_ext_i`) inline
+/// recursively through `lower_expr`. Only pure combinational bodies are
+/// supported: `let name = expr;` bindings ending in a tail expression, with no
+/// early return, `?`, `.await`, or statement-level side effects.
+fn lower_inlined_fn_call(call: &ExprCall, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
+    let name = call_path(call).expect("caller checked call_path names a known fn");
+    let fn_ir = ctx.fns.get(&name).cloned().expect("caller checked fns contains name");
+
+    if ctx.inlining.contains(&name) {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!("cannot inline recursive function `{name}` into hardware"),
+            span: call.span,
+            suggested_rewrite: None,
+        });
+    }
+
+    let inlined = build_inlined_expr(&fn_ir, &call.args, call.span)?;
+
+    ctx.inlining.insert(name.clone());
+    let result = lower_expr(&inlined, ctx);
+    ctx.inlining.remove(&name);
+    result
+}
+
+/// The caller-side expression a free-fn call is equivalent to: parameter→argument
+/// substitution plus folding of the body's `let` bindings into the tail.
+fn build_inlined_expr(
+    fn_ir: &FrontendFnIR,
+    args: &[ExprType],
+    call_span: SourceSpan,
+) -> Result<ExprType, CHIRLowerError> {
+    let params = &fn_ir.signature.params;
+    if params.len() != args.len() {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "call to `{}` has {} argument(s) but it declares {} parameter(s)",
+                fn_ir.name,
+                args.len(),
+                params.len()
+            ),
+            span: call_span,
+            suggested_rewrite: None,
+        });
+    }
+
+    // Each parameter starts bound to its argument expression.
+    let mut subst: std::collections::HashMap<String, ExprType> = params
+        .iter()
+        .zip(args.iter())
+        .map(|(p, a)| (p.name.clone(), a.clone()))
+        .collect();
+
+    let body = &fn_ir.raw_statements;
+    let tail_idx = tail_expr_index(body).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("cannot inline `{}`: body has no tail expression to return", fn_ir.name),
+        span: fn_ir.span,
+        suggested_rewrite: None,
+    })?;
+
+    // Fold each `let` binding into the substitution, applying earlier bindings to
+    // its initializer. Anything other than a `let` before the tail is a
+    // statement-level effect we can't fold into a single expression — reject it.
+    for (i, stmt) in body.iter().enumerate() {
+        if i == tail_idx {
+            break;
+        }
+        match &stmt.kind {
+            RawStmtKind::Local(local) => {
+                let init = local.init.as_ref().ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "cannot inline `{}`: `let {}` has no initializer",
+                        fn_ir.name, local.name
+                    ),
+                    span: local.span,
+                    suggested_rewrite: None,
+                })?;
+                let value = substitute_expr(init, &subst);
+                subst.insert(local.name.clone(), value);
+            }
+            // Nested items (e.g. a `const`) don't participate in value flow.
+            RawStmtKind::Item(_) => {}
+            RawStmtKind::Expr(_) => {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "cannot inline `{}`: only `let` bindings and a tail expression are \
+                         supported (found a non-binding statement before the tail)",
+                        fn_ir.name
+                    ),
+                    span: stmt.span,
+                    suggested_rewrite: None,
+                });
+            }
+        }
+    }
+
+    let tail = match &body[tail_idx].kind {
+        RawStmtKind::Expr(es) => &es.expr,
+        _ => unreachable!("tail_expr_index returns an expression statement"),
+    };
+    Ok(substitute_expr(tail, &subst))
+}
+
+/// Index of the tail expression: the last statement, when it is an expression
+/// statement with no trailing semicolon.
+fn tail_expr_index(body: &[RawStmt]) -> Option<usize> {
+    let last = body.len().checked_sub(1)?;
+    match &body[last].kind {
+        RawStmtKind::Expr(es) if !es.has_semi => Some(last),
+        _ => None,
+    }
+}
+
+/// Return a copy of `expr` with every simple-identifier reference that appears in
+/// `subst` replaced by its bound expression. Used to inline free-fn bodies.
+/// Limitation: does not track shadowing introduced by nested `let`/match binders,
+/// which pure combinational helpers do not rely on.
+fn substitute_expr(expr: &ExprType, subst: &std::collections::HashMap<String, ExprType>) -> ExprType {
+    let mut e = expr.clone();
+    subst_in_place(&mut e, subst);
+    e
+}
+
+fn subst_in_place(e: &mut ExprType, subst: &std::collections::HashMap<String, ExprType>) {
+    match e {
+        ExprType::Path(p) => {
+            if let Some(rep) = simple_ident(&p.path_text).and_then(|id| subst.get(&id)) {
+                *e = rep.clone();
+            }
+        }
+        ExprType::Lit(_) => {}
+        ExprType::Binary(b) => {
+            subst_in_place(&mut b.left, subst);
+            subst_in_place(&mut b.right, subst);
+        }
+        ExprType::Unary(u) => subst_in_place(&mut u.expr, subst),
+        ExprType::Cast(c) => subst_in_place(&mut c.expr, subst),
+        ExprType::Reference(r) => subst_in_place(&mut r.expr, subst),
+        ExprType::Call(c) => {
+            subst_in_place(&mut c.func, subst);
+            for a in &mut c.args {
+                subst_in_place(a, subst);
+            }
+        }
+        ExprType::MethodCall(m) => {
+            subst_in_place(&mut m.receiver, subst);
+            for a in &mut m.args {
+                subst_in_place(a, subst);
+            }
+        }
+        ExprType::Index(i) => {
+            subst_in_place(&mut i.base, subst);
+            subst_in_place(&mut i.index, subst);
+        }
+        ExprType::Field(f) => subst_in_place(&mut f.base, subst),
+        ExprType::Tuple(t) => t.elements.iter_mut().for_each(|el| subst_in_place(el, subst)),
+        ExprType::Array(a) => a.elements.iter_mut().for_each(|el| subst_in_place(el, subst)),
+        ExprType::If(f) => {
+            subst_in_place(&mut f.condition, subst);
+            subst_in_stmts(&mut f.then_block, subst);
+            if let Some(eb) = &mut f.else_branch {
+                subst_in_place(eb, subst);
+            }
+        }
+        ExprType::Match(m) => {
+            subst_in_place(&mut m.scrutinee, subst);
+            for arm in &mut m.arms {
+                if let Some(g) = &mut arm.guard {
+                    subst_in_place(g, subst);
+                }
+                subst_in_place(&mut arm.body, subst);
+            }
+        }
+        ExprType::Block(b) => subst_in_stmts(&mut b.stmts, subst),
+        ExprType::Struct(s) => {
+            for f in &mut s.fields {
+                subst_in_place(&mut f.expr, subst);
+            }
+            if let Some(r) = &mut s.rest {
+                subst_in_place(r, subst);
+            }
+        }
+        ExprType::Range(r) => {
+            if let Some(s) = &mut r.start {
+                subst_in_place(s, subst);
+            }
+            if let Some(en) = &mut r.end {
+                subst_in_place(en, subst);
+            }
+        }
+        ExprType::Repeat(r) => {
+            subst_in_place(&mut r.expr, subst);
+            subst_in_place(&mut r.len, subst);
+        }
+        ExprType::Try(t) => subst_in_place(&mut t.expr, subst),
+        ExprType::Return(r) => {
+            if let Some(v) = &mut r.value {
+                subst_in_place(v, subst);
+            }
+        }
+        // Await/Async/Assign/Let/Loop/While/Macro/Break/Continue/Yield/Const do
+        // not appear in the pure combinational tails we inline; a body using them
+        // is rejected before substitution or fails to lower afterward.
+        _ => {}
+    }
+}
+
+fn subst_in_stmts(stmts: &mut [RawStmt], subst: &std::collections::HashMap<String, ExprType>) {
+    for s in stmts {
+        match &mut s.kind {
+            RawStmtKind::Local(l) => {
+                if let Some(init) = &mut l.init {
+                    subst_in_place(init, subst);
+                }
+            }
+            RawStmtKind::Expr(es) => subst_in_place(&mut es.expr, subst),
+            RawStmtKind::Item(_) => {}
+        }
+    }
+}
+
+/// A simple identifier reference (`w`), not a path (`Opcode::LUI`) or empty.
+fn simple_ident(path_text: &str) -> Option<String> {
+    let compact: String = path_text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.contains("::") || !is_ident(&compact) {
+        return None;
+    }
+    Some(compact)
+}
+
 /// If `path` is a `Bits`-style value constructor, return its declared bit width.
 /// An explicit turbofish (`Bits::<8>::from_u8`) wins; otherwise the `from_uNN`
 /// name implies an NN-bit value (`from_u32` → 32) — the width the constructor
@@ -351,6 +584,16 @@ fn build_enum_registry(fir: &FrontendModuleIR) -> EnumRegistry {
         registry.insert(item.name.clone(), EnumDef { width: bits_for(max), variants });
     }
     registry
+}
+
+/// Registry of file-scope free functions available for inlining (#7b): only
+/// receiver-less functions (methods/associated fns are a later increment).
+fn build_fn_registry(fir: &FrontendModuleIR) -> std::collections::HashMap<String, FrontendFnIR> {
+    fir.file_fns
+        .iter()
+        .filter(|f| f.receiver.is_none())
+        .map(|f| (f.name.clone(), f.clone()))
+        .collect()
 }
 
 /// The bit width of a resolved hardware type.
@@ -572,6 +815,7 @@ fn lower_comb_body(
         .collect();
     ctx.symbols = build_port_symbols(fir);
     ctx.enums = build_enum_registry(fir);
+    ctx.fns = build_fn_registry(fir);
 
     let mut stmts = Vec::new();
 
@@ -707,6 +951,7 @@ fn lower_seq_body(
         .collect();
     ctx.symbols = symbols;
     ctx.enums = enums;
+    ctx.fns = build_fn_registry(fir);
 
     // Emit pre-loop wires first so they are declared before any use, then the
     // loop body itself.
@@ -757,6 +1002,11 @@ struct LowerCtx<'a> {
     /// it names (e.g. `t` in `(Phase::Yellow, t, _)` → `timer`). Populated only
     /// while lowering that arm's guard and body.
     bindings: std::collections::HashMap<String, CHIRExpr>,
+    /// File-scope free functions available for inlining (#7b), by name. Built
+    /// from `FrontendModuleIR::file_fns`.
+    fns: std::collections::HashMap<String, FrontendFnIR>,
+    /// Free-fn names currently being inlined, to detect (and reject) recursion.
+    inlining: std::collections::HashSet<String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -774,6 +1024,8 @@ impl<'a> LowerCtx<'a> {
             symbols: SymbolTable::new(),
             enums: EnumRegistry::new(),
             bindings: std::collections::HashMap::new(),
+            fns: std::collections::HashMap::new(),
+            inlining: std::collections::HashSet::new(),
         }
     }
 
@@ -1104,6 +1356,9 @@ pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRL
         ExprType::Call(call) => {
             if call.is_hardware_module {
                 lower_hardware_call(call, ctx)
+            } else if call_path(call).as_deref().is_some_and(|n| ctx.fns.contains_key(n)) {
+                // Call to a file-scope free function (#7b): inline it.
+                lower_inlined_fn_call(call, ctx)
             } else if let Some(ctor) = call_path(call).as_deref().and_then(classify_value_ctor) {
                 match ctor {
                     // `Bits::from_u32(x)` — the value is the argument,
@@ -3458,5 +3713,98 @@ mod tests {
         } else {
             panic!("expected sequential body");
         }
+    }
+
+    // ── Free-function inlining (#7b) ─────────────────────────────────────────
+
+    fn capture_fns(file_src: &str) -> Vec<FrontendFnIR> {
+        let file: syn::File = syn::parse_str(file_src).unwrap();
+        crate::parser::capture_file_scope(&file, &no_hw()).fns
+    }
+
+    #[test]
+    fn inline_single_expr_fn_substitutes_param() {
+        use copper_core::frontend_ir::{ExprPath, ExprType};
+        // add_one(a) where body is `x + one` → `a + one`.
+        let fns = capture_fns("fn add_one(x: Bits<8>) -> Bits<8> { x + one }");
+        let arg = ExprType::Path(ExprPath { path_text: "a".into(), span: span() });
+        let inlined = build_inlined_expr(&fns[0], &[arg], span()).unwrap();
+        match inlined {
+            ExprType::Binary(b) => {
+                assert!(matches!(*b.left, ExprType::Path(p) if p.path_text == "a"));
+                assert_eq!(b.op, "+");
+                assert!(matches!(*b.right, ExprType::Path(p) if p.path_text == "one"));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_let_tail_fn_folds_bindings() {
+        use copper_core::frontend_ir::{ExprPath, ExprType};
+        // f(z) with body `let b = a + one; b + two` → `(z + one) + two`.
+        let fns = capture_fns("fn f(a: Bits<8>) -> Bits<8> { let b = a + one; b + two }");
+        let arg = ExprType::Path(ExprPath { path_text: "z".into(), span: span() });
+        let inlined = build_inlined_expr(&fns[0], &[arg], span()).unwrap();
+        match inlined {
+            ExprType::Binary(outer) => {
+                assert_eq!(outer.op, "+");
+                match *outer.left {
+                    ExprType::Binary(inner) => {
+                        assert!(matches!(*inner.left, ExprType::Path(p) if p.path_text == "z"));
+                        assert!(matches!(*inner.right, ExprType::Path(p) if p.path_text == "one"));
+                    }
+                    other => panic!("expected inner binary (z + one), got {other:?}"),
+                }
+                assert!(matches!(*outer.right, ExprType::Path(p) if p.path_text == "two"));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_arg_count_mismatch_is_rejected() {
+        let fns = capture_fns("fn f(a: Bits<8>, b: Bits<8>) -> Bits<8> { a + b }");
+        assert!(matches!(
+            build_inlined_expr(&fns[0], &[], span()),
+            Err(CHIRLowerError::UnsupportedConstruct { .. })
+        ));
+    }
+
+    #[test]
+    fn inline_non_let_statement_is_rejected() {
+        use copper_core::frontend_ir::{ExprPath, ExprType};
+        // A `;`-terminated statement before the tail can't fold into one expression.
+        let fns = capture_fns("fn f(a: Bits<8>) -> Bits<8> { a.touch(); a }");
+        let arg = ExprType::Path(ExprPath { path_text: "z".into(), span: span() });
+        assert!(matches!(
+            build_inlined_expr(&fns[0], &[arg], span()),
+            Err(CHIRLowerError::UnsupportedConstruct { .. })
+        ));
+    }
+
+    #[test]
+    fn inline_end_to_end_lowers_helper_into_combinational_module() {
+        // The module calls a file-scope helper; the call must inline and lower.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          out.write(add_one(a.read())); \
+                      }";
+        let mut fir = make_fir_hw(module, &no_hw());
+        fir.file_fns = capture_fns("fn add_one(x: Bits<8>) -> Bits<8> { x + Bits::<8>::from_lit::<1>() }");
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry())
+            .expect("module with an inlined helper call should lower");
+        assert!(matches!(chir.body, CHIRBody::Combinational(_)));
+    }
+
+    #[test]
+    fn inline_unknown_fn_still_errors() {
+        // A call to a function that isn't a captured file_fn stays unsupported.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          out.write(mystery(a.read())); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw()); // no file_fns injected
+        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_err());
     }
 }

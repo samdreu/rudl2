@@ -192,9 +192,20 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
     (inherent assoc-fn no receiver; marker trait-impl), traits + `&self`/`&mut self`
     receivers, and the empty-file-scope invariant for a bare `ItemFn`.
 
-  **#7b+ — consumption (separate milestones, dependency-ordered, NOT this step):**
-  1. Free-fn **inlining** (arg→param substitution, body splice, return/tail-value
-     threading; `sign_ext_*` are leaves, `decode` calls them).
+  **#7b+ — consumption (separate milestones, dependency-ordered):**
+  1. [~] Free-fn **inlining** — **increment 1 done (2026-07-23).** CHIR now inlines
+     calls to file-scope free fns (`build_fn_registry` on `LowerCtx`; the `Call`
+     arm of `lower_expr` dispatches known `file_fns` to `lower_inlined_fn_call`).
+     Mechanism is substitution-based: params bound to args, `let` bindings folded
+     into the tail via `substitute_expr`, result lowered; nested helper calls
+     inline recursively; direct recursion rejected. **Scope:** receiver-less free
+     fns whose body is `let`-bindings + a tail expr (pure combinational). Rejects
+     arg-count mismatch and non-`let` statements before the tail. So `sign_ext_*`-
+     shaped helpers inline end-to-end; `decode`/`alu_exec_*` still need the layers
+     below (they use `?` / match-as-value / struct returns). **Limitations:** no
+     shadowing tracking in `substitute_expr` (pure helpers don't rely on it); impl
+     **methods** not yet inlined (only free fns — `build_fn_registry` filters to
+     `receiver.is_none()`). 6 tests.
   2. **Struct lowering** (wire bundles; field access → select; construction →
      per-field assign).
   3. **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`, so
