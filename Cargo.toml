@@ -44,6 +44,10 @@ name = "pattern_detector"
 path = "examples/sequential/pattern_detector.rs"
 
 [[example]]
+name = "pattern_detector_2"
+path = "examples/sequential/pattern_detector_2.rs"
+
+[[example]]
 name = "traffic_light_fsm"
 path = "examples/sequential/traffic_light_fsm.rs"
 

@@ -1,7 +1,17 @@
 # Copper Transpilation Roadmap (Actionable Plan)
 
-**Status date:** 2026-07-23 (was 2026-07-14).
+**Status date:** 2026-07-24 (was 2026-07-23).
 **Author:** working plan derived from a review of the current code + design docs.
+
+> **2026-07-24 checkpoint.** Const-generic combinational examples green; a
+> **parameterized equivalence harness** now behaviorally verifies 8 modules
+> (transpiled SV vs sim under Verilator); conditional-output → implicit-hold
+> register; a trailing-segment silent-miscompile fixed; Phase D P0s fixed. The
+> **execution-model timing** question is fully characterized (a uniform 1-cycle
+> offset for multi-cycle sequential logic — [EXECUTION_MODEL_RECONCILIATION.md]).
+> **Next milestone: control extraction** (async CFG → explicit single-tick FSM),
+> designed and ready to implement — [CONTROL_EXTRACTION.md]. See
+> [TRANSPILATION_TODO.md](TRANSPILATION_TODO.md) for the authoritative status.
 **Relationship to `TRANSPILATION_PLAN.md`:** that document holds the architecture
 and the accepted decision log and is still the source of truth for *why* the
 pipeline is shaped the way it is. This document is the *what-to-do-next*: it

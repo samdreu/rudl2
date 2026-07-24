@@ -7,6 +7,20 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
 
 **P0** = emits wrong hardware, fix first. **P1** = gap with a known shape. **P2** = cleanup.
 
+> **2026-07-24 checkpoint.** Landed this session (all committed, 8 equivalence
+> tests green): **parameterized equivalence harness** (`.with_params` → `-GN=8`)
+> — locking in `shift_register`/`rotate_right`/`priority_encode`/`det_010` as
+> transpiled-vs-sim tests, and it **caught two real bugs**; **const-generic
+> combinational** greened (`usize`/`from_usize`/`%`/`Resize`, `rotate_right` +
+> `priority_encode`); **forward width-inference** and **auto-hoist** removed the
+> source-annotation workarounds; **Phase D P0s** fixed; **conditional output →
+> implicit-hold register**; **trailing-segment output drop** (a silent miscompile)
+> fixed; **`matches!`** support. Two design docs added:
+> [EXECUTION_MODEL_RECONCILIATION.md](EXECUTION_MODEL_RECONCILIATION.md) (the
+> multi-cycle sim-vs-hardware 1-cycle-offset finding) and
+> [CONTROL_EXTRACTION.md](CONTROL_EXTRACTION.md) (the next milestone, designed).
+> **Next: implement control extraction, increment A** (Phase C, below).
+
 > **2026-07-23 status.** This branch now sits on `fix/frontend` (macro/CDC/sim
 > hardening — barrier removal, synced-reads, `synchronizer` mode). Two bodies of
 > work landed on top: **Phase A FIR capture** (#1–#7a — the FIR now losslessly
@@ -96,18 +110,39 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
       "write FSMs naturally with async/await" claim rests on. Needs a richer FSM
       than the linear phase counter: states that self-loop with counters and take
       data-dependent transitions.
-- [ ] **P1 — Sim vs phase-FSM input-read timing (found via equivalence harness,
-      2026-07-24).** `mac_pipeline` transpiles + lints clean, but the new
-      `mac_pipeline_equivalence` test is **`verilator: FAIL` with `trace: PASS`** —
-      the transpiled 3-phase FSM reads pipeline inputs on a *regular* every-3-cycle
-      cadence (phase 0 at cycles 1, 4, 7…), while the simulator reads on an
-      *irregular* cadence (cycle 1 pre-edge, then post-edge of cycles 3, 6, 9…) — an
-      artifact of the async/await pre/post-edge + synced-read execution model. Same
-      inputs → different outputs. So a straight-line multi-phase pipeline is **not
-      currently sim-equivalent** (earlier "mac_pipeline verified" was wrong). The
-      test is `#[ignore]`d with this explanation. Fix = reconcile the two execution
-      models (which cycle a `.read()` samples). Related to the `pre_edge_barrier`
-      note above and the control-extraction milestone.
+
+      **← DESIGNED, next to implement (2026-07-24). See
+      [CONTROL_EXTRACTION.md](CONTROL_EXTRACTION.md).** Chosen architecture: a
+      FIR→FIR pass that flattens the async control flow into an **explicit
+      single-tick FSM** (`match pc { .. }; clk.tick().await`) — the shape the
+      existing pipeline already lowers correctly (`det_010`, `mac_fsm`), so all of
+      CHIR/SHIR/VLIR/emit is reused and the new code is confined to the FIR pass.
+      The `lower_into` algorithm (straight-line + `if`/`else`, incl. the
+      empty-continuation correctness crux) is worked out in the doc. Increments:
+      (A) straight-line + `if`/`else`, (B) `while` self-loops, (C) counted `for`
+      delays (counter register), (D) `continue`/`break`. Adjudicator:
+      `det_010_awaits` (the multi-tick twin of the verified single-tick `det_010`,
+      proven equal in sim by `pattern_detector_2`); stretch goal: `uart/rx`.
+      **Bonus:** because the output is single-tick, this *dissolves* the timing
+      discrepancy below (single-tick is where sim and hardware agree).
+- [ ] **P1 — Sim vs hardware timing: a uniform 1-cycle offset for multi-cycle
+      sequential logic (2026-07-24). See
+      [EXECUTION_MODEL_RECONCILIATION.md](EXECUTION_MODEL_RECONCILIATION.md).**
+      Found via the equivalence harness: `mac_pipeline` (multi-tick) is
+      `verilator: FAIL` / `trace: PASS` — the transpiled FSM reads inputs one cycle
+      later than the sim. Then `mac_fsm` (single-tick, once conditional-output was
+      fixed) showed the *same* one-cycle gap on the **output** side (registered
+      `out` lags the sim by 1). Unified finding: **natural clocked hardware — a
+      register capturing at the clock edge — is consistently one cycle *behind* the
+      simulator for multi-cycle sequential logic**, on reads (mac_pipeline) and
+      writes (mac_fsm) alike. The two sim codings agree with *each other*
+      (self-consistent) but both hardware realizations land one cycle later ⇒ the
+      **sim appears to run one cycle "ahead"** of clocked hardware. Not provable
+      without an **independent hand-written Verilog reference**; that's the only
+      thing that settles it. `mac_pipeline_equivalence` and `mac_fsm_equivalence`
+      are `#[ignore]`d documenting this. **Likely resolved by control extraction**
+      (above): extracted single-tick FSMs are the agreeing category, so the offset
+      may simply not arise once async bodies are extracted rather than phased.
 - [ ] **P2 —** Confirm the trailing-segment fix is right: post-tick *wires* are hoisted
       into the same phase's pre-edge, port drives keep their timing. Worth a second look.
 
@@ -595,9 +630,16 @@ model, and the simulator API.
       errors, and needed for `panic!` regardless); pursue the `HardwareType` bound
       later as its own milestone — it would subsume only the `Option` third of the
       scan, never the `panic!` part.
-- [ ] **P1 — Decide the conditional/phased output semantics** (the open design
-      question). Options and the prototype evidence are in
-      `tests/affine_port_prototype.rs` and the coverage map. Gates Phase D's P0 items.
+- [~] **Conditional/phased output semantics — decided + implemented (2026-07-24).**
+      A conditionally-driven **output port** in a sequential module is an
+      **implicit-hold register**: its drive lowers to a guarded `always_ff`
+      `out <= v` (holding otherwise), not a combinational latch. Unconditional
+      outputs stay `assign`s. Unblocks `mac_fsm` and the Phase D multiply-driven P0.
+      `vlir_lower::{conditional_output_ports, split_output_regs}`. **Caveat:** this
+      matches the sim's *storage* semantics (out holds between writes) but not yet
+      its *timing* — the register lands one cycle later (see the 1-cycle-offset
+      finding under Phase C / EXECUTION_MODEL_RECONCILIATION.md), which is the
+      remaining open part, expected to resolve with control extraction.
 - [ ] **P2 — Stale design docs.** `TRANSPILATION_PLAN.md`, `FIR_DESIGN.md`,
       `CHIR_DESIGN.md` still describe the obsolete `function_typed` / `emit!` model.
 - [ ] **P2 — Retire `copper-codegen/src/verilog.rs`** (legacy, unreachable from the
@@ -607,10 +649,18 @@ model, and the simulator API.
 
 ## Verification you can lean on while auditing
 
-- `cargo test --workspace` — 453 tests, currently 0 failures.
-- 4 modules behaviorally verified sim-vs-Verilog: `counter`, `lfsr`,
-  `pattern_detector`, `traffic_light_fsm` (see `tests/common/mod.rs`).
+- `cargo test --lib -p copper-codegen -p copper-core` — 296 + 102, 0 failures.
+  (`cargo test --workspace` also builds the examples; skip a WIP example if one
+  doesn't yet compile.)
+- **8 equivalence tests** (`tests/*_equivalence.rs`) behaviorally verify
+  transpiled-SV vs sim under Verilator, `.with_params` for parametric modules:
+  `m1_counter`, `lfsr`, `pattern_detector`, `traffic_light`, `shift_register`
+  (N=8), `rotate_right` (N=8), `priority_encode` (N=8), `det_010`. Two more
+  (`mac_pipeline`, `mac_fsm`) are `#[ignore]`d — the multi-cycle 1-cycle-offset
+  finding (Phase C). The harness caught two real bugs this session.
 - Golden tests pin exact emitted text for the counter, the `Logic` comb module,
   block-branch `if`, and the enum FSM.
-- **Caution:** Verilator lint is not a sufficient gate on its own — it missed the
-  multiply-driven output above.
+- **Caution:** Verilator *lint* is not a sufficient gate — it missed the
+  multiply-driven output. But the equivalence harness (sim vs Verilator sim, sim
+  = source of truth) does catch behavioral disagreement; lean on it for any
+  sequential change.
