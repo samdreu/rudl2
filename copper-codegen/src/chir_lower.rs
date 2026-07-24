@@ -1422,6 +1422,19 @@ fn lower_expr_stmt(
         // (Verilator unrolls it at elaboration, so `end` may be a parameter). The
         // loop variable is in scope for the body.
         ExprType::ForLoop(f) => {
+            // A `clk.tick().await` inside a `for` is a counted delay: it needs a
+            // cycle-counter register + a self-loop state (control extraction),
+            // which is not built. Reject it rather than silently drop the delay
+            // (the loop body would otherwise be treated as combinational).
+            if stmts_contain_tick(&f.body) {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: "clk.tick().await inside a for-loop (a counted delay) is not yet \
+                                  supported — it needs control extraction (a cycle counter + \
+                                  self-loop state), not unrolling".to_string(),
+                    span,
+                    suggested_rewrite: None,
+                });
+            }
             let var = f.pat_text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
             if !is_ident(&var) {
                 return Err(CHIRLowerError::UnsupportedConstruct {
@@ -2893,6 +2906,39 @@ fn extract_block_expr_value(
     })
 }
 
+/// True if any statement issues a `clk.tick().await` at any nesting depth. A tick
+/// is only valid at the top level of a module's `loop` body (that is what the
+/// phase FSM extracts); a tick inside a `for`/`while`/`if`/`match` needs control
+/// extraction (counters / self-loop states), which is not yet built — so such a
+/// tick must be *rejected*, never silently dropped.
+fn stmts_contain_tick(stmts: &[RawStmt]) -> bool {
+    stmts.iter().any(stmt_contains_tick)
+}
+
+fn stmt_contains_tick(stmt: &RawStmt) -> bool {
+    match &stmt.kind {
+        RawStmtKind::Expr(es) => expr_contains_tick(&es.expr),
+        RawStmtKind::Local(l) => l.init.as_ref().is_some_and(expr_contains_tick),
+        RawStmtKind::Item(_) => false,
+    }
+}
+
+fn expr_contains_tick(e: &ExprType) -> bool {
+    match e {
+        ExprType::Await(a) => is_tick_await(&a.base),
+        ExprType::ForLoop(f) => stmts_contain_tick(&f.body),
+        ExprType::Loop(l) => stmts_contain_tick(&l.body),
+        ExprType::While(w) => stmts_contain_tick(&w.body),
+        ExprType::Block(b) => stmts_contain_tick(&b.stmts),
+        ExprType::If(f) => {
+            stmts_contain_tick(&f.then_block)
+                || f.else_branch.as_deref().is_some_and(expr_contains_tick)
+        }
+        ExprType::Match(m) => m.arms.iter().any(|a| expr_contains_tick(&a.body)),
+        _ => false,
+    }
+}
+
 fn reject_tick_in_branch(stmts: &[RawStmt], span: SourceSpan) -> Result<(), CHIRLowerError> {
     for stmt in stmts {
         if let RawStmtKind::Expr(es) = &stmt.kind {
@@ -4336,6 +4382,26 @@ mod tests {
         let reg = build_fn_registry(&fir);
         assert!(!reg.contains_key("Foo::get"));
         assert!(!reg.contains_key("get"));
+    }
+
+    // ── control-extraction guard (no silent miscompile) ──────────────────────
+
+    #[test]
+    fn tick_inside_for_loop_is_rejected_not_dropped() {
+        // A counted delay (`for _ in 0..4 { clk.tick().await }`) needs control
+        // extraction. Until that exists it must be rejected, never silently
+        // dropped (which would emit hardware missing the delay).
+        let module = "#[hardware(sequential)] \
+                      async fn m(clk: Clock<MainClk>, d: In<Bits<8>, MainClk>, out: Out<Bits<8>, MainClk>) { \
+                          loop { \
+                              for _ in 0..4 { clk.tick().await; } \
+                              out.write(d.read()); \
+                              clk.tick().await; \
+                          } \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        let err = lower_to_chir(&fir, &no_hw(), &empty_registry());
+        assert!(err.is_err(), "tick inside a for-loop must be rejected");
     }
 
     // ── forward width-inference ───────────────────────────────────────────────

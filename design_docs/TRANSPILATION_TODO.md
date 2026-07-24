@@ -70,11 +70,32 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
       (`dual_port_ram`) still doesn't transpile at all (`cannot infer bit
       width` on `Memory`, unrelated — see **P2 — Memory's language
       integration** below). Re-check once Memory transpiles.
-- [ ] **P1 — No control extraction.** One phase per tick (`n_ticks = segments.len()-1`)
-      means counted delays (`for _ in 0..434 { tick }` → 434 phases) and data-dependent
-      waits (`while cond { tick }`) cannot be expressed. This blocks `uart/rx` and is
-      what the README's "write FSMs naturally with async/await" claim rests on. Needs
-      counters + self-loop states, not unrolling. Own milestone.
+- [x] **Resolved (2026-07-24) — P0: `for { tick }` was a silent miscompile.** When
+      for-loop lowering landed (for `rotate_right`/`priority_encode`), a
+      `clk.tick().await` inside a `for` stopped being unrolled *and* stopped
+      erroring — the loop body was treated as combinational, so a counted delay
+      (`for _ in 0..4 { tick }`) was **silently dropped** (empty `always_ff`, wrong
+      hardware, no error). Now rejected with a clear message via a recursive
+      `stmts_contain_tick` guard in the `ForLoop` lowering arm (`if`/`while` were
+      already rejected). 1 test. This closes the silent-wrong-hardware hole; the
+      *feature* to actually support it is the milestone below.
+- [ ] **P1 — No control extraction (own milestone).** The phase FSM extracts a
+      **static** count of **top-level** ticks in the module `loop` body
+      (`split_at_ticks` doesn't descend into nested bodies; `n_ticks =
+      segments.len()-1`). That handles a straight-line pipeline (`mac_pipeline`: 3
+      ticks → a 3-phase FSM with `phase_r` + inferred pipeline registers) and
+      single-tick FSMs. It **cannot** express, and every form is now rejected (not
+      miscompiled):
+      - **Counted delays** — `for _ in 0..434 { tick }` — need a **cycle-counter
+        register** ("stay in this state until the counter hits N"), *not* 434
+        unrolled phases.
+      - **Data-dependent waits** — `while cond { tick }` — need a **self-looping
+        state** that holds until the condition.
+      - Conditional ticks (`if cond { tick }`) — rejected today.
+      This blocks `uart/rx` (which uses all three at once) and is what the README's
+      "write FSMs naturally with async/await" claim rests on. Needs a richer FSM
+      than the linear phase counter: states that self-loop with counters and take
+      data-dependent transitions.
 - [ ] **P2 —** Confirm the trailing-segment fix is right: post-tick *wires* are hoisted
       into the same phase's pre-edge, port drives keep their timing. Worth a second look.
 
