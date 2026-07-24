@@ -26,7 +26,7 @@ fn priority_encode<const N: usize, const N_LOG: usize>(
     const { assert!(N_LOG == safe_clog2(N), "N_LOG must equal safe_clog2(N)") };
 
     let in_val = inputs.read();
-    let mut res = Bits::zero();
+    let mut res: Bits<N_LOG> = Bits::zero();
     let mut v = Logic::Zero;
 
     for i in 0..N {

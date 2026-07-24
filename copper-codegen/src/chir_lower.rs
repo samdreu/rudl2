@@ -83,6 +83,11 @@ pub fn resolve_type(ty_text: &str, span: SourceSpan) -> Result<CHIRType, CHIRLow
         "i32"  => Ok(CHIRType::SInt { width: Width::Concrete(32) }),
         "i64"  => Ok(CHIRType::SInt { width: Width::Concrete(64) }),
         "i128" => Ok(CHIRType::SInt { width: Width::Concrete(128) }),
+        // `usize`/`isize` have no fixed hardware width; used almost entirely as
+        // loop/index quantities, so treat them as 32-bit (matching the SV `int`
+        // loop variable, keeping index arithmetic width-consistent).
+        "usize" => Ok(CHIRType::UInt { width: Width::Concrete(32) }),
+        "isize" => Ok(CHIRType::SInt { width: Width::Concrete(32) }),
         "bool" => Ok(CHIRType::Bool),
         "Bit"  => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
         "Logic" => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
@@ -518,6 +523,9 @@ fn classify_value_ctor(path: &str) -> Option<ValueCtor> {
         ("from_u32", 32),
         ("from_u16", 16),
         ("from_u8", 8),
+        // `from_usize` mirrors the 32-bit `usize` resolution; the value is the
+        // argument, retyped to the assignment/operand context.
+        ("from_usize", 32),
     ] {
         if path.ends_with(name) {
             // An explicit type turbofish overrides the name's implied width.
@@ -1110,7 +1118,9 @@ fn lower_local_binding(
         Some(t) => resolve_type(&t.ty_text, t.span)?,
         None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
     };
-    let value = lower_expr(init, ctx)?;
+    // Retype context-width default literals (e.g. `Bits::zero()`) to the binding's
+    // declared width — including a symbolic parameter width (`Bits<N>` → `N'd0`).
+    let value = retype_default_literals_in_values(lower_expr(init, ctx)?, type_width(&ty));
     ctx.symbols.insert(local.name.clone(), ty.clone());
     out.push(CHIRStmt::Wire {
         name: local.name.clone(),
@@ -1328,7 +1338,7 @@ fn lower_expr_stmt(
                             suggested_rewrite: None,
                         }
                     })?;
-                    let value = retype_default_literals_in_values(value, width_of_type(&ty));
+                    let value = retype_default_literals_in_values(value, type_width(&ty));
                     let tmp = format!("{target}_next_val");
                     ctx.symbols.insert(tmp.clone(), ty.clone());
                     out.push(CHIRStmt::Wire { name: tmp.clone(), ty, value, span });
@@ -1350,9 +1360,10 @@ fn lower_expr_stmt(
             }
             let target = extract_assign_target(&assign.left, span)?;
             let mut value = lower_expr(&assign.right, ctx)?;
-            // Propagate the target's width into untyped literals on the RHS.
+            // Propagate the target's width into untyped literals on the RHS. A
+            // symbolic (parameter) width is fine — the literal becomes `N'd…`.
             if let Some(ty) = ctx.symbols.get(&target) {
-                value = retype_default_literals_in_values(value, width_of_type(ty));
+                value = retype_default_literals_in_values(value, type_width(ty));
             }
             out.push(CHIRStmt::Assign { target, value, span });
         }
@@ -1959,14 +1970,22 @@ fn balance_binop_literals(left: CHIRExpr, right: CHIRExpr, ctx: &LowerCtx) -> (C
 /// Conditions and match scrutinees are deliberately left alone: in
 /// `phase == 2'd0 ? 0 : …` the `2'd0` is comparing a 2-bit register and must keep
 /// its own width, while the `0` result belongs to the assignment target.
-fn retype_default_literals_in_values(e: CHIRExpr, width: usize) -> CHIRExpr {
-    let recurse = |x: Box<CHIRExpr>| Box::new(retype_default_literals_in_values(*x, width));
+/// The declared width of a type as a `Width` (concrete or symbolic parameter).
+fn type_width(ty: &CHIRType) -> Width {
+    match ty {
+        CHIRType::UInt { width } | CHIRType::SInt { width } => width.clone(),
+        CHIRType::Bool => Width::Concrete(1),
+    }
+}
+
+fn retype_default_literals_in_values(e: CHIRExpr, width: Width) -> CHIRExpr {
+    let recurse = |x: Box<CHIRExpr>| Box::new(retype_default_literals_in_values(*x, width.clone()));
     match e {
         CHIRExpr::Lit(l)
             if l.ty == CHIRType::UInt { width: Width::Concrete(DEFAULT_LIT_WIDTH) } =>
         {
             CHIRExpr::Lit(CHIRLit {
-                ty: CHIRType::UInt { width: Width::Concrete(width) },
+                ty: CHIRType::UInt { width: width.clone() },
                 value: l.value,
             })
         }
@@ -1982,7 +2001,7 @@ fn retype_default_literals_in_values(e: CHIRExpr, width: usize) -> CHIRExpr {
                 .map(|a| CHIRCaseArm {
                     pattern: a.pattern,
                     guard: a.guard,
-                    value: retype_default_literals_in_values(a.value, width),
+                    value: retype_default_literals_in_values(a.value, width.clone()),
                 })
                 .collect(),
             default: default.map(recurse),
@@ -2198,6 +2217,7 @@ fn lower_binop(op: &str, span: SourceSpan) -> Result<CHIRBinOp, CHIRLowerError> 
         "+"  => Ok(CHIRBinOp::Add { wrapping: false }),
         "-"  => Ok(CHIRBinOp::Sub { wrapping: false }),
         "*"  => Ok(CHIRBinOp::Mul { wrapping: false }),
+        "%"  => Ok(CHIRBinOp::Rem),
         "&"  => Ok(CHIRBinOp::BitAnd),
         "|"  => Ok(CHIRBinOp::BitOr),
         "^"  => Ok(CHIRBinOp::BitXor),

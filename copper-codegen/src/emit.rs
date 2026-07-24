@@ -438,8 +438,14 @@ fn lit_str(width: &Width, value: u128) -> String {
     match width {
         Width::Concrete(1) => format!("1'b{}", value & 1),
         Width::Concrete(n) => format!("{}'d{}", n, value),
-        // A literal sized by a parameter, e.g. `N'd5`.
-        Width::Param(name) => format!("{name}'d{value}"),
+        // A parameter can't be a sized literal's width (`N'd0` is illegal SV), so
+        // use context-sized forms: `'0` all-zeros, `'1` all-ones, else an unsized
+        // decimal that the assignment context sizes.
+        Width::Param(_) => match value {
+            0 => "'0".to_string(),
+            v if v == u128::MAX => "'1".to_string(),
+            v => v.to_string(),
+        },
     }
 }
 
@@ -478,6 +484,7 @@ fn binop_str(op: VLIRBinOp) -> &'static str {
         VLIRBinOp::Add => "+",
         VLIRBinOp::Sub => "-",
         VLIRBinOp::Mul => "*",
+        VLIRBinOp::Rem => "%",
         VLIRBinOp::BitAnd => "&",
         VLIRBinOp::BitOr => "|",
         VLIRBinOp::BitXor => "^",

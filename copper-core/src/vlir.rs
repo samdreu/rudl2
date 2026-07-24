@@ -241,7 +241,7 @@ pub enum VLIRExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VLIRBinOp {
-    Add, Sub, Mul,
+    Add, Sub, Mul, Rem,
     BitAnd, BitOr, BitXor,
     Shl, Shr,
     Eq, Neq, Lt, Lte, Gt, Gte,

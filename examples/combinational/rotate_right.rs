@@ -28,7 +28,7 @@ fn rotate_right<const N: usize, const N_LOG: usize>(
     let data = data_i.read();
     let rot = rot_i.read().as_u128() as usize;
 
-    let mut o_val = Bits::zero();
+    let mut o_val: Bits<N> = Bits::zero();
     for i in 0..N {
         o_val[i] = data[(i + rot) % N];
     }

@@ -311,6 +311,7 @@ pub enum CHIRBinOp {
     Add { wrapping: bool },
     Sub { wrapping: bool },
     Mul { wrapping: bool },
+    Rem,
     BitAnd,
     BitOr,
     BitXor,

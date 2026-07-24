@@ -488,6 +488,7 @@ fn lower_binop(op: &CHIRBinOp) -> VLIRBinOp {
         CHIRBinOp::Add { .. } => VLIRBinOp::Add,
         CHIRBinOp::Sub { .. } => VLIRBinOp::Sub,
         CHIRBinOp::Mul { .. } => VLIRBinOp::Mul,
+        CHIRBinOp::Rem => VLIRBinOp::Rem,
         CHIRBinOp::BitAnd => VLIRBinOp::BitAnd,
         CHIRBinOp::BitOr => VLIRBinOp::BitOr,
         CHIRBinOp::BitXor => VLIRBinOp::BitXor,
