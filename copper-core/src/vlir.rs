@@ -237,6 +237,11 @@ pub enum VLIRExpr {
         base: Box<VLIRExpr>,
         index: Box<VLIRExpr>,
     },
+    /// `width'(expr)` — width-cast (legal with a symbolic width).
+    Resize {
+        expr: Box<VLIRExpr>,
+        width: Width,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

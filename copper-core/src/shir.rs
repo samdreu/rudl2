@@ -1,4 +1,4 @@
-use crate::chir::{CHIRBinOp, CHIRType, CHIRUnOp, ModuleParam};
+use crate::chir::{CHIRBinOp, CHIRType, CHIRUnOp, ModuleParam, Width};
 use crate::frontend_ir::SourceSpan;
 
 // ── Module ────────────────────────────────────────────────────────────────────
@@ -193,6 +193,11 @@ pub enum SHIRExpr {
     DynBit {
         base: Box<SHIRExpr>,
         index: Box<SHIRExpr>,
+    },
+    /// Width-cast — `width'(expr)`.
+    Resize {
+        expr: Box<SHIRExpr>,
+        width: Width,
     },
     /// Compares phase_r == idx. Used in multi-phase post_edge conditions.
     PhaseEq(usize),

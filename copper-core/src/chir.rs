@@ -291,6 +291,13 @@ pub enum CHIRExpr {
         base: Box<CHIRExpr>,
         index: Box<CHIRExpr>,
     },
+    /// Width-cast to a target width — emitted as the SV `width'(expr)` cast.
+    /// Legal with a symbolic (parameter) width, so it cleans up assignments that
+    /// mix concrete index quantities with parameter-width signals.
+    Resize {
+        expr: Box<CHIRExpr>,
+        width: Width,
+    },
 }
 
 #[derive(Debug, Clone)]

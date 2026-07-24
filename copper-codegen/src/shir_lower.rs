@@ -771,6 +771,7 @@ fn collect_expr_vars(expr: &CHIRExpr, visitor: &mut impl FnMut(&str)) {
             collect_expr_vars(base, visitor);
             collect_expr_vars(index, visitor);
         }
+        CHIRExpr::Resize { expr, .. } => collect_expr_vars(expr, visitor),
     }
 }
 
@@ -816,6 +817,10 @@ fn subst_vars(expr: SHIRExpr, subst: &HashMap<String, SHIRExpr>) -> SHIRExpr {
         SHIRExpr::DynBit { base, index } => SHIRExpr::DynBit {
             base: Box::new(subst_vars(*base, subst)),
             index: Box::new(subst_vars(*index, subst)),
+        },
+        SHIRExpr::Resize { expr, width } => SHIRExpr::Resize {
+            expr: Box::new(subst_vars(*expr, subst)),
+            width,
         },
     }
 }
@@ -884,6 +889,10 @@ pub fn lower_expr(expr: &CHIRExpr) -> Result<SHIRExpr, SHIRLowerError> {
         CHIRExpr::DynBit { base, index } => Ok(SHIRExpr::DynBit {
             base: Box::new(lower_expr(base)?),
             index: Box::new(lower_expr(index)?),
+        }),
+        CHIRExpr::Resize { expr, width } => Ok(SHIRExpr::Resize {
+            expr: Box::new(lower_expr(expr)?),
+            width: width.clone(),
         }),
     }
 }

@@ -476,6 +476,14 @@ fn expr_str(e: &VLIRExpr) -> String {
             }
         }
         VLIRExpr::DynBit { base, index } => format!("{}[{}]", expr_str(base), expr_str(index)),
+        // `width'(expr)` — SV width-cast; the size may be a parameter.
+        VLIRExpr::Resize { expr, width } => {
+            let size = match width {
+                Width::Concrete(n) => n.to_string(),
+                Width::Param(name) => name.clone(),
+            };
+            format!("{}'({})", size, expr_str(expr))
+        }
     }
 }
 

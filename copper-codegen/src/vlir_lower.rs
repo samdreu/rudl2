@@ -438,6 +438,10 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer) -> LowerResult<VLIRExpr> {
             base: Box::new(lower_expr(base, leg)?),
             index: Box::new(lower_expr(index, leg)?),
         },
+        SHIRExpr::Resize { expr, width } => VLIRExpr::Resize {
+            expr: Box::new(lower_expr(expr, leg)?),
+            width: width.clone(),
+        },
         SHIRExpr::PhaseEq(idx) => VLIRExpr::BinOp {
             left: Box::new(VLIRExpr::Var("phase_r".to_string())),
             op: VLIRBinOp::Eq,

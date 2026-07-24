@@ -1119,8 +1119,11 @@ fn lower_local_binding(
         None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
     };
     // Retype context-width default literals (e.g. `Bits::zero()`) to the binding's
-    // declared width — including a symbolic parameter width (`Bits<N>` → `N'd0`).
-    let value = retype_default_literals_in_values(lower_expr(init, ctx)?, type_width(&ty));
+    // declared width — including a symbolic parameter width (`Bits<N>` → `N'd0`) —
+    // and width-cast a value whose width differs from the declared type.
+    let tw = type_width(&ty);
+    let value = retype_default_literals_in_values(lower_expr(init, ctx)?, tw.clone());
+    let value = resize_to_target(value, &tw, ctx);
     ctx.symbols.insert(local.name.clone(), ty.clone());
     out.push(CHIRStmt::Wire {
         name: local.name.clone(),
@@ -1362,8 +1365,10 @@ fn lower_expr_stmt(
             let mut value = lower_expr(&assign.right, ctx)?;
             // Propagate the target's width into untyped literals on the RHS. A
             // symbolic (parameter) width is fine — the literal becomes `N'd…`.
-            if let Some(ty) = ctx.symbols.get(&target) {
-                value = retype_default_literals_in_values(value, type_width(ty));
+            // A value whose width differs from the target is width-cast.
+            if let Some(tw) = ctx.symbols.get(&target).map(type_width) {
+                value = retype_default_literals_in_values(value, tw.clone());
+                value = resize_to_target(value, &tw, ctx);
             }
             out.push(CHIRStmt::Assign { target, value, span });
         }
@@ -1978,6 +1983,33 @@ fn type_width(ty: &CHIRType) -> Width {
     }
 }
 
+/// The `Width` of a lowered expression when it can be read off directly (a signal
+/// reference or a literal); `None` for anything whose width needs inference.
+fn expr_width(e: &CHIRExpr, ctx: &LowerCtx) -> Option<Width> {
+    match e {
+        CHIRExpr::Var(name) => ctx.symbols.get(name).map(type_width),
+        CHIRExpr::Lit(l) => Some(type_width(&l.ty)),
+        CHIRExpr::Slice { high, low, .. } => Some(Width::Concrete(high - low + 1)),
+        CHIRExpr::DynBit { .. } => Some(Width::Concrete(1)),
+        CHIRExpr::Resize { width, .. } => Some(width.clone()),
+        _ => None,
+    }
+}
+
+/// Wrap `value` in a width-cast to `target` when its width is known and differs,
+/// so an assignment that mixes concrete and parameter widths stays lint-clean
+/// (`res = N_LOG'(i)`). A no-op when the widths match or the value width is
+/// unknown (that path already width-matches or is inferred elsewhere).
+fn resize_to_target(value: CHIRExpr, target: &Width, ctx: &LowerCtx) -> CHIRExpr {
+    match expr_width(&value, ctx) {
+        Some(w) if &w != target => CHIRExpr::Resize {
+            expr: Box::new(value),
+            width: target.clone(),
+        },
+        _ => value,
+    }
+}
+
 fn retype_default_literals_in_values(e: CHIRExpr, width: Width) -> CHIRExpr {
     let recurse = |x: Box<CHIRExpr>| Box::new(retype_default_literals_in_values(*x, width.clone()));
     match e {
@@ -2031,6 +2063,10 @@ fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
         }
         CHIRExpr::Slice { high, low, .. } => Some(high - low + 1),
         CHIRExpr::DynBit { .. } => Some(1),
+        CHIRExpr::Resize { width, .. } => match width {
+            Width::Concrete(n) => Some(*n),
+            Width::Param(_) => None,
+        },
         CHIRExpr::Concat(parts) => {
             parts.iter().map(|p| width_of_chir_expr(p, ctx)).sum::<Option<usize>>()
         }
@@ -2628,6 +2664,7 @@ fn validate_expr(
             validate_expr(base, known, span)?;
             validate_expr(index, known, span)?;
         }
+        CHIRExpr::Resize { expr, .. } => validate_expr(expr, known, span)?,
     }
     Ok(())
 }
