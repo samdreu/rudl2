@@ -11,9 +11,13 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
 > hardening — barrier removal, synced-reads, `synchronizer` mode). Two bodies of
 > work landed on top: **Phase A FIR capture** (#1–#7a — the FIR now losslessly
 > represents the whole example set) and the first **Phase B CHIR consumption**
-> increments (free-fn + impl-assoc-fn inlining, struct lowering, match-as-value,
-> Option `unwrap_or`). See the Phase A audit (§ below) and the *CHIR consumption
-> progress* note under Phase B. Workspace: 453 tests, 0 failures.
+> increments (free-fn + impl-assoc-fn inlining, struct lowering, match-as-value).
+> **Design decision (2026-07-23):** `Option`/`?`/`panic!` are **banned** in
+> hardware bodies (rejected at the macro) rather than lowered — use explicit
+> `{valid, payload}` structs; the `unwrap_or` increment was reverted and the
+> `rv32i_cpu` examples are excluded until rewritten. See the Phase A audit
+> (§ below), the *CHIR consumption progress* note under Phase B, and
+> *Cross-cutting → Banned software idioms*.
 
 ---
 
@@ -93,15 +97,17 @@ implemented:
    access already matched that naming.
 4. **Match-as-value** (`bc977d4`) — was largely present (`case` / `Mux`-chain);
    fixed a lone `_` arm against a tuple scrutinee.
-5. **Option `unwrap_or`** (`30cd790`) — fold `Some(v)`→v / `None`→default in a
-   visible producer, then lower as match-as-value.
 
-**Net:** the inline → struct → match → `unwrap_or` stack composes, so
-`alu_exec_*`-shaped bodies and `BranchCond::from_bits(f3).unwrap_or(Beq)` (the CPU
-BRANCH arm) lower end-to-end. **What still gates a full `decode`/CPU:** the `?`
-operator + cross-fn validity threading, `match { Some(d)=>d, None=>panic!() }`
-(panic is unsynthesizable), and let-bound Option `Var`s (need a materialized
-valid-bit representation) — all under **#7b+ item 3** and **#4** below.
+> **Option `unwrap_or` (`30cd790`) was reverted (`bd7eed7`).** After weighing the
+> hardware mapping, `Option`/`?`/`panic!` are now **banned** in hardware bodies
+> rather than lowered — see *Cross-cutting → Banned software idioms*. Maybe-valid
+> data is modeled with an explicit `{ valid: Logic, payload: T }` struct (which
+> struct lowering already supports).
+
+**Net:** the inline → struct → match stack composes, so `alu_exec_*`-shaped
+bodies lower end-to-end. The CPU `decode` path is *not* reachable as written — it
+uses the now-banned idioms and must be rewritten to the explicit `{valid,payload}`
+form (the two `rv32i_cpu` examples are excluded from the build until then).
 
 - [ ] **P1 — Unary `!` on a multi-bit value** emits SV logical-`!` (1-bit reduce)
       instead of bitwise `~`. Correct for 1-bit `Logic`, wrong for `Bits<N>`. Needs
@@ -271,11 +277,17 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
      scrutinee arity. So `alu_exec_reg`/`alu_exec_imm`-shaped `let r = match (t) {
      .. }` (partial-wildcard arms, if-expr arm bodies, trailing `_`) now lowers.
      2 tests; golden e2e unchanged.
-  3. **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`, so
-     this needs a real design decision (compile-time resolution of pure decoders
-     vs. valid-bit lowering). Likely gates the CPU regardless of capture.
-  4. **Enum-with-methods** (`Opcode::from_bits -> Option<Self>`; matching on
-     struct-held enum fields).
+  3. ~~**`Option`/`Result` + `?`**~~ — **resolved by banning, not lowering
+     (2026-07-23).** Hardware has no `Option`; every lowering strategy (fold =
+     logic duplication + erased valid signal; valid-bit = hidden state + `?`
+     threading) fights the model, and `panic!` is unsynthesizable. Decision:
+     reject `Option`/`?`/`panic!` in hardware bodies with actionable errors and
+     use explicit `{ valid, payload }` structs instead. Enforced at the macro
+     (see *Cross-cutting → Banned software idioms*). Increment 1 (`unwrap_or`
+     fold) reverted.
+  4. **Enum-with-methods** — `Opcode::from_bits` etc. return `Option`, so this
+     folds into the ban above; an inherent-`impl` fn that returns a plain value
+     still inlines (increment 2).
   5. **Const-generic monomorphization** (consumes #2 generics + #1 turbofish).
   6. **File-scope const substitution** (`CLKS_PER_BIT` into loop bounds; interacts
      with control-extraction, a separate P1).
@@ -482,6 +494,30 @@ model, and the simulator API.
 
 ## Cross-cutting
 
+- [x] **Banned software idioms: `Option` / `?` / `panic!` (decided + enforced
+      2026-07-23).** These have no honest gate mapping — folding duplicates logic
+      and erases the valid signal, a valid-bit representation hides state and needs
+      cross-fn `?` threading, and `panic!` is unsynthesizable (any lowering is the
+      compiler guessing a value on an "impossible" path). Per Copper's
+      "unrepresentable bugs" premise they are **rejected**, not lowered:
+      - **Enforcement:** `check_no_unsupported_idioms` in `copper-macros`
+        (`UnsupportedIdiom` visitor) rejects `?`, `panic!`/`unreachable!`/`todo!`/
+        `unimplemented!`, and `Option` (`Some`/`None` expr+pattern, `Option<T>`
+        type, `unwrap`/`unwrap_or`/`expect`) in any hardware-module body, at the
+        definition site, with actionable messages pointing to the explicit form.
+      - **Explicit form:** maybe-valid data → a `{ valid: Logic, payload: T }`
+        struct you branch on (struct lowering already supports this); an error
+        condition → an explicit output (e.g. `illegal: Logic`), not a panic.
+      - **Fallout:** the `unwrap_or` lowering increment was reverted (`bd7eed7`).
+        The `rv32i_cpu`(+pipelined) examples use these idioms in `decode` and are
+        **excluded from the build** (commented `[[example]]` in `Cargo.toml`) until
+        rewritten to the explicit form. All other examples build; workspace green.
+      - **Not yet:** the macro only sees a module's own body. A banned idiom inside
+        a *file-scope helper* that gets inlined (e.g. a `from_bits` returning
+        `Option`) is caught later by CHIR as an unsupported construct, not yet with
+        the same actionable message — a future polish. A first-class `Valid<T>`
+        sugar (explicit `.valid`/`.payload`, no `?`/panic) could be revisited later
+        if ergonomics demand, but is out of scope.
 - [ ] **P1 — Decide the conditional/phased output semantics** (the open design
       question). Options and the prototype evidence are in
       `tests/affine_port_prototype.rs` and the coverage map. Gates Phase D's P0 items.

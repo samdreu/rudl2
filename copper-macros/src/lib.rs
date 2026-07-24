@@ -205,6 +205,118 @@ pub(crate) fn check_no_clock_construction(f: &ItemFn) -> Result<(), Error> {
     }
 }
 
+// ── Unsupported software idioms: Option / `?` / panic! ──────────────────────
+//
+// A hardware module describes gates, not software control flow. `Option`, the
+// `?` operator, and `panic!` have no honest gate-level meaning, and every way to
+// lower them either duplicates logic, hides a valid-bit as implicit state, or
+// silently guesses a value on an "impossible" path. Copper's premise is that
+// such ambiguity should be *unrepresentable*, so these are rejected at the macro
+// (the definition site) with a pointer to the explicit hardware form: a
+// `{ valid: Logic, payload: T }` struct you branch on, and an explicit output
+// signal (e.g. `illegal: Logic`) instead of a panic.
+
+const OPTION_GUIDANCE: &str = "`Option` is not supported in a hardware module — \
+    model maybe-valid data explicitly with a `{ valid: Logic, payload: T }` struct \
+    and branch on `.valid`, rather than `Some`/`None`/`unwrap`.";
+
+struct UnsupportedIdiom {
+    found: Option<(proc_macro2::Span, String)>,
+}
+
+impl UnsupportedIdiom {
+    fn flag(&mut self, span: proc_macro2::Span, msg: impl Into<String>) {
+        if self.found.is_none() {
+            self.found = Some((span, msg.into()));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for UnsupportedIdiom {
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        self.flag(
+            syn::spanned::Spanned::span(node),
+            "the `?` operator is not supported in a hardware module — it is software \
+             control flow with no gate-level meaning. Return a `{ valid: Logic, .. }` \
+             struct and branch on `.valid` instead of propagating `None`/`Err`.",
+        );
+        syn::visit::visit_expr_try(self, node);
+    }
+
+    // `visit_macro` fires for a macro invocation in any position — expression
+    // (`x = panic!()`) or statement (`panic!();`, which is a `Stmt::Macro`, not
+    // an `Expr::Macro`).
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if let Some(id) = node.path.get_ident() {
+            let n = id.to_string();
+            if matches!(n.as_str(), "panic" | "unreachable" | "todo" | "unimplemented") {
+                self.flag(
+                    syn::spanned::Spanned::span(node),
+                    format!(
+                        "`{n}!` is not synthesizable in a hardware module — an \
+                         unreachable/error condition must be an explicit output signal \
+                         (e.g. an `illegal: Logic` port), not a panic."
+                    ),
+                );
+            }
+        }
+        syn::visit::visit_macro(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*node.func {
+            if p.path.segments.last().is_some_and(|s| s.ident == "Some") {
+                self.flag(syn::spanned::Spanned::span(node), OPTION_GUIDANCE);
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if node.path.is_ident("None") {
+            self.flag(syn::spanned::Spanned::span(node), OPTION_GUIDANCE);
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if matches!(node.method.to_string().as_str(), "unwrap" | "unwrap_or" | "expect") {
+            self.flag(syn::spanned::Spanned::span(node), OPTION_GUIDANCE);
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_pat(&mut self, node: &'ast syn::Pat) {
+        let is_option_pat = match node {
+            syn::Pat::TupleStruct(ts) => ts.path.segments.last().is_some_and(|s| s.ident == "Some"),
+            syn::Pat::Ident(pi) => pi.ident == "None" && pi.subpat.is_none(),
+            syn::Pat::Path(pp) => pp.path.segments.last().is_some_and(|s| s.ident == "None"),
+            _ => false,
+        };
+        if is_option_pat {
+            self.flag(syn::spanned::Spanned::span(node), OPTION_GUIDANCE);
+        }
+        syn::visit::visit_pat(self, node);
+    }
+
+    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+        if node.path.segments.last().is_some_and(|s| s.ident == "Option") {
+            self.flag(syn::spanned::Spanned::span(node), OPTION_GUIDANCE);
+        }
+        syn::visit::visit_type_path(self, node);
+    }
+}
+
+/// Reject `Option` / `?` / `panic!` (and friends) inside a hardware module body.
+pub(crate) fn check_no_unsupported_idioms(f: &ItemFn) -> Result<(), Error> {
+    let mut v = UnsupportedIdiom { found: None };
+    v.visit_block(f.block.as_ref());
+    match v.found {
+        Some((span, msg)) => Err(Error::new(span, msg)),
+        None => Ok(()),
+    }
+}
+
 /// Visits an async fn body and records which clock parameter names have a `.tick().await` call.
 struct TickAwaitVisitor<'a> {
     clock_names: &'a HashSet<String>,
@@ -501,6 +613,12 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
         return err.to_compile_error().into();
     }
 
+    // Reject software idioms that have no honest gate mapping (Option / `?` /
+    // panic!) — use an explicit `{ valid, payload }` struct and error output.
+    if let Err(err) = check_no_unsupported_idioms(&input_fn) {
+        return err.to_compile_error().into();
+    }
+
     match hardware_mode {
         HardwareMode::Sequential | HardwareMode::Synchronizer => {
             // Regular sequential modules must be single-domain; synchronizers are
@@ -669,8 +787,87 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
 #[cfg(test)]
 mod tests {
     use super::cdc_check::check_cdc;
-    use super::{check_no_clock_construction, validate_hardware_fn, HardwareMode};
+    use super::{
+        check_no_clock_construction, check_no_unsupported_idioms, validate_hardware_fn, HardwareMode,
+    };
     use syn::parse_quote;
+
+    // ── Option / `?` / panic! are rejected ──────────────────────────────────
+
+    #[test]
+    fn question_mark_operator_rejected() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                loop { let x = decode(i.read())?; o.write(x); clk.tick().await; }
+            }
+        };
+        assert!(check_no_unsupported_idioms(&f).is_err());
+    }
+
+    #[test]
+    fn panic_family_macros_rejected() {
+        for body in [
+            "panic!(\"bad\")",
+            "unreachable!()",
+            "todo!()",
+            "unimplemented!()",
+        ] {
+            let stmt: syn::Stmt = syn::parse_str(&format!("{body};")).unwrap();
+            let f: syn::ItemFn = parse_quote! {
+                async fn m(clk: Clock<C>, o: Out<Bits<8>, C>) {
+                    loop { #stmt o.write(Bits::zero()); clk.tick().await; }
+                }
+            };
+            assert!(check_no_unsupported_idioms(&f).is_err(), "{body} should be rejected");
+        }
+    }
+
+    #[test]
+    fn option_some_none_and_unwrap_rejected() {
+        // Some(..) expression
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<C>, o: Out<Bits<8>, C>) {
+                loop { let _x = Some(Bits::zero()); o.write(Bits::zero()); clk.tick().await; }
+            }
+        };
+        assert!(check_no_unsupported_idioms(&f).is_err());
+
+        // `match … { Some(d) => .., None => .. }` patterns + unwrap_or method
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                loop {
+                    let c = classify(i.read()).unwrap_or(Bits::zero());
+                    o.write(c);
+                    clk.tick().await;
+                }
+            }
+        };
+        assert!(check_no_unsupported_idioms(&f).is_err());
+
+        // `Option<T>` in a type annotation
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<C>, o: Out<Bits<8>, C>) {
+                loop { let _x: Option<Bits<8>> = None; o.write(Bits::zero()); clk.tick().await; }
+            }
+        };
+        assert!(check_no_unsupported_idioms(&f).is_err());
+    }
+
+    #[test]
+    fn ordinary_hardware_body_is_accepted() {
+        // No Option / ? / panic — a plain FSM body passes.
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut acc: Bits<8> = Bits::zero();
+                loop {
+                    acc = acc + i.read();
+                    o.write(acc);
+                    clk.tick().await;
+                }
+            }
+        };
+        assert!(check_no_unsupported_idioms(&f).is_ok());
+    }
 
     // ── Clocks are provided, not constructed (Gap 2) ────────────────────────
 

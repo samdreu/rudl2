@@ -59,13 +59,19 @@ path = "examples/sequential/lfsr.rs"
 name = "dual_port_ram"
 path = "examples/memory/dual_port_ram.rs"
 
-[[example]]
-name = "rv32i_cpu"
-path = "examples/cpu/rv32i_cpu.rs"
-
-[[example]]
-name = "rv32i_cpu_pipelined"
-path = "examples/cpu/rv32i_cpu_pipelined.rs"
+# The RV32I CPU examples are temporarily excluded from the build. Their `decode`
+# path is written in a software idiom (`Option`, `?`, `panic!`) that a hardware
+# module may not use — the `#[hardware]` macro now rejects it. They need a rewrite
+# to the explicit hardware form: a `{ valid, payload }` decode result branched on
+# `.valid`, and an explicit `illegal` output instead of `panic!`. Re-enable once
+# rewritten. See design_docs/TRANSPILATION_TODO.md (Cross-cutting: banned idioms).
+# [[example]]
+# name = "rv32i_cpu"
+# path = "examples/cpu/rv32i_cpu.rs"
+#
+# [[example]]
+# name = "rv32i_cpu_pipelined"
+# path = "examples/cpu/rv32i_cpu_pipelined.rs"
 
 [[example]]
 name = "uart_rx"
