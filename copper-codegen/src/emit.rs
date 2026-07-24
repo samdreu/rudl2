@@ -350,6 +350,15 @@ impl Emitter<'_> {
                 }
                 self.out.push_str(&format!("{}end\n", self.indent(level)));
             }
+            VLIRStmt::IndexAssign { base, index, value } => {
+                self.out.push_str(&format!(
+                    "{}{}[{}] = {};\n",
+                    self.indent(level),
+                    base,
+                    expr_str(index),
+                    expr_str(value),
+                ));
+            }
         }
     }
 
@@ -393,6 +402,8 @@ fn collect_wire_decls(
                 }
             }
             VLIRStmt::ForLoop { body, .. } => collect_wire_decls(body, out, seen),
+            // A bit-assign targets an already-declared signal.
+            VLIRStmt::IndexAssign { .. } => {}
         }
     }
 }
@@ -409,6 +420,8 @@ fn range_str(w: &Width) -> String {
         Width::Param(name) => format!("[{name}-1:0] "),
     }
 }
+
+// (DynBit expr handled in expr_str below.)
 
 /// A `for`-loop bound renders as a plain integer, not a width-sized literal —
 /// the loop variable is a 32-bit `int`, so `64'd0` would width-truncate. A
@@ -456,6 +469,7 @@ fn expr_str(e: &VLIRExpr) -> String {
                 format!("{}[{}:{}]", expr_str(expr), high, low)
             }
         }
+        VLIRExpr::DynBit { base, index } => format!("{}[{}]", expr_str(base), expr_str(index)),
     }
 }
 

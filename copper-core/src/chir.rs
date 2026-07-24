@@ -211,6 +211,15 @@ pub enum CHIRStmt {
         body: Vec<CHIRStmt>,
         span: SourceSpan,
     },
+
+    /// A single-bit assignment `base[index] = value;` (LHS bit-assign). `base` is
+    /// an already-declared signal; only the selected bit is driven.
+    IndexAssign {
+        base: String,
+        index: CHIRExpr,
+        value: CHIRExpr,
+        span: SourceSpan,
+    },
 }
 
 impl CHIRStmt {
@@ -223,6 +232,7 @@ impl CHIRStmt {
             CHIRStmt::If { span, .. } => span,
             CHIRStmt::Match { span, .. } => span,
             CHIRStmt::ForLoop { span, .. } => span,
+            CHIRStmt::IndexAssign { span, .. } => span,
         }
     }
 }
@@ -274,6 +284,12 @@ pub enum CHIRExpr {
         expr: Box<CHIRExpr>,
         high: usize,
         low: usize,
+    },
+    /// A single-bit select at a *dynamic* (runtime) index — `base[index]`.
+    /// A constant index uses `Slice` instead.
+    DynBit {
+        base: Box<CHIRExpr>,
+        index: Box<CHIRExpr>,
     },
 }
 

@@ -1339,6 +1339,15 @@ fn lower_expr_stmt(
                 }
                 return Ok(());
             }
+            // LHS bit-assign: `base[index] = value` drives a single bit of an
+            // already-declared signal.
+            if let ExprType::Index(idx) = assign.left.as_ref() {
+                let base = extract_assign_target(&idx.base, span)?;
+                let index = lower_expr(&idx.index, ctx)?;
+                let value = lower_expr(&assign.right, ctx)?;
+                out.push(CHIRStmt::IndexAssign { base, index, value, span });
+                return Ok(());
+            }
             let target = extract_assign_target(&assign.left, span)?;
             let mut value = lower_expr(&assign.right, ctx)?;
             // Propagate the target's width into untyped literals on the RHS.
@@ -2002,6 +2011,7 @@ fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
             width_of_chir_expr(then_val, ctx).or_else(|| width_of_chir_expr(else_val, ctx))
         }
         CHIRExpr::Slice { high, low, .. } => Some(high - low + 1),
+        CHIRExpr::DynBit { .. } => Some(1),
         CHIRExpr::Concat(parts) => {
             parts.iter().map(|p| width_of_chir_expr(p, ctx)).sum::<Option<usize>>()
         }
@@ -2099,12 +2109,15 @@ fn project_tuple_element(
 /// separate lowering step).
 fn lower_index(idx: &ExprIndex, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
     let base = lower_expr(&idx.base, ctx)?;
-    let bit = eval_const_usize(&idx.index).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
-        description: "bit index must be a compile-time constant".to_string(),
-        span: idx.span,
-        suggested_rewrite: Some("use a literal index, or unroll the loop so the index is constant".to_string()),
-    })?;
-    Ok(CHIRExpr::Slice { expr: Box::new(base), high: bit, low: bit })
+    // A compile-time constant index is a static one-bit `Slice`; anything else
+    // (e.g. a loop variable) is a dynamic single-bit select `base[index]`.
+    match eval_const_usize(&idx.index) {
+        Some(bit) => Ok(CHIRExpr::Slice { expr: Box::new(base), high: bit, low: bit }),
+        None => {
+            let index = lower_expr(&idx.index, ctx)?;
+            Ok(CHIRExpr::DynBit { base: Box::new(base), index: Box::new(index) })
+        }
+    }
 }
 
 /// Evaluate an expression to a constant `usize`, for use as a bit index.
@@ -2525,6 +2538,19 @@ fn validate_stmts(
                 body_known.insert(var.clone());
                 validate_stmts(body, &mut body_known, *s)?;
             }
+            CHIRStmt::IndexAssign { base, index, value, span: s } => {
+                // `base` must be an already-declared signal; the bit-assign drives
+                // one of its bits.
+                if !known.contains(base.as_str()) {
+                    return Err(CHIRLowerError::UnsupportedConstruct {
+                        description: format!("bit-assign target '{base}' is not declared"),
+                        span: *s,
+                        suggested_rewrite: None,
+                    });
+                }
+                validate_expr(index, known, *s)?;
+                validate_expr(value, known, *s)?;
+            }
         }
     }
     Ok(())
@@ -2577,6 +2603,10 @@ fn validate_expr(
         }
         CHIRExpr::Slice { expr, .. } => {
             validate_expr(expr, known, span)?;
+        }
+        CHIRExpr::DynBit { base, index } => {
+            validate_expr(base, known, span)?;
+            validate_expr(index, known, span)?;
         }
     }
     Ok(())
@@ -2974,11 +3004,16 @@ mod tests {
     }
 
     #[test]
-    fn non_constant_bit_index_is_rejected() {
-        // A variable index needs loop unrolling first; must error, not miscompile.
+    fn non_constant_bit_index_lowers_to_dynbit() {
+        // A variable bit index is now a dynamic single-bit select `d[i]`
+        // (CHIRExpr::DynBit), not an error. A constant index still uses Slice.
         let fir = make_fir("fn f(d: In<Bits<8>, ()>, i: In<u8, ()>, o: Out<Logic, ()>) { let w = d.read()[i.read() as usize]; o.write(w); }");
-        let result = lower_to_chir(&fir, &no_hw(), &empty_registry());
-        assert!(result.is_err(), "variable index should be rejected");
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry())
+            .expect("dynamic bit index should lower to DynBit");
+        let CHIRBody::Combinational(b) = chir.body else { panic!("expected comb body") };
+        let has_dynbit = b.stmts.iter().any(|s| matches!(
+            s, CHIRStmt::Wire { value: CHIRExpr::DynBit { .. }, .. }));
+        assert!(has_dynbit, "expected a DynBit in the lowered body");
     }
 
     #[test]

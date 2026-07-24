@@ -176,6 +176,13 @@ fn lower_stmt_list(
                     });
                 }
             }
+            CHIRStmt::IndexAssign { base, index, value, .. } => {
+                out.push(SHIRStmt::IndexAssign {
+                    base: base.clone(),
+                    index: rename_vars(lower_expr(index)?, renames),
+                    value: rename_vars(lower_expr(value)?, renames),
+                });
+            }
             // Assign, AwaitTick — not pre_edge statements
             _ => {}
         }
@@ -727,6 +734,11 @@ fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
             collect_expr_vars(end, visitor);
             for s in body { collect_expr_vars_in_stmt(s, visitor); }
         }
+        CHIRStmt::IndexAssign { base, index, value, .. } => {
+            visitor(base);
+            collect_expr_vars(index, visitor);
+            collect_expr_vars(value, visitor);
+        }
         CHIRStmt::AwaitTick { .. } => {}
     }
 }
@@ -755,6 +767,10 @@ fn collect_expr_vars(expr: &CHIRExpr, visitor: &mut impl FnMut(&str)) {
         }
         CHIRExpr::Concat(exprs) => { for e in exprs { collect_expr_vars(e, visitor); } }
         CHIRExpr::Slice { expr, .. } => collect_expr_vars(expr, visitor),
+        CHIRExpr::DynBit { base, index } => {
+            collect_expr_vars(base, visitor);
+            collect_expr_vars(index, visitor);
+        }
     }
 }
 
@@ -796,6 +812,10 @@ fn subst_vars(expr: SHIRExpr, subst: &HashMap<String, SHIRExpr>) -> SHIRExpr {
             expr: Box::new(subst_vars(*expr, subst)),
             high,
             low,
+        },
+        SHIRExpr::DynBit { base, index } => SHIRExpr::DynBit {
+            base: Box::new(subst_vars(*base, subst)),
+            index: Box::new(subst_vars(*index, subst)),
         },
     }
 }
@@ -861,6 +881,10 @@ pub fn lower_expr(expr: &CHIRExpr) -> Result<SHIRExpr, SHIRLowerError> {
             high: *high,
             low: *low,
         }),
+        CHIRExpr::DynBit { base, index } => Ok(SHIRExpr::DynBit {
+            base: Box::new(lower_expr(base)?),
+            index: Box::new(lower_expr(index)?),
+        }),
     }
 }
 
@@ -908,6 +932,7 @@ impl HasSpan for CHIRStmt {
             CHIRStmt::If { span, .. } => span,
             CHIRStmt::Match { span, .. } => span,
             CHIRStmt::ForLoop { span, .. } => span,
+            CHIRStmt::IndexAssign { span, .. } => span,
         }
     }
 }

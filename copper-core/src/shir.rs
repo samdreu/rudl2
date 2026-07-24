@@ -135,6 +135,12 @@ pub enum SHIRStmt {
         end: SHIRExpr,
         body: Vec<SHIRStmt>,
     },
+    /// `base[index] = value;` — single-bit assignment.
+    IndexAssign {
+        base: String,
+        index: SHIRExpr,
+        value: SHIRExpr,
+    },
 }
 
 #[derive(Debug)]
@@ -182,6 +188,11 @@ pub enum SHIRExpr {
         expr: Box<SHIRExpr>,
         high: usize,
         low: usize,
+    },
+    /// Single-bit select at a dynamic index — `base[index]`.
+    DynBit {
+        base: Box<SHIRExpr>,
+        index: Box<SHIRExpr>,
     },
     /// Compares phase_r == idx. Used in multi-phase post_edge conditions.
     PhaseEq(usize),

@@ -254,7 +254,8 @@ fn lower_flat_stmts(
             // Conditional structures — including ones that drive output ports
             // (a Moore output). These lower into `always_comb`, where the port is
             // assigned on every path, so no latch is inferred.
-            SHIRStmt::If { .. } | SHIRStmt::Match { .. } | SHIRStmt::ForLoop { .. } => {
+            SHIRStmt::If { .. } | SHIRStmt::Match { .. } | SHIRStmt::ForLoop { .. }
+            | SHIRStmt::IndexAssign { .. } => {
                 comb.push(lower_comb_stmt(s, leg)?);
             }
         }
@@ -320,6 +321,11 @@ fn lower_comb_stmt(s: &SHIRStmt, leg: &Legalizer) -> LowerResult<VLIRStmt> {
             end: lower_expr(end, leg)?,
             body: body.iter().map(|s| lower_comb_stmt(s, leg)).collect::<LowerResult<_>>()?,
         }),
+        SHIRStmt::IndexAssign { base, index, value } => Ok(VLIRStmt::IndexAssign {
+            base: leg.get(base),
+            index: lower_expr(index, leg)?,
+            value: lower_expr(value, leg)?,
+        }),
     }
 }
 
@@ -361,6 +367,11 @@ fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
             end: end.clone(),
             body: body.iter().map(clone_comb_stmt).collect(),
         },
+        VLIRStmt::IndexAssign { base, index, value } => VLIRStmt::IndexAssign {
+            base: base.clone(),
+            index: index.clone(),
+            value: value.clone(),
+        },
     }
 }
 
@@ -374,6 +385,8 @@ fn first_port_drive(s: &SHIRStmt) -> Option<String> {
             .find_map(first_port_drive),
         SHIRStmt::Match { arms, .. } => arms.iter().flat_map(|a| &a.stmts).find_map(first_port_drive),
         SHIRStmt::ForLoop { body, .. } => body.iter().find_map(first_port_drive),
+        // A bit-assign drives a signal, not (in the supported cases) a port.
+        SHIRStmt::IndexAssign { .. } => None,
     }
 }
 
@@ -420,6 +433,10 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer) -> LowerResult<VLIRExpr> {
             expr: Box::new(lower_expr(expr, leg)?),
             high: *high,
             low: *low,
+        },
+        SHIRExpr::DynBit { base, index } => VLIRExpr::DynBit {
+            base: Box::new(lower_expr(base, leg)?),
+            index: Box::new(lower_expr(index, leg)?),
         },
         SHIRExpr::PhaseEq(idx) => VLIRExpr::BinOp {
             left: Box::new(VLIRExpr::Var("phase_r".to_string())),
@@ -588,6 +605,8 @@ fn assigned_on_all_paths(stmts: &[VLIRStmt]) -> HashSet<String> {
             // A `for` loop may iterate zero times (bound could be 0), so nothing
             // it assigns is guaranteed on all paths — conservative, and correct.
             VLIRStmt::ForLoop { .. } => {}
+            // A single-bit assign is a partial drive of `base`; not all-paths.
+            VLIRStmt::IndexAssign { .. } => {}
         }
     }
     all
@@ -643,6 +662,10 @@ fn assigned_on_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
             }
             VLIRStmt::ForLoop { body, .. } => {
                 any.extend(assigned_on_any_path(body));
+            }
+            // A bit-assign drives `base` (partially) — it counts as touching it.
+            VLIRStmt::IndexAssign { base, .. } => {
+                any.insert(base.clone());
             }
         }
     }
@@ -773,6 +796,8 @@ fn collect_stmt_names(stmts: &[SHIRStmt], leg: &mut Legalizer) {
                 }
             }
             SHIRStmt::ForLoop { body, .. } => collect_stmt_names(body, leg),
+            // A bit-assign targets an already-declared signal; nothing new to name.
+            SHIRStmt::IndexAssign { .. } => {}
         }
     }
 }
@@ -834,6 +859,23 @@ mod e2e_tests {
         assert!(sv.contains("acc = (acc + 32'd1);"), "expected blocking reassign: {sv}");
         // `acc` is declared exactly once despite two assignments to it.
         assert_eq!(sv.matches("logic [31:0] acc;").count(), 1, "acc declared once: {sv}");
+    }
+
+    #[test]
+    fn lhs_bit_assign_with_dynamic_index_emits() {
+        // `o[i] = a[i]` inside a loop: LHS bit-assign + dynamic bit-select read.
+        let src = r#"
+            fn copy_bits<const N: usize>(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) {
+                let mut o: Bits<8> = Bits::from_u8(0);
+                for i in 0..N {
+                    o[i] = a.read()[i];
+                }
+                out.write(o);
+            }
+        "#;
+        let sv = transpile(src);
+        println!("\n===== GENERATED VERILOG (bit-assign) =====\n{sv}\n=====");
+        assert!(sv.contains("o[i] = a[i];"), "expected LHS bit-assign + dyn read: {sv}");
     }
 
     #[test]

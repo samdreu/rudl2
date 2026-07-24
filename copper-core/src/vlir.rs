@@ -163,6 +163,12 @@ pub enum VLIRStmt {
         end: VLIRExpr,
         body: Vec<VLIRStmt>,
     },
+    /// `base[index] = value;` — single-bit assignment.
+    IndexAssign {
+        base: String,
+        index: VLIRExpr,
+        value: VLIRExpr,
+    },
 }
 
 /// Statements inside `always_ff` blocks (non-blocking `<=` only).
@@ -225,6 +231,11 @@ pub enum VLIRExpr {
         expr: Box<VLIRExpr>,
         high: usize,
         low: usize,
+    },
+    /// `base[index]` — single-bit select at a dynamic index.
+    DynBit {
+        base: Box<VLIRExpr>,
+        index: Box<VLIRExpr>,
     },
 }
 
