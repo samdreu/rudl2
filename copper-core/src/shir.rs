@@ -1,4 +1,4 @@
-use crate::chir::{CHIRBinOp, CHIRType, CHIRUnOp};
+use crate::chir::{CHIRBinOp, CHIRType, CHIRUnOp, ModuleParam};
 use crate::frontend_ir::SourceSpan;
 
 // ── Module ────────────────────────────────────────────────────────────────────
@@ -6,6 +6,9 @@ use crate::frontend_ir::SourceSpan;
 #[derive(Debug)]
 pub struct SHIRModule {
     pub name: String,
+    /// Module-level parameters (const generics), carried through from CHIR to
+    /// VLIR emission (M2).
+    pub params: Vec<ModuleParam>,
     pub ports: Vec<SHIRPort>,
     pub body: SHIRBody,
     pub span: SourceSpan,

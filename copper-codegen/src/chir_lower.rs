@@ -34,7 +34,7 @@ pub fn lower_to_chir(
 
     let module = CHIRModule {
         name: fir.module_name.clone(),
-        params: Vec::new(),
+        params: build_module_params(fir),
         ports,
         body,
         span: fir.span,
@@ -43,6 +43,23 @@ pub fn lower_to_chir(
     validate_module(&module)?;
 
     Ok(module)
+}
+
+/// Module-level parameters from the FIR's const generics (`<const N: usize>`).
+/// Type/lifetime/domain generics are not module parameters. `default` is the
+/// source-declared default (`<const N: usize = 8>`) when present — the transpiler
+/// is invoked on a definition, so a caller otherwise supplies `N` at instantiation.
+fn build_module_params(fir: &FrontendModuleIR) -> Vec<copper_core::chir::ModuleParam> {
+    use copper_core::frontend_ir::GenericParamKind;
+    fir.signature
+        .generics
+        .iter()
+        .filter(|g| g.kind == GenericParamKind::Const)
+        .map(|g| copper_core::chir::ModuleParam {
+            name: g.name.clone(),
+            default: g.default.as_ref().and_then(|d| d.trim().parse::<usize>().ok()),
+        })
+        .collect()
 }
 
 // ── Type resolution ───────────────────────────────────────────────────────────
@@ -86,9 +103,14 @@ fn parse_bits_type(compact: &str, span: SourceSpan) -> Result<CHIRType, CHIRLowe
     let inner = compact
         .strip_prefix("Bits<")
         .and_then(|s| s.strip_suffix('>'));
-    match inner.and_then(|s| s.parse::<usize>().ok()) {
-        Some(width) => Ok(CHIRType::UInt { width: Width::Concrete(width) }),
-        None => Err(CHIRLowerError::UnresolvableType {
+    match inner {
+        // `Bits<8>` — a concrete width.
+        Some(s) if s.parse::<usize>().is_ok() => {
+            Ok(CHIRType::UInt { width: Width::Concrete(s.parse().unwrap()) })
+        }
+        // `Bits<N>` — a const-generic parameter: a symbolic width (M2).
+        Some(s) if is_ident(s) => Ok(CHIRType::UInt { width: Width::Param(s.to_string()) }),
+        _ => Err(CHIRLowerError::UnresolvableType {
             ty_text: compact.to_string(),
             span,
         }),
@@ -2723,9 +2745,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_bits_identifier_width_is_symbolic_param() {
+        // `Bits<N>` with an identifier arg is a const-generic parameter → a
+        // symbolic width (M2), not an error. (Whether the param is actually
+        // declared is validated elsewhere; an undeclared one fails at emission.)
+        assert_eq!(
+            resolve_type("Bits<N>", span()).unwrap(),
+            CHIRType::UInt { width: Width::Param("N".to_string()) }
+        );
+    }
+
+    #[test]
     fn test_resolve_bits_invalid_width_returns_error() {
+        // Neither a number nor a plain identifier → unresolvable.
         assert!(matches!(
-            resolve_type("Bits<foo>", span()),
+            resolve_type("Bits<1.5>", span()),
             Err(CHIRLowerError::UnresolvableType { .. })
         ));
     }

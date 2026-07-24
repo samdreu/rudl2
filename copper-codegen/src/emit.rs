@@ -52,7 +52,29 @@ impl Emitter<'_> {
     // ── Header ──────────────────────────────────────────────────────────────
 
     fn emit_port_header(&mut self, m: &VLIRModule) {
-        self.out.push_str(&format!("module {} (\n", m.name));
+        if m.params.is_empty() {
+            self.out.push_str(&format!("module {} (\n", m.name));
+        } else {
+            // `module name #(parameter int N = 8, parameter int M = 4) (`
+            self.out.push_str(&format!("module {} #(\n", m.name));
+            let last = m.params.len().saturating_sub(1);
+            for (i, p) in m.params.iter().enumerate() {
+                // Always emit a default so the module is valid standalone (a
+                // parameter with no value is a Verilator lint error). Use the
+                // source default when known, else a `1` placeholder that an
+                // instantiation overrides.
+                let default = p.default.unwrap_or(1);
+                let comma = if i == last { "" } else { "," };
+                self.out.push_str(&format!(
+                    "{}parameter int {} = {}{}\n",
+                    self.indent(1),
+                    p.name,
+                    default,
+                    comma
+                ));
+            }
+            self.out.push_str(") (\n");
+        }
         // Clock inputs first, then other inputs, then outputs.
         let mut ordered: Vec<&VLIRPort> = Vec::new();
         ordered.extend(m.ports.iter().filter(|p| p.kind == VLIRPortKind::Clock));
@@ -369,6 +391,8 @@ fn range_str(w: &Width) -> String {
     match w {
         Width::Concrete(1) => String::new(),
         Width::Concrete(n) => format!("[{}:0] ", n - 1),
+        // A parametric width `N` renders as `[N-1:0]`.
+        Width::Param(name) => format!("[{name}-1:0] "),
     }
 }
 
@@ -376,6 +400,8 @@ fn lit_str(width: &Width, value: u128) -> String {
     match width {
         Width::Concrete(1) => format!("1'b{}", value & 1),
         Width::Concrete(n) => format!("{}'d{}", n, value),
+        // A literal sized by a parameter, e.g. `N'd5`.
+        Width::Param(name) => format!("{name}'d{value}"),
     }
 }
 

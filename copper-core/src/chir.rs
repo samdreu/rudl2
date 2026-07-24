@@ -67,16 +67,31 @@ pub enum CHIRType {
 pub enum Width {
     /// A fully-resolved bit width.
     Concrete(usize),
-    // M2: Param(String) — a `parameter N`
-    // M2: Sub(Box<Width>, usize) — e.g. `N - 1`
+    /// A symbolic width bound to a module parameter — `Bits<N>` → `Param("N")`,
+    /// emitted as a SystemVerilog `parameter` and a `[N-1:0]` range (M2).
+    Param(String),
+    // M2 (later): Sub(Box<Width>, usize) — e.g. `N - 1`
 }
 
 impl Width {
-    /// The resolved width. Panics on a non-concrete width — callers that can
-    /// legitimately encounter symbolic widths (M2+) must match explicitly.
+    /// The resolved concrete width, if known. `None` for a symbolic (`Param`)
+    /// width — callers that legitimately handle symbolic widths use this instead
+    /// of `concrete()`.
+    pub fn as_concrete(&self) -> Option<usize> {
+        match self {
+            Width::Concrete(n) => Some(*n),
+            Width::Param(_) => None,
+        }
+    }
+
+    /// The resolved width. Panics on a symbolic width — callers that can
+    /// legitimately encounter one (M2+) must use `as_concrete`/match explicitly.
     pub fn concrete(&self) -> usize {
         match self {
             Width::Concrete(n) => *n,
+            Width::Param(name) => {
+                panic!("width `{name}` is symbolic (a module parameter); this path needs a concrete width")
+            }
         }
     }
 }

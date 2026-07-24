@@ -102,7 +102,13 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
         SHIRBody::Sequential(s) => VLIRBody::Sequential(lower_seq(s, &leg)?),
     };
 
-    Ok(VLIRModule { name, params: Vec::new(), ports, body })
+    let params = shir
+        .params
+        .iter()
+        .map(|p| copper_core::vlir::VLIRParam { name: p.name.clone(), default: p.default })
+        .collect();
+
+    Ok(VLIRModule { name, params, ports, body })
 }
 
 // ── Combinational body ──────────────────────────────────────────────────────
@@ -787,6 +793,22 @@ mod e2e_tests {
         let f: syn::ItemFn = syn::parse_str(src).expect("parse");
         transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default())
             .expect("transpile")
+    }
+
+    #[test]
+    fn const_generic_module_emits_sv_parameter() {
+        // A const-generic `Bits<N>` module emits a SystemVerilog `parameter` and
+        // parametric `[N-1:0]` port ranges (M2 const-generic increment 1).
+        let src = r#"
+            fn passthru<const N: usize>(a: In<Bits<N>, C>, out: Out<Bits<N>, C>) {
+                out.write(a.read());
+            }
+        "#;
+        let sv = transpile(src);
+        println!("\n===== GENERATED VERILOG (const-generic) =====\n{sv}\n=====");
+        assert!(sv.contains("module passthru #("), "expected parameter header: {sv}");
+        assert!(sv.contains("parameter int N"), "expected `parameter int N`: {sv}");
+        assert!(sv.contains("[N-1:0]"), "expected parametric range `[N-1:0]`: {sv}");
     }
 
     #[test]
