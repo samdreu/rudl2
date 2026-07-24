@@ -32,22 +32,25 @@ pub enum Opcode {
     ALU_IMM = 0x13,
     ALU_REG = 0x33,
     ECALL  = 0x73,
+    // An unrecognized opcode. Hardware has no `Option`, so decode is total: an
+    // illegal instruction is an explicit value the module traps on, not `None`.
+    INVALID = 0x00,
 }
 
 impl Opcode {
-    pub fn from_bits(op: Bits<7>) -> Option<Self> {
+    pub fn from_bits(op: Bits<7>) -> Self {
         match op.as_usize() {
-            0x37 => Some(Opcode::LUI),
-            0x17 => Some(Opcode::AUIPC),
-            0x6F => Some(Opcode::JAL),
-            0x67 => Some(Opcode::JALR),
-            0x63 => Some(Opcode::BRANCH),
-            0x03 => Some(Opcode::LOAD),
-            0x23 => Some(Opcode::STORE),
-            0x13 => Some(Opcode::ALU_IMM),
-            0x33 => Some(Opcode::ALU_REG),
-            0x73 => Some(Opcode::ECALL),
-            _ => None,
+            0x37 => Opcode::LUI,
+            0x17 => Opcode::AUIPC,
+            0x6F => Opcode::JAL,
+            0x67 => Opcode::JALR,
+            0x63 => Opcode::BRANCH,
+            0x03 => Opcode::LOAD,
+            0x23 => Opcode::STORE,
+            0x13 => Opcode::ALU_IMM,
+            0x33 => Opcode::ALU_REG,
+            0x73 => Opcode::ECALL,
+            _ => Opcode::INVALID,
         }
     }
 }
@@ -57,15 +60,16 @@ pub enum BranchCond {
 }
 
 impl BranchCond {
-    pub fn from_bits(f3: Bits<3>) -> Option<Self> {
+    // Total: an unrecognized funct3 defaults to `Beq` (the old `.unwrap_or(Beq)`).
+    pub fn from_bits(f3: Bits<3>) -> Self {
         match f3.as_usize() {
-            0x0 => Some(BranchCond::Beq),
-            0x1 => Some(BranchCond::Bne),
-            0x4 => Some(BranchCond::Blt),
-            0x5 => Some(BranchCond::Bge),
-            0x6 => Some(BranchCond::Bltu),
-            0x7 => Some(BranchCond::Bgeu),
-            _ => None,
+            0x0 => BranchCond::Beq,
+            0x1 => BranchCond::Bne,
+            0x4 => BranchCond::Blt,
+            0x5 => BranchCond::Bge,
+            0x6 => BranchCond::Bltu,
+            0x7 => BranchCond::Bgeu,
+            _ => BranchCond::Beq,
         }
     }
 }
@@ -116,10 +120,12 @@ fn sign_ext_j(instr: Bits<32>) -> Bits<32> {
     Bits::<32>::from_u32(((raw as i32) << 11 >> 11) as u32)
 }
 
-fn decode(instr: Bits<32>) -> Option<InstrDecoded> {
+// Total decode: `opcode` is `Opcode::INVALID` for an unrecognized instruction,
+// which the module traps on. No `Option`/`?` — those have no hardware meaning.
+fn decode(instr: Bits<32>) -> InstrDecoded {
     let w = instr.as_u32();
-    let opcode = Opcode::from_bits(instr.truncate::<7>())?;
-    Some(InstrDecoded {
+    let opcode = Opcode::from_bits(instr.truncate::<7>());
+    InstrDecoded {
         opcode,
         rd:  ((w >> 7)  & 0x1F) as usize,
         rs1: ((w >> 15) & 0x1F) as usize,
@@ -131,7 +137,7 @@ fn decode(instr: Bits<32>) -> Option<InstrDecoded> {
         imm_b: sign_ext_b(instr),
         imm_j: sign_ext_j(instr),
         imm_u: Bits::<32>::from_u32(w & 0xFFFF_F000),
-    })
+    }
 }
 
 fn alu_exec_reg(a: Bits<32>, b: Bits<32>, f3: Bits<3>, f7: Bits<7>) -> AluOutput {
@@ -208,11 +214,8 @@ async fn rv32i_cpu(
         }
         let instr: Bits<32> = imem.read_port::<0>().data();
 
-        // Decode
-        let decoded = match decode(instr) {
-            Some(d) => d,
-            None => panic!("Invalid instr 0x{:08x} at PC 0x{:08x}", instr.as_u32(), pc.as_u32()),
-        };
+        // Decode (total: `opcode` is `INVALID` for an unrecognized instruction)
+        let decoded = decode(instr);
 
         match decoded.opcode {
             Opcode::LUI => {
@@ -292,7 +295,7 @@ async fn rv32i_cpu(
                 let rv1: Bits<32> = if decoded.rs1 == 0 { Bits::zero() } else { regfile.read_port::<0>().data() };
                 let rv2: Bits<32> = if decoded.rs2 == 0 { Bits::zero() } else { regfile.read_port::<1>().data() };
 
-                let branch_cond = BranchCond::from_bits(decoded.f3).unwrap_or(BranchCond::Beq);
+                let branch_cond = BranchCond::from_bits(decoded.f3);
                 let taken = match branch_cond {
                     BranchCond::Beq  => rv1 == rv2,
                     BranchCond::Bne  => rv1 != rv2,
@@ -409,6 +412,16 @@ async fn rv32i_cpu(
                 program_counter.write(pc);
                 halted.write(Logic::One);
                 a0_out.write(a0);
+                loop { clk.tick().await; }
+            }
+
+            // Illegal instruction: trap by halting. This is the explicit-hardware
+            // replacement for the old `None => panic!()` — an unrepresentable
+            // opcode becomes an observable halt, not a simulation panic.
+            Opcode::INVALID => {
+                program_counter.write(pc);
+                halted.write(Logic::One);
+                a0_out.write(Bits::zero());
                 loop { clk.tick().await; }
             }
         }

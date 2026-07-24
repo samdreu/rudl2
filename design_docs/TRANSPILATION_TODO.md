@@ -15,7 +15,7 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
 > **Design decision (2026-07-23):** `Option`/`?`/`panic!` are **banned** in
 > hardware bodies (rejected at the macro) rather than lowered — use explicit
 > `{valid, payload}` structs; the `unwrap_or` increment was reverted and the
-> `rv32i_cpu` examples are excluded until rewritten. See the Phase A audit
+> `rv32i_cpu` examples were rewritten to the explicit form. See the Phase A audit
 > (§ below), the *CHIR consumption progress* note under Phase B, and
 > *Cross-cutting → Banned software idioms*.
 
@@ -106,8 +106,11 @@ implemented:
 
 **Net:** the inline → struct → match stack composes, so `alu_exec_*`-shaped
 bodies lower end-to-end. The CPU `decode` path is *not* reachable as written — it
-uses the now-banned idioms and must be rewritten to the explicit `{valid,payload}`
-form (the two `rv32i_cpu` examples are excluded from the build until then).
+used the now-banned idioms and was **rewritten** to the explicit form: total
+`Opcode::from_bits -> Opcode` (with an `INVALID` variant), `BranchCond::from_bits
+-> BranchCond` (defaulting to `Beq`), `decode -> InstrDecoded` (no `Option`/`?`),
+and an `Opcode::INVALID` arm that traps by halting instead of `panic!`. Both CPU
+examples build and pass (10/10 base, 13/13 pipelined).
 
 - [ ] **P1 — Unary `!` on a multi-bit value** emits SV logical-`!` (1-bit reduce)
       instead of bitwise `~`. Correct for 1-bit `Logic`, wrong for `Bits<N>`. Needs
@@ -509,9 +512,12 @@ model, and the simulator API.
         struct you branch on (struct lowering already supports this); an error
         condition → an explicit output (e.g. `illegal: Logic`), not a panic.
       - **Fallout:** the `unwrap_or` lowering increment was reverted (`bd7eed7`).
-        The `rv32i_cpu`(+pipelined) examples use these idioms in `decode` and are
-        **excluded from the build** (commented `[[example]]` in `Cargo.toml`) until
-        rewritten to the explicit form. All other examples build; workspace green.
+        The `rv32i_cpu`(+pipelined) examples used these idioms in `decode` and were
+        **rewritten** to the explicit form (total `from_bits` returning the enum
+        with an `INVALID`/default variant; `decode -> InstrDecoded`; an
+        `Opcode::INVALID` arm that halts instead of `panic!`). Both re-enabled and
+        passing; workspace green. (The pipelined version's only `panic!` was in its
+        testbench, not the module, so it needed no change.)
       - **Not yet:** the macro only sees a module's own body. A banned idiom inside
         a *file-scope helper* that gets inlined (e.g. a `from_bits` returning
         `Option`) is caught later by CHIR as an unsupported construct, not yet with
