@@ -47,8 +47,8 @@ equivalence test the moment it goes green.
 | `sequential/traffic_light_fsm` | ❌ | enum + `(phase, timer) = match …` | Enums, Tuple-match, Tuple-assign |
 | `cdc/two_domain_counter` | ❌ | `Bits::from_lit::<1>()` (0-arg ctor) | Const constructors, Multi-clock |
 | `sequential/shift_register` | ❌ | symbolic `Bits<N>` | Const generics, For-loops, LHS bit-assign |
-| `combinational/rotate_right` | ❌ | not detected (function-typed) | **Migration**, Const generics, For-loops |
-| `combinational/priority_encode` | ❌ | not detected (function-typed) | **Migration**, Const generics, For-loops |
+| `combinational/rotate_right` | ✅ | transpiles + Verilator-lint-clean + behaviorally verified (2026-07-24) | — |
+| `combinational/priority_encode` | ✅ | transpiles + Verilator-lint-clean + behaviorally verified (2026-07-24) | — |
 | `combinational/ripple_carry_adder` | ❌ | not detected (function-typed) | **Migration**, Submodule hierarchy |
 | `combinational/mux` | ❌ | array port `[Bits<W>; ELS]` | Array ports, Const generics |
 | `sequential/pipeline_mac` | ❌ | ambiguous width (FSM regs) | Enums / width inference; multi-module |
