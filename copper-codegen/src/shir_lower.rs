@@ -124,6 +124,17 @@ fn lower_stmt_list(
                     });
                 }
             }
+            CHIRStmt::ForLoop { var, start, end, body, .. } => {
+                let body_stmts = lower_stmt_list(body, promoted_names, renames)?;
+                if !body_stmts.is_empty() {
+                    out.push(SHIRStmt::ForLoop {
+                        var: var.clone(),
+                        start: rename_vars(lower_expr(start)?, renames),
+                        end: rename_vars(lower_expr(end)?, renames),
+                        body: body_stmts,
+                    });
+                }
+            }
             // Assign, AwaitTick — not pre_edge statements
             _ => {}
         }
@@ -667,6 +678,11 @@ fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
                 for s in &arm.body { collect_expr_vars_in_stmt(s, visitor); }
             }
         }
+        CHIRStmt::ForLoop { start, end, body, .. } => {
+            collect_expr_vars(start, visitor);
+            collect_expr_vars(end, visitor);
+            for s in body { collect_expr_vars_in_stmt(s, visitor); }
+        }
         CHIRStmt::AwaitTick { .. } => {}
     }
 }
@@ -847,6 +863,7 @@ impl HasSpan for CHIRStmt {
             CHIRStmt::AwaitTick { span, .. } => span,
             CHIRStmt::If { span, .. } => span,
             CHIRStmt::Match { span, .. } => span,
+            CHIRStmt::ForLoop { span, .. } => span,
         }
     }
 }

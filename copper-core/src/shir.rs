@@ -128,6 +128,13 @@ pub enum SHIRStmt {
         scrutinee: SHIRExpr,
         arms: Vec<SHIRMatchArm>,
     },
+    /// `for <var> in <start>..<end>` (exclusive), emitted as an SV `for`.
+    ForLoop {
+        var: String,
+        start: SHIRExpr,
+        end: SHIRExpr,
+        body: Vec<SHIRStmt>,
+    },
 }
 
 #[derive(Debug)]

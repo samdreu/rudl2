@@ -337,6 +337,19 @@ impl Emitter<'_> {
                 }
                 self.out.push_str(&format!("{}endcase\n", self.indent(level)));
             }
+            VLIRStmt::ForLoop { var, start, end, body } => {
+                self.out.push_str(&format!(
+                    "{}for (int {v} = {}; {v} < {}; {v}++) begin\n",
+                    self.indent(level),
+                    expr_str(start),
+                    expr_str(end),
+                    v = var,
+                ));
+                for st in body {
+                    self.comb_stmt(st, level + 1);
+                }
+                self.out.push_str(&format!("{}end\n", self.indent(level)));
+            }
         }
     }
 
@@ -379,6 +392,7 @@ fn collect_wire_decls(
                     collect_wire_decls(d, out, seen);
                 }
             }
+            VLIRStmt::ForLoop { body, .. } => collect_wire_decls(body, out, seen),
         }
     }
 }
@@ -463,5 +477,50 @@ fn unop_str(op: VLIRUnOp) -> &'static str {
         VLIRUnOp::ReductionAnd => "&",
         VLIRUnOp::ReductionOr => "|",
         VLIRUnOp::ReductionXor => "^",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use copper_core::vlir::{
+        VLIRBody, VLIRCombBody, VLIRExpr, VLIRModule, VLIRParam, VLIRPort, VLIRPortDir,
+        VLIRPortKind, VLIRStmt,
+    };
+
+    /// A `ForLoop` statement over a parameter bound renders as an SV `for` inside
+    /// `always_comb`, with the body indented (for-loop structure lowering).
+    #[test]
+    fn for_loop_renders_sv_for() {
+        let module = VLIRModule {
+            name: "loopy".to_string(),
+            params: vec![VLIRParam { name: "N".to_string(), default: Some(8) }],
+            ports: vec![VLIRPort {
+                name: "out".to_string(),
+                direction: VLIRPortDir::Output,
+                kind: VLIRPortKind::Logic,
+                width: Width::Concrete(8),
+            }],
+            body: VLIRBody::Combinational(VLIRCombBody {
+                submodules: vec![],
+                comb_stmts: vec![VLIRStmt::ForLoop {
+                    var: "i".to_string(),
+                    start: VLIRExpr::Lit { width: Width::Concrete(32), value: 0 },
+                    end: VLIRExpr::Var("N".to_string()),
+                    body: vec![VLIRStmt::WireAssign {
+                        name: "acc".to_string(),
+                        width: Width::Concrete(8),
+                        value: VLIRExpr::Var("i".to_string()),
+                    }],
+                }],
+                output_assigns: vec![],
+            }),
+        };
+        let sv = emit_verilog(&module, &EmitConfig::default());
+        assert!(
+            sv.contains("for (int i = 32'd0; i < N; i++) begin"),
+            "expected SV for loop, got:\n{sv}"
+        );
+        assert!(sv.contains("acc = i;"), "expected loop body, got:\n{sv}");
     }
 }

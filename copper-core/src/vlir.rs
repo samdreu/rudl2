@@ -156,6 +156,13 @@ pub enum VLIRStmt {
         arms: Vec<VLIRCaseArm>,
         default: Option<Vec<VLIRStmt>>,
     },
+    /// `for (int <var> = <start>; <var> < <end>; <var>++) begin … end`.
+    ForLoop {
+        var: String,
+        start: VLIRExpr,
+        end: VLIRExpr,
+        body: Vec<VLIRStmt>,
+    },
 }
 
 /// Statements inside `always_ff` blocks (non-blocking `<=` only).

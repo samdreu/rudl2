@@ -200,6 +200,17 @@ pub enum CHIRStmt {
         arms: Vec<CHIRMatchArm>,
         span: SourceSpan,
     },
+
+    /// A `for <var> in <start>..<end>` loop, emitted as a SystemVerilog `for`
+    /// (Verilator unrolls it at elaboration, so `end` may be a parameter). The
+    /// bound is exclusive (`<`).
+    ForLoop {
+        var: String,
+        start: CHIRExpr,
+        end: CHIRExpr,
+        body: Vec<CHIRStmt>,
+        span: SourceSpan,
+    },
 }
 
 impl CHIRStmt {
@@ -211,6 +222,7 @@ impl CHIRStmt {
             CHIRStmt::AwaitTick { span, .. } => span,
             CHIRStmt::If { span, .. } => span,
             CHIRStmt::Match { span, .. } => span,
+            CHIRStmt::ForLoop { span, .. } => span,
         }
     }
 }

@@ -254,7 +254,7 @@ fn lower_flat_stmts(
             // Conditional structures — including ones that drive output ports
             // (a Moore output). These lower into `always_comb`, where the port is
             // assigned on every path, so no latch is inferred.
-            SHIRStmt::If { .. } | SHIRStmt::Match { .. } => {
+            SHIRStmt::If { .. } | SHIRStmt::Match { .. } | SHIRStmt::ForLoop { .. } => {
                 comb.push(lower_comb_stmt(s, leg)?);
             }
         }
@@ -314,6 +314,12 @@ fn lower_comb_stmt(s: &SHIRStmt, leg: &Legalizer) -> LowerResult<VLIRStmt> {
             }
             Ok(VLIRStmt::Case { selector, arms: case_arms, default })
         }
+        SHIRStmt::ForLoop { var, start, end, body } => Ok(VLIRStmt::ForLoop {
+            var: var.clone(),
+            start: lower_expr(start, leg)?,
+            end: lower_expr(end, leg)?,
+            body: body.iter().map(|s| lower_comb_stmt(s, leg)).collect::<LowerResult<_>>()?,
+        }),
     }
 }
 
@@ -349,6 +355,12 @@ fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
                 .collect(),
             default: default.as_ref().map(|d| d.iter().map(clone_comb_stmt).collect()),
         },
+        VLIRStmt::ForLoop { var, start, end, body } => VLIRStmt::ForLoop {
+            var: var.clone(),
+            start: start.clone(),
+            end: end.clone(),
+            body: body.iter().map(clone_comb_stmt).collect(),
+        },
     }
 }
 
@@ -361,6 +373,7 @@ fn first_port_drive(s: &SHIRStmt) -> Option<String> {
             .chain(else_stmts.iter().flatten())
             .find_map(first_port_drive),
         SHIRStmt::Match { arms, .. } => arms.iter().flat_map(|a| &a.stmts).find_map(first_port_drive),
+        SHIRStmt::ForLoop { body, .. } => body.iter().find_map(first_port_drive),
     }
 }
 
@@ -572,6 +585,9 @@ fn assigned_on_all_paths(stmts: &[VLIRStmt]) -> HashSet<String> {
                     all.extend(common.unwrap_or_default());
                 }
             }
+            // A `for` loop may iterate zero times (bound could be 0), so nothing
+            // it assigns is guaranteed on all paths — conservative, and correct.
+            VLIRStmt::ForLoop { .. } => {}
         }
     }
     all
@@ -624,6 +640,9 @@ fn assigned_on_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
                 if let Some(d) = default {
                     any.extend(assigned_on_any_path(d));
                 }
+            }
+            VLIRStmt::ForLoop { body, .. } => {
+                any.extend(assigned_on_any_path(body));
             }
         }
     }
@@ -753,6 +772,7 @@ fn collect_stmt_names(stmts: &[SHIRStmt], leg: &mut Legalizer) {
                     collect_stmt_names(&a.stmts, leg);
                 }
             }
+            SHIRStmt::ForLoop { body, .. } => collect_stmt_names(body, leg),
         }
     }
 }

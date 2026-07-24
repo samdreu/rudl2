@@ -1232,6 +1232,45 @@ fn lower_expr_stmt(
         // it. Elide it.
         ExprType::Const(_) => {}
 
+        // `for <var> in <start>..<end> { <body> }` → a SystemVerilog `for` loop
+        // (Verilator unrolls it at elaboration, so `end` may be a parameter). The
+        // loop variable is in scope for the body.
+        ExprType::ForLoop(f) => {
+            let var = f.pat_text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            if !is_ident(&var) {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!("unsupported for-loop pattern `{}`; use a simple loop variable", f.pat_text),
+                    span,
+                    suggested_rewrite: None,
+                });
+            }
+            let (start, end) = match &*f.iter {
+                ExprType::Range(r) if !r.inclusive => {
+                    let start = match &r.start {
+                        Some(s) => lower_expr(s, ctx)?,
+                        None => CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(32) }, value: 0 }),
+                    };
+                    let end = match &r.end {
+                        Some(e) => lower_expr(e, ctx)?,
+                        None => return Err(CHIRLowerError::UnsupportedConstruct {
+                            description: "for-loop range needs an upper bound".to_string(),
+                            span, suggested_rewrite: None,
+                        }),
+                    };
+                    (start, end)
+                }
+                _ => return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: "only exclusive range `start..end` for-loops are supported".to_string(),
+                    span,
+                    suggested_rewrite: Some("rewrite the iterator as `a..b`".to_string()),
+                }),
+            };
+            // The loop variable is an integer index, in scope for the body.
+            ctx.symbols.insert(var.clone(), CHIRType::UInt { width: Width::Concrete(32) });
+            let body = lower_stmts(&f.body, ctx)?;
+            out.push(CHIRStmt::ForLoop { var, start, end, body, span });
+        }
+
         ExprType::Await(await_expr) => {
             if is_tick_await(&await_expr.base) {
                 out.push(CHIRStmt::AwaitTick {
@@ -2408,6 +2447,11 @@ fn validate_module(module: &CHIRModule) -> Result<(), CHIRLowerError> {
     for port in &module.ports {
         known.insert(port.name.clone());
     }
+    // Module parameters (const generics) are usable in expressions (e.g. a loop
+    // bound `N`); they resolve to SystemVerilog parameters at emission.
+    for p in &module.params {
+        known.insert(p.name.clone());
+    }
 
     match &module.body {
         CHIRBody::Combinational(body) => {
@@ -2470,6 +2514,16 @@ fn validate_stmts(
                     let mut arm_known = known.clone();
                     validate_stmts(&arm.body, &mut arm_known, *s)?;
                 }
+            }
+            CHIRStmt::ForLoop { var, start, end, body, span: s } => {
+                validate_expr(start, known, *s)?;
+                validate_expr(end, known, *s)?;
+                // The loop variable is in scope for the body. Bounds like a module
+                // parameter `N` are not `known` locals, so they are exempt from the
+                // use-before-def check (they resolve to SV parameters at emission).
+                let mut body_known = known.clone();
+                body_known.insert(var.clone());
+                validate_stmts(body, &mut body_known, *s)?;
             }
         }
     }
@@ -4017,6 +4071,32 @@ mod tests {
         let reg = build_fn_registry(&fir);
         assert!(!reg.contains_key("Foo::get"));
         assert!(!reg.contains_key("get"));
+    }
+
+    // ── for-loop lowering ─────────────────────────────────────────────────────
+
+    #[test]
+    fn for_loop_lowers_to_chir_forloop_over_param_bound() {
+        // `for i in 0..N { .. }` → CHIRStmt::ForLoop with the param bound and the
+        // loop variable in scope for the (non-empty) body.
+        let module = "#[hardware(combinational)] \
+                      fn m<const N: usize>(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let mut acc: Bits<8> = a.read(); \
+                          for i in 0..N { acc = acc + Bits::from_u8(1); } \
+                          out.write(acc); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry()).expect("lowers");
+        let CHIRBody::Combinational(b) = chir.body else { panic!("expected comb body") };
+        let forloop = b.stmts.iter().find_map(|s| match s {
+            CHIRStmt::ForLoop { var, end, body, .. } => Some((var.clone(), end.clone(), body.len())),
+            _ => None,
+        });
+        let (var, end, body_len) = forloop.expect("a ForLoop stmt");
+        assert_eq!(var, "i");
+        // Bound `N` is a module parameter reference.
+        assert!(matches!(end, CHIRExpr::Var(ref n) if n == "N"), "end should be Var(N), got {end:?}");
+        assert!(body_len >= 1, "loop body should be captured");
     }
 
     // ── const-block elision ───────────────────────────────────────────────────
