@@ -822,9 +822,11 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             span: capture_source_span(e),
         }),
 
-        // `panic!(...)`, `println!(...)`, etc. — a macro call in expression
-        // position. See `classify_raw_stmt_kind` for the statement-position form.
-        Expr::Macro(e) => ExprType::Macro(macro_to_expr(&e.mac, capture_source_span(e))),
+        // `matches!(x, Pat)` desugars to `match x { Pat => true, _ => false }`,
+        // reusing match-as-value lowering. Other macros (`panic!`, `println!`, …)
+        // are captured structurally as `ExprMacro`.
+        Expr::Macro(e) => desugar_matches(&e.mac, hardware_fns, capture_source_span(e))
+            .unwrap_or_else(|| ExprType::Macro(macro_to_expr(&e.mac, capture_source_span(e)))),
 
         // Fallback for unsupported/unhandled expressions
         _ => ExprType::Lit(ExprLit {
@@ -832,6 +834,41 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             span: capture_source_span(expr),
         }),
     }
+}
+
+/// Desugar `matches!(scrutinee, pattern)` into an equivalent match-as-value
+/// (`match scrutinee { pattern => true, _ => false }`) so it lowers through the
+/// existing match machinery. Returns `None` for any other macro.
+fn desugar_matches(
+    mac: &syn::Macro,
+    hardware_fns: &std::collections::HashSet<String>,
+    span: SourceSpan,
+) -> Option<ExprType> {
+    if mac.path.segments.last().map(|s| s.ident != "matches").unwrap_or(true) {
+        return None;
+    }
+    use syn::parse::Parser;
+    let parse = |input: syn::parse::ParseStream| -> syn::Result<(syn::Expr, syn::Pat)> {
+        let scrutinee: syn::Expr = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+        Ok((scrutinee, pat))
+    };
+    let (scrutinee, pat) = parse.parse2(mac.tokens.clone()).ok()?;
+    let bool_arm = |value: bool, pattern_text: String| ExprMatchArm {
+        pattern_text,
+        guard: None,
+        body: Box::new(ExprType::Lit(ExprLit { text: value.to_string(), span })),
+        span,
+    };
+    Some(ExprType::Match(ExprMatch {
+        scrutinee: Box::new(parse_expr_type(&scrutinee, hardware_fns)),
+        arms: vec![
+            bool_arm(true, pat.to_token_stream().to_string()),
+            bool_arm(false, "_".to_string()),
+        ],
+        span,
+    }))
 }
 
 /// Shared lowering of a `syn::Macro` invocation to `ExprMacro`, used from both

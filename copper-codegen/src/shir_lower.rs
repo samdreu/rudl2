@@ -273,16 +273,15 @@ fn lower_seq_body(
         //             reg_assigns from seg_1 / trailing (same edge, next iteration wraps here).
         // Both segments share a forwarding map so seg_1 sees seg_0's register assignments.
         let mut pre_edge = lower_pre_edge_stmts(&segments[0], &promoted_names, &no_renames)?;
-        // Wires declared *after* the tick are the combinational next-state logic
-        // feeding this edge's register updates, so they belong to the same
-        // phase's pre-edge block. (Only wires are hoisted — port drives keep
-        // their original timing.)
-        let trailing_wires: Vec<CHIRStmt> = segments[1]
-            .iter()
-            .filter(|s| matches!(s, CHIRStmt::Wire { .. }))
-            .cloned()
-            .collect();
-        pre_edge.extend(lower_pre_edge_stmts(&trailing_wires, &promoted_names, &no_renames)?);
+        // The trailing (post-tick) segment's *combinational* logic — wires and
+        // output-port drives, including inside `if`/`match` — belongs to this
+        // phase's pre-edge: it computes the registered outputs from the state the
+        // edge just latched (e.g. a Moore output written after the tick). Passing
+        // the whole segment through the pre-edge lowering keeps those and drops
+        // the register reassignments (which `extract_reg_updates` below turns into
+        // this edge's post_edge updates). Previously only `Wire`s were hoisted, so
+        // a post-tick `out.write(...)` was silently dropped.
+        pre_edge.extend(lower_pre_edge_stmts(&segments[1], &promoted_names, &no_renames)?);
         let mut all_post_edge = extract_reg_updates(
             &segments[0],
             &seq.registers,

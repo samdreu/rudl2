@@ -2396,15 +2396,8 @@ fn lower_lit_expr(
 ) -> Result<CHIRExpr, CHIRLowerError> {
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
 
-    if is_ident(&compact) {
-        return Ok(CHIRExpr::Var(compact));
-    }
-
-    if let Some((value, _)) = parse_int_literal(&compact) {
-        let ty = infer_type_from_suffix(&compact).unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
-        return Ok(CHIRExpr::Lit(CHIRLit { ty, value }));
-    }
-
+    // Keyword literals — checked before the identifier case (`true`/`false` are
+    // valid identifiers and would otherwise be treated as variable references).
     match compact.as_str() {
         "true"  => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::Bool, value: 1 })),
         "false" => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::Bool, value: 0 })),
@@ -2412,6 +2405,15 @@ fn lower_lit_expr(
         "Logic::One"  => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(1) }, value: 1 })),
         "Logic::Zero" => return Ok(CHIRExpr::Lit(CHIRLit { ty: CHIRType::UInt { width: Width::Concrete(1) }, value: 0 })),
         _ => {}
+    }
+
+    if is_ident(&compact) {
+        return Ok(CHIRExpr::Var(compact));
+    }
+
+    if let Some((value, _)) = parse_int_literal(&compact) {
+        let ty = infer_type_from_suffix(&compact).unwrap_or(CHIRType::UInt { width: Width::Concrete(64) });
+        return Ok(CHIRExpr::Lit(CHIRLit { ty, value }));
     }
 
     // An enum variant path (`State::IDLE`) → its encoded value.

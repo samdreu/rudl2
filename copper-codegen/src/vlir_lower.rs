@@ -1574,9 +1574,12 @@ endmodule
 
     /// The deferred-feature guards produce errors, not wrong Verilog.
     #[test]
-    fn tuple_match_is_rejected_not_miscompiled() {
-        // A match on a tuple scrutinee is an M2 feature; it must surface an
-        // error rather than silently emitting incorrect SystemVerilog.
+    fn tuple_match_lowers_to_case_over_concat() {
+        // A match on a tuple scrutinee (once an M2-deferred feature) now lowers to
+        // a `case` over the concatenated selector `{j, k}` — a correct JK
+        // flip-flop (hold / reset / set / toggle). Its next-state `match` sits in
+        // the post-tick (trailing) segment, so this also covers the trailing
+        // segment's register updates.
         let src = r#"
             async fn jk(clk: Clock<C>, j: In<bool, C>, k: In<bool, C>, q: Out<bool, C>) {
                 let mut state = false;
@@ -1593,8 +1596,9 @@ endmodule
             }
         "#;
         let f: syn::ItemFn = syn::parse_str(src).expect("parse");
-        let result =
-            transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default());
-        assert!(result.is_err(), "tuple match should be rejected, got: {result:?}");
+        let sv = transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default())
+            .expect("tuple-scrutinee match now transpiles");
+        assert!(sv.contains("case ({j, k})"), "expected case over {{j, k}}: {sv}");
+        assert!(sv.contains("state <= (!state)"), "expected toggle in the j=k=1 arm: {sv}");
     }
 }
