@@ -337,6 +337,7 @@ pub enum ExprType {
     Const(ExprConst),
     Try(ExprTry),
     Macro(ExprMacro),
+    ForLoop(ExprForLoop),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +548,18 @@ pub struct ExprUnary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprWhile {
     pub condition: Box<ExprType>,
+    pub body: Vec<RawStmt>,
+    pub span: SourceSpan,
+}
+
+/// A `for <pat> in <iter> { <body> }` loop. `pat_text` is the loop-variable
+/// pattern as source text (`i`, `_`); `iter` is the iterator expression, usually
+/// a range (`0..N`). Lowering unrolls or emits an SV loop (a later increment);
+/// this captures it structurally instead of dropping it to opaque text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprForLoop {
+    pub pat_text: String,
+    pub iter: Box<ExprType>,
     pub body: Vec<RawStmt>,
     pub span: SourceSpan,
 }

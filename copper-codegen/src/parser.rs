@@ -3,7 +3,7 @@ use copper_core::frontend_ir::{
     ExprBlock, ExprBreak, ExprConst, ExprContinue, ExprField, ExprIf, ExprIndex, ExprLet, ExprLit, ExprLoop,
     ExprMacro, ExprMatch, ExprTry,
     ExprMatchArm, ExprMethodCall, ExprPath, ExprRange, ExprReference, ExprRepeat, ExprReturn, ExprStmt,
-    ExprStruct, ExprStructField, ExprTuple, ExprType, ExprUnary, ExprWhile, ExprYield, FrontendClassification,
+    ExprForLoop, ExprStruct, ExprStructField, ExprTuple, ExprType, ExprUnary, ExprWhile, ExprYield, FrontendClassification,
     FrontendFnIR, FrontendImplIR, FrontendModuleIR, FrontendSignature, FrontendTraitIR, GenericParamKind,
     GenericParamMeta, HardwareMode, ItemConst, ItemEnum,
     ItemMacro, ItemOther, ItemStmt, ItemStruct, ItemType, LocalStmt, RawParam, RawStmt, RawStmtKind,
@@ -792,6 +792,13 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
 
         Expr::While(e) => ExprType::While(ExprWhile {
             condition: Box::new(parse_expr_type(&e.cond, hardware_fns)),
+            body: parse_block_stmts(&e.body, hardware_fns),
+            span: capture_source_span(e),
+        }),
+
+        Expr::ForLoop(e) => ExprType::ForLoop(ExprForLoop {
+            pat_text: e.pat.to_token_stream().to_string(),
+            iter: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             body: parse_block_stmts(&e.body, hardware_fns),
             span: capture_source_span(e),
         }),
@@ -2671,6 +2678,20 @@ mod tests {
                 assert!(matches!(method.args[0], ExprType::Lit(_)));
             }
             _ => panic!("expected method call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_for_loop_captured_structurally() {
+        // `for i in 0..N { ... }` is captured as ExprForLoop, not opaque text.
+        let expr: Expr = parse_quote!(for i in 0..N { o[i] = a[i]; });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::ForLoop(f) => {
+                assert_eq!(compact_ws(&f.pat_text), "i");
+                assert!(matches!(*f.iter, ExprType::Range(_)), "iter should be a range");
+                assert_eq!(f.body.len(), 1);
+            }
+            other => panic!("expected for-loop, got {other:?}"),
         }
     }
 

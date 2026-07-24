@@ -1227,6 +1227,11 @@ fn lower_expr_stmt(
     out: &mut Vec<CHIRStmt>,
 ) -> Result<(), CHIRLowerError> {
     match expr {
+        // A `const { … }` block (e.g. `const { assert!(N == clog2(M)) }`) is a
+        // compile-time check with no hardware meaning — Rust has already verified
+        // it. Elide it.
+        ExprType::Const(_) => {}
+
         ExprType::Await(await_expr) => {
             if is_tick_await(&await_expr.base) {
                 out.push(CHIRStmt::AwaitTick {
@@ -4012,6 +4017,31 @@ mod tests {
         let reg = build_fn_registry(&fir);
         assert!(!reg.contains_key("Foo::get"));
         assert!(!reg.contains_key("get"));
+    }
+
+    // ── const-block elision ───────────────────────────────────────────────────
+
+    #[test]
+    fn const_block_assertion_is_elided() {
+        // `const { assert!(..) }` is a compile-time check; it lowers to nothing
+        // and does not block the module.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          const { assert!(8 == 8, \"width\") }; \
+                          out.write(a.read()); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        let chir = lower_to_chir(&fir, &no_hw(), &empty_registry())
+            .expect("const-block should be elided, not block lowering");
+        // The body has exactly the port write — the const block produced no stmt.
+        if let CHIRBody::Combinational(b) = chir.body {
+            assert_eq!(
+                b.stmts.iter().filter(|s| matches!(s, CHIRStmt::PortWrite { .. })).count(),
+                1
+            );
+        } else {
+            panic!("expected combinational body");
+        }
     }
 
     // ── Struct lowering (milestone 2) ─────────────────────────────────────────
