@@ -518,6 +518,31 @@ model, and the simulator API.
         the same actionable message — a future polish. A first-class `Valid<T>`
         sugar (explicit `.valid`/`.payload`, no `?`/panic) could be revisited later
         if ergonomics demand, but is out of scope.
+
+      **Design note — why a syntactic scan, and the `HardwareType`-bound path
+      (future refinement, decided to defer 2026-07-23).** We considered making
+      these *type* errors instead of a macro scan. Per construct:
+      - **`?`** is *already* a type error in a module body — a hardware fn returns
+        `()`, and `?` needs a `Try`/`FromResidual` return type. The macro check
+        just supplies a nicer, domain-specific message over an error Rust already
+        gives.
+      - **`panic!`** *cannot* be a type error: it has type `!` and coerces to
+        anything, so it is always well-typed. Rejecting it requires a syntactic
+        scan or a custom lint — **there is no type-only route**, which is the
+        decisive reason the scan stays even if the rest moves to types.
+      - **`Option`** *could* be a genuine type error via a `HardwareType` marker
+        trait (implemented by `Bits`/`Logic`/hardware structs, not `Option`)
+        threaded through the hardware value model so every value in a module body
+        must be provably a hardware type. Upsides over the scan: it also catches
+        banned idioms **inside inlined helpers** (closes the gap above) and has no
+        syntactic false positives (a user fn named `Some`, an unrelated `unwrap`).
+        Cost: it interacts with generics, inference, and every port/op signature —
+        a proper language-design milestone, best paired with the wider typing /
+        width-checking story, **not** a same-day swap.
+      **Decision:** keep the macro scan as the mechanism now (ships, tailored
+      errors, and needed for `panic!` regardless); pursue the `HardwareType` bound
+      later as its own milestone — it would subsume only the `Option` third of the
+      scan, never the `panic!` part.
 - [ ] **P1 — Decide the conditional/phased output semantics** (the open design
       question). Options and the prototype evidence are in
       `tests/affine_port_prototype.rs` and the coverage map. Gates Phase D's P0 items.
