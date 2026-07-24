@@ -75,6 +75,9 @@ pub struct HardwareTest {
     verilator_waveform_path: Option<String>,
     actual_trace: SimulationTrace,
     phase_data: Vec<PhasedCycleData>,
+    /// SystemVerilog module parameter overrides for Verilator (`-G<name>=<val>`),
+    /// so a parametric DUT is Verilated at the same widths the simulator ran.
+    params: Vec<(String, i64)>,
 }
 
 /// One simulation cycle with explicit pre-clock and post-clock signal snapshots.
@@ -98,12 +101,20 @@ impl HardwareTest {
             verilator_waveform_path: None,
             actual_trace: SimulationTrace::new(),
             phase_data: Vec::new(),
+            params: Vec::new(),
         }
     }
 
     /// Set the Verilog file path for Verilator cross-verification.
     pub fn with_verilog(mut self, path: &str) -> Self {
         self.verilog_path = Some(path.to_string());
+        self
+    }
+
+    /// Override SystemVerilog module parameters when Verilating (`-GN=8`), so a
+    /// parametric DUT is checked at the concrete widths the simulator used.
+    pub fn with_params(mut self, params: &[(&str, i64)]) -> Self {
+        self.params = params.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         self
     }
 
@@ -244,7 +255,7 @@ impl HardwareTest {
         // 4. Run Verilator cross-validation (with optional trace output)
         if let Some(ref verilog_path) = self.verilog_path {
             let vcd_out = self.verilator_waveform_path.as_deref();
-            match verify_with_verilator_traced(verilog_path, &self.name, &self.actual_trace, vcd_out) {
+            match verify_with_verilator_traced(verilog_path, &self.name, &self.actual_trace, vcd_out, &self.params) {
                 Ok(true) => {
                     result.verilator_ok = Some(true);
                     result.verilator_waveform_path = self.verilator_waveform_path.clone();

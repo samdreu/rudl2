@@ -51,7 +51,7 @@ equivalence test the moment it goes green.
 | `combinational/priority_encode` | ✅ | transpiles + Verilator-lint-clean + behaviorally verified (2026-07-24) | — |
 | `combinational/ripple_carry_adder` | ❌ | not detected (function-typed) | **Migration**, Submodule hierarchy |
 | `combinational/mux` | ❌ | array port `[Bits<W>; ELS]` | Array ports, Const generics |
-| `sequential/pipeline_mac` | ❌ | ambiguous width (FSM regs) | Enums / width inference; multi-module |
+| `sequential/pipeline_mac` | ⚠️ | transpiles + lint-clean, but **NOT sim-equivalent**: phase-FSM vs sim input-read timing mismatch (2026-07-24) | Sim/hardware execution-model reconciliation |
 | `memory/dual_port_ram` | ❌ | `Memory::<…>` as a wire | Memory RTL lowering |
 | `uart/rx` | ❌ | `while` loop | **Migration** (rewrite to `loop`+tick) |
 | `uart/system` | ❌ | 3 modules + submodule wiring | Submodule hierarchy |

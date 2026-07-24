@@ -250,7 +250,7 @@ pub fn verify_with_verilator(
     module_name: &str,
     trace: &SimulationTrace,
 ) -> Result<bool, String> {
-    verify_with_verilator_traced(verilog_file, module_name, trace, None)
+    verify_with_verilator_traced(verilog_file, module_name, trace, None, &[])
 }
 
 /// Run Verilator simulation, compare with expected trace, and optionally dump
@@ -264,6 +264,7 @@ pub(crate) fn verify_with_verilator_traced(
     module_name: &str,
     trace: &SimulationTrace,
     vcd_output_path: Option<&str>,
+    params: &[(String, i64)],
 ) -> Result<bool, String> {
     let has_clock = verilog_has_clock_port(verilog_file)?;
     let tracing   = vcd_output_path.is_some();
@@ -294,6 +295,13 @@ pub(crate) fn verify_with_verilator_traced(
         );
     }
 
+    // Module parameter overrides (`-GN=8`), so the Verilated design matches the
+    // widths the simulator ran with. Built here so the strings outlive the args.
+    let param_args: Vec<String> = params
+        .iter()
+        .map(|(name, value)| format!("-G{name}={value}"))
+        .collect();
+
     // Build compile arguments
     let mut verilator_args: Vec<&str> = vec![
         "--cc", "--exe", "--build",
@@ -301,6 +309,9 @@ pub(crate) fn verify_with_verilator_traced(
         "-Wall", "-Wno-DECLFILENAME",
         "-CFLAGS", "-std=c++14",
     ];
+    for p in &param_args {
+        verilator_args.push(p);
+    }
     if tracing {
         verilator_args.push("--trace");
     }

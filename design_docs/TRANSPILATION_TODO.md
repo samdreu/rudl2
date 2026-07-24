@@ -96,6 +96,18 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
       "write FSMs naturally with async/await" claim rests on. Needs a richer FSM
       than the linear phase counter: states that self-loop with counters and take
       data-dependent transitions.
+- [ ] **P1 — Sim vs phase-FSM input-read timing (found via equivalence harness,
+      2026-07-24).** `mac_pipeline` transpiles + lints clean, but the new
+      `mac_pipeline_equivalence` test is **`verilator: FAIL` with `trace: PASS`** —
+      the transpiled 3-phase FSM reads pipeline inputs on a *regular* every-3-cycle
+      cadence (phase 0 at cycles 1, 4, 7…), while the simulator reads on an
+      *irregular* cadence (cycle 1 pre-edge, then post-edge of cycles 3, 6, 9…) — an
+      artifact of the async/await pre/post-edge + synced-read execution model. Same
+      inputs → different outputs. So a straight-line multi-phase pipeline is **not
+      currently sim-equivalent** (earlier "mac_pipeline verified" was wrong). The
+      test is `#[ignore]`d with this explanation. Fix = reconcile the two execution
+      models (which cycle a `.read()` samples). Related to the `pre_edge_barrier`
+      note above and the control-extraction milestone.
 - [ ] **P2 —** Confirm the trailing-segment fix is right: post-tick *wires* are hoisted
       into the same phase's pre-edge, port drives keep their timing. Worth a second look.
 

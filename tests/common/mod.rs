@@ -75,6 +75,14 @@ impl EquivalenceTest {
         }
     }
 
+    /// Override the transpiled module's SystemVerilog parameters for the Verilator
+    /// cross-check (e.g. `&[("N", 8), ("N_1", 7)]`) — the same widths the
+    /// simulator ran the parametric DUT at.
+    pub fn with_params(mut self, params: &[(&str, i64)]) -> Self {
+        self.test = self.test.with_params(params);
+        self
+    }
+
     /// Like `new`, but checks the simulator against the reference model only —
     /// no transpilation, no Verilator cross-check. Use this for DUTs where the
     /// transpiler is known not to agree with the simulator yet (see
