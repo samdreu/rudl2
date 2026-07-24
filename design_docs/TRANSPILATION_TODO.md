@@ -271,22 +271,9 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
      scrutinee arity. So `alu_exec_reg`/`alu_exec_imm`-shaped `let r = match (t) {
      .. }` (partial-wildcard arms, if-expr arm bodies, trailing `_`) now lowers.
      2 tests; golden e2e unchanged.
-  3. [~] **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`.
-     **Increment 1 done (2026-07-23) — `unwrap_or` by arm-folding.** When the
-     Option producer is *visible* (a `Some`/`None`/`match`, e.g. an inlined
-     `from_bits`), `opt.unwrap_or(default)` is lowered by rewriting `Some(v)` → v
-     and `None` → default in place, then lowering the result as match-as-value —
-     no materialized Option needed. Sees through one level of free-fn inlining
-     (`Type::from_bits(x).unwrap_or(d)`). `unwrap_or`'s result type is inferred
-     from the default arg. So `BranchCond::from_bits(f3).unwrap_or(Beq)` — the CPU
-     BRANCH arm — now lowers end-to-end (inline → fold → `case`). 4 tests.
-     **Chosen approach:** fold-into-arms where the producer is visible, *not* a
-     valid-bit struct (deferred until needed). **Deferred (increment 2+, gate the
-     rest of the CPU):** the `?` operator and cross-function validity threading
-     (`decode` uses `Opcode::from_bits(..)?`); `match opt { Some(d) => d, None =>
-     panic!() }` (panic is unsynthesizable — needs a trap/assume-valid policy); and
-     a **let-bound** Option `Var` (needs the materialized valid-bit representation,
-     since the producer isn't visible at the use site — currently a clear error).
+  3. **`Option`/`Result` + `?`** — ⚠️ the hard one; hardware has no `Option`, so
+     this needs a real design decision (compile-time resolution of pure decoders
+     vs. valid-bit lowering). Likely gates the CPU regardless of capture.
   4. **Enum-with-methods** (`Opcode::from_bits -> Option<Self>`; matching on
      struct-held enum fields).
   5. **Const-generic monomorphization** (consumes #2 generics + #1 turbofish).
