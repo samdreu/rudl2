@@ -61,21 +61,62 @@ fn lower_comb_body(
         .map(lower_submodule)
         .collect::<Result<_, _>>()?;
 
-    let stmts = lower_stmt_list(&comb.stmts, &std::collections::HashSet::new(), &HashMap::new())?;
+    // A combinational local may be *reassigned* (`acc = acc + 1`, incl. inside a
+    // loop). Such an Assign becomes another blocking assign to the same signal;
+    // its declared type comes from the original `let` wire, collected here.
+    let mut wire_types = HashMap::new();
+    collect_wire_types(&comb.stmts, &mut wire_types);
+
+    let stmts = lower_stmt_list(&comb.stmts, &std::collections::HashSet::new(), &HashMap::new(), &wire_types)?;
 
     Ok(SHIRCombBody { submodules, stmts })
 }
 
+/// Collect every combinational wire's declared type (`let` bindings), recursing
+/// into conditional and loop bodies.
+fn collect_wire_types(
+    stmts: &[CHIRStmt],
+    out: &mut HashMap<String, copper_core::chir::CHIRType>,
+) {
+    for stmt in stmts {
+        match stmt {
+            CHIRStmt::Wire { name, ty, .. } => { out.insert(name.clone(), ty.clone()); }
+            CHIRStmt::If { then_body, else_body, .. } => {
+                collect_wire_types(then_body, out);
+                if let Some(eb) = else_body { collect_wire_types(eb, out); }
+            }
+            CHIRStmt::Match { arms, .. } => {
+                for a in arms { collect_wire_types(&a.body, out); }
+            }
+            CHIRStmt::ForLoop { body, .. } => collect_wire_types(body, out),
+            _ => {}
+        }
+    }
+}
+
 /// Lower a CHIR statement list into SHIR statements, handling wire promotion renames.
-/// Used in both comb body lowering and pre_edge lowering.
+/// Used in both comb body lowering and pre_edge lowering. `wire_types` names the
+/// combinational wires that a reassignment may target (empty for the sequential
+/// pre-edge path, where an `Assign` is a register update handled elsewhere).
 fn lower_stmt_list(
     stmts: &[CHIRStmt],
     promoted_names: &std::collections::HashSet<String>,
     renames: &HashMap<String, String>,
+    wire_types: &HashMap<String, copper_core::chir::CHIRType>,
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
     let mut out = Vec::new();
     for stmt in stmts {
         match stmt {
+            // A reassignment of a known combinational wire → another blocking
+            // assign to it (`name = value;`). The single `logic` declaration is
+            // deduplicated downstream, so repeated assigns share one wire.
+            CHIRStmt::Assign { target, value, .. } if wire_types.contains_key(target) => {
+                out.push(SHIRStmt::Wire {
+                    name: target.clone(),
+                    ty: wire_types[target].clone(),
+                    value: rename_vars(lower_expr(value)?, renames),
+                });
+            }
             CHIRStmt::Wire { name, ty, value, .. } => {
                 out.push(SHIRStmt::Wire {
                     name: name.clone(),
@@ -90,9 +131,9 @@ fn lower_stmt_list(
                 });
             }
             CHIRStmt::If { condition, then_body, else_body, .. } => {
-                let then_stmts = lower_stmt_list(then_body, promoted_names, renames)?;
+                let then_stmts = lower_stmt_list(then_body, promoted_names, renames, wire_types)?;
                 let else_stmts = else_body.as_ref()
-                    .map(|eb| lower_stmt_list(eb, promoted_names, renames))
+                    .map(|eb| lower_stmt_list(eb, promoted_names, renames, wire_types))
                     .transpose()?;
                 if !then_stmts.is_empty() || else_stmts.as_ref().map_or(false, |e| !e.is_empty()) {
                     out.push(SHIRStmt::If {
@@ -105,7 +146,7 @@ fn lower_stmt_list(
             CHIRStmt::Match { scrutinee, arms, .. } => {
                 let shir_arms = arms.iter()
                     .map(|arm| {
-                        let stmts = lower_stmt_list(&arm.body, promoted_names, renames)?;
+                        let stmts = lower_stmt_list(&arm.body, promoted_names, renames, wire_types)?;
                         Ok(SHIRMatchArm {
                             patterns: arm.patterns.iter()
                                 .map(|p| lower_pattern(p))
@@ -125,7 +166,7 @@ fn lower_stmt_list(
                 }
             }
             CHIRStmt::ForLoop { var, start, end, body, .. } => {
-                let body_stmts = lower_stmt_list(body, promoted_names, renames)?;
+                let body_stmts = lower_stmt_list(body, promoted_names, renames, wire_types)?;
                 if !body_stmts.is_empty() {
                     out.push(SHIRStmt::ForLoop {
                         var: var.clone(),
@@ -445,7 +486,10 @@ fn lower_pre_edge_stmts(
     promoted_names: &HashSet<String>,
     renames: &HashMap<String, String>,
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
-    lower_stmt_list(stmts, promoted_names, renames)
+    // The sequential pre-edge path has no combinational reassignments (an `Assign`
+    // there is a register update handled by the segment logic), so the wire-type
+    // map is empty and such assigns are left for that path.
+    lower_stmt_list(stmts, promoted_names, renames, &HashMap::new())
 }
 
 // ── Helpers: register update extraction ──────────────────────────────────────

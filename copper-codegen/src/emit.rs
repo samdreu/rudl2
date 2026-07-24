@@ -341,8 +341,8 @@ impl Emitter<'_> {
                 self.out.push_str(&format!(
                     "{}for (int {v} = {}; {v} < {}; {v}++) begin\n",
                     self.indent(level),
-                    expr_str(start),
-                    expr_str(end),
+                    loop_bound_str(start),
+                    loop_bound_str(end),
                     v = var,
                 ));
                 for st in body {
@@ -407,6 +407,17 @@ fn range_str(w: &Width) -> String {
         Width::Concrete(n) => format!("[{}:0] ", n - 1),
         // A parametric width `N` renders as `[N-1:0]`.
         Width::Param(name) => format!("[{name}-1:0] "),
+    }
+}
+
+/// A `for`-loop bound renders as a plain integer, not a width-sized literal —
+/// the loop variable is a 32-bit `int`, so `64'd0` would width-truncate. A
+/// literal bound becomes its decimal value; anything else (e.g. a `parameter N`)
+/// uses the normal expression form.
+fn loop_bound_str(e: &VLIRExpr) -> String {
+    match e {
+        VLIRExpr::Lit { value, .. } => value.to_string(),
+        other => expr_str(other),
     }
 }
 
@@ -518,7 +529,7 @@ mod tests {
         };
         let sv = emit_verilog(&module, &EmitConfig::default());
         assert!(
-            sv.contains("for (int i = 32'd0; i < N; i++) begin"),
+            sv.contains("for (int i = 0; i < N; i++) begin"),
             "expected SV for loop, got:\n{sv}"
         );
         assert!(sv.contains("acc = i;"), "expected loop body, got:\n{sv}");

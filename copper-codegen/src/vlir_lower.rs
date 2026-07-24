@@ -816,6 +816,27 @@ mod e2e_tests {
     }
 
     #[test]
+    fn for_loop_with_reassignment_emits_end_to_end() {
+        // The loop body reassigns a combinational local — this is what makes a
+        // for-loop produce real hardware (previously the reassign was dropped).
+        let src = r#"
+            fn accumulate<const N: usize>(a: In<Bits<32>, ()>, out: Out<Bits<32>, ()>) {
+                let mut acc: Bits<32> = a.read();
+                for i in 0..N {
+                    acc = acc + Bits::from_u32(1);
+                }
+                out.write(acc);
+            }
+        "#;
+        let sv = transpile(src);
+        println!("\n===== GENERATED VERILOG (for + reassign) =====\n{sv}\n=====");
+        assert!(sv.contains("; i < N; i++) begin"), "expected SV for loop: {sv}");
+        assert!(sv.contains("acc = (acc + 32'd1);"), "expected blocking reassign: {sv}");
+        // `acc` is declared exactly once despite two assignments to it.
+        assert_eq!(sv.matches("logic [31:0] acc;").count(), 1, "acc declared once: {sv}");
+    }
+
+    #[test]
     fn const_generic_module_emits_sv_parameter() {
         // A const-generic `Bits<N>` module emits a SystemVerilog `parameter` and
         // parametric `[N-1:0]` port ranges (M2 const-generic increment 1).
