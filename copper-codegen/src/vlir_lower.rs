@@ -16,7 +16,7 @@ use copper_core::shir::{
 };
 use copper_core::vlir::{
     VLIRAlwaysFF, VLIRBinOp, VLIRCaseArm, VLIRBody, VLIRCombBody, VLIRCombPhase, VLIRContinuousAssign, VLIRExpr,
-    VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind, VLIRRegDecl, VLIRSeqBody, VLIRStmt,
+    VLIRFFCaseArm, VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind, VLIRRegDecl, VLIRSeqBody, VLIRStmt,
     VLIRSubmoduleInst, VLIRUnOp,
 };
 
@@ -164,6 +164,26 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
         let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg)?;
         // Output continuous assigns are module-level; collect from every phase.
         output_assigns.append(&mut outs);
+
+        // A conditionally-driven output holds between writes → an implicit-hold
+        // register. Move its drives from `always_comb` (where an undriven path is
+        // a latch) to `always_ff` (`if (guard) out <= v`, holding otherwise),
+        // preserving the guard structure. Done before the latch check so the
+        // registered output no longer counts as a comb latch.
+        let cond_outs = conditional_output_ports(&stmts);
+        if !cond_outs.is_empty() {
+            let (cleaned, out_ff) = split_output_regs(&stmts, &cond_outs);
+            stmts = cleaned;
+            if multi_phase {
+                ff_stmts.push(VLIRFFStmt::If {
+                    condition: phase_eq(phase.phase_idx, &phase_r_width),
+                    then_stmts: out_ff,
+                    else_stmts: None,
+                });
+            } else {
+                ff_stmts.extend(out_ff);
+            }
+        }
 
         let phase_guard = if multi_phase {
             Some(phase_eq(phase.phase_idx, &phase_r_width))
@@ -661,6 +681,148 @@ fn case_is_exhaustive(arms: &[VLIRCaseArm]) -> bool {
     match width {
         Some(w) if w < 64 => values.len() as u128 == 1u128 << w,
         _ => false,
+    }
+}
+
+// ── Conditional-output → implicit-hold register (conditional/phased-output semantics) ──
+
+/// Output ports driven (via `PortAssign`) on *every* path through `stmts`.
+/// Mirrors `assigned_on_all_paths` but counts only output-port drives.
+fn ports_driven_all_paths(stmts: &[VLIRStmt]) -> HashSet<String> {
+    let mut all = HashSet::new();
+    for s in stmts {
+        match s {
+            VLIRStmt::PortAssign { port_name, .. } => { all.insert(port_name.clone()); }
+            VLIRStmt::If { then_stmts, else_stmts: Some(e), .. } => {
+                let both: HashSet<String> = ports_driven_all_paths(then_stmts)
+                    .intersection(&ports_driven_all_paths(e)).cloned().collect();
+                all.extend(both);
+            }
+            VLIRStmt::If { else_stmts: None, .. } => {}
+            VLIRStmt::Case { arms, default, .. } => {
+                if default.is_some() || case_is_exhaustive(arms) {
+                    let mut common: Option<HashSet<String>> = default.as_ref().map(|d| ports_driven_all_paths(d));
+                    for a in arms {
+                        let s = ports_driven_all_paths(&a.stmts);
+                        common = Some(match common { None => s, Some(c) => c.intersection(&s).cloned().collect() });
+                    }
+                    all.extend(common.unwrap_or_default());
+                }
+            }
+            _ => {}
+        }
+    }
+    all
+}
+
+/// Output ports driven on *at least one* path through `stmts`.
+fn ports_driven_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
+    let mut any = HashSet::new();
+    for s in stmts {
+        match s {
+            VLIRStmt::PortAssign { port_name, .. } => { any.insert(port_name.clone()); }
+            VLIRStmt::If { then_stmts, else_stmts, .. } => {
+                any.extend(ports_driven_any_path(then_stmts));
+                if let Some(e) = else_stmts { any.extend(ports_driven_any_path(e)); }
+            }
+            VLIRStmt::Case { arms, default, .. } => {
+                for a in arms { any.extend(ports_driven_any_path(&a.stmts)); }
+                if let Some(d) = default { any.extend(ports_driven_any_path(d)); }
+            }
+            VLIRStmt::ForLoop { body, .. } => any.extend(ports_driven_any_path(body)),
+            _ => {}
+        }
+    }
+    any
+}
+
+/// Output ports driven on some-but-not-all paths — a conditional output. In a
+/// sequential module these become **implicit-hold registers**: the `.write()`
+/// holds its value between writes, so the drive belongs in `always_ff`
+/// (`if (guard) out <= v`, holding otherwise) rather than `always_comb` (where an
+/// undriven path is a latch). This is the sim's semantics for a conditionally
+/// written output.
+fn conditional_output_ports(stmts: &[VLIRStmt]) -> HashSet<String> {
+    let all = ports_driven_all_paths(stmts);
+    ports_driven_any_path(stmts).difference(&all).cloned().collect()
+}
+
+/// Split the target output ports' drives out of `stmts` (combinational) and into
+/// mirrored `always_ff` non-blocking assigns, preserving the surrounding
+/// `if`/`case` guard structure. Returns (combinational remainder, ff updates).
+fn split_output_regs(stmts: &[VLIRStmt], targets: &HashSet<String>) -> (Vec<VLIRStmt>, Vec<VLIRFFStmt>) {
+    let mut comb = Vec::new();
+    let mut ff = Vec::new();
+    for s in stmts {
+        let (c, mut f) = split_output_reg(s, targets);
+        if let Some(c) = c { comb.push(c); }
+        ff.append(&mut f);
+    }
+    (comb, ff)
+}
+
+fn split_output_reg(s: &VLIRStmt, targets: &HashSet<String>) -> (Option<VLIRStmt>, Vec<VLIRFFStmt>) {
+    match s {
+        VLIRStmt::PortAssign { port_name, value } if targets.contains(port_name) => {
+            (None, vec![VLIRFFStmt::NonBlockingAssign { target: port_name.clone(), value: value.clone() }])
+        }
+        VLIRStmt::If { condition, then_stmts, else_stmts } => {
+            let (tc, tf) = split_output_regs(then_stmts, targets);
+            let (ec, ef) = match else_stmts {
+                Some(e) => { let (c, f) = split_output_regs(e, targets); (Some(c), f) }
+                None => (None, Vec::new()),
+            };
+            let comb = if tc.is_empty() && ec.as_ref().map_or(true, |c| c.is_empty()) {
+                None
+            } else {
+                Some(VLIRStmt::If { condition: condition.clone(), then_stmts: tc, else_stmts: ec })
+            };
+            let ff = if tf.is_empty() && ef.is_empty() {
+                Vec::new()
+            } else {
+                vec![VLIRFFStmt::If {
+                    condition: condition.clone(),
+                    then_stmts: tf,
+                    else_stmts: if ef.is_empty() { None } else { Some(ef) },
+                }]
+            };
+            (comb, ff)
+        }
+        VLIRStmt::Case { selector, arms, default } => {
+            let mut comb_arms = Vec::new();
+            let mut ff_arms = Vec::new();
+            for a in arms {
+                let (ac, af) = split_output_regs(&a.stmts, targets);
+                if !ac.is_empty() { comb_arms.push(VLIRCaseArm { selector_value: a.selector_value.clone(), stmts: ac }); }
+                if !af.is_empty() { ff_arms.push(VLIRFFCaseArm { selector_value: a.selector_value.clone(), stmts: af }); }
+            }
+            let (comb_default, ff_default) = match default {
+                Some(d) => {
+                    let (c, f) = split_output_regs(d, targets);
+                    (if c.is_empty() { None } else { Some(c) }, if f.is_empty() { None } else { Some(f) })
+                }
+                None => (None, None),
+            };
+            let comb = if comb_arms.is_empty() && comb_default.is_none() {
+                None
+            } else {
+                Some(VLIRStmt::Case { selector: selector.clone(), arms: comb_arms, default: comb_default })
+            };
+            let ff = if ff_arms.is_empty() && ff_default.is_none() {
+                Vec::new()
+            } else {
+                // A registered hold needs a complete case: the empty default means
+                // "no assignment → the output register holds" (and avoids a
+                // Verilator CASEINCOMPLETE warning).
+                vec![VLIRFFStmt::Case {
+                    selector: selector.clone(),
+                    arms: ff_arms,
+                    default: ff_default.or_else(|| Some(Vec::new())),
+                }]
+            };
+            (comb, ff)
+        }
+        other => (Some(clone_comb_stmt(other)), Vec::new()),
     }
 }
 
@@ -1346,9 +1508,12 @@ endmodule
     /// class of bug should be impossible to express, so a combinational signal
     /// assigned on only some control paths is a hard error.
     #[test]
-    fn partial_conditional_assignment_is_rejected_as_latch() {
-        // `out` is written only in the `Stage::Out` arm — the other stages leave
-        // it unassigned, which in `always_comb` would infer a latch.
+    fn conditional_output_becomes_registered_not_latch() {
+        // `out` is written only in the `Stage::Out` arm. The simulator holds an
+        // output between writes, so this is an implicit-hold register, not a
+        // combinational latch: it lowers to a guarded `always_ff` update
+        // (`case (stage) ... out <= acc; default: ; endcase`) that holds
+        // otherwise — not the old hard latch error.
         let src = r#"
             enum Stage { Load = 0, Mul = 1, Out = 2 }
 
@@ -1366,12 +1531,12 @@ endmodule
                 }
             }
         "#;
-        let err = crate::transpile_source(src, None, &EmitConfig::default())
-            .expect_err("a partially-assigned combinational output must be rejected");
-        assert!(
-            err.contains("latch"),
-            "expected a latch diagnostic, got: {err}"
-        );
+        let sv = crate::transpile_source(src, None, &EmitConfig::default())
+            .expect("a conditionally-written output registers (implicit hold), not a latch");
+        // The output is a registered non-blocking assign in always_ff, and is NOT
+        // driven combinationally (no `out = ` blocking assign).
+        assert!(sv.contains("out <="), "expected a registered output: {sv}");
+        assert!(!sv.contains("out ="), "output must not be a combinational drive: {sv}");
     }
 
     /// ...but a `case` whose arms cover every value of the selector is complete,
