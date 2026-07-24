@@ -1,8 +1,23 @@
 # Copper Transpilation — Coverage Map
 
-**Status date:** 2026-07-14. Companion to
+**Status date:** 2026-07-14, with a **2026-07-23 update banner** below. Companion to
 [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (the roadmap is the *why/what-next*;
 this map is *which examples force which features, and in what order*).
+
+> **2026-07-23 update — several rows have moved; the §1 table below is the
+> 2026-07-14 snapshot.** Since then: enums + tuple-match landed, so
+> `pattern_detector` and `traffic_light_fsm` **now transpile** (both have
+> equivalence tests). CHIR gained free-fn/impl-assoc-fn **inlining**, **struct
+> lowering**, and **match-as-value**. The old-model combinational examples
+> (`rotate_right`/`priority_encode`/`ripple_carry_adder`) were **migrated** to
+> In/Out (rebase onto `fix/frontend`), so "Migration" is done. **Const generics
+> increment 1** (symbolic width + SV `parameter`s) landed, so `Bits<N>` resolves;
+> those examples now block on **for-loops / array ports / width inference**, not
+> the type. `Option`/`?`/`panic!` are now **banned** (see TODO); the `rv32i_cpu`
+> decode was rewritten to the explicit `{valid,payload}`/`INVALID` form.
+> Individual modules of multi-module files (e.g. `fast_counter`) transpile; the
+> driver just needs `--module`. See [TRANSPILATION_TODO.md](TRANSPILATION_TODO.md)
+> for authoritative status.
 
 ## How to read this
 

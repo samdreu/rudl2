@@ -291,7 +291,20 @@ audit is the **full** example set (incl. CPU/UART). Grouped by severity.
   4. **Enum-with-methods** — `Opcode::from_bits` etc. return `Option`, so this
      folds into the ban above; an inherent-`impl` fn that returns a plain value
      still inlines (increment 2).
-  5. **Const-generic monomorphization** (consumes #2 generics + #1 turbofish).
+  5. [~] **Const generics** — **increment 1 done (2026-07-23).** Chose *SV
+     parameters* over monomorphization (SystemVerilog has `parameter` natively —
+     honest and one module, not one-per-instantiation). Filled the scaffolded
+     `Width` M2 seam: `Width::Param(String)` (+ `as_concrete`); `Bits<N>` with an
+     identifier arg → symbolic width; `CHIRModule.params` from the FIR's const
+     generics (#2 capture) threaded CHIR→SHIR→VLIR; emit renders `#(parameter int
+     N = <default>)` and `[N-1:0]`. A passthrough `Bits<N>` module emits a
+     Verilator-lint-clean parametric module. `rotate_right`/`priority_encode`/
+     `shift_register` now advance *past* `Bits<N>` to their next gaps (for-loops,
+     width inference); `mux` hits array ports. **Deferred:** validating a
+     `Bits<N>` param is actually declared (any identifier is accepted; undeclared
+     → fails at emission), `Width::Sub` for `N-1`-style derived widths, and the
+     companion features those examples still need (for-loops over a symbolic `N`,
+     array ports, LHS bit-assign).
   6. **File-scope const substitution** (`CLKS_PER_BIT` into loop bounds; interacts
      with control-extraction, a separate P1).
 
