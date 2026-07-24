@@ -680,6 +680,157 @@ fn resolve_enum_path(path: &str, enums: &EnumRegistry) -> Option<(CHIRType, u128
 
 /// Build a symbol table of a module's data ports (`In<T,D>` / `Out<T,D>`) mapping
 /// port name → inner hardware type. Clock ports are excluded.
+/// Forward width-inference: map an un-annotated local to the type of the output
+/// port it is later written to. Copper users write
+/// `let mut acc = Bits::zero(); …; out.write(acc);` and Rust infers `acc`'s width
+/// from the write; the bottom-up pass can't, so we look ahead for the write.
+fn build_write_inferred_types(fir: &FrontendModuleIR, port_symbols: &SymbolTable) -> SymbolTable {
+    let out_ports: std::collections::HashSet<String> = fir
+        .signature
+        .params
+        .iter()
+        .filter(|p| {
+            let c: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            c.starts_with("Out<")
+        })
+        .map(|p| p.name.clone())
+        .collect();
+
+    let mut inferred = SymbolTable::new();
+    collect_writes_in_stmts(&fir.raw_statements, port_symbols, &out_ports, &mut inferred);
+
+    // Propagate widths across `a = b` local-to-local assignments (e.g.
+    // `out_n = shifted` gives `shifted` out_n's width, which itself came from
+    // `out.write(out_n)`). Fixpoint over the collected pairs. This only ever adds
+    // fallback entries used when bottom-up inference is ambiguous, so a spurious
+    // pair can't override a width that inference already determines.
+    let mut pairs = Vec::new();
+    collect_local_assign_pairs(&fir.raw_statements, &mut pairs);
+    loop {
+        let mut changed = false;
+        for (a, b) in &pairs {
+            if let Some(ty) = inferred.get(a).cloned() {
+                if inferred.insert(b.clone(), ty).is_none() { changed = true; }
+            }
+            if let Some(ty) = inferred.get(b).cloned() {
+                if inferred.insert(a.clone(), ty).is_none() { changed = true; }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    inferred
+}
+
+/// Collect `(lhs, rhs)` identifier pairs from `a = b` assignments in the body,
+/// recursing into loops/branches. Used to propagate forward-inferred widths.
+fn collect_local_assign_pairs(stmts: &[RawStmt], out: &mut Vec<(String, String)>) {
+    for s in stmts {
+        match &s.kind {
+            RawStmtKind::Expr(es) => collect_pairs_in_expr(&es.expr, out),
+            RawStmtKind::Local(l) => {
+                if let Some(i) = &l.init {
+                    collect_pairs_in_expr(i, out);
+                }
+            }
+            RawStmtKind::Item(_) => {}
+        }
+    }
+}
+
+fn collect_pairs_in_expr(e: &ExprType, out: &mut Vec<(String, String)>) {
+    match e {
+        ExprType::Assign(a) => {
+            if let (Some(l), Some(r)) = (ident_of_expr(&a.left), ident_of_expr(&a.right)) {
+                out.push((l, r));
+            }
+        }
+        ExprType::Loop(l) => collect_local_assign_pairs(&l.body, out),
+        ExprType::While(w) => collect_local_assign_pairs(&w.body, out),
+        ExprType::Block(b) => collect_local_assign_pairs(&b.stmts, out),
+        ExprType::If(f) => {
+            collect_local_assign_pairs(&f.then_block, out);
+            if let Some(eb) = &f.else_branch {
+                collect_pairs_in_expr(eb, out);
+            }
+        }
+        ExprType::Match(m) => {
+            for arm in &m.arms {
+                collect_pairs_in_expr(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_writes_in_stmts(
+    stmts: &[RawStmt],
+    ports: &SymbolTable,
+    out_ports: &std::collections::HashSet<String>,
+    out: &mut SymbolTable,
+) {
+    for s in stmts {
+        match &s.kind {
+            RawStmtKind::Local(l) => {
+                if let Some(init) = &l.init {
+                    collect_writes_in_expr(init, ports, out_ports, out);
+                }
+            }
+            RawStmtKind::Expr(es) => collect_writes_in_expr(&es.expr, ports, out_ports, out),
+            RawStmtKind::Item(_) => {}
+        }
+    }
+}
+
+fn collect_writes_in_expr(
+    e: &ExprType,
+    ports: &SymbolTable,
+    out_ports: &std::collections::HashSet<String>,
+    out: &mut SymbolTable,
+) {
+    match e {
+        // `<out_port>.write(<local>)` — the local takes the port's type.
+        ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 1 => {
+            if let (Some(port), Some(local)) =
+                (ident_of_expr(&mc.receiver), ident_of_expr(&mc.args[0]))
+            {
+                if out_ports.contains(&port) {
+                    if let Some(ty) = ports.get(&port) {
+                        out.entry(local).or_insert_with(|| ty.clone());
+                    }
+                }
+            }
+        }
+        ExprType::Loop(l) => collect_writes_in_stmts(&l.body, ports, out_ports, out),
+        ExprType::While(w) => collect_writes_in_stmts(&w.body, ports, out_ports, out),
+        ExprType::Block(b) => collect_writes_in_stmts(&b.stmts, ports, out_ports, out),
+        ExprType::If(f) => {
+            collect_writes_in_stmts(&f.then_block, ports, out_ports, out);
+            if let Some(eb) = &f.else_branch {
+                collect_writes_in_expr(eb, ports, out_ports, out);
+            }
+        }
+        ExprType::Match(m) => {
+            for arm in &m.arms {
+                collect_writes_in_expr(&arm.body, ports, out_ports, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A plain identifier (`acc`, `out`) from a `Path`/`Lit` expression.
+fn ident_of_expr(e: &ExprType) -> Option<String> {
+    let text = match e {
+        ExprType::Path(p) => &p.path_text,
+        ExprType::Lit(l) => &l.text,
+        _ => return None,
+    };
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    is_ident(&compact).then_some(compact)
+}
+
 fn build_port_symbols(fir: &FrontendModuleIR) -> SymbolTable {
     let mut symbols = SymbolTable::new();
     for p in &fir.signature.params {
@@ -873,6 +1024,7 @@ fn lower_comb_body(
     ctx.enums = build_enum_registry(fir);
     ctx.fns = build_fn_registry(fir);
     ctx.structs = build_struct_registry(fir);
+    ctx.write_inferred = build_write_inferred_types(fir, &ctx.symbols);
 
     let mut stmts = Vec::new();
 
@@ -929,13 +1081,19 @@ fn lower_seq_body(
     // ports (or later registers) can infer their width.
     let mut symbols = build_port_symbols(fir);
     let enums = build_enum_registry(fir);
+    // Forward inference: a register/wire whose width the init can't determine
+    // (`let mut out_n = Bits::x()`) takes the type of the output port it drives.
+    let write_inferred = build_write_inferred_types(fir, &symbols);
 
     for stmt in &fir.raw_statements {
         match &stmt.kind {
             RawStmtKind::Local(local) if local.is_mut => {
                 let ty = match (&local.ty, &local.init) {
                     (Some(t), _) => resolve_type(&t.ty_text, t.span)?,
-                    (None, Some(init)) => infer_type_from_expr(init, local.span, &symbols, &enums)?,
+                    (None, Some(init)) => match infer_type_from_expr(init, local.span, &symbols, &enums) {
+                        Ok(t) => t,
+                        Err(e) => write_inferred.get(&local.name).cloned().ok_or(e)?,
+                    },
                     (None, None) => return Err(CHIRLowerError::AmbiguousWidth { span: local.span }),
                 };
                 symbols.insert(local.name.clone(), ty.clone());
@@ -953,7 +1111,10 @@ fn lower_seq_body(
                 if let Some(init) = &local.init {
                     let ty = match &local.ty {
                         Some(t) => resolve_type(&t.ty_text, t.span)?,
-                        None => infer_type_from_expr(init, local.span, &symbols, &enums)?,
+                        None => match infer_type_from_expr(init, local.span, &symbols, &enums) {
+                            Ok(t) => t,
+                            Err(e) => write_inferred.get(&local.name).cloned().ok_or(e)?,
+                        },
                     };
                     symbols.insert(local.name.clone(), ty.clone());
                     pre_loop_wires.push((local.name.clone(), ty, init, local.span));
@@ -997,6 +1158,7 @@ fn lower_seq_body(
     ctx.enums = enums;
     ctx.fns = build_fn_registry(fir);
     ctx.structs = build_struct_registry(fir);
+    ctx.write_inferred = build_write_inferred_types(fir, &ctx.symbols);
 
     // Emit pre-loop wires first so they are declared before any use, then the
     // loop body itself.
@@ -1055,6 +1217,10 @@ struct LowerCtx<'a> {
     /// File-scope struct definitions by name, for struct lowering (milestone 2):
     /// a struct value binds one wire per field (`<base>_<field>`).
     structs: std::collections::HashMap<String, ItemStruct>,
+    /// Forward-inferred local types: an un-annotated `let x = <context-width
+    /// ctor>` (e.g. `Bits::zero()`) whose width the bottom-up pass can't derive
+    /// takes the type of the output port it is later written to (`out.write(x)`).
+    write_inferred: SymbolTable,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1075,6 +1241,7 @@ impl<'a> LowerCtx<'a> {
             fns: std::collections::HashMap::new(),
             inlining: std::collections::HashSet::new(),
             structs: std::collections::HashMap::new(),
+            write_inferred: SymbolTable::new(),
         }
     }
 
@@ -1116,7 +1283,13 @@ fn lower_local_binding(
 
     let ty = match &local.ty {
         Some(t) => resolve_type(&t.ty_text, t.span)?,
-        None => infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums)?,
+        // Bottom-up inference first; if the width is ambiguous (a context-width
+        // ctor like `Bits::zero()`), fall back to the type of the output port this
+        // local is later written to (forward inference).
+        None => match infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums) {
+            Ok(t) => t,
+            Err(e) => ctx.write_inferred.get(&local.name).cloned().ok_or(e)?,
+        },
     };
     // Retype context-width default literals (e.g. `Bits::zero()`) to the binding's
     // declared width — including a symbolic parameter width (`Bits<N>` → `N'd0`) —
@@ -4163,6 +4336,38 @@ mod tests {
         let reg = build_fn_registry(&fir);
         assert!(!reg.contains_key("Foo::get"));
         assert!(!reg.contains_key("get"));
+    }
+
+    // ── forward width-inference ───────────────────────────────────────────────
+
+    #[test]
+    fn forward_inference_from_port_write() {
+        // `let mut acc = Bits::zero()` has no annotation and an ambiguous width;
+        // it is inferred from `out.write(acc)` where `out` is `Bits<8>`.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let mut acc = Bits::zero(); \
+                          acc = a.read(); \
+                          out.write(acc); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_ok());
+    }
+
+    #[test]
+    fn forward_inference_propagates_across_assignment() {
+        // `tmp`'s width isn't set by a port write; it comes from `r = tmp`, and
+        // `r` from `out.write(r)`.
+        let module = "#[hardware(combinational)] \
+                      fn m(a: In<Bits<8>, ()>, out: Out<Bits<8>, ()>) { \
+                          let mut r = Bits::zero(); \
+                          let mut tmp = Bits::zero(); \
+                          tmp = a.read(); \
+                          r = tmp; \
+                          out.write(r); \
+                      }";
+        let fir = make_fir_hw(module, &no_hw());
+        assert!(lower_to_chir(&fir, &no_hw(), &empty_registry()).is_ok());
     }
 
     // ── for-loop lowering ─────────────────────────────────────────────────────
