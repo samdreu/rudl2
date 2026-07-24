@@ -115,7 +115,8 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
 
 fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
     let submodules = c.submodules.iter().map(|s| lower_submodule(s, leg)).collect::<LowerResult<_>>()?;
-    let (comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg)?;
+    let (mut comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg)?;
+    hoist_branch_local_defaults(&mut comb_stmts);
     check_no_latches(&comb_stmts)?;
     Ok(VLIRCombBody { submodules, comb_stmts, output_assigns })
 }
@@ -148,7 +149,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
     let mut ff_stmts = Vec::new();
 
     for phase in &s.phases {
-        let (stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg)?;
+        let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg)?;
         // Output continuous assigns are module-level; collect from every phase.
         output_assigns.append(&mut outs);
 
@@ -157,6 +158,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
         } else {
             None
         };
+        hoist_branch_local_defaults(&mut stmts);
         check_no_latches(&stmts)?;
         comb_phases.push(VLIRCombPhase { phase_guard, stmts });
 
@@ -678,6 +680,95 @@ fn assigned_on_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
 }
 
 /// Reject any combinational block that would infer a latch — a signal assigned
+/// Auto-hoist block-local combinational defaults.
+///
+/// A `let x = <default>` declared inside a conditional branch (e.g. a shift
+/// temporary `let mut shifted = Bits::zero()` inside `if en { … }`) lowers to a
+/// `WireAssign` nested in that branch. At module scope that leaves `x` assigned on
+/// only some paths — a false latch, since `x` is only *read* on the path where it
+/// is written. Rather than force the source to hoist the temp (a hardware concern
+/// leaking into natural Rust), hoist the default here: move the literal-init
+/// `WireAssign` to the top of the block so `x` is driven on every path. The
+/// in-branch bit-assigns/reassigns remain and overwrite it as before.
+///
+/// Scoped narrowly: only a `WireAssign` with a *literal* value (a default) whose
+/// name is not already assigned at the top level is hoisted — conditional drives
+/// of real signals/ports are untouched.
+fn hoist_branch_local_defaults(stmts: &mut Vec<VLIRStmt>) {
+    let top_assigned: HashSet<String> = stmts.iter().filter_map(top_level_assign_name).collect();
+    let mut hoisted: Vec<VLIRStmt> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    strip_nested_defaults(stmts, false, &top_assigned, &mut hoisted, &mut seen);
+    // Prepend in original first-seen order.
+    for h in hoisted.into_iter().rev() {
+        stmts.insert(0, h);
+    }
+}
+
+fn top_level_assign_name(s: &VLIRStmt) -> Option<String> {
+    match s {
+        VLIRStmt::WireAssign { name, .. } => Some(name.clone()),
+        VLIRStmt::PortAssign { port_name, .. } => Some(port_name.clone()),
+        // If/Case/ForLoop are conditional — they assign nothing unconditionally.
+        _ => None,
+    }
+}
+
+fn strip_nested_defaults(
+    body: &mut Vec<VLIRStmt>,
+    is_nested: bool,
+    top_assigned: &HashSet<String>,
+    hoisted: &mut Vec<VLIRStmt>,
+    seen: &mut HashSet<String>,
+) {
+    let mut keep = Vec::with_capacity(body.len());
+    for mut s in body.drain(..) {
+        // Recurse into sub-bodies first (they are one level more nested).
+        match &mut s {
+            VLIRStmt::If { then_stmts, else_stmts, .. } => {
+                strip_nested_defaults(then_stmts, true, top_assigned, hoisted, seen);
+                if let Some(e) = else_stmts {
+                    strip_nested_defaults(e, true, top_assigned, hoisted, seen);
+                }
+            }
+            VLIRStmt::Case { arms, default, .. } => {
+                for a in arms {
+                    strip_nested_defaults(&mut a.stmts, true, top_assigned, hoisted, seen);
+                }
+                if let Some(d) = default {
+                    strip_nested_defaults(d, true, top_assigned, hoisted, seen);
+                }
+            }
+            VLIRStmt::ForLoop { body, .. } => {
+                strip_nested_defaults(body, true, top_assigned, hoisted, seen);
+            }
+            _ => {}
+        }
+        // A nested literal-init WireAssign to a not-top-assigned name is a
+        // block-local default: hoist it (once) and strip it from the branch.
+        let hoistable = if is_nested {
+            match &s {
+                VLIRStmt::WireAssign { name, value: VLIRExpr::Lit { .. }, .. }
+                    if !top_assigned.contains(name) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(name) = hoistable {
+            if seen.insert(name) {
+                hoisted.push(s);
+            }
+            continue; // stripped from the branch either way
+        }
+        keep.push(s);
+    }
+    *body = keep;
+}
+
 /// on some control paths but not all. Copper's premise is that this class of bug
 /// should be impossible to express, so it is an error, not a silent emission.
 fn check_no_latches(stmts: &[VLIRStmt]) -> LowerResult<()> {
@@ -843,6 +934,32 @@ mod e2e_tests {
         let f: syn::ItemFn = syn::parse_str(src).expect("parse");
         transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default())
             .expect("transpile")
+    }
+
+    #[test]
+    fn auto_hoist_block_local_default_avoids_false_latch() {
+        // `tmp` is declared with a default and used only inside the `en` branch —
+        // a block-local temporary. Without the auto-hoist it's a false latch
+        // (assigned on some paths, but only read where assigned). The hoist moves
+        // its default to the top of always_comb, so it transpiles from unmodified,
+        // natural Rust.
+        let src = r#"
+            fn m(a: In<Bits<8>, ()>, en: In<Logic, ()>, out: Out<Bits<8>, ()>) {
+                let mut r: Bits<8> = Bits::from_u8(0);
+                if en.read() == Logic::One {
+                    let mut tmp: Bits<8> = Bits::from_u8(0);
+                    tmp = a.read();
+                    r = tmp;
+                }
+                out.write(r);
+            }
+        "#;
+        let sv = transpile(src);
+        // `tmp`'s default is hoisted above the branch (appears before the `if`).
+        let comb = &sv[sv.find("always_comb").unwrap()..];
+        let tmp_pos = comb.find("tmp = 8'd0;").expect("hoisted tmp default");
+        let if_pos = comb.find("if (").expect("branch");
+        assert!(tmp_pos < if_pos, "tmp default should be hoisted before the branch:\n{sv}");
     }
 
     #[test]

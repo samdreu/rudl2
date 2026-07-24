@@ -355,7 +355,7 @@ impl Emitter<'_> {
                     "{}{}[{}] = {};\n",
                     self.indent(level),
                     base,
-                    expr_str(index),
+                    loop_bound_str(index),
                     expr_str(value),
                 ));
             }
@@ -475,7 +475,7 @@ fn expr_str(e: &VLIRExpr) -> String {
                 format!("{}[{}:{}]", expr_str(expr), high, low)
             }
         }
-        VLIRExpr::DynBit { base, index } => format!("{}[{}]", expr_str(base), expr_str(index)),
+        VLIRExpr::DynBit { base, index } => format!("{}[{}]", expr_str(base), loop_bound_str(index)),
         // `width'(expr)` — SV width-cast; the size may be a parameter.
         VLIRExpr::Resize { expr, width } => {
             let size = match width {
