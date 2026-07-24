@@ -23,19 +23,19 @@ Companions: [TRANSPILATION_ROADMAP.md](TRANSPILATION_ROADMAP.md) (status + decis
 
 ## Phase D — VLIR legalization
 
-- [ ] **P0 — Multiply-driven outputs.** A port driven in >1 phase becomes multiple
+- [x] **Resolved (2026-07-24) — P0: Multiply-driven outputs.** Detect-and-reject: a port driven in >1 phase now errors (`MultiplyDrivenOutput`) in `lower_seq` instead of emitting conflicting `assign`s. The phase-mux/registered-output feature is still the deferred conditional-output decision. Was: A port driven in >1 phase becomes multiple
       *unguarded* `assign`s (`assign busy = 1'b1; assign busy = 1'b0;`); phase guards
       are dropped at `vlir_lower.rs:147` (`output_assigns.append`). Verilator does
       **not** catch this, even with `-Wwarn-MULTIDRIVEN`. Detect and reject until the
       registered-output decision lands.
-- [ ] **P0 — Latch checker has a per-phase hole.** `check_no_latches` runs on each
+- [x] **Resolved (2026-07-24) — P0: Latch per-phase hole.** Fixed by emission, not the checker: each phase-local combinational temp now gets a `<w> = '0;` default at the top of the merged multi-phase `always_comb` (emit `seq_body`), so no latch is inferred — mac_pipeline is now Verilator-lint-clean. (Cross-phase-read wires are already promoted to registers, so defaulting the remaining phase-local temps is behavior-preserving.) Was: `check_no_latches` runs on each
       phase's statements, but the emitter merges all phases into one `always_comb`
       with `if (phase_r == K)` guards. A signal assigned in only one phase is a latch
       across the whole block. `mac_pipeline` demonstrates it (`product`, `c_s`);
       Verilator warns, our checker passes. Fix: model the merged block.
-- [ ] **P1 — Phase-local wire defaults.** Emitting `product = '0;` etc. at the top of
-      `always_comb` removes the inferred storage above without rejecting the module.
-      Standard practice; likely the right fix for the `mac_pipeline` case specifically.
+- [x] **Resolved (2026-07-24) — P1: Phase-local wire defaults.** Implemented as the
+      fix for the latch P0 above — emit `<w> = '0;` at the top of the multi-phase
+      `always_comb`. This is exactly the "standard practice" fix anticipated here.
 
 ## Phase E — Emission
 

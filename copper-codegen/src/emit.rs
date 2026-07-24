@@ -149,6 +149,18 @@ impl Emitter<'_> {
         let has_comb = s.comb_phases.iter().any(|p| !p.stmts.is_empty());
         if has_comb {
             self.out.push_str(&format!("{}always_comb begin\n", self.indent(1)));
+            // Multi-phase: each pre-edge wire is a *phase-local* combinational
+            // temp assigned inside only its own `if (phase_r == K)` guard. Merged
+            // into one always_comb that would infer a latch (the value must "hold"
+            // in the other phases). These temps are read only in the phase that
+            // computes them (cross-phase uses are promoted to registers), so a
+            // default at the top drives every path — no latch, same behavior.
+            let multi_phase = s.comb_phases.iter().any(|p| p.phase_guard.is_some());
+            if multi_phase {
+                for (name, _) in &decls {
+                    self.out.push_str(&format!("{}{} = '0;\n", self.indent(2), name));
+                }
+            }
             for phase in &s.comb_phases {
                 self.comb_phase(phase);
             }

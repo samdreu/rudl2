@@ -37,6 +37,11 @@ pub enum VLIRLowerError {
     /// would infer a latch. Copper exists to make this class of bug impossible, so
     /// it is rejected rather than emitted.
     LatchInferred { signals: Vec<String> },
+    /// An output port is driven in more than one phase, which would emit multiple
+    /// unguarded continuous assigns (`assign out = a; assign out = 0;`). Verilator
+    /// does not flag this, so it is rejected until phase-muxed / registered outputs
+    /// are decided (the conditional-output-semantics milestone).
+    MultiplyDrivenOutput { port: String },
 }
 
 impl std::fmt::Display for VLIRLowerError {
@@ -57,6 +62,13 @@ impl std::fmt::Display for VLIRLowerError {
                      Assign on every path (add the missing branch/`_` arm), or make it a \
                      register by assigning it every cycle",
                     signals.join(", ")
+                ),
+            VLIRLowerError::MultiplyDrivenOutput { port } =>
+                write!(
+                    f,
+                    "output port '{port}' is driven in more than one phase (across \
+                     clk.tick().await boundaries), which would emit multiple conflicting \
+                     drivers. Drive it in exactly one phase, or hold it in a register",
                 ),
         }
     }
@@ -173,6 +185,16 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
             });
         } else {
             ff_stmts.extend(updates);
+        }
+    }
+
+    // A port driven in more than one phase accumulates multiple continuous
+    // assigns to the same target — multiply-driven, undefined, and not flagged by
+    // Verilator. Reject rather than emit it.
+    let mut seen_ports = HashSet::new();
+    for a in &output_assigns {
+        if !seen_ports.insert(a.target.clone()) {
+            return Err(VLIRLowerError::MultiplyDrivenOutput { port: a.target.clone() });
         }
     }
 
@@ -934,6 +956,50 @@ mod e2e_tests {
         let f: syn::ItemFn = syn::parse_str(src).expect("parse");
         transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default())
             .expect("transpile")
+    }
+
+    #[test]
+    fn multi_phase_wires_get_top_defaults_no_latch() {
+        // A 3-phase pipeline (mac): `product`/`c_s` computed in phase 0, `sum` in
+        // phase 1, output in phase 2. Each comb temp is phase-local; without a top
+        // default the merged always_comb would infer a latch (Verilator LATCH).
+        let src = r#"
+            async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, b: In<Bits<8>, MainClk>,
+                       c: In<Bits<8>, MainClk>, out: Out<Bits<8>, MainClk>) {
+                loop {
+                    let product = a.read() * b.read();
+                    let c_s = c.read();
+                    clk.tick().await;
+                    let sum = product + c_s;
+                    clk.tick().await;
+                    out.write(sum);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        let sv = transpile(src);
+        let comb = &sv[sv.find("always_comb").unwrap()..sv.find("always_ff").unwrap()];
+        // Phase-local temps are defaulted before the phase guards.
+        assert!(comb.contains("product = '0;"), "expected phase-local defaults:\n{sv}");
+        assert!(comb.contains("sum = '0;"), "expected phase-local defaults:\n{sv}");
+    }
+
+    #[test]
+    fn multiply_driven_output_across_phases_is_rejected() {
+        // `out` driven in two phases would emit two conflicting continuous assigns.
+        let src = r#"
+            async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, out: Out<Bits<8>, MainClk>) {
+                loop {
+                    out.write(a.read());
+                    clk.tick().await;
+                    out.write(Bits::from_u8(0));
+                    clk.tick().await;
+                }
+            }
+        "#;
+        let f: syn::ItemFn = syn::parse_str(src).expect("parse");
+        let res = transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default());
+        assert!(res.is_err(), "multiply-driven output must be rejected");
     }
 
     #[test]
