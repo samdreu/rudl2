@@ -5,6 +5,15 @@ the simulator was reading one cycle early; fixed in `copper-sim`. OUTPUT timing
 scoped as a distinct, still-open item (see the last section). The investigation,
 evidence, and the debate that preceded the verdict are kept below.
 
+> **OUTPUT timing RESOLVED (2026-07-25).** The still-open output-timing item was
+> settled by the dual-convention experiment: the executor adopted **post-edge
+> continuation** (register clocked at edge N observable in cycle N) plus explicit
+> **`RegOut`** for the outputs where inference is provably ambiguous. This
+> superseded the interim atomic/pre-edge model. See
+> **design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md** (the current authority) and
+> REGISTERED_OUTPUTS.md. The output analysis below is retained as the investigation
+> record, not the final convention.
+
 ---
 
 ## VERDICT (2026-07-24): the simulator was wrong on reads — fixed

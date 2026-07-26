@@ -19,7 +19,10 @@ transpiler), reproduced by two ignored probe tests:
 - `tests/mem_latency_probe.rs` — block-RAM read latency, two DUT structures
 - reference Verilog: `tests/fixtures/timing_probe_sv/*.sv`
 
-Run with `cargo test --test <name> -- --ignored --nocapture`.
+Run with `cargo test --test <name> -- --ignored --nocapture`. The conclusion is
+pinned as a live (non-ignored) regression test in
+`tests/regout_postedge_probe.rs`: plain `Out` is combinational (`[1,2,3,…]`), the
+same body on a `RegOut` is registered (`[0,1,2,…]`).
 
 ## The two executor conventions
 

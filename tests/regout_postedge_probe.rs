@@ -1,6 +1,8 @@
-//! TEMP: does the RegOut primitive compose with the post-edge executor to restore
-//! registered (+1) output timing? Compare a plain-Out counter (combinational,
-//! [1,2,3]) against a RegOut counter (registered, expect [0,1,2]).
+//! RegOut behavior regression: under the post-edge executor, a plain `Out` output
+//! is combinational (a "write v; tick; v+=1" counter reads [1,2,3,…]), while the
+//! same body driving a `RegOut` output is registered — its value is deferred one
+//! cycle to [0,1,2,…]. This pins the two output-timing behaviors the
+//! register/combinational distinction selects between (EXECUTOR_CONVENTION_EXPERIMENT.md).
 use copper_core::port::{registered_wire, wire, Out};
 use copper_core::types::Bits;
 use copper_core::{Clock, ClockDomain};
@@ -9,7 +11,6 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 #[test]
-#[ignore = "temp RegOut/post-edge composition probe"]
 fn regout_defers_one_cycle_under_postedge() {
     // Plain-Out counter: write v before tick, increment after.
     let mut clk = Clock::<MainClk>::new();

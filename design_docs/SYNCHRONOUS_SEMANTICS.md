@@ -232,31 +232,32 @@ trace by construction. `RegOut`/aliasing is a *transpiler* concern (later); it d
 not exist at the sim level. The precise executor design is in
 ATOMIC_INSTANT_EXECUTOR.md.
 
-## Status — atomic model locked in (2026-07-25)
+## Status — post-edge convention adopted (2026-07-25)
 
-The atomic-instant executor is now the sim's semantics and the suite is
-re-baselined to it (`cargo test --tests --lib` + `-p copper-sim` + `--examples`:
-green, with the documented `#[ignore]`s below).
+> This section originally recorded an "atomic model locked in" state (tick resolves
+> at the **pre-edge**). That lock-in was **reversed** after the dual-convention
+> experiment (EXECUTOR_CONVENTION_EXPERIMENT.md): the pre-edge choice over-delays
+> write-after-tick outputs by one cycle versus independent hand-written Verilog (a
+> basic DFF `q<=d` did not match). The executor now resolves ticks at the
+> **post-edge**. The current state:
 
-- **One-cycle-latency rule (canonical).** A value that crosses a `clk.tick().await`
-  is observed one cycle later than the compressed sim used to show it. Concretely:
-  a Moore output `out.write(state)` *after* the tick reads `[0,1,2,…]` (the state
-  before this iteration's post-tick update), not `[1,2,3,…]`; a held output shows
-  its value in the instant its `out.write` runs, held otherwise. This is the single
-  rule behind every re-baselined trace.
-- **`synced_read` is KEPT.** It is no longer needed for input read-timing (the
-  atomic tick-at-pre-edge resolution subsumes that), but it still provides the
-  no-tick-spin guard (`same_call` term) that prevents an infinite settle loop when a
-  reaction reads without ticking. Removing it is a separate cleanup, not part of
-  this lock-in.
-- **`RegOut` is superseded at the sim level** (held ⇒ registered by construction);
-  see REGISTERED_OUTPUTS.md. The primitive remains in `port.rs`, unused by the sim,
-  retained only as possible input to transpiler alignment.
-- **Ignored tests** are the transpiler-alignment-blocked equivalence tests plus the
-  understood-divergence cases (`det_010` vs `det_010_awaits`, mid-phase `accum_2`,
-  composition +1 re-times). Each carries a reason pointing here or to
-  ATOMIC_INSTANT_EXECUTOR.md. Un-ignoring them is the deferred transpiler-timing
-  alignment task.
+- **Edge-N observability (canonical).** A register clocked at edge N is observed in
+  cycle N — the standard synchronous-testbench convention. A Moore output written
+  *before* its tick (`out.write(v); tick`) matches hand-written Verilog with plain
+  `Out`; an output written *after* its tick, or a genuinely-held (conditional)
+  output, needs `RegOut` to defer one cycle and match the registered hardware.
+- **`synced_read` is KEPT.** Still provides the no-tick-spin guard (`same_call`
+  term) that prevents an infinite settle loop when a reaction reads without ticking.
+- **`RegOut` is ADOPTED, not superseded.** The register/combinational distinction is
+  irreducible (no single phase is universally correct), so `RegOut` is the minimal
+  explicit marker; the macro + sim support it and `mac_fsm` uses it. See
+  REGISTERED_OUTPUTS.md. (The transpiler does not yet lower it — the one remaining
+  alignment step.)
+- **Ignored tests: 6** (was 14). Post-edge silently reconciled the sim with the
+  transpiler for `mac_pipeline`/`det_010`/`counter`, so those un-ignored. The
+  genuine open items are `mac_fsm` (needs transpiler `RegOut`) and the mid-phase
+  cross-tick read (`accum_2`/`probe_fsm`); the other 3 are reproducible probes. See
+  the triage in the git history and EXECUTOR_CONVENTION_EXPERIMENT.md.
 
 ## Open questions
 

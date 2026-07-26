@@ -1,14 +1,22 @@
 # Explicit Registered Outputs (`RegOut`)
 
-**Status:** SUPERSEDED for the simulator (2026-07-25) by the atomic-instant model
-(SYNCHRONOUS_SEMANTICS.md / ATOMIC_INSTANT_EXECUTOR.md). The sim now registers held
-outputs *by construction* — an output only takes a value in the instant its
-`out.write` runs, so no explicit marker is needed at the sim level. The `RegOut`
-primitive in `copper-core/src/port.rs` is now unused by the sim; the sim-side
-prototypes were removed. This document is retained because the *transpiler*
-alignment still has the same choice to make (register held outputs vs alias), and
-an explicit `RegOut` marker may inform how the transpiler is aligned to the atomic
-sim timing. Original design below.
+**Status:** ADOPTED for the macro + simulator (2026-07-25); transpiler lowering
+pending. An earlier revision of this note marked `RegOut` "superseded" under the
+interim atomic model (which registered *every* held output by construction). The
+dual-convention experiment (EXECUTOR_CONVENTION_EXPERIMENT.md) reversed that: under
+the post-edge convention no single global scheduling choice is correct for both
+write-before-tick and write-after-tick outputs — the register/combinational
+distinction is irreducible — so `RegOut` is the **minimal, provably-necessary**
+explicit marker, not a redundant one.
+
+Current state:
+- `RegOut<T,D>` is a first-class output port type (`copper-core/src/port.rs`).
+- The `#[hardware]` macro accepts it (`copper-macros`); `mac_fsm`'s held output
+  uses it (`examples/sequential/pipeline_mac.rs`).
+- **Not yet done:** the transpiler does not lower `RegOut` to a registered output
+  (`always_ff … out <= v`). Until it does, `mac_fsm_equivalence` stays ignored
+  (the sim registers via `RegOut`, the transpiler still emits combinational). This
+  is the remaining transpiler-alignment step. Original design below.
 
 ## Summary
 
