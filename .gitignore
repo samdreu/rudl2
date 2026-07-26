@@ -13,3 +13,9 @@ Cargo.lock
 
 # macOS system files
 .DS_Store
+
+# Generated simulation waveforms
+waveforms/
+
+# Local agent/editor config
+.claude/
