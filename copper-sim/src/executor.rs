@@ -262,12 +262,22 @@ impl HardwareExecutor {
     pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
         crate::synced_read::bump_call_id();
 
+        // Post-edge continuation convention: a `clk.tick()` resolves in the
+        // POST-edge settle, so a reaction's post-tick code runs in the SAME
+        // `tick_clock`, AFTER the advance. A register clocked at edge N is thus
+        // observable in cycle N — the standard synchronous-testbench convention —
+        // so the primitive constructs (flip-flop `q<=d`, enabled register,
+        // synchronous-read RAM) match hand-written Verilog. Held/registered OUTPUT
+        // ports that need one more cycle of latency use an explicit `RegOut`.
+        // See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.
         crate::set_poll_phase(crate::PollPhase::PreEdge);
+        copper_core::types::set_tick_resolving(false);
         self.poll_tasks();
 
         clk.advance();
 
         crate::set_poll_phase(crate::PollPhase::PostEdge);
+        copper_core::types::set_tick_resolving(true);
         self.poll_tasks();
 
         self.cycle += 1;
@@ -347,6 +357,9 @@ mod tests {
         let dirty = out.dirty_handle();
         exec.spawn_wired(wired_counter(clk.clone(), out), vec![dirty]);
 
+        // Post-edge continuation: out.write(value) and the increment both run in
+        // the tick's post-edge, so the value written at edge N (after incrementing)
+        // is observed in cycle N — the counter reads 1,2,3 (matching `assign q=v`).
         exec.tick_clock(&mut clk);
         assert_eq!(in_.read(), 1);
 

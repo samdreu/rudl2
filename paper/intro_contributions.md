@@ -26,7 +26,11 @@ state-machine compiler for this: Rust's own `async` lowering transforms the func
 the FSM, and its fields *are* the registers. The same source text is compiled by `rustc` into
 a cycle-accurate simulation and, independently, lowered by Copper's transpiler
 (FIR → CHIR → SHIR → VLIR) to SystemVerilog; the two are checked for behavioral equivalence
-under Verilator.
+under Verilator. Critically, the simulator's cycle-level timing is itself **anchored to
+independent, hand-written SystemVerilog references** for the primitive sequential constructs
+(flip-flop, enabled register, synchronous-read RAM), so "cycle-accurate" means *matches
+hardware* rather than *matches our own transpiler* — the same-source equivalence is a
+correctness property, not a self-consistency check.
 
 On top of this, Copper uses Rust's type and ownership systems for structural safety. Clock
 domains are phantom type parameters (`Clock<D>`, `In<T,D>`, `Out<T,D>`), so a signal produced
@@ -42,10 +46,29 @@ exactly one driver, with no separate analysis pass.
    encoding: variables live across `clk.tick().await` become the registers of the synthesized
    FSM. `[Evidence: traffic_light_fsm, uart/rx; macro is validation-only — copper-macros/src/lib.rs.]`
 
-2. **A same-source correspondence between simulation and synthesis, checked by construction.**
-   The identical Rust source is executed for cycle-accurate simulation and transpiled to
-   SystemVerilog, and we verify behavioral equivalence under Verilator with an automated
-   harness. `[Evidence: tests/lfsr_equivalence.rs, tests/m1_counter_equivalence.rs. TODO: expand example set.]`
+2. **A same-source correspondence between simulation and synthesis, checked by construction —
+   and anchored to hardware.** The identical Rust source is executed for cycle-accurate
+   simulation and transpiled to SystemVerilog, and we verify behavioral equivalence under
+   Verilator. To keep this from being circular (two Copper artifacts agreeing with each other),
+   the simulator's timing is *separately* validated against **independent, third-party
+   SystemVerilog** — modules from the **BaseJump STL** hardware library, checked against both
+   BaseJump's own module sources *and* the parameters/stimulus from BaseJump's own testbenches
+   — as well as hand-written references for the primitive constructs (flip-flop `q <= d`,
+   enabled register, synchronous-read block RAM). Because the reference DUTs and the test
+   vectors both come from a third party, the equivalence is anchored to hardware neither we nor
+   our transpiler authored. `[Evidence: sim≡BaseJump-Verilog in examples/basejump/ —
+   bsg_dff_en, bsg_mux_one_hot, bsg_counter_up_down, bsg_encode_one_hot, bsg_gray_to_binary,
+   bsg_adder_one_hot; sim≡hand-written-SV in examples/memory/dual_port_ram.rs,
+   tests/timing_probe_investigation.rs, tests/mem_latency_probe.rs; sim≡transpiler in
+   tests/*_equivalence.rs. TODO: expand the BaseJump set and the transpiler-verified set.]`
+
+5. **A minimal, provably-necessary output-timing annotation.** Control-flow inference resolves
+   register-vs-combinational timing for *internal* state (contribution 1), but we show — by a
+   dual-convention executor experiment against hand-written Verilog — that no single global
+   scheduling choice can make *output-port* timing correct for both registered and combinational
+   outputs simultaneously: the two conventions are exact duals. Copper therefore infers output
+   timing where it is derivable and requires exactly one explicit annotation (`RegOut`) at the
+   provably-ambiguous boundary. `[Evidence: design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.]`
 
 3. **Ownership-enforced single-driver and phantom-typed clock domains** as lightweight,
    pass-free structural guarantees discharged entirely by the Rust compiler. We position clock-
@@ -54,7 +77,8 @@ exactly one driver, with no separate analysis pass.
 
 4. **A staged transpilation pipeline (FIR → CHIR → SHIR → VLIR → SystemVerilog)** that lowers
    Rust `async` hardware modules to Verilator-lint-clean SystemVerilog, with the Copper
-   simulator as the semantic reference. `[Evidence: copper-codegen. Scope: single clock domain,
+   simulator — itself validated against independent hand-written Verilog (contribution 2) — as
+   the semantic reference. `[Evidence: copper-codegen. Scope: single clock domain,
    flat modules, current example feature set — see TRANSPILATION_ROADMAP.md.]`
 
 ## Claims explicitly NOT made (guardrails)
@@ -63,6 +87,10 @@ exactly one driver, with no separate analysis pass.
 - Not "unified sim/synth" as a novelty (table stakes); the novelty is the *verified same-source
   correspondence*.
 - No timing-safety guarantee in the Anvil sense; no pipeline-composition typing in the Filament sense.
+- Not "zero timing annotations." We infer register-vs-combinational timing for internal state,
+  but output-port timing requires one explicit annotation (`RegOut`) — and we argue that
+  annotation is *minimal and provably necessary*, not a limitation (contribution 5). Framing the
+  annotation as a characterized boundary is stronger and safer than a zero-annotation superlative.
 
 ## Open items before this is submittable
 - [ ] Expand transpiler coverage and the equivalence-verified example set (bounds the eval).

@@ -2,6 +2,8 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::types::{Clock, ClockDomain, ClockEdgeListener};
+
 pub struct DirtyHandle(Arc<AtomicBool>);
 impl DirtyHandle {
     pub fn take(&self) -> bool {
@@ -60,6 +62,78 @@ pub fn wire<T: Clone + PartialEq, D>(initial: T) -> (Out<T, D>, In<T, D>) {
         inner,
         _domain: PhantomData,
     };
+    (out, input)
+}
+
+// ── Registered (implicit-hold) output ─────────────────────────────────────────
+//
+// The simulation model of a conditionally-driven output port. In hardware such an
+// output is a flip-flop with enable: it captures its written value at the clock
+// edge and holds otherwise (a combinational conditional drive would be a latch).
+// A `RegOut` mirrors that: `write` buffers a value, and at each `posedge` (via the
+// `ClockEdgeListener` path `clk.advance()` fires, between the pre- and post-edge
+// settle) the buffered value commits to the observed cell — so it is seen one
+// cycle after the write executes, exactly like the transpiled implicit-hold
+// register. Unconditional outputs stay on plain combinational `Out`.
+//
+// See EXECUTION_MODEL_RECONCILIATION.md (output-timing) and `Memory`, which uses
+// the same `on_posedge` commit pattern.
+
+struct RegOutShared<T> {
+    /// The observed value (what the reader sees). Shared with the `In` handle.
+    committed: Arc<Mutex<T>>,
+    /// A write buffered this cycle, committed at the next posedge; `None` = hold.
+    pending: Mutex<Option<T>>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl<T: Clone + PartialEq + Send + Sync> ClockEdgeListener for RegOutShared<T> {
+    fn on_posedge(&self) {
+        if let Some(v) = self.pending.lock().unwrap().take() {
+            let mut c = self.committed.lock().unwrap();
+            if *c != v {
+                *c = v;
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        // No pending write → the register holds its committed value.
+    }
+}
+
+/// The write handle for a registered output. Same surface as `Out` (`write`,
+/// `dirty_handle`), so a module body is identical whether its output is plain or
+/// registered.
+pub struct RegOut<T, D> {
+    shared: Arc<RegOutShared<T>>,
+    _domain: PhantomData<D>,
+}
+
+impl<T: Clone + PartialEq + Send + Sync, D> RegOut<T, D> {
+    pub fn write(&self, value: T) {
+        *self.shared.pending.lock().unwrap() = Some(value);
+    }
+
+    pub fn dirty_handle(&self) -> DirtyHandle {
+        DirtyHandle(self.shared.dirty.clone())
+    }
+}
+
+/// Create a registered output wired to a reader, clocked by `clock`. The output
+/// commits buffered writes at each `posedge` and holds between them.
+pub fn registered_wire<T: Clone + PartialEq + Send + Sync + 'static, D: ClockDomain>(
+    clock: &Clock<D>,
+    initial: T,
+) -> (RegOut<T, D>, In<T, D>) {
+    let committed = Arc::new(Mutex::new(initial));
+    let shared = Arc::new(RegOutShared {
+        committed: committed.clone(),
+        pending: Mutex::new(None),
+        dirty: Arc::new(AtomicBool::new(false)),
+    });
+    let listener: Arc<dyn ClockEdgeListener> = shared.clone();
+    clock.register_listener(Arc::downgrade(&listener));
+    let out = RegOut { shared, _domain: PhantomData };
+    let input = In { inner: committed, _domain: PhantomData };
     (out, input)
 }
 

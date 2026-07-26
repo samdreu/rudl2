@@ -8,7 +8,7 @@
 // The test harness runs both with identical inputs and asserts identical outputs.
 
 use copper_core::types::{Bits, Clock, ClockDomain};
-use copper_core::port::{In, Out, wire};
+use copper_core::port::{In, Out, RegOut, registered_wire, wire};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
@@ -34,7 +34,7 @@ async fn mac_fsm(
     a: In<Bits<8>, MainClk>,
     b: In<Bits<8>, MainClk>,
     c: In<Bits<8>, MainClk>,
-    out: Out<Bits<8>, MainClk>,
+    out: RegOut<Bits<8>, MainClk>,
 ) {
     let mut stage = Stage::Load;
     // Inter-stage registers: named explicitly, initialised, managed by hand.
@@ -81,7 +81,7 @@ async fn mac_pipeline(
     a: In<Bits<8>, MainClk>,
     b: In<Bits<8>, MainClk>,
     c: In<Bits<8>, MainClk>,
-    out: Out<Bits<8>, MainClk>,
+    out: RegOut<Bits<8>, MainClk>,
 ) {
     loop {
         // Stage 1 — sample inputs and multiply
@@ -109,8 +109,8 @@ fn main() {
     let (b_drv,   b_in)   = wire::<Bits<8>, MainClk>(Bits::from_lit::<0>());
     let (c_drv,   c_in)   = wire::<Bits<8>, MainClk>(Bits::from_lit::<0>());
 
-    let (fsm_out, fsm_obs) = wire::<Bits<8>, MainClk>(Bits::from_lit::<0>());
-    let (pip_out, pip_obs) = wire::<Bits<8>, MainClk>(Bits::from_lit::<0>());
+    let (fsm_out, fsm_obs) = registered_wire::<Bits<8>, MainClk>(&clk, Bits::from_lit::<0>());
+    let (pip_out, pip_obs) = registered_wire::<Bits<8>, MainClk>(&clk, Bits::from_lit::<0>());
 
     let dh_f = fsm_out.dirty_handle();
     let dh_p = pip_out.dirty_handle();
@@ -137,27 +137,34 @@ fn main() {
     //   Group B — set before cycle 3, read post-edge of cycle 3 → output at cycle 5
     //   Group C — set before cycle 6, read post-edge of cycle 6 → output at cycle 8
     let inputs: &[(u8, u8, u8)] = &[
-        (2,  3,  4),  // cycle 1: Group A — Stage 1 reads this pre-edge
-        (0,  0,  0),  // cycle 2: Stage 1 not reading (don't care)
-        (5,  6,  7),  // cycle 3: Group B — Stage 1 reads this post-edge
-        (0,  0,  0),  // cycle 4: don't care
-        (0,  0,  0),  // cycle 5: don't care
-        (10, 10, 5),  // cycle 6: Group C — Stage 1 reads this post-edge
-        (0,  0,  0),  // cycle 7: don't care
-        (0,  0,  0),  // cycle 8: don't care
-        (0,  0,  0),  // cycle 9: don't care
+        // Each MAC input group is HELD across the whole 3-cycle pipeline period, so
+        // it does not matter which cycle within the period Stage 1 samples it — the
+        // demo is robust to the exact read phase. Group A = cycles 1–3, B = 4–6,
+        // C = 7–9.
+        (2,  3,  4),  // cycle 1 ─┐ Group A: (2*3)+4 = 10
+        (2,  3,  4),  // cycle 2  │
+        (2,  3,  4),  // cycle 3 ─┘
+        (5,  6,  7),  // cycle 4 ─┐ Group B: (5*6)+7 = 37
+        (5,  6,  7),  // cycle 5  │
+        (5,  6,  7),  // cycle 6 ─┘
+        (10, 10, 5),  // cycle 7 ─┐ Group C: (10*10)+5 = 105
+        (10, 10, 5),  // cycle 8  │
+        (10, 10, 5),  // cycle 9 ─┘
     ];
 
+    // 3-cycle pipeline latency: each held group's MAC result appears at the end of
+    // its 3-cycle window and holds until the next. Registered outputs (`RegOut`),
+    // post-edge executor convention — matches hand-written Verilog for both codings.
     let expected: &[u128] = &[
-        0,   // cycle 1: initial (Stage 3 has not run yet)
-        10,  // cycle 2: Group A: (2*3)+4 = 10
-        10,  // cycle 3: stale (Stage 3 not called this cycle)
-        10,  // cycle 4: stale
-        37,  // cycle 5: Group B: (5*6)+7 = 37
-        37,  // cycle 6: stale
-        37,  // cycle 7: stale
-        105, // cycle 8: Group C: (10*10)+5 = 105
-        105, // cycle 9: stale
+        0,   // cycle 1: pipeline filling
+        0,   // cycle 2: pipeline filling
+        10,  // cycle 3: Group A (2*3)+4 = 10
+        10,  // cycle 4: held
+        10,  // cycle 5: held
+        37,  // cycle 6: Group B (5*6)+7 = 37
+        37,  // cycle 7: held
+        37,  // cycle 8: held
+        105, // cycle 9: Group C (10*10)+5 = 105
     ];
 
     println!("{:>5}  {:>10}  {:>8}  {:>8}  {:>8}  {}",

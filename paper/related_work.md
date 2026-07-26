@@ -73,8 +73,21 @@ Chisel, PyMTL3, Clash, and Bluespec all provide simulation and synthesis from on
 so "unified sim/synth" alone is not a contribution. Copper's claim is narrower and stronger:
 the **same literal source text** is compiled by rustc for cycle-accurate simulation *and* fed
 to the transpiler for SystemVerilog, and the two are checked for behavioral equivalence under
-Verilator (the equivalence harness in `tests/*_equivalence.rs`). `[VERIFY: current end-to-end
-equivalence is demonstrated for counter and lfsr; scale before framing as a general guarantee.]`
+Verilator (the equivalence harness in `tests/*_equivalence.rs`). A same-source sim/synth check
+is only meaningful if the reference is anchored: two artifacts from one compiler can be made to
+agree while both diverging from hardware. We therefore separately **validate the simulator's
+cycle-level timing against independent, third-party SystemVerilog** — modules from the
+**BaseJump STL** library [Taylor et al.], checked against BaseJump's own DUT sources and the
+parameters/stimulus of BaseJump's own testbenches, plus hand-written references for the
+primitive constructs (flip-flop, enabled register, synchronous-read RAM). Because both the
+reference hardware and the test vectors originate outside Copper, the equivalence rests on a
+hardware anchor rather than on internal self-consistency. This anchoring surfaced a substantive
+semantic result: for *output-port* timing, no single executor scheduling convention matches
+hardware for both registered and combinational outputs — the two are exact duals — which we
+resolve with a single, provably-necessary `RegOut` annotation while inference continues to
+handle internal state. `[VERIFY: current end-to-end equivalence is demonstrated for counter and
+lfsr; hand-written-reference anchoring is demonstrated for FF/enff/RAM (dual_port_ram + timing
+probes); scale both before framing as a general guarantee.]`
 
 ---
 
@@ -87,6 +100,7 @@ equivalence is demonstrated for counter and lfsr; scale before framing as a gene
 - *Arch: An AI-Native Hardware Description Language for Register-Transfer Clocked Hardware Design.* arXiv:2604.05983, 2026.
 - Berry & Gonthier. *The Esterel Synchronous Programming Language: Design, Semantics, Implementation.* Sci. Comput. Program. 19(2), 1992.
 - Baaij et al. *Clash: A Functional Hardware Description Language.* (clash-lang.org)
+- Taylor et al. *BaseJump STL: SystemVerilog Standard Template Library.* bespoke-silicon-group/basejump_stl (Solderpad Hardware License v0.51). Used as independent hardware references for the equivalence eval.
 - Bachrach et al. *Chisel: Constructing Hardware in a Scala Embedded Language.* DAC 2012.
 - Nikhil. *Bluespec SystemVerilog.* MEMOCODE 2004.
 - Basu. *RHDL: Rust as a Hardware Description Language.* LATTE 2024/2025.

@@ -54,6 +54,28 @@ parser refactor emits `ExprType::Path` for a bare-identifier `port.write()` rece
 intended/last-known-good state, not the current tree. **Transpiler fix is planned by the
 author.** Any paper claim of demonstrated equivalence must wait until these tests are green.
 
+## Executor-convention decision (2026-07-25) — anchors C2, adds a semantics sub-result
+The simulator's cross-tick **output timing** was investigated against independent hand-written
+Verilog (not the transpiler). Finding: the executor's tick-phase choice is an **irreducible
+dual** — pre-edge continuation makes write-before-tick outputs (Moore FSM, e.g. `mac_fsm`)
+match hardware but write-after-tick outputs (flip-flop, enabled register, sync-RAM read) off by
+one cycle; post-edge continuation does the exact reverse. No single global convention is correct
+for both. See `design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md` (probes:
+`tests/timing_probe_investigation.rs`, `tests/mem_latency_probe.rs`; refs:
+`tests/fixtures/timing_probe_sv/*.sv`).
+
+**Decision: adopt the post-edge base (the more hardware-standard convention — a register clocked
+at edge N is observable in cycle N) + an explicit `RegOut` annotation for held/registered output
+ports.** This makes the primitive constructs match hand-written Verilog, which is what lets C2
+("cycle-accurate", "semantic reference") be a *hardware* claim rather than a self-consistency
+check. Two paper consequences:
+- **C2/C4 reframed** to "sim anchored to independent hand-written references," defusing the
+  circularity attack ("you only proved your sim agrees with your transpiler").
+- **New contribution 5**: output-timing inference is provably insufficient at exactly one point;
+  `RegOut` is the minimal, characterized annotation. This is a partial answer to the
+  "no formal semantics" weakness below.
+- **Guardrail added**: do NOT claim "zero timing annotations."
+
 ## Known weaknesses a reviewer will attack
 - **Transpiler coverage is thin** (counter + lfsr end-to-end, *once the fix lands*). The eval
   section is bounded by how many examples pass `transpile_source` + Verilator. Active TODO.

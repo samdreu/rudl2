@@ -62,7 +62,7 @@ fn main() {
     );
 
     let mut test = HardwareTest::new("dual_port_ram")
-        .with_verilog("examples/memory/sv/dual_port_ram.v")
+        .with_verilog("examples/memory/sv/dual_port_ram.sv")
         .with_waveform("waveforms/dual_port_ram.vcd")
         .with_verilator_waveform("waveforms/dual_port_ram_v.vcd");
 

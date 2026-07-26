@@ -1,8 +1,21 @@
 # Control Extraction: async control flow → explicit FSM
 
-**Status:** design + in-progress (2026-07-24). The milestone behind the README's
-"write FSMs naturally with async/await" claim. Blocks `uart/rx` and
-`det_010_awaits`.
+**Status:** increment A (straight-line + `if`/`else`) DONE and validated
+(2026-07-24). The milestone behind the README's "write FSMs naturally with
+async/await" claim. Increments B–D (while / for / break-continue) still ahead;
+`uart/rx` is the stretch goal.
+
+**Increment A landed:** the FIR→FIR pass in `copper-codegen/src/control_extract.rs`
+(wired into `transpile_fir`, gated to fire only when a tick is nested in a branch,
+so linear modules are untouched) flattens tick-in-`if`/`else` loops into the
+single-tick `match pc` FSM. Validated **structurally** by
+`tests/control_extraction_structural.rs`: the extracted async modules (`if_tick`,
+`branch_merge`) transpile to byte-identical SystemVerilog as their hand-written
+explicit `match pc` twins — the det_010_awaits→det_010 method. (Structural rather
+than sim-vs-Verilator because the synthetic modules have conditional/pre-tick
+outputs, which hit the still-open OUTPUT-timing item in
+EXECUTION_MODEL_RECONCILIATION.md; the READ-timing half is fixed, so
+`mac_pipeline` now passes sim-vs-Verilator.)
 
 ## Problem
 

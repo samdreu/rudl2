@@ -86,3 +86,28 @@ path = "examples/cdc/two_domain_counter.rs"
 [[example]]
 name = "flag_crossing"
 path = "examples/cdc/flag_crossing.rs"
+
+# BaseJump STL — Copper modules checked against independent (BaseJump) Verilog.
+[[example]]
+name = "bsg_dff_en"
+path = "examples/basejump/bsg_dff_en.rs"
+
+[[example]]
+name = "bsg_mux_one_hot"
+path = "examples/basejump/bsg_mux_one_hot.rs"
+
+[[example]]
+name = "bsg_counter_up_down"
+path = "examples/basejump/bsg_counter_up_down.rs"
+
+[[example]]
+name = "bsg_encode_one_hot"
+path = "examples/basejump/bsg_encode_one_hot.rs"
+
+[[example]]
+name = "bsg_gray_to_binary"
+path = "examples/basejump/bsg_gray_to_binary.rs"
+
+[[example]]
+name = "bsg_adder_one_hot"
+path = "examples/basejump/bsg_adder_one_hot.rs"

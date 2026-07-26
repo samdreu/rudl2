@@ -136,6 +136,7 @@ pub(crate) fn check_cdc(f: &ItemFn) -> Result<(), Error> {
         let Some(kind) = (match outer.as_deref() {
             Some("In") => Some("input"),
             Some("Out") => Some("output"),
+            Some("RegOut") => Some("output"),
             _ => None,
         }) else {
             continue;
@@ -690,18 +691,21 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
                     ));
                 }
 
-                // All parameters must be Clock<D>, In<T>, or Out<T>
+                // All parameters must be Clock<D>, In<T>, Out<T>, or RegOut<T>.
+                // `RegOut<T,D>` is a registered output port (an enabled flip-flop):
+                // same body surface as `Out` (`.write`), but its value commits at the
+                // clock edge, so a held/conditional output is a proper register rather
+                // than a latch. It counts as an output. See copper-core RegOut and
+                // design_docs/REGISTERED_OUTPUTS.md.
                 match outer_type_name(&pat_ty.ty).as_deref() {
-                    Some("Clock") => has_clock = true,
-                    Some("In")    => {}
-                    Some("Out")   => has_out = true,
-                    // Some("Vec")   => {
-                    //     // Handle Vec<In<T>> or Vec<Out<T>> if needed
-                    // }
+                    Some("Clock")  => has_clock = true,
+                    Some("In")     => {}
+                    Some("Out")    => has_out = true,
+                    Some("RegOut") => has_out = true,
                     _ => {
                         return Err(Error::new_spanned(
                             &pat_ty.ty,
-                            "hardware function parameters must be Clock<D>, In<T>, or Out<T>",
+                            "hardware function parameters must be Clock<D>, In<T>, Out<T>, or RegOut<T>",
                         ));
                     }
                 }

@@ -103,12 +103,15 @@ fn main() {
     //      1           4         0          0
     //      2           6         0          0
     //      3           8         1          0  flag latches in fast domain
-    //      4          10         1          1  synchronized — 1 slow-cycle latency ✓
-    //      5+         ..         1          1
+    //      4          10         1          0  in flight through the synchronizer
+    //      5          12         1          1  synchronized — 2-slow-cycle latency ✓
+    //      6+         ..         1          1
     //
-    // The 2-FF synchronizer adds 1 slow-cycle of data latency (the two flip-flops
-    // provide metastability resolution time within that one cycle, not two cycles
-    // of propagation delay).
+    // The 2-FF synchronizer adds two destination-clock cycles of latency: the flag
+    // is captured by the first flip-flop on one ClkSlow edge and forwarded to the
+    // second on the next, which is exactly what the post-edge (hardware-standard)
+    // executor convention reproduces. (The old single-cycle figure was an artifact
+    // of the previous compressed-execution timing.)
     //
     // Note on assignment order in sync_2ff: `ff2 = ff1` must precede `ff1 = d`
     // because Copper's sequential-forwarding semantics make later assignments in
@@ -135,9 +138,10 @@ fn main() {
         let flag_raw  = consumer_obs.read(); // we observe sync output, not raw fast signal
 
         // flag_raw (latched) first asserts at slow_cycle 3 (fast count first reaches 8).
-        // After 1 slow-cycle synchronizer latency, flag_sync appears at slow_cycle 4.
+        // The 2-FF synchronizer resolves over two destination-clock edges, so flag_sync
+        // appears at slow_cycle 5 (2-slow-cycle latency).
         let flag_sync = consumer_obs.read();
-        let expected  = if slow_cycle >= 4 { Logic::One } else { Logic::Zero };
+        let expected  = if slow_cycle >= 5 { Logic::One } else { Logic::Zero };
         let pass = flag_sync == expected;
         if !pass { all_pass = false; }
 
@@ -153,7 +157,7 @@ fn main() {
         let _ = raw_display;
     }
 
-    println!("\n1-slow-cycle synchronizer latency verified: {}",
+    println!("\n2-slow-cycle synchronizer latency verified: {}",
         if all_pass { "✓" } else { "✗" });
     if !all_pass { std::process::exit(1); }
 }

@@ -931,15 +931,36 @@ pub struct ClockTick<Domain: ClockDomain> {
     _domain: PhantomData<Domain>,
 }
 
+thread_local! {
+    /// Whether a `clk.tick()` resolves in the current settle pass. The executor
+    /// enables this in the POST-edge pass only, so a reaction's post-tick code runs
+    /// after `clk.advance()` within the same `tick_clock` (the post-edge continuation
+    /// convention — a register clocked at edge N is observable in cycle N). Each loop
+    /// reaction still advances by exactly one tick per `tick_clock` — never compressed
+    /// into the same call as the previous reaction. See
+    /// design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md. Defaults `true` so bare-future
+    /// unit tests that don't drive the phase still progress.
+    static TICK_RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Executor hook: mark whether a `clk.tick()` resolves in the current settle pass.
+pub fn set_tick_resolving(resolves: bool) {
+    TICK_RESOLVING.with(|c| c.set(resolves));
+}
+
+fn tick_resolves_now() -> bool {
+    TICK_RESOLVING.with(|c| c.get())
+}
+
 impl<Domain: ClockDomain> std::future::Future for ClockTick<Domain> {
     type Output = ();
-    
+
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let mut state = self.state.lock().unwrap();
-        if state.cycle >= self.target_cycle {
+        if state.cycle >= self.target_cycle && tick_resolves_now() {
             std::task::Poll::Ready(())
         } else {
             state.wakers.push(cx.waker().clone());

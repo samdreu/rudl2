@@ -2,6 +2,7 @@
 mod parser;
 mod verilog;
 pub mod chir_lower;
+pub mod control_extract;
 pub mod shir_lower;
 pub mod vlir_lower;
 pub mod emit;
@@ -34,6 +35,13 @@ pub fn transpile_fir(
     registry: &ModuleRegistry,
     config: &EmitConfig,
 ) -> Result<String, String> {
+    // Control extraction (FIR→FIR): flatten async control-flow loops whose ticks
+    // live inside branches into an explicit single-tick `match pc` FSM — the shape
+    // the pipeline below already lowers correctly. No-op for linear modules.
+    let mut fir = fir.clone();
+    control_extract::extract_control(&mut fir);
+    let fir = &fir;
+
     let chir = lower_to_chir(fir, hardware_fns, registry).map_err(|e| format!("{e}"))?;
     let shir = lower_to_shir(&chir).map_err(|e| format!("{e}"))?;
     let vlir = lower_to_vlir(&shir).map_err(|e| format!("{e}"))?;
