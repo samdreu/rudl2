@@ -31,7 +31,6 @@ const DUT_SRC: &str = include_str!("fixtures/mac_pipeline_dut.rs");
 // `copper-sim/src/synced_read.rs` fix. Inputs are read every 3 cycles at phase 0
 // (cycles 0, 3, 6), so the stimulus places its three input groups there.
 #[test]
-#[ignore = "sim re-timed to atomic semantics; transpiler output-timing alignment pending — see design_docs/ATOMIC_INSTANT_EXECUTOR.md"]
 fn mac_pipeline_sim_matches_transpiled_verilog() {
     let mut eq = EquivalenceTest::new("mac_pipeline", DUT_SRC);
 

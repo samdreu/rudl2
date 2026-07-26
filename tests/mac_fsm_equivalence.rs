@@ -16,16 +16,18 @@ impl ClockDomain for MainClk {}
 include!("fixtures/mac_fsm_dut.rs");
 const DUT_SRC: &str = include_str!("fixtures/mac_fsm_dut.rs");
 
-// KNOWN FAILURE (documented). With conditional-output → implicit-hold register,
-// mac_fsm now *transpiles* — and the adjudication result is decisive: its `out`
-// (registered: `out <= result` at the Stage::Out edge) is **one cycle later** than
-// the simulator (`trace: PASS`, `verilator: FAIL`, out lags by 1). This is the
-// SAME one-cycle discrepancy as mac_pipeline's read timing, now on the output
-// side — i.e. natural clocked hardware (register captures at the edge) is
-// consistently one cycle *behind* the simulator for multi-cycle sequential logic.
-// See design_docs/EXECUTION_MODEL_RECONCILIATION.md. Un-ignore once reconciled.
+// KNOWN FAILURE (documented) — the canonical `RegOut` case. mac_fsm writes `out`
+// *before* its tick (in the Stage::Out arm), so under the post-edge convention the
+// plain-`Out` simulator observes it one cycle *early* relative to the transpiler's
+// registered output (`out <= result` at the edge). The fix is to declare this
+// output `RegOut` (which defers it one cycle to match) — the macro + sim already
+// support `RegOut`, but the transpiler does not yet lower it, so this fixture stays
+// on plain `Out` and the test stays ignored until transpiler `RegOut` support
+// lands. (Contrast mac_pipeline / det_010 / counter, which now pass under post-edge
+// with plain `Out`.) See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md and
+// design_docs/REGISTERED_OUTPUTS.md.
 #[test]
-#[ignore = "sim is 1 cycle ahead of the registered output — see EXECUTION_MODEL_RECONCILIATION.md"]
+#[ignore = "canonical RegOut case: write-before-tick output is 1 cycle early under post-edge with plain Out; needs RegOut lowered by the transpiler (deferred) — see design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md"]
 fn mac_fsm_sim_matches_transpiled_verilog() {
     let mut eq = EquivalenceTest::new("mac_fsm", DUT_SRC);
     let mut clk = Clock::<MainClk>::new();

@@ -80,7 +80,7 @@ fn probe_timing_four_way() {
 /// agree" boundary is really "no phase-gated cross-tick read". Intentionally
 /// failing (verilator: FAIL); kept as an executable record of the finding.
 #[test]
-#[ignore = "demonstrates the sim-reads-one-cycle-early gap (verilator FAIL) — see EXECUTION_MODEL_RECONCILIATION.md"]
+#[ignore = "demonstration: a phase-gated cross-tick (mid-phase) read still diverges from the transpiler by one cycle under post-edge — the same open case as read_timing_equivalence::accum_2. See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md"]
 fn probe_fsm_sim_matches_verilog() {
     let mut eq = EquivalenceTest::for_module("probe_fsm", DUT_SRC, Some("probe_fsm"));
     let mut clk = Clock::<MainClk>::new();

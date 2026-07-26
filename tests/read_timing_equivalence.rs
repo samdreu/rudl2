@@ -25,7 +25,6 @@ fn sampled_at(n: usize, p: usize) -> usize {
 
 /// 2-tick sample-and-hold: `out` holds the input sampled every 2 cycles.
 #[test]
-#[ignore = "sim re-timed to atomic semantics; transpiler output-timing alignment pending — see design_docs/ATOMIC_INSTANT_EXECUTOR.md"]
 fn sample_hold_2_sim_matches_verilog() {
     let inputs: Vec<u8> = (0..12).map(|i| (i as u8) + 10).collect();
     let mut eq = EquivalenceTest::for_module("sample_hold_2", DUT_SRC, Some("sample_hold_2"));
@@ -58,7 +57,7 @@ fn sample_hold_2_sim_matches_verilog() {
 /// the other transpiler-alignment ignores — NOT a read-timing bug. See
 /// SYNCHRONOUS_SEMANTICS.md / ATOMIC_INSTANT_EXECUTOR.md.
 #[test]
-#[ignore = "held output registered (+1) vs combinational reference; transpiler output-timing alignment pending — read timing is correct under atomic"]
+#[ignore = "mid-phase (between-ticks) read: sim and transpiler disagree by one cycle. Under post-edge the loop-top read cases (sample_hold_2, sum_hold_2) now match, but this read whose result crosses a *second* tick does not — adjudication pending. See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md"]
 fn accum_2_sim_matches_verilog() {
     let step: Vec<u8> = (0..12).map(|i| (i as u8) + 1).collect();
     let mut eq = EquivalenceTest::for_module("accum_2", DUT_SRC, Some("accum_2"));
@@ -86,7 +85,6 @@ fn accum_2_sim_matches_verilog() {
 
 /// Two loop-top cross-tick reads summed, then held (period 2).
 #[test]
-#[ignore = "sim re-timed to atomic semantics; transpiler output-timing alignment pending — see design_docs/ATOMIC_INSTANT_EXECUTOR.md"]
 fn sum_hold_2_sim_matches_verilog() {
     let a: Vec<u8> = (0..12).map(|i| (i as u8) + 10).collect();
     let b: Vec<u8> = (0..12).map(|i| (i as u8) + 1).collect();

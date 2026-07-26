@@ -74,17 +74,43 @@ async fn det_010_awaits (
     }
 }
 
+fn main() {
+    // Demo: run det_010 over a bit stream containing the "010" pattern and print
+    // when the detector fires. (The equivalence checks live in the tests below.)
+    let mut clk = Clock::<MainClk>::new();
+    let mut exec = HardwareExecutor::new();
+    let (rstn_drv, rstn) = wire::<Logic, MainClk>(Logic::One);
+    let (in_drv, in_i) = wire::<Logic, MainClk>(Logic::Zero);
+    let (out_drv, out_obs) = wire::<Logic, MainClk>(Logic::Zero);
+    let dh = out_drv.dirty_handle();
+    exec.spawn_wired(det_010(clk.clone(), rstn, in_i, out_drv), vec![dh]);
+
+    println!("=== det_010 (detects the pattern 0,1,0) ===");
+    // Assert reset (rstn low) for one cycle to reach a known state.
+    rstn_drv.write(Logic::Zero);
+    in_drv.write(Logic::Zero);
+    exec.tick_clock(&mut clk);
+
+    let stream = [1u8, 1, 0, 1, 0, 0, 1, 0, 1, 0];
+    for &b in &stream {
+        rstn_drv.write(Logic::One);
+        in_drv.write(if b == 1 { Logic::One } else { Logic::Zero });
+        exec.tick_clock(&mut clk);
+        let fired = out_obs.read() == Logic::One;
+        println!("in={b} -> out={}{}", fired as u8, if fired { "   <-- 010 detected" } else { "" });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Under atomic-instant semantics the two codings are NOT cycle-identical:
-    // det_010_awaits writes its output at the detection instant, det_010 writes
-    // post-tick (+1), so they differ by one cycle (both detect the same pattern).
-    // This equivalence held only under the old compressed execution. See
-    // design_docs/ATOMIC_INSTANT_EXECUTOR.md.
+    // Under the post-edge execution convention the two codings are cycle-identical
+    // again: a register clocked at edge N is observed in cycle N, so det_010's
+    // post-tick `out.write(state)` and det_010_awaits's write-at-detection agree.
+    // (They diverged only under the interim atomic/pre-edge model.)
+    // See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.
     #[test]
-    #[ignore = "det_010 vs det_010_awaits differ by one cycle under atomic semantics (out.write position)"]
     fn det_010_variants_match_transition_table() {
         let mut clk = Clock::<MainClk>::new();
         let mut exec = HardwareExecutor::new();

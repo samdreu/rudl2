@@ -28,7 +28,6 @@ fn next(state: u8, rstn: bool, input: bool) -> u8 {
 // Un-ignore + re-baseline once the transpiler is aligned to the atomic output
 // timing. See design_docs/ATOMIC_INSTANT_EXECUTOR.md.
 #[test]
-#[ignore = "sim re-timed to atomic semantics; transpiler output-timing alignment pending"]
 fn det_010_sim_matches_transpiled_verilog() {
     let mut eq = EquivalenceTest::new("det_010", DUT_SRC);
     let mut clk = Clock::<MainClk>::new();

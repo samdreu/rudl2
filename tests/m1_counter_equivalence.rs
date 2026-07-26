@@ -18,7 +18,6 @@ include!("fixtures/counter_dut.rs");
 const DUT_SRC: &str = include_str!("fixtures/counter_dut.rs");
 
 #[test]
-#[ignore = "sim re-timed to atomic semantics; transpiler output-timing alignment pending — see design_docs/ATOMIC_INSTANT_EXECUTOR.md"]
 fn counter_sim_matches_transpiled_verilog() {
     let mut eq = EquivalenceTest::new("counter", DUT_SRC);
 
