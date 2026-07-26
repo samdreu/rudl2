@@ -106,12 +106,22 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
                 SHIRPortKind::Clock => Width::Concrete(1),
                 SHIRPortKind::Data { ty } => width_of(ty),
             },
+            registered: p.registered,
         })
+        .collect();
+
+    // Output ports declared `RegOut<T,D>` are registered by construction (driven
+    // from always_ff), independent of whether the body writes them on all paths.
+    let registered_outs: HashSet<String> = shir
+        .ports
+        .iter()
+        .filter(|p| p.registered)
+        .map(|p| leg.get(&p.name))
         .collect();
 
     let body = match &shir.body {
         SHIRBody::Combinational(c) => VLIRBody::Combinational(lower_comb(c, &leg)?),
-        SHIRBody::Sequential(s) => VLIRBody::Sequential(lower_seq(s, &leg)?),
+        SHIRBody::Sequential(s) => VLIRBody::Sequential(lower_seq(s, &leg, &registered_outs)?),
     };
 
     let params = shir
@@ -135,7 +145,7 @@ fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
 
 // ── Sequential body ─────────────────────────────────────────────────────────
 
-fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
+fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>) -> LowerResult<VLIRSeqBody> {
     let clock = leg.get(&s.clock);
 
     let reg_decls = s
@@ -170,7 +180,11 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer) -> LowerResult<VLIRSeqBody> {
         // a latch) to `always_ff` (`if (guard) out <= v`, holding otherwise),
         // preserving the guard structure. Done before the latch check so the
         // registered output no longer counts as a comb latch.
-        let cond_outs = conditional_output_ports(&stmts);
+        // Registered = conditionally-driven (implicit-hold, latch-avoidance) ∪
+        // explicitly-declared `RegOut` ports (registered even when written on all
+        // paths — an unconditional `RegOut` is a plain D flip-flop).
+        let mut cond_outs = conditional_output_ports(&stmts);
+        cond_outs.extend(registered_outs.iter().cloned());
         if !cond_outs.is_empty() {
             let (cleaned, out_ff) = split_output_regs(&stmts, &cond_outs);
             stmts = cleaned;

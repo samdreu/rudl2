@@ -552,6 +552,7 @@ mod tests {
                 direction: VLIRPortDir::Output,
                 kind: VLIRPortKind::Logic,
                 width: Width::Concrete(8),
+                registered: false,
             }],
             body: VLIRBody::Combinational(VLIRCombBody {
                 submodules: vec![],

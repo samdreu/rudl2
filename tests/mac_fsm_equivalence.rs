@@ -6,7 +6,7 @@
 //! Also the first real exercise of conditional-output -> implicit-hold register.
 mod common;
 use common::EquivalenceTest;
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, RegOut};
 use copper_core::types::Bits;
 use copper_core::{Clock, ClockDomain};
 use copper_macros::hardware;
@@ -16,18 +16,12 @@ impl ClockDomain for MainClk {}
 include!("fixtures/mac_fsm_dut.rs");
 const DUT_SRC: &str = include_str!("fixtures/mac_fsm_dut.rs");
 
-// KNOWN FAILURE (documented) — the canonical `RegOut` case. mac_fsm writes `out`
-// *before* its tick (in the Stage::Out arm), so under the post-edge convention the
-// plain-`Out` simulator observes it one cycle *early* relative to the transpiler's
-// registered output (`out <= result` at the edge). The fix is to declare this
-// output `RegOut` (which defers it one cycle to match) — the macro + sim already
-// support `RegOut`, but the transpiler does not yet lower it, so this fixture stays
-// on plain `Out` and the test stays ignored until transpiler `RegOut` support
-// lands. (Contrast mac_pipeline / det_010 / counter, which now pass under post-edge
-// with plain `Out`.) See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md and
-// design_docs/REGISTERED_OUTPUTS.md.
+// The canonical `RegOut` case, now aligned. mac_fsm writes `out` in the Stage::Out
+// arm and holds it between writes, so it is a registered output: declared `RegOut`,
+// the simulator (deferred-commit `registered_wire`) and the transpiler (`out <=
+// result` in `always_ff`) both give the +1 registered timing and agree under
+// Verilator. See design_docs/REGISTERED_OUTPUTS.md.
 #[test]
-#[ignore = "canonical RegOut case: write-before-tick output is 1 cycle early under post-edge with plain Out; needs RegOut lowered by the transpiler (deferred) — see design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md"]
 fn mac_fsm_sim_matches_transpiled_verilog() {
     let mut eq = EquivalenceTest::new("mac_fsm", DUT_SRC);
     let mut clk = Clock::<MainClk>::new();
@@ -35,11 +29,15 @@ fn mac_fsm_sim_matches_transpiled_verilog() {
     let (a_drv, a_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (b_drv, b_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (c_drv, c_in) = wire::<Bits<8>, MainClk>(Bits::zero());
-    let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
+    let (out_drv, out_obs): (RegOut<Bits<8>, MainClk>, _) = registered_wire(&clk, Bits::zero());
     let dh = out_drv.dirty_handle();
     exec.spawn_wired(mac_fsm(clk.clone(), a_in, b_in, c_in, out_drv), vec![dh]);
-    let inputs: &[(u8,u8,u8)] = &[(2,3,4),(0,0,0),(5,6,7),(0,0,0),(0,0,0),(10,10,5),(0,0,0),(0,0,0),(0,0,0)];
-    let expected: &[u8] = &[0,10,10,10,37,37,37,105,105];
+    // mac_fsm samples inputs in its Load state, which recurs every 3 cycles (0,3,6);
+    // hold each input group across its 3-cycle window so each MAC is well-defined.
+    // out = a*b+c, driven in the Out state (cycles 2,5,8) and held (RegOut): the
+    // three groups give 2*3+4=10, 5*6+7=37, 10*10+5=105.
+    let inputs: &[(u8,u8,u8)] = &[(2,3,4),(2,3,4),(2,3,4),(5,6,7),(5,6,7),(5,6,7),(10,10,5),(10,10,5),(10,10,5)];
+    let expected: &[u8] = &[0,0,10,10,10,37,37,37,105];
     for (&(av,bv,cv), &exp) in inputs.iter().zip(expected.iter()) {
         a_drv.write(Bits::from_u8(av)); b_drv.write(Bits::from_u8(bv)); c_drv.write(Bits::from_u8(cv));
         exec.tick_clock(&mut clk);

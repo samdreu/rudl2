@@ -961,6 +961,7 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
                 name: param.name.clone(),
                 direction: CHIRPortDir::Input,
                 kind: CHIRPortKind::Clock { domain },
+                registered: false,
                 span: param.span,
             });
         } else if let Some(inner) = strip_port_wrapper("In<", &compact) {
@@ -969,6 +970,20 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
                 name: param.name.clone(),
                 direction: CHIRPortDir::Input,
                 kind: CHIRPortKind::Data { ty },
+                registered: false,
+                span: param.span,
+            });
+        } else if let Some(inner) = strip_port_wrapper("RegOut<", &compact) {
+            // Registered output: same data port as `Out`, but its value commits at
+            // the clock edge → driven from `always_ff` (an enabled flip-flop), so a
+            // held/conditional output is a real register, not a latch, and matches
+            // the simulator's `RegOut` (+1) timing. See design_docs/REGISTERED_OUTPUTS.md.
+            let ty = resolve_type(inner, param.ty.span)?;
+            ports.push(CHIRPort {
+                name: param.name.clone(),
+                direction: CHIRPortDir::Output,
+                kind: CHIRPortKind::Data { ty },
+                registered: true,
                 span: param.span,
             });
         } else if let Some(inner) = strip_port_wrapper("Out<", &compact) {
@@ -977,6 +992,7 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
                 name: param.name.clone(),
                 direction: CHIRPortDir::Output,
                 kind: CHIRPortKind::Data { ty },
+                registered: false,
                 span: param.span,
             });
         } else {
@@ -986,6 +1002,7 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
                 name: param.name.clone(),
                 direction: CHIRPortDir::Input,
                 kind: CHIRPortKind::Data { ty },
+                registered: false,
                 span: param.span,
             });
         }
@@ -998,6 +1015,7 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
             name: "out".to_string(),
             direction: CHIRPortDir::Output,
             kind: CHIRPortKind::Data { ty },
+            registered: false,
             span: ret_ty.span,
         });
     }
@@ -3924,12 +3942,14 @@ mod tests {
                     name: "a".to_string(),
                     direction: CHIRPortDir::Input,
                     kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
+                    registered: false,
                     span: span(),
                 },
                 CHIRPort {
                     name: "out".to_string(),
                     direction: CHIRPortDir::Output,
                     kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
+                    registered: false,
                     span: span(),
                 },
             ],
@@ -3957,12 +3977,14 @@ mod tests {
                     name: "a".to_string(),
                     direction: CHIRPortDir::Input,
                     kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
+                    registered: false,
                     span: span(),
                 },
                 CHIRPort {
                     name: "out".to_string(),
                     direction: CHIRPortDir::Output,
                     kind: CHIRPortKind::Data { ty: CHIRType::UInt { width: Width::Concrete(8) } },
+                    registered: false,
                     span: span(),
                 },
             ],

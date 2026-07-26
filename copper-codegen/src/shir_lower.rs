@@ -48,6 +48,7 @@ fn lower_ports(ports: &[CHIRPort]) -> Vec<SHIRPort> {
             CHIRPortKind::Clock { .. } => SHIRPortKind::Clock,
             CHIRPortKind::Data { ty } => SHIRPortKind::Data { ty: ty.clone() },
         },
+        registered: p.registered,
         span: p.span,
     }).collect()
 }

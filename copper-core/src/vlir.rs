@@ -47,6 +47,9 @@ pub struct VLIRPort {
     /// Resolved bit width. `Width` (not raw `usize`) so a future parametric
     /// port (`[N-1:0]`) is a new variant, not a field re-type.
     pub width: Width,
+    /// Registered output port (`RegOut<T,D>`) — driven from `always_ff`. See
+    /// `CHIRPort::registered`.
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -30,6 +30,11 @@ pub struct CHIRPort {
     pub name: String,
     pub direction: CHIRPortDir,
     pub kind: CHIRPortKind,
+    /// A registered output port (`RegOut<T,D>`): its value commits at the clock
+    /// edge, so the transpiler drives it from `always_ff` (a real flip-flop)
+    /// rather than combinationally, regardless of whether it is written on all
+    /// paths. Always `false` for inputs, clocks, and plain `Out`.
+    pub registered: bool,
     pub span: SourceSpan,
 }
 

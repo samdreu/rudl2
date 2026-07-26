@@ -19,6 +19,9 @@ pub struct SHIRPort {
     pub name: String,
     pub direction: SHIRPortDir,
     pub kind: SHIRPortKind,
+    /// Registered output port (`RegOut<T,D>`) — driven from `always_ff`. See
+    /// `CHIRPort::registered`.
+    pub registered: bool,
     pub span: SourceSpan,
 }
 
