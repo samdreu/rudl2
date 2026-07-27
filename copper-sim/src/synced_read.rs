@@ -26,25 +26,35 @@
 //! iterations share a `call_id`, so the re-read suspends the task until the next
 //! `tick_clock`.
 
-use std::cell::Cell;
+use std::any::TypeId;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use copper_core::port::In;
+use copper_core::ClockDomain;
 
 thread_local! {
-    static CALL_ID: Cell<u64> = Cell::new(0);
+    /// Keyed per clock domain (by `TypeId`) so bumping one domain's call id on its
+    /// `tick_clock` cannot perturb another domain's read-freshness tracking.
+    static CALL_ID: RefCell<HashMap<TypeId, u64>> = RefCell::new(HashMap::new());
 }
 
-/// Called once per `tick_clock()` invocation. Internal to this crate — nothing
-/// outside `HardwareExecutor` needs to bump this.
-pub(crate) fn bump_call_id() {
-    CALL_ID.with(|c| c.set(c.get() + 1));
+/// Called once per `tick_clock()` invocation, for the domain being ticked.
+/// Internal to this crate — nothing outside `HardwareExecutor` needs to bump this.
+pub(crate) fn bump_call_id<Domain: ClockDomain>() {
+    CALL_ID.with(|c| {
+        let mut map = c.borrow_mut();
+        let entry = map.entry(TypeId::of::<Domain>()).or_insert(0);
+        *entry += 1;
+    });
 }
 
-fn current_call_id() -> u64 {
-    CALL_ID.with(|c| c.get())
+fn current_call_id<Domain: ClockDomain>() -> u64 {
+    CALL_ID.with(|c| c.borrow().get(&TypeId::of::<Domain>()).copied().unwrap_or(0))
 }
 
 #[doc(hidden)]
@@ -80,18 +90,31 @@ pub mod __private {
         }
     }
 
-    pub struct SyncedRead<'a, T, D> {
+    /// `D` is the port's own declared clock domain (whatever `In<T, D>` says);
+    /// `TickDomain` is the clock whose phase/call-id actually gates this read.
+    /// They coincide for an ordinary port on a single- or multi-clock module (the
+    /// port's domain is ticked by one of this function's own `Clock<D>`
+    /// parameters), but diverge for a `#[hardware(synchronizer)]` module's
+    /// sanctioned foreign-domain input: nothing in this function ever ticks that
+    /// port's nominal domain (it belongs to some other module entirely), so the
+    /// macro passes the synchronizer's own native clock as `TickDomain` instead —
+    /// the read is gated by the reactor that is actually executing it, not by the
+    /// port's CDC label. See `copper-macros::inject_synced_reads` for how the two
+    /// are chosen per port.
+    pub struct SyncedRead<'a, T, D, TickDomain> {
         port: &'a In<T, D>,
         tracker: &'a ReadTracker,
         current_wrap: u64,
+        _tick_domain: PhantomData<TickDomain>,
     }
 
-    impl<'a, T: Clone, D> Future for SyncedRead<'a, T, D> {
+    impl<'a, T: Clone, D, TickDomain: ClockDomain> Future for SyncedRead<'a, T, D, TickDomain> {
         type Output = T;
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
-            let pre_edge = crate::is_pre_edge();
+            let pre_edge = crate::is_pre_edge::<TickDomain>();
             let wrapped_since = self.current_wrap > self.tracker.wrap_at_last_success.get();
-            let same_call = current_call_id() == self.tracker.last_success_call_id.get();
+            let same_call =
+                current_call_id::<TickDomain>() == self.tracker.last_success_call_id.get();
 
             // A read positioned *before* any tick in its loop iteration samples
             // its input at the registering clock edge — the pre-edge settle of the
@@ -122,7 +145,7 @@ pub mod __private {
             if block {
                 Poll::Pending
             } else {
-                self.tracker.last_success_call_id.set(current_call_id());
+                self.tracker.last_success_call_id.set(current_call_id::<TickDomain>());
                 self.tracker.wrap_at_last_success.set(self.current_wrap);
                 self.tracker.last_success_pre_edge.set(pre_edge);
                 Poll::Ready(self.port.read())
@@ -131,12 +154,14 @@ pub mod __private {
     }
 
     /// `wrap` is the enclosing tick-bearing loop's wrap counter (macro-injected,
-    /// incremented once at the top of the loop, unconditionally).
-    pub fn synced_read<'a, T: Clone, D>(
+    /// incremented once at the top of the loop, unconditionally). `TickDomain` is
+    /// always turbofished explicitly by the macro (see `SyncedRead` above) —
+    /// nothing here ties it to `D`, so it cannot be inferred from the arguments.
+    pub fn synced_read<'a, T: Clone, D, TickDomain: ClockDomain>(
         port: &'a In<T, D>,
         tracker: &'a ReadTracker,
         wrap: u64,
-    ) -> SyncedRead<'a, T, D> {
-        SyncedRead { port, tracker, current_wrap: wrap }
+    ) -> SyncedRead<'a, T, D, TickDomain> {
+        SyncedRead { port, tracker, current_wrap: wrap, _tick_domain: PhantomData }
     }
 }

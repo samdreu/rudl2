@@ -260,7 +260,7 @@ impl HardwareExecutor {
     /// This includes a pre-edge settle phase where all tasks are polled to allow combinational logic to run, 
     /// then the clock is advanced, and then a post-edge settle phase where tasks are polled again to allow sequential logic to update based on the new clock edge.
     pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
-        crate::synced_read::bump_call_id();
+        crate::synced_read::bump_call_id::<Domain>();
 
         // Post-edge continuation convention: a `clk.tick()` resolves in the
         // POST-edge settle, so a reaction's post-tick code runs in the SAME
@@ -270,14 +270,19 @@ impl HardwareExecutor {
         // synchronous-read RAM) match hand-written Verilog. Held/registered OUTPUT
         // ports that need one more cycle of latency use an explicit `RegOut`.
         // See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.
-        crate::set_poll_phase(crate::PollPhase::PreEdge);
-        copper_core::types::set_tick_resolving(false);
+        //
+        // All three phase/resolution/call-id signals are keyed per clock domain
+        // (`Domain`), so ticking this clock cannot perturb any other domain's
+        // tasks — required for multi-clock designs to be poll-order- and
+        // interleave-independent (see design_docs/SYNCHRONOUS_SEMANTICS.md).
+        crate::set_poll_phase::<Domain>(crate::PollPhase::PreEdge);
+        copper_core::types::set_tick_resolving::<Domain>(false);
         self.poll_tasks();
 
         clk.advance();
 
-        crate::set_poll_phase(crate::PollPhase::PostEdge);
-        copper_core::types::set_tick_resolving(true);
+        crate::set_poll_phase::<Domain>(crate::PollPhase::PostEdge);
+        copper_core::types::set_tick_resolving::<Domain>(true);
         self.poll_tasks();
 
         self.cycle += 1;

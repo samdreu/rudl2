@@ -1,7 +1,9 @@
-use copper_core::Module;
+use copper_core::{ClockDomain, Module};
+use std::any::TypeId;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -28,16 +30,24 @@ pub(crate) enum PollPhase {
 }
 
 thread_local! {
-    /// Current clock phase set by `tick_clock` before each settle pass.
-    static POLL_PHASE: RefCell<PollPhase> = RefCell::new(PollPhase::PreEdge);
+    /// Current clock phase set by `tick_clock` before each settle pass, keyed per
+    /// clock domain (by `TypeId`) so that advancing one domain's clock cannot
+    /// perturb another domain's phase-gated futures. A domain with no entry yet
+    /// defaults to `PreEdge` (see `is_pre_edge`).
+    static POLL_PHASE: RefCell<HashMap<TypeId, PollPhase>> = RefCell::new(HashMap::new());
 }
 
-pub(crate) fn set_poll_phase(phase: PollPhase) {
-    POLL_PHASE.with(|cell| *cell.borrow_mut() = phase);
+pub(crate) fn set_poll_phase<Domain: ClockDomain>(phase: PollPhase) {
+    POLL_PHASE.with(|cell| {
+        cell.borrow_mut().insert(TypeId::of::<Domain>(), phase);
+    });
 }
 
-fn is_pre_edge() -> bool {
-    POLL_PHASE.with(|cell| *cell.borrow() == PollPhase::PreEdge)
+fn is_pre_edge<Domain: ClockDomain>() -> bool {
+    POLL_PHASE.with(|cell| {
+        cell.borrow().get(&TypeId::of::<Domain>()).copied().unwrap_or(PollPhase::PreEdge)
+            == PollPhase::PreEdge
+    })
 }
 
 /// A future that suspends for exactly one delta cycle, then resumes.
@@ -77,21 +87,24 @@ pub fn delta_yield() -> DeltaYield {
 }
 
 /// A future that blocks during post-edge settle and resolves at the start of
-/// the next pre-edge settle.
+/// the next pre-edge settle, for its own clock domain `Domain`.
 ///
 /// Unlike `delta_yield`, which resumes after exactly one delta pass regardless
-/// of clock phase, `PreEdgeBarrier` checks the executor's current phase on every
-/// poll. It returns `Pending` whenever the executor is in post-edge (even across
+/// of clock phase, `PreEdgeBarrier` checks `Domain`'s current phase on every
+/// poll. It returns `Pending` whenever `Domain` is in post-edge (even across
 /// multiple dirty-driven re-polls), and `Ready` the first time it is polled in
 /// pre-edge. This guarantees that the code after the barrier always executes with
 /// fresh inputs that were driven by the testbench before the current `tick_clock`
-/// call began.
-pub struct PreEdgeBarrier;
+/// call began. Scoped per domain so a barrier for one clock is never woken by
+/// another clock's phase transitions.
+pub struct PreEdgeBarrier<Domain: ClockDomain> {
+    _domain: PhantomData<Domain>,
+}
 
-impl Future for PreEdgeBarrier {
+impl<Domain: ClockDomain> Future for PreEdgeBarrier<Domain> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        if is_pre_edge() {
+        if is_pre_edge::<Domain>() {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -99,11 +112,11 @@ impl Future for PreEdgeBarrier {
     }
 }
 
-/// Return a future that suspends until the executor enters its pre-edge settle
-/// phase. Inject this at the end of every sequential module's main loop via
-/// `#[hardware(sequential)]` — the macro does this automatically.
-pub fn pre_edge_barrier() -> PreEdgeBarrier {
-    PreEdgeBarrier
+/// Return a future that suspends until `Domain`'s clock enters its pre-edge
+/// settle phase. Inject this at the end of every sequential module's main loop
+/// via `#[hardware(sequential)]` — the macro does this automatically.
+pub fn pre_edge_barrier<Domain: ClockDomain>() -> PreEdgeBarrier<Domain> {
+    PreEdgeBarrier { _domain: PhantomData }
 }
 
 /// A helper macro to spawn a child module's future and track the parent-child relationship in the executor.

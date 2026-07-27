@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use syn::{parse_macro_input, visit::Visit, visit_mut::VisitMut, Error, FnArg, ItemFn, Pat, ReturnType, Type};
 
 enum HardwareMode {
@@ -38,6 +38,38 @@ fn outer_type_name(ty: &Type) -> Option<String> {
         type_path.path.segments.last().map(|s| s.ident.to_string())
     } else {
         None
+    }
+}
+
+/// The `D` in a `Clock<D>` parameter's type (its one type argument).
+fn clock_domain_type(ty: &Type) -> Option<Type> {
+    let Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(ab) = &seg.arguments else { return None };
+    ab.args.iter().find_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    })
+}
+
+/// The `D` in an `In<T, D>` parameter's type — `()` for the one-arg shorthand
+/// `In<T>`, whose domain defaults to the unit domain.
+fn in_port_domain_type(ty: &Type) -> Type {
+    let unit: Type = syn::parse_quote!(());
+    let Type::Path(tp) = ty else { return unit };
+    let Some(seg) = tp.path.segments.last() else { return unit };
+    let syn::PathArguments::AngleBracketed(ab) = &seg.arguments else { return unit };
+    let type_args: Vec<Type> = ab
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            syn::GenericArgument::Type(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    match type_args.len() {
+        0 | 1 => unit, // `In<T>` — the one type arg is `T`; domain is the default.
+        _ => type_args.last().unwrap().clone(),
     }
 }
 
@@ -320,6 +352,12 @@ pub(crate) fn check_no_unsupported_idioms(f: &ItemFn) -> Result<(), Error> {
 
 /// Visits an async fn body and records which clock parameter names have a `.tick().await` call.
 struct TickAwaitVisitor<'a> {
+    // NOTE: `visit_expr_await` currently records *every* `.tick().await` receiver
+    // into `found` without checking it against `clock_names`. Either the visit
+    // should filter to actual clock params (`clock_names.contains(..)`) — a latent
+    // correctness gap — or this field is vestigial. Flagged during run-copper
+    // setup; left in place pending that decision.
+    #[allow(dead_code)]
     clock_names: &'a HashSet<String>,
     found: HashSet<String>,
 }
@@ -470,12 +508,15 @@ impl VisitMut for WrapCounterInjector {
 
 /// Rewrites every `<param>.read()` call — for `<param>` one of this function's
 /// `In<T, D>` parameters — into a call through the per-port freshness check,
-/// using that parameter's hidden tracker and the enclosing loop's
-/// `__copper_wrap` counter. Only call after confirming (via
-/// `find_unprotectable_in_uses`) that every use of every `In` parameter is one
-/// of these recognized call sites.
+/// using that parameter's hidden tracker, the enclosing loop's `__copper_wrap`
+/// counter, and the domain (`tick_domain_of[name]`) whose phase/call-id gates
+/// this specific read (see `inject_synced_reads` for how that's chosen — it is
+/// usually `name`'s own declared domain, but not always). Only call after
+/// confirming (via `find_unprotectable_in_uses`) that every use of every `In`
+/// parameter is one of these recognized call sites.
 struct SyncedReadRewriter<'a> {
     in_params: &'a HashSet<String>,
+    tick_domain_of: &'a HashMap<String, Type>,
 }
 
 impl<'a> VisitMut for SyncedReadRewriter<'a> {
@@ -497,8 +538,9 @@ impl<'a> VisitMut for SyncedReadRewriter<'a> {
         if let Some(name) = matched_name {
             let port_ident = format_ident!("{}", name);
             let tracker_ident = format_ident!("__copper_tracker_{}", name);
+            let tick_domain = &self.tick_domain_of[&name];
             *expr = syn::parse_quote! {
-                ::copper_sim::synced_read::__private::synced_read(
+                ::copper_sim::synced_read::__private::synced_read::<_, _, #tick_domain>(
                     &#port_ident, &#tracker_ident, __copper_wrap,
                 ).await
             };
@@ -538,6 +580,72 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
         return Err(err);
     }
 
+    // Each `In<T, D>` parameter's reads are gated by whichever clock domain's
+    // phase/call-id they should be read against. Usually that is the port's own
+    // declared `D` — the normal case for both single-clock modules and a
+    // multi-clock module with one real `Clock<D>` parameter per domain its ports
+    // use, since each domain really is ticked (by this function's own
+    // `.tick().await` on that clock) and so its phase genuinely tracks this
+    // read's freshness.
+    //
+    // It is NOT the port's own domain when nothing in this function ticks that
+    // domain at all — a domain-agnostic `In<T>` port (declared domain `()`,
+    // which nothing ever ticks), or a `#[hardware(synchronizer)]` module's
+    // sanctioned foreign-domain input (its whole point is to read a domain this
+    // reactor doesn't share). In both cases the read is actually happening
+    // inside whichever clock's reactor is executing this code, so we fall back
+    // to that: this function's own (single) `Clock<D>` parameter. That fallback
+    // is unambiguous today because every function reaching it is sequential-like
+    // and CDC-restricted to exactly one *native* clock parameter feeding its
+    // ports — `check_cdc` requires it for plain sequential modules, and every
+    // shipped synchronizer (e.g. `sync_2ff`) likewise has exactly one real
+    // `Clock<D>` (its `Dst`) with possibly-many foreign-domain `In` ports. A
+    // module with several real, independently-ticked clocks and an *additional*
+    // domain-agnostic/foreign port would be ambiguous here — rejected below
+    // rather than guessed at.
+    let clock_domains: Vec<Type> = f
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            FnArg::Typed(pt) if outer_type_name(&pt.ty).as_deref() == Some("Clock") => {
+                clock_domain_type(&pt.ty)
+            }
+            _ => None,
+        })
+        .collect();
+    let clock_domain_strs: HashSet<String> = clock_domains
+        .iter()
+        .map(|t| quote!(#t).to_string())
+        .collect();
+
+    let mut tick_domain_of: HashMap<String, Type> = HashMap::new();
+    for arg in &f.sig.inputs {
+        let FnArg::Typed(pt) = arg else { continue };
+        if outer_type_name(&pt.ty).as_deref() != Some("In") {
+            continue;
+        }
+        let Pat::Ident(pi) = &*pt.pat else { continue };
+        let name = pi.ident.to_string();
+        let port_domain = in_port_domain_type(&pt.ty);
+        let tick_domain = if clock_domain_strs.contains(&quote!(#port_domain).to_string()) {
+            port_domain
+        } else if let [only] = clock_domains.as_slice() {
+            only.clone()
+        } else {
+            return Err(Error::new_spanned(
+                &pt.ty,
+                format!(
+                    "`{name}`'s clock domain isn't ticked by any `Clock<D>` parameter of this \
+                     function, and the function has {} `Clock<D>` parameters — need exactly one \
+                     to infer which clock gates this read. This port shape isn't supported yet.",
+                    clock_domains.len(),
+                ),
+            ));
+        };
+        tick_domain_of.insert(name, tick_domain);
+    }
+
     let mut wrap_decl: Vec<syn::Stmt> = vec![syn::parse_quote! { let mut __copper_wrap: u64 = 0; }];
     for name in &in_params {
         let tracker_ident = format_ident!("__copper_tracker_{}", name);
@@ -548,7 +656,8 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
     f.block.stmts.splice(0..0, wrap_decl);
 
     WrapCounterInjector.visit_block_mut(&mut f.block);
-    SyncedReadRewriter { in_params: &in_params }.visit_block_mut(&mut f.block);
+    SyncedReadRewriter { in_params: &in_params, tick_domain_of: &tick_domain_of }
+        .visit_block_mut(&mut f.block);
 
     Ok(())
 }
