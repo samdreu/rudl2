@@ -8,11 +8,11 @@
             "cargo": {
                 "args": [
                     "run",
-                    "--example=inverter",
+                    "--example=sipo_block",
                     "--package=copper"
                 ],
                 "filter": {
-                    "name": "inverter",
+                    "name": "sipo_block",
                     "kind": "bin"
                 }
             },
@@ -32,7 +32,7 @@
                     "--nocapture"
                 ],
                 "filter": {
-                    "name": "inverter",
+                    "name": "sipo_block",
                     "kind": "bin"
                 }
             },
