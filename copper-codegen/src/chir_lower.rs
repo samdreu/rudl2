@@ -1211,7 +1211,11 @@ fn lower_seq_body(
 
 // ── Lowering context ──────────────────────────────────────────────────────────
 
-struct LowerCtx<'a> {
+pub(crate) struct LowerCtx<'a> {
+    // NOTE: threaded through the lowering pipeline but not yet consumed here.
+    // See run-copper setup notes — candidate for a scoped "unthread hardware_fns"
+    // cleanup or a real use (submodule detection).
+    #[allow(dead_code)]
     hardware_fns: &'a std::collections::HashSet<String>,
     registry: &'a ModuleRegistry,
     submodules: Vec<CHIRSubmoduleInst>,
@@ -1689,7 +1693,7 @@ fn lower_else_branch(
 
 // ── Expression lowering ───────────────────────────────────────────────────────
 
-pub fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
+pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
     match expr {
         ExprType::Lit(lit) => lower_name_or_lit(&lit.text, lit.span, ctx),
         ExprType::Path(path) => lower_name_or_lit(&path.path_text, path.span, ctx),
@@ -2446,14 +2450,6 @@ fn lower_lit_expr(
     })
 }
 
-fn lower_text_expr(
-    text: &str,
-    span: SourceSpan,
-    enums: &EnumRegistry,
-) -> Result<CHIRExpr, CHIRLowerError> {
-    lower_lit_expr(text.trim(), span, enums)
-}
-
 fn lower_binop(op: &str, span: SourceSpan) -> Result<CHIRBinOp, CHIRLowerError> {
     match op {
         "+"  => Ok(CHIRBinOp::Add { wrapping: false }),
@@ -2759,7 +2755,7 @@ fn validate_module(module: &CHIRModule) -> Result<(), CHIRLowerError> {
 fn validate_stmts(
     stmts: &[CHIRStmt],
     known: &mut std::collections::HashSet<String>,
-    span: SourceSpan,
+    _span: SourceSpan,
 ) -> Result<(), CHIRLowerError> {
     for stmt in stmts {
         match stmt {

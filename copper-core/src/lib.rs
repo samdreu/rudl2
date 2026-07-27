@@ -71,15 +71,13 @@ impl<const N: usize> Wire<N> {
 }
 
 pub struct Register<const N: usize> {
-    name: String,
     value: [Logic; N],
     dir: Direction,
 }
 
 impl<const N: usize> Register<N> {
-    pub fn new(name: &str, dir: Direction) -> Self {
+    pub fn new(dir: Direction) -> Self {
         Self {
-            name: name.to_string(),
             value: [Logic::X; N],
             dir,
         }

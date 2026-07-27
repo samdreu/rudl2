@@ -451,7 +451,7 @@ fn validate_seq_chir(seq: &CHIRSeqBody, span: SourceSpan) -> Result<(), SHIRLowe
 
 fn check_no_tick_in_branch(stmt: &CHIRStmt, span: SourceSpan) -> Result<(), SHIRLowerError> {
     match stmt {
-        CHIRStmt::If { then_body, else_body, span: s, .. } => {
+        CHIRStmt::If { then_body, else_body, span: _s, .. } => {
             for s in then_body {
                 if matches!(s, CHIRStmt::AwaitTick { .. }) {
                     return Err(SHIRLowerError::TickInsideBranch { span: *s.span() });
@@ -528,7 +528,7 @@ fn extract_reg_updates(
 fn extract_updates_from_stmts(
     stmts: &[CHIRStmt],
     reg_names: &HashSet<String>,
-    span: SourceSpan,
+    _span: SourceSpan,
     renames: &HashMap<String, String>,
     forwarding: &mut HashMap<String, SHIRExpr>,
 ) -> Result<Vec<SHIRRegUpdate>, SHIRLowerError> {
@@ -924,26 +924,6 @@ fn lower_reg_decl(r: &CHIRRegDecl) -> Result<SHIRReg, SHIRLowerError> {
         ty: r.ty.clone(),
         init: r.init.as_ref().map(|lit| SHIRLit { ty: lit.ty.clone(), value: lit.value }),
     })
-}
-
-// Helper: get the span from a CHIRStmt
-trait HasSpan {
-    fn span(&self) -> &SourceSpan;
-}
-
-impl HasSpan for CHIRStmt {
-    fn span(&self) -> &SourceSpan {
-        match self {
-            CHIRStmt::Wire { span, .. } => span,
-            CHIRStmt::Assign { span, .. } => span,
-            CHIRStmt::PortWrite { span, .. } => span,
-            CHIRStmt::AwaitTick { span, .. } => span,
-            CHIRStmt::If { span, .. } => span,
-            CHIRStmt::Match { span, .. } => span,
-            CHIRStmt::ForLoop { span, .. } => span,
-            CHIRStmt::IndexAssign { span, .. } => span,
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

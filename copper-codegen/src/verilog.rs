@@ -1,6 +1,6 @@
 use copper_core::{ModuleIR, Logic};
-use copper_core::ir::{UnaryOp, BinaryOp, Statement, Expression, Signal, Pattern, LogicValue};
-use log::{debug, info, warn, error};
+use copper_core::ir::{UnaryOp, BinaryOp, Statement, Expression, Pattern, LogicValue};
+use log::{debug, info, warn};
 
 pub struct VerilogGenerator;
 

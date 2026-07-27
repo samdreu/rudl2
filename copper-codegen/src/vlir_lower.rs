@@ -433,21 +433,6 @@ fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
     }
 }
 
-fn first_port_drive(s: &SHIRStmt) -> Option<String> {
-    match s {
-        SHIRStmt::PortDrive { port_name, .. } => Some(port_name.clone()),
-        SHIRStmt::Wire { .. } => None,
-        SHIRStmt::If { then_stmts, else_stmts, .. } => then_stmts
-            .iter()
-            .chain(else_stmts.iter().flatten())
-            .find_map(first_port_drive),
-        SHIRStmt::Match { arms, .. } => arms.iter().flat_map(|a| &a.stmts).find_map(first_port_drive),
-        SHIRStmt::ForLoop { body, .. } => body.iter().find_map(first_port_drive),
-        // A bit-assign drives a signal, not (in the supported cases) a port.
-        SHIRStmt::IndexAssign { .. } => None,
-    }
-}
-
 // ── Submodule ───────────────────────────────────────────────────────────────
 
 fn lower_submodule(m: &SHIRSubmoduleInst, leg: &Legalizer) -> LowerResult<VLIRSubmoduleInst> {
