@@ -8,7 +8,6 @@
 use std::marker::PhantomData;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::task::Waker;
 
 
 // primitive logic values (0, 1, X)
@@ -824,7 +823,6 @@ pub trait ClockDomain: 'static {}
 #[derive(Debug)]
 struct ClockState {
     cycle: u64,
-    wakers: Vec<Waker>,
     listeners: Vec<std::sync::Weak<dyn ClockEdgeListener>>,
 }
 
@@ -844,7 +842,6 @@ impl<Domain: ClockDomain> Clock<Domain> {
         Self {
             state: Arc::new(Mutex::new(ClockState {
                 cycle: 0, // starts at t=0
-                wakers: Vec::new(), // no wakers initially
                 listeners: Vec::new(), // no listeners initially
             })),
             _domain: PhantomData, 
@@ -871,12 +868,6 @@ impl<Domain: ClockDomain> Clock<Domain> {
                 None => false, // remove if listener was dropped
             }
         });
-        // wake any tasks waiting on this clock tick
-        let wakers = std::mem::take(&mut state.wakers);
-        drop(state); // release lock before waking ?????
-        for w in wakers {
-            w.wake();
-        }
     }
     
     /// Create a future that completes on the next clock edge
@@ -965,15 +956,23 @@ fn tick_resolves_now<Domain: ClockDomain>() -> bool {
 impl<Domain: ClockDomain> std::future::Future for ClockTick<Domain> {
     type Output = ();
 
+    // No waker registration: the simulation executor doesn't use one (it polls
+    // every task unconditionally every delta cycle via a noop waker — see
+    // `HardwareExecutor::poll_tasks`), and this future previously pushed a new
+    // `Waker` clone into `state.wakers` on every Pending poll with no dedup,
+    // growing unboundedly across the delta cycles within a single settle phase
+    // before `advance()` finally drained it. Removed rather than fixed to dedup:
+    // a real waker-based executor is not on the roadmap (the fixed-point
+    // delta-cycle model has no equivalent in `futures`' wake-driven primitives),
+    // so there was nothing for the registration to ever usefully serve.
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if state.cycle >= self.target_cycle && tick_resolves_now::<Domain>() {
             std::task::Poll::Ready(())
         } else {
-            state.wakers.push(cx.waker().clone());
             std::task::Poll::Pending
         }
     }

@@ -1,6 +1,7 @@
 //! Module-composition tests: combinational logic as plain functions, sequential
 //! modules spawned as a tracked hierarchy (`spawn_child` / `module_info`) and as
-//! peers (`spawn`). Uses the current `In<T,D>` / `Out<T,D>` wire port model.
+//! peers (`spawn_untracked`). Uses the current `In<T,D>` / `Out<T,D>` wire port
+//! model.
 
 use copper_core::port::{wire, In, Out};
 use copper_core::{Clock, ClockDomain};
@@ -117,7 +118,7 @@ fn sequential_modules_spawn_with_spawn_child() {
 }
 
 #[test]
-fn peer_modules_continue_using_exec_spawn() {
+fn peer_modules_continue_using_spawn_untracked() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
@@ -125,9 +126,9 @@ fn peer_modules_continue_using_exec_spawn() {
     let (out2_drv, out2_obs) = wire::<u8, MainClk>(0);
     let (out3_drv, out3_obs) = wire::<u8, MainClk>(0);
 
-    exec.spawn(counter_by::<1>(clk.clone(), out1_drv));
-    exec.spawn(counter_by::<2>(clk.clone(), out2_drv));
-    exec.spawn(counter_by::<5>(clk.clone(), out3_drv));
+    exec.spawn_untracked(counter_by::<1>(clk.clone(), out1_drv));
+    exec.spawn_untracked(counter_by::<2>(clk.clone(), out2_drv));
+    exec.spawn_untracked(counter_by::<5>(clk.clone(), out3_drv));
 
     let expected = [(0u8, 0u8, 0u8), (1, 2, 5), (2, 4, 10), (3, 6, 15)];
 

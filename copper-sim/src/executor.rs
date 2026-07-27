@@ -90,10 +90,24 @@ impl HardwareExecutor {
         }
     }
 
-    /// Spawn a `#[hardware]` module. Takes a [`HardwareModule`] — a bare
-    /// `async fn` (plain `Future`) will not type-check, which is what makes the
-    /// attribute mandatory.
-    pub fn spawn<F>(&mut self, module: HardwareModule<F>)
+    /// Spawn a `#[hardware]` module with no [`DirtyHandle`]s registered — the
+    /// executor cannot observe this module's output changes, so it will never
+    /// trigger an extra delta cycle on this module's behalf when some other
+    /// task's combinational logic depends on its output settling first.
+    ///
+    /// Named `_untracked` (not just `spawn`) deliberately: the missing
+    /// dirty-tracking is a real correctness trap for any design where another
+    /// spawned task's combinational settling depends on this module's output,
+    /// and the old bare `spawn` name gave no signal at the call site that this
+    /// was happening. Safe uses are ones where nothing else in this executor
+    /// needs to react to this module's output within a delta-cycle settle pass
+    /// — a single self-contained top-level module (e.g. `rv32i_cpu`, whose
+    /// output is only read by the testbench after `tick_clock` returns, not by
+    /// another spawned task), independent peers with no cross-dependencies
+    /// (`counter_by` in `module_composition_hybrid.rs`), or test/probe
+    /// scaffolding. If you're wiring a module whose output another task's
+    /// combinational logic reads, use [`Self::spawn_wired`] instead.
+    pub fn spawn_untracked<F>(&mut self, module: HardwareModule<F>)
     where
         F: Future<Output = ()> + 'static,
     {
@@ -132,7 +146,12 @@ impl HardwareExecutor {
         });
     }
 
-    /// spawn a child module's future, and track the parent-child relationship
+    /// Spawn a child module's future and track the parent-child relationship for
+    /// [`Self::module_info`]. Untracked like [`Self::spawn_untracked`] (no
+    /// `DirtyHandle`s) — fine for a purely-registered hierarchy where nothing
+    /// needs iterative combinational re-settling across children within one
+    /// delta-cycle pass (see `module_composition_hybrid.rs`), not for a
+    /// hierarchy with combinational dependencies between children.
     pub fn spawn_child<F>(&mut self, child_name: &str, parent_name: &str, module: HardwareModule<F>)
     where
         F: Future<Output = ()> + 'static,
@@ -164,7 +183,7 @@ impl HardwareExecutor {
         }
 
         // spawn the child's module as a task in the executor
-        self.spawn(module);
+        self.spawn_untracked(module);
     }
 
     /// Get information about a module by name, if it exists. This can be used to inspect the module hierarchy and relationships.
@@ -218,8 +237,14 @@ impl HardwareExecutor {
             );
 
             let mut any_dirty = false;
-            for task in &mut self.tasks {
-                let _ = task.future.as_mut().poll(&mut context);
+            for (i, task) in self.tasks.iter_mut().enumerate() {
+                assert!(
+                    task.future.as_mut().poll(&mut context).is_pending(),
+                    "hardware module task {i} completed (its future returned Poll::Ready) — a \
+                     #[hardware] module's body is a `loop {{ .. }}` that never terminates; a \
+                     module future resolving indicates a malformed module (e.g. an early \
+                     `return` or a loop that broke), not legal hardware behavior."
+                );
                 let port_dirty = task.port_dirties.iter().any(|h| h.take());
                 if port_dirty {
                     task.consecutive_dirty += 1;

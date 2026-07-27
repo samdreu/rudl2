@@ -441,7 +441,7 @@ fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let (a0_out, a0_in)          = wire::<Bits<32>, MainClk>(Bits::zero());
 
     prog_out.write(program_bits);
-    exec.spawn(rv32i_cpu(clk.clone(), prog_in, pc_out, halted_out, a0_out));
+    exec.spawn_untracked(rv32i_cpu(clk.clone(), prog_in, pc_out, halted_out, a0_out));
 
     for cycle in 1..=max_cycles {
         exec.tick_clock(&mut clk);
