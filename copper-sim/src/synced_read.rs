@@ -105,6 +105,23 @@ pub mod __private {
         port: &'a In<T, D>,
         tracker: &'a ReadTracker,
         current_wrap: u64,
+        /// The `call_id` of the most recent PRE-EDGE read success *this wrap*
+        /// (shared across every `In` parameter's reads in the function — see
+        /// `synced_read` and `copper-macros::inject_synced_reads`), or `None` if
+        /// no read has succeeded at pre-edge yet this wrap. Scoped to a specific
+        /// call_id (not just "anytime this wrap") deliberately: a read whose own
+        /// history is post-edge-type (like `bsg_dff_en`'s `data.read()` right
+        /// after its only tick) still needs deferring if some EARLIER read in
+        /// THIS SAME `tick_clock` call already consumed this edge's data at
+        /// pre-edge — the "leading phase" case (`sipo_block`'s `w1`/`w2`/`w3`,
+        /// each following a loop-top-or-earlier read separated by its own tick).
+        /// But a read reached without crossing any NEW tick since that earlier
+        /// success — e.g. `det_010_awaits`'s `if in_i.read() == One` immediately
+        /// after a `while in_i.read() == Zero` loop exits, no tick in between —
+        /// must NOT defer just because some read succeeded at pre-edge many
+        /// calls ago; comparing call_ids is what tells "still the same edge, a
+        /// different call site" apart from "a genuinely later edge."
+        leading_pre_edge_call_id: &'a Cell<Option<u64>>,
         _tick_domain: PhantomData<TickDomain>,
     }
 
@@ -112,9 +129,10 @@ pub mod __private {
         type Output = T;
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
             let pre_edge = crate::is_pre_edge::<TickDomain>();
+            let call_id = current_call_id::<TickDomain>();
             let wrapped_since = self.current_wrap > self.tracker.wrap_at_last_success.get();
-            let same_call =
-                current_call_id::<TickDomain>() == self.tracker.last_success_call_id.get();
+            let same_call = call_id == self.tracker.last_success_call_id.get();
+            let leading_this_call = self.leading_pre_edge_call_id.get() == Some(call_id);
 
             // A read positioned *before* any tick in its loop iteration samples
             // its input at the registering clock edge — the pre-edge settle of the
@@ -129,8 +147,21 @@ pub mod __private {
             //
             // A read *after* a tick (e.g. `count = count + step.read()`) instead
             // consumes the value the edge just produced; it settles at post-edge
-            // and must NOT be deferred. `last_success_pre_edge` records which kind
-            // this port's reader is, so only pre-edge readers are held back.
+            // and must NOT be deferred, UNLESS some earlier read in THIS SAME
+            // `tick_clock` call already succeeded at pre-edge (`leading_this_call`)
+            // — that earlier read already consumed this cycle's data, so a
+            // *later* post-tick read that crossed its own tick to get here (e.g.
+            // `sipo_block`'s `w1` following `w0`) needs a cycle of its own too,
+            // exactly like a loop-top read does on re-entry. `bsg_dff_en`'s
+            // `data.read()` — the first and only read in an iteration whose tick
+            // is the loop's first statement — never sees this, so it fires
+            // un-deferred as before. `last_success_pre_edge` records which kind
+            // THIS port's own reader is; `leading_this_call` additionally
+            // captures whether some OTHER read already claimed this same edge —
+            // scoped to the current call_id specifically, so a read reached
+            // without crossing a new tick since that earlier success (e.g. a
+            // check immediately following a `while` loop's exit, no tick in
+            // between) is correctly treated as the same instant, not deferred.
             // Same-iteration re-reads leave the wrap counter unmoved
             // (wrapped_since == false) and never block.
             //
@@ -141,27 +172,41 @@ pub mod __private {
             // wrapped re-read in the same call is held back regardless of phase,
             // suspending the task until the next `tick_clock`.
             let block = wrapped_since
-                && (same_call || (!pre_edge && self.tracker.last_success_pre_edge.get()));
+                && (same_call
+                    || (!pre_edge
+                        && (self.tracker.last_success_pre_edge.get() || leading_this_call)));
             if block {
                 Poll::Pending
             } else {
-                self.tracker.last_success_call_id.set(current_call_id::<TickDomain>());
+                self.tracker.last_success_call_id.set(call_id);
                 self.tracker.wrap_at_last_success.set(self.current_wrap);
                 self.tracker.last_success_pre_edge.set(pre_edge);
+                if pre_edge {
+                    self.leading_pre_edge_call_id.set(Some(call_id));
+                }
                 Poll::Ready(self.port.read())
             }
         }
     }
 
     /// `wrap` is the enclosing tick-bearing loop's wrap counter (macro-injected,
-    /// incremented once at the top of the loop, unconditionally). `TickDomain` is
+    /// incremented once at the top of the loop, unconditionally). `leading` is a
+    /// per-function flag reset to `None` alongside `wrap` (macro-injected) and
+    /// shared by every `In` parameter's reads — see `SyncedRead`. `TickDomain` is
     /// always turbofished explicitly by the macro (see `SyncedRead` above) —
     /// nothing here ties it to `D`, so it cannot be inferred from the arguments.
     pub fn synced_read<'a, T: Clone, D, TickDomain: ClockDomain>(
         port: &'a In<T, D>,
         tracker: &'a ReadTracker,
         wrap: u64,
+        leading: &'a Cell<Option<u64>>,
     ) -> SyncedRead<'a, T, D, TickDomain> {
-        SyncedRead { port, tracker, current_wrap: wrap, _tick_domain: PhantomData }
+        SyncedRead {
+            port,
+            tracker,
+            current_wrap: wrap,
+            leading_pre_edge_call_id: leading,
+            _tick_domain: PhantomData,
+        }
     }
 }

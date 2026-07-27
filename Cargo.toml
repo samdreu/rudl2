@@ -111,3 +111,7 @@ path = "examples/basejump/bsg_gray_to_binary.rs"
 [[example]]
 name = "bsg_adder_one_hot"
 path = "examples/basejump/bsg_adder_one_hot.rs"
+
+[[example]]
+name = "sipo_block"
+path = "examples/basejump/sipo_block.rs"

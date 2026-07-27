@@ -485,14 +485,20 @@ fn find_unprotectable_in_uses(block: &syn::Block, in_params: &HashSet<String>) -
 }
 
 /// Increments a hidden `__copper_wrap` counter at the top of every `loop`
-/// block that directly contains a `.tick().await`. `__copper_wrap` is
-/// function-scoped (declared once, by the caller, before this runs) and never
-/// reset — even loops entered many times (e.g. a "wait for ready" loop nested
-/// inside an outer per-instruction loop) just keep counting up, which is what
-/// keeps `SyncedReadTracker`'s "has this port's reader wrapped since its last
-/// success" check correct on re-entry: a counter that reset per-entry could
-/// go backwards relative to a tracker's last-seen value and block a read that
-/// should succeed immediately.
+/// block that directly contains a `.tick().await`, and resets the hidden
+/// `__copper_wrap_leading_read` flag (see
+/// `SyncedRead::leading_pre_edge_call_id`) alongside it — a new iteration
+/// hasn't consumed any edge yet. `__copper_wrap` is function-scoped (declared
+/// once, by the caller, before this runs) and never reset — even loops entered
+/// many times (e.g. a "wait for ready" loop nested inside an outer
+/// per-instruction loop) just keep counting up, which is what keeps
+/// `SyncedReadTracker`'s "has this port's reader wrapped since its last
+/// success" check correct on re-entry: a counter that reset per-entry could go
+/// backwards relative to a tracker's last-seen value and block a read that
+/// should succeed immediately. (Resetting `__copper_wrap_leading_read` to
+/// `None` here isn't strictly required for correctness — it's compared against
+/// the current call_id, which never repeats — but keeps it from holding a
+/// stale value indefinitely.)
 struct WrapCounterInjector;
 
 impl VisitMut for WrapCounterInjector {
@@ -500,6 +506,8 @@ impl VisitMut for WrapCounterInjector {
         let needs_wrap = block_has_tick_await_direct(&node.body);
         syn::visit_mut::visit_expr_loop_mut(self, node); // nested loops handled independently
         if needs_wrap {
+            let reset_leading: syn::Stmt = syn::parse_quote! { __copper_wrap_leading_read.set(None); };
+            node.body.stmts.insert(0, reset_leading);
             let incr: syn::Stmt = syn::parse_quote! { __copper_wrap += 1; };
             node.body.stmts.insert(0, incr);
         }
@@ -507,16 +515,32 @@ impl VisitMut for WrapCounterInjector {
 }
 
 /// Rewrites every `<param>.read()` call — for `<param>` one of this function's
-/// `In<T, D>` parameters — into a call through the per-port freshness check,
-/// using that parameter's hidden tracker, the enclosing loop's `__copper_wrap`
-/// counter, and the domain (`tick_domain_of[name]`) whose phase/call-id gates
-/// this specific read (see `inject_synced_reads` for how that's chosen — it is
-/// usually `name`'s own declared domain, but not always). Only call after
-/// confirming (via `find_unprotectable_in_uses`) that every use of every `In`
-/// parameter is one of these recognized call sites.
+/// `In<T, D>` parameters — into a call through the per-read-*site* freshness
+/// check, using a tracker unique to this call site, the enclosing loop's
+/// `__copper_wrap` counter, and the domain (`tick_domain_of[name]`) whose
+/// phase/call-id gates this specific read (see `inject_synced_reads` for how
+/// that's chosen — it is usually `name`'s own declared domain, but not
+/// always). Only call after confirming (via `find_unprotectable_in_uses`) that
+/// every use of every `In` parameter is one of these recognized call sites.
+///
+/// Each call site gets its OWN tracker (`__copper_tracker_<name>_<site index>`)
+/// rather than sharing one per parameter — a loop that reads the same port at
+/// more than one position in an iteration (e.g. a SIPO deserializer: one
+/// loop-top read plus a "mid-phase" read after each of several ticks) would
+/// otherwise have later reads inherit the earlier read's already-succeeded-
+/// this-wrap bookkeeping. `wrap_at_last_success` only changes once per loop
+/// re-entry, so a shared tracker can't tell "the same call site being read
+/// again this iteration" (must not block — nothing new to wait for) apart from
+/// "a genuinely different call site, whose tick just resolved, being read for
+/// the first time this iteration" (must settle at the right phase like any
+/// other read) — the shared tracker always took the former, silently
+/// promoting later reads to fire immediately with a stale, one-cycle-early
+/// value. See `examples/basejump/sipo_block.rs`.
 struct SyncedReadRewriter<'a> {
     in_params: &'a HashSet<String>,
     tick_domain_of: &'a HashMap<String, Type>,
+    next_site_id: HashMap<String, u32>,
+    trackers: Vec<syn::Ident>,
 }
 
 impl<'a> VisitMut for SyncedReadRewriter<'a> {
@@ -536,12 +560,17 @@ impl<'a> VisitMut for SyncedReadRewriter<'a> {
         };
 
         if let Some(name) = matched_name {
+            let site_id = self.next_site_id.entry(name.clone()).or_insert(0);
+            let this_id = *site_id;
+            *site_id += 1;
+
             let port_ident = format_ident!("{}", name);
-            let tracker_ident = format_ident!("__copper_tracker_{}", name);
+            let tracker_ident = format_ident!("__copper_tracker_{}_{}", name, this_id);
+            self.trackers.push(tracker_ident.clone());
             let tick_domain = &self.tick_domain_of[&name];
             *expr = syn::parse_quote! {
                 ::copper_sim::synced_read::__private::synced_read::<_, _, #tick_domain>(
-                    &#port_ident, &#tracker_ident, __copper_wrap,
+                    &#port_ident, &#tracker_ident, __copper_wrap, &__copper_wrap_leading_read,
                 ).await
             };
         }
@@ -646,9 +675,22 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
         tick_domain_of.insert(name, tick_domain);
     }
 
-    let mut wrap_decl: Vec<syn::Stmt> = vec![syn::parse_quote! { let mut __copper_wrap: u64 = 0; }];
-    for name in &in_params {
-        let tracker_ident = format_ident!("__copper_tracker_{}", name);
+    // Rewrite read call sites first — each one claims its own tracker identifier
+    // (see `SyncedReadRewriter`), so the set of trackers to declare is only known
+    // once this pass has run.
+    let mut rewriter = SyncedReadRewriter {
+        in_params: &in_params,
+        tick_domain_of: &tick_domain_of,
+        next_site_id: HashMap::new(),
+        trackers: Vec::new(),
+    };
+    rewriter.visit_block_mut(&mut f.block);
+
+    let mut wrap_decl: Vec<syn::Stmt> = vec![
+        syn::parse_quote! { let mut __copper_wrap: u64 = 0; },
+        syn::parse_quote! { let __copper_wrap_leading_read: ::std::cell::Cell<Option<u64>> = ::std::cell::Cell::new(None); },
+    ];
+    for tracker_ident in &rewriter.trackers {
         wrap_decl.push(syn::parse_quote! {
             let #tracker_ident = ::copper_sim::synced_read::__private::ReadTracker::new();
         });
@@ -656,8 +698,6 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
     f.block.stmts.splice(0..0, wrap_decl);
 
     WrapCounterInjector.visit_block_mut(&mut f.block);
-    SyncedReadRewriter { in_params: &in_params, tick_domain_of: &tick_domain_of }
-        .visit_block_mut(&mut f.block);
 
     Ok(())
 }

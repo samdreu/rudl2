@@ -196,6 +196,27 @@ impl HardwareTest {
         );
     }
 
+    /// Add extra signals to the phased waveform for `cycle` (which must already
+    /// have been recorded via `record_cycle_phased`) — visible in the VCD only,
+    /// NOT fed into the Verilator cross-check. Use this for internal debug/probe
+    /// signals (e.g. an internal register mirrored onto a debug `Out` port) that
+    /// have no reliably-accessible matching member on the compiled Verilog side
+    /// (unlike top-level ports, a `reg` internal to the reference module isn't
+    /// guaranteed to show up as a `top->name` struct member Verilator will let a
+    /// generated testbench compare against) — routing them through
+    /// `record_cycle_phased` instead would risk a testbench that doesn't compile.
+    pub fn add_debug_signals_phased(
+        &mut self,
+        cycle: usize,
+        pre: &[(&str, &[Logic])],
+        post: &[(&str, &[Logic])],
+    ) {
+        if let Some(pd) = self.phase_data.iter_mut().find(|pd| pd.cycle == cycle) {
+            pd.pre_signals.extend(to_owned_signals(pre));
+            pd.post_signals.extend(to_owned_signals(post));
+        }
+    }
+
     /// Finalize: export waveforms and run Verilator (if configured). No trace assertion.
     pub fn finish(self) -> TestResult {
         self.finish_internal(None)
@@ -362,20 +383,25 @@ fn export_phased_vcd(
     }
     vcd.push_str("$end\n");
 
-    // One pre/post pair per cycle.
-    // Start at time 2 (not 0) so cycle 0's pre-edge doesn't collide with the
-    // $dumpvars block above, which is also at #0.
-    for pd in phase_data {
-        let t_pre  = (pd.cycle as u64) * 2 + 2;
+    // One pre/post pair per cycle, at `2*cycle`/`2*cycle+1` — the same convention
+    // Verilator's own generated testbench uses (`tb->clk=0; eval(); dump();
+    // tb->clk=1; eval(); dump();` once per cycle, starting at time 0), so the two
+    // VCDs land on the same absolute time axis and can be diffed directly in a
+    // viewer. The very first cycle's PRE edge is skipped here — it was already
+    // declared by the `$dumpvars` block above, at the same time 0.
+    for (i, pd) in phase_data.iter().enumerate() {
+        let t_pre  = (pd.cycle as u64) * 2;
         let t_post = t_pre + 1;
 
-        // Pre-clock edge: clk = 0
-        vcd.push_str(&format!("#{}\n", t_pre));
-        vcd.push_str(&format!("b0 {}\n", clk_sym));
-        for (name, sym) in &signal_symbols {
-            let vals = lookup_signal(&pd.pre_signals, name).map(Vec::as_slice);
-            let width = widths.get(name).copied().unwrap_or(1);
-            vcd.push_str(&format!("{} {}\n", logic_vals_to_vcd(vals, width), sym));
+        if i > 0 {
+            // Pre-clock edge: clk = 0
+            vcd.push_str(&format!("#{}\n", t_pre));
+            vcd.push_str(&format!("b0 {}\n", clk_sym));
+            for (name, sym) in &signal_symbols {
+                let vals = lookup_signal(&pd.pre_signals, name).map(Vec::as_slice);
+                let width = widths.get(name).copied().unwrap_or(1);
+                vcd.push_str(&format!("{} {}\n", logic_vals_to_vcd(vals, width), sym));
+            }
         }
 
         // Post-clock edge: clk = 1
