@@ -65,6 +65,152 @@ pub fn infer_registers(f: &ItemFn) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+/// The **sequential register set** of an independent hand-written reference
+/// SystemVerilog module — the reference side of G2's structural
+/// register-inference correctness check
+/// (`design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`).
+///
+/// Returns the flip-flops: identifiers that are the target of a **nonblocking
+/// assignment** (`x <= …`), minus **output ports** (`output [reg] … x`). This
+/// rests on the universal RTL convention that `<=` is used only in sequential
+/// (`always @(posedge …)`) blocks and blocking `=` in combinational ones — so it
+/// correctly **excludes the `next_*` combinational regs** of the two-process
+/// Moore idiom (which use `=`), and it excludes Copper's `RegOut` output-port axis
+/// (`output reg`), leaving only genuine internal state.
+///
+/// This is deliberately a small, convention-based extractor for *test references*,
+/// not a full Verilog parser.
+pub fn reference_sv_registers(sv: &str) -> BTreeSet<String> {
+    let text = strip_sv_noise(sv);
+    let outputs = output_port_names(&text);
+    nonblocking_assign_targets(&text)
+        .difference(&outputs)
+        .cloned()
+        .collect()
+}
+
+/// The two ways G2 compares an inferred register set to a reference SV's registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegMatch {
+    /// Names match exactly — valid only when the reference SV is a *faithful
+    /// translation* that mirrors the design's own names (e.g. `mac_fsm.sv`).
+    NameExact,
+    /// Only the flip-flop *count* matches — the honest bar for a truly independent
+    /// reference whose author chose different names/encoding (e.g. a two-process
+    /// Moore `cur_state` vs Copper's `state`). Item 2 strengthens this to
+    /// storage-equivalence (count + per-register bit-width) once inference carries
+    /// widths from resolved Rust types.
+    StorageEquivalent,
+}
+
+/// Assert that the register set inferred from `dut_src` matches the sequential
+/// registers of reference SystemVerilog `sv` under `mode`. The reusable G2
+/// harness capability; `tests/common` will call this once item 2 wires inference
+/// into the transpile pipeline.
+pub fn assert_registers_match_reference_sv(dut_src: &str, sv: &str, mode: RegMatch) {
+    let inferred: BTreeSet<String> = infer_registers(
+        &syn::parse_str(dut_src).expect("DUT source parses as a single hardware fn"),
+    )
+    .into_iter()
+    .collect();
+    let reference = reference_sv_registers(sv);
+    match mode {
+        RegMatch::NameExact => assert_eq!(
+            inferred, reference,
+            "inferred register set does not name-match the reference SV's sequential registers"
+        ),
+        RegMatch::StorageEquivalent => assert_eq!(
+            inferred.len(),
+            reference.len(),
+            "inferred flip-flop count {} != reference count {} (inferred {inferred:?} vs \
+             reference {reference:?})",
+            inferred.len(),
+            reference.len()
+        ),
+    }
+}
+
+/// Drop `//` line comments and `[..]` width specs so the register extractors see
+/// bare declarations/assignments.
+fn strip_sv_noise(sv: &str) -> String {
+    let mut out = String::with_capacity(sv.len());
+    for line in sv.lines() {
+        let line = match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let mut depth = 0u32; // strip [ .. ] (bit widths / indices)
+        for ch in line.chars() {
+            match ch {
+                '[' => depth += 1,
+                ']' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Identifiers that are the LHS of a nonblocking assignment `x <= …`.
+fn nonblocking_assign_targets(text: &str) -> BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut names = BTreeSet::new();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find("<=") {
+        let pos = i + rel;
+        // Walk back over whitespace, then capture the identifier.
+        let mut j = pos;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        let end = j;
+        while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+            j -= 1;
+        }
+        if j < end {
+            names.insert(text[j..end].to_string());
+        }
+        i = pos + 2;
+    }
+    names
+}
+
+/// Identifiers declared as module output ports (`output [reg|wire|logic] … name`),
+/// handling both ANSI header ports and separate `output` declarations. Each
+/// `output` occurrence is scanned up to the next `;` or `)`, skipping type
+/// keywords, and stopping at the next direction keyword (for comma-joined headers
+/// like `… output out )`).
+fn output_port_names(text: &str) -> BTreeSet<String> {
+    const TYPE_KW: [&str; 6] = ["reg", "wire", "logic", "signed", "output", "bit"];
+    let bytes = text.as_bytes();
+    let mut names = BTreeSet::new();
+    let mut k = 0;
+    while let Some(rel) = text[k..].find("output") {
+        let start = k + rel;
+        let next = start + "output".len();
+        let prev_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let word_ok = next >= text.len() || !bytes[next].is_ascii_alphanumeric();
+        if prev_ok && word_ok {
+            let stop = text[next..]
+                .find([';', ')'])
+                .map(|p| next + p)
+                .unwrap_or(text.len());
+            for tok in text[next..stop].split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if matches!(tok, "input" | "inout") {
+                    break; // next port in an ANSI header
+                }
+                if !tok.is_empty() && !TYPE_KW.contains(&tok) {
+                    names.insert(tok.to_string());
+                }
+            }
+        }
+        k = next;
+    }
+    names
+}
+
 /// Production entry point (item 2): infer registers from the shared frontend IR
 /// via full backward liveness over the CFG. Stubbed for the G6 slice — present to
 /// pin the intended type dependency on `copper-core`'s IR, confirming the shared
@@ -245,35 +391,67 @@ mod tests {
     /// the reference's internal `reg` declarations (excluding the `output reg`,
     /// which is Copper's `RegOut` output-port axis, not internal state) and asserts
     /// they equal the inferred set.
+    fn read_ref_sv(rel: &str) -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    }
+
+    /// G2 structural correctness, NAME-EXACT form: `mac_fsm.sv` is a faithful
+    /// translation mirroring the design's names, so the inferred set matches the
+    /// reference's sequential registers name-for-name.
     #[test]
     fn inferred_set_matches_independent_reference_sv() {
-        let sv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/timing_probe_sv/mac_fsm.sv");
-        let sv = std::fs::read_to_string(&sv_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", sv_path.display()));
+        let sv = read_ref_sv("../tests/fixtures/timing_probe_sv/mac_fsm.sv");
+        assert_registers_match_reference_sv(MAC_FSM_SRC, &sv, RegMatch::NameExact);
+    }
 
-        let mut sv_regs: BTreeSet<String> = BTreeSet::new();
-        for line in sv.lines() {
-            let t = line.trim();
-            // Internal registers only: `reg [..] a, b, c;`. Skip `output reg ..`.
-            if let Some(rest) = t.strip_prefix("reg ") {
-                let after_width = rest.rsplit(']').next().unwrap_or(rest);
-                for name in after_width.trim_end_matches(';').split(',') {
-                    let name = name.trim();
-                    if !name.is_empty() {
-                        sv_regs.insert(name.to_string());
-                    }
+    /// The reference extractor returns the flip-flops only: the `output reg out`
+    /// (Copper's RegOut axis) is excluded despite being nonblocking-assigned.
+    #[test]
+    fn reference_extractor_excludes_output_port() {
+        let sv = read_ref_sv("../tests/fixtures/timing_probe_sv/mac_fsm.sv");
+        let regs = reference_sv_registers(&sv);
+        assert!(!regs.contains("out"), "output reg must be excluded, got {regs:?}");
+        assert_eq!(
+            regs,
+            ["c_latch", "product", "result", "stage"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// G2 structural correctness, STORAGE-EQUIVALENT form + the naming nuance: the
+    /// independent `pattern_detector_010.sv` is a two-process Moore machine whose
+    /// flip-flop is `cur_state` (its `next_state` is combinational — blocking `=`,
+    /// correctly excluded) — a *different name* from Copper's `state`. Names cannot
+    /// match, but the flip-flop COUNT does. This is why G2's independent-reference
+    /// bar is storage-equivalence, not name-equality.
+    #[test]
+    fn det_010_reference_is_storage_equivalent_not_name_exact() {
+        let det_010_src = r#"
+            #[hardware(sequential)]
+            async fn det_010(clk: Clock<C>, rstn: In<Logic, C>, in_i: In<Logic, C>, out_o: Out<Logic, C>) {
+                let mut state = State::A;
+                loop {
+                    if rstn.read() == Logic::Zero { state = State::A; }
+                    else { state = next(state, in_i.read()); }
+                    clk.tick().await;
+                    if matches!(state, State::D) { out_o.write(Logic::One); }
+                    else { out_o.write(Logic::Zero); }
                 }
             }
-        }
+        "#;
+        let sv = read_ref_sv("../examples/sequential/sv/pattern_detector_010.sv");
 
-        let inferred: BTreeSet<String> =
-            infer_registers(&parse(MAC_FSM_SRC)).into_iter().collect();
+        // Flip-flop set: only cur_state (next_state is combinational, excluded).
+        let reference = reference_sv_registers(&sv);
+        assert_eq!(reference, ["cur_state"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
 
-        assert_eq!(
-            inferred, sv_regs,
-            "inferred register set does not structurally match the independent \
-             reference SV mac_fsm.sv"
-        );
+        // Names differ (state vs cur_state) — so NameExact would fail, but
+        // StorageEquivalent (count) holds.
+        assert_registers_match_reference_sv(det_010_src, &sv, RegMatch::StorageEquivalent);
+        let inferred: BTreeSet<String> = infer_registers(&parse(det_010_src)).into_iter().collect();
+        assert_ne!(inferred, reference, "names are expected to differ for an independent reference");
     }
 }

@@ -11,9 +11,10 @@
 > items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
 > `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
 > `tests/golden_traces.rs`), **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
-> contribution 1 re-scopes; recorded in `paper/`), and **G6 DONE** (c2 feasible — new
-> `copper-analysis` crate consumed by both macro + codegen, no cycle; `syn::ItemFn` input);
-> G2/G5 (decisions) open.
+> contribution 1 re-scopes; recorded in `paper/`), **G6 DONE** (c2 feasible — new
+> `copper-analysis` crate consumed by both macro + codegen, no cycle; `syn::ItemFn` input),
+> **G2 DONE** (structural reg-match defined + `copper-analysis` capability built), and **G5 DONE**
+> (provable-claims register below). **All gates G1–G6 cleared** — item 2 can begin.
 
 ## Architecture decision (the foundation) — c2 + "just Rust"
 
@@ -87,7 +88,8 @@ honestly.
 The two priorities — **proven/evidence-backed novelty** and **correctness** — make these gates to
 clear before the c2 refactor + read-timing retirement (items 3/6 and the c2-sharing of item 2)
 proceed. They do *not* block continuing the item-2 CFG scaffolding already in progress on the
-branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions still to record.
+branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions (**both now
+recorded — DONE**).
 
 - **G1 — Timing-pattern coverage matrix + fill the `det_010` gap (correctness). DONE — see
   `design_docs/TIMING_COVERAGE_MATRIX.md`.** c2 makes sim-vs-transpiler *timing* agree by
@@ -101,11 +103,25 @@ branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions 
   **One gap remains — CDC/synchronizer latency (pattern 5)** — deferred by design to **item 4**'s
   multi-clock verification (which already calls for an independent async-FIFO Verilog reference); it
   is *not* on item 3's critical path.
-- **G2 — Register-inference correctness is defined *structurally* (decision).** A behavioral pass
-  doesn't prove it (an over-approximated register set can still simulate correctly). Define
-  correctness as a **structural reg-for-reg match against the independent hand-written reference
-  SV**, and make the equivalence harness able to assert declared-register structure (today it
-  asserts behavior + Verilator, not the reg set). Design this in from the start.
+- **G2 — Register-inference correctness is defined *structurally* (decision). DONE.** A behavioral
+  pass doesn't prove it (an over-approximated register set can still simulate correctly), so
+  correctness is defined as a **structural match of the inferred register set against the sequential
+  (flip-flop) registers of an independent hand-written reference SV**, with the reference side
+  computed by the convention that **nonblocking `<=` targets are the flip-flops** (excluding
+  combinational `next_*` blocking-`=` regs and `output reg` — the `RegOut` axis). Two forms,
+  empirically calibrated on the actual references:
+  - **Name-exact** — valid only when the reference is a *faithful translation* mirroring the design's
+    own names (e.g. `mac_fsm.sv` → {stage, product, c_latch, result}).
+  - **Storage-equivalent** (count now; count + per-register bit-width once item 2 carries widths from
+    resolved Rust types) — the honest bar for a *truly independent* reference whose author chose
+    different names/encoding (e.g. `pattern_detector_010.sv`'s two-process Moore `cur_state` vs
+    Copper's `state`: names cannot match, count does).
+  **Capability built & exercised** in `copper-analysis`: `reference_sv_registers`, `RegMatch`, and
+  `assert_registers_match_reference_sv` (unit-tested on `mac_fsm` name-exact + `det_010`
+  storage-equivalent). **Hook for item 2:** `tests/common::EquivalenceTest` calls
+  `assert_registers_match_reference_sv` once item 2 wires inference into the transpile pipeline
+  (today it asserts behavior + Verilator, not the reg set). This is the artifact behind item 2's G5
+  claim.
 - **G3 — Guardrails land before the refactor (correctness). DONE.** Both artifacts landed: (1) a
   **poll-order fuzzer** — `HardwareExecutor` gained a test-only `PollOrder` knob
   (`Insertion` default = unchanged production behavior; `Reversed`; `Seeded(u64)` reshuffles every
@@ -128,11 +144,9 @@ branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions 
   hardware anchoring, none of which Prost has (bespoke language+compiler, 3-page vision paper, no
   eval). Recorded in `paper/related_work.md`, `paper/00_claims_audit.md` (LEAD #1),
   `paper/intro_contributions.md`. **Open decision: exact contribution-1 re-wording (user's call).**
-- **G5 — Write the exact provable claim per item before coding (novelty; decision).** Each claim
-  names its artifact: item 2 → "register set inferred from control flow, *proven by structural
-  reg-match vs independent SV*" (G2); item 3 → "no runtime timing oracle; timing correct against the
-  *expanded* hardware anchor set" (G1); cross-cutting → "poll-order independent, *proven by fuzzer*"
-  (G3).
+- **G5 — Write the exact provable claim per item before coding (novelty; decision). DONE.** Every
+  item's claim is now pinned to a *named artifact that proves it* — see the **Provable claims
+  register** below. No item ships a novelty claim without its proof artifact named up front.
 - **G6 — Prove c2's dependency structure on a vertical slice first (feasibility). DONE — c2 is
   feasible; c1 stays closed.** The open unknown ("can the `copper-macros` proc-macro depend on the
   shared analysis crate without circular/compile-time problems?") is answered **yes**. New crate
@@ -157,6 +171,27 @@ branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions 
   and live across an interior await, e.g. `mac_pipeline`). The slice's calls are read-only (log
   only); item 2/3 route real facts through them. **The three sub-decisions above are USER-APPROVED
   (2026-07-29) as the item-2 foundation.**
+
+## Provable claims register (G5)
+
+Each item's novelty/correctness claim, paired with the **named artifact** that proves it and the
+paper contribution it supports. The rule (G5): no item ships a claim without its proof artifact
+existing and green — this is what keeps the claims *evidence-backed* rather than asserted.
+
+| Item | Provable claim | Proof artifact (the thing that must be green) | Paper | Status |
+|---|---|---|---|---|
+| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2): `copper-analysis::assert_registers_match_reference_sv` — name-exact for faithful refs (`mac_fsm.sv`), storage-equivalent for independent refs; wired into `tests/common::EquivalenceTest` | C1 | artifact built (G2); claim pending item-2 general liveness |
+| 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression tests that uneven-per-branch-tick designs still pass | C1 | pending item 2 |
+| 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); specifically un-ignoring `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` | C1/C2 | anchor in place (G1); claim pending item 3 |
+| 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | Trace/transpile/Verilator equivalence vs an **independent hand-written async-FIFO SV** + a **clock-interleave fuzzer** (≥2 relative tick rates ⇒ equal results) — fills the G1 pattern-5 (CDC) gap | C1/C4 | pending item 4 |
+| 5 | The formal semantics (CFG model, liveness rule, reachability, cross-domain interleave independence) are *stated*, construction-independent | `SYNCHRONOUS_SEMANTICS.md` rewrite with the `control_extract.rs:208-210` finding as a worked example | — | pending item 5 |
+| 6 | Levelized (topo-once) scheduling gives the **same settled values** as iterate-to-fixpoint, and makes poll-order independence *structural* | Suite green under levelized scheduler + the **poll-order fuzzer becomes moot** (canonical order) | C4 | pending item 6 |
+| cross | **Poll-order independence** — a well-formed design simulates identically under any poll order | **Poll-order fuzzer** (G3): `tests/poll_order_fuzz.rs` (insertion ≡ reversed ≡ seeded) | C1/C2 | DONE |
+| cross | **No silent behavioral drift** across the refactor | **Frozen golden traces** (G3): `tests/golden_traces.rs` + committed `*.trace` snapshots | — | DONE |
+| cross | Sim/synth same-source correspondence is **non-circular** — anchored to third-party hardware | Sim ≡ **BaseJump STL** Verilog (`examples/basejump/`), independent of the transpiler | C2 | DONE (standing) |
+
+Paper key: C1 = `async`-as-FSM (re-scoped for Prost, see G4); C2 = verified same-source correspondence;
+C4 = staged transpilation pipeline. See `paper/00_claims_audit.md` and `paper/intro_contributions.md`.
 
 ## Implementation items (sequenced)
 
