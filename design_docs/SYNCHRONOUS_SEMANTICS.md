@@ -1,28 +1,115 @@
-pre-edge settle
-clock edge
-post-edge settle
-post-edge observation
-Include examples for:
+# Synchronous semantics
 
-simple counter,
-combinational passthrough,
-register with enable,
-two clk.tick().awaits,
-Out vs RegOut,
-memory read timing.
+The reference for Copper's execution/timing model. It states the semantics as properties of the
+**design**, independent of any particular construction (codegen's `match pc` FSM is one realization,
+not the semantics). Companion: `SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` (the staged work); every claim
+below is grounded in the code cited inline and exercised by the test suite.
 
+## Execution model — c2 + "just Rust"
 
-Every clk.tick().await is a clock-cycle boundary; every suspension point becomes an FSM state; every value live across an await becomes a register; every path through a hardware loop must eventually reach an await; and simulation must be independent of Rust async poll order.
+**The default simulator always executes plain Rust.** A `#[hardware]` async fn is run as-is by the
+async executor (`copper-sim`); rustc's own coroutine lowering *is* the FSM. A shared compile-time
+control/liveness analysis (`copper-analysis`, the CFG below) *informs* the sim — it supplies register
+and read-timing facts the macro bakes into the generated code — but the sim never *interprets* an IR.
+This is load-bearing: sim and transpiler are then two independent derivations from one source, which
+is what makes their same-source equivalence non-circular (`paper/threats_to_validity.md` T6) and is
+LEAD contribution #1. A CHIR interpreter may exist only as an optional **validation-only backend,
+never the default** (impl-plan item 7). This "b vs c2" decision was settled 2026-07-29 against the
+alternative of making the sim consume an FSM IR.
 
-Hardware timing must be defined by Copper’s FSM/cycle semantics, not by Rust future poll order.
+## The clock tick — phases
 
-poll_tasks order must be an implementation detail.
-Well-formed Copper designs must simulate identically under any task order.
+`HardwareExecutor::tick_clock` (`copper-sim/src/executor.rs`) drives one clock cycle through four
+phases:
 
-In #[hardware] code, the only allowed await should be direct clk.tick().await
-or a small set of Copper-defined hardware waits such as channel.read().await.
+1. **Pre-edge settle** — phase `PreEdge`; `poll_tasks()` runs the combinational delta-cycle loop to a
+   fixed point with the registers still holding the *previous* cycle's values. Pre-edge (leading)
+   input reads sample here.
+2. **Clock edge** — `clk.advance()`; registers commit their next-state values.
+3. **Post-edge settle** — phase `PostEdge`; `poll_tasks()` settles again with the new register values.
+4. **Post-edge observation** — after `tick_clock` returns, a testbench reads the settled post-edge
+   values.
 
-Be careful about non-blocking channels and FIFOs
+**Post-edge continuation convention.** A `clk.tick()` future resolves in the *post-edge* settle, so a
+reaction's post-tick code runs in the **same** `tick_clock`, after the advance. A register clocked at
+edge N is therefore observable in cycle N — the standard synchronous-testbench convention — so
+Copper's primitives (flip-flop `q <= d`, enabled register, synchronous-read RAM) match hand-written
+Verilog cycle-for-cycle. This is validated against independent BaseJump STL hardware
+(`examples/basejump/`), not against the transpiler.
+
+**Per-domain phase keying.** The phase, tick-resolution, and read-timing signals are keyed *per clock
+domain* (`set_poll_phase::<Domain>`, `set_tick_resolving::<Domain>`; impl-plan item 1). Ticking one
+clock cannot perturb another domain's tasks — the prerequisite for the multi-clock interleave
+independence below.
+
+## Cycle boundaries and FSM states
+
+Each `clk.tick().await` is a **clock-cycle boundary**; a **clock cycle** is a maximal tick-free region
+of an execution. A **suspension point** (a program point at which a coroutine can be paused across a
+boundary) is an **FSM state**. **Every value live across a boundary is a register** (made precise by
+the liveness rule under *The CFG model*). These are the four informal invariants — boundary,
+FSM-state, register, and *every loop path reaches a tick* (reachability well-formedness, below) — now
+each a checked property rather than an accident of construction.
+
+## Output timing — `Out` vs `RegOut`
+
+Two output-port kinds capture the Mealy/Moore distinction explicitly:
+
+- **`Out<T,D>`** — a combinational (Mealy) output driven within the cycle (`assign out = …`). It
+  reflects the current cycle's logic, with no added latency; an `Out` left unwritten on a path
+  *holds* its value (a conditional write is an **enabled register**, verified `sim ≡ BaseJump` on
+  `bsg_dff_en`).
+- **`RegOut<T,D>`** — a registered (Moore) output driven from `always_ff`; its value commits at the
+  clock edge, so it appears one cycle later. Use it for write-before-tick Moore outputs (verified on
+  `sipo_block`). The two axes — input read timing and output register timing — are orthogonal.
+
+## Input read timing — static edge-phase classification
+
+An `In` read is classified **statically** by its position relative to ticks, replacing the retired
+runtime freshness oracle (impl-plan item 3; `copper_analysis::classify_reads`):
+
+- **`Deferred`** — a "leading"/pre-tick read (a clock tick follows it within the iteration). Its result
+  is registered at that edge, so it samples at the **next pre-edge settle**. The macro emits
+  `pre_edge_barrier::<D>().await` before the `.read()`.
+- **`Immediate`** — a trailing/post-tick read (no tick follows before the iteration closes). It consumes
+  the value the just-past edge produced and fires without deferral — a plain `.read()`.
+
+At runtime there is then no timing heuristic, only the accepted phase machinery. The classification
+reproduces the timing the old heuristic got right (loop-top reads in `mac_pipeline`/`sipo_block`
+defer; the trailing next-state reads in `counter`/`traffic_light` fire immediately) and fixes the
+class it got wrong (the variable-iteration `while in_i.read() == 0 { tick }` in `det_010_awaits`) —
+anchored to the independent `pattern_detector_010.sv`.
+
+## Poll-order and cross-domain interleave independence
+
+**Single domain — poll-order independence.** `poll_tasks` order is an implementation detail: a
+well-formed design simulates **bit-identically** under any task order. Enforced by the poll-order
+fuzzer (`tests/poll_order_fuzz.rs`: `Insertion` ≡ `Reversed` ≡ `Seeded`). Item 6 will make the order
+canonical (levelized scheduling), retiring the fuzzer.
+
+**Multiple domains — cross-domain interleave independence.** Independently-ticking clock domains have
+no defined phase relationship. The generalized invariant: **a well-formed multi-clock design behaves
+correctly under any relative tick interleaving/rate of its domains, provided every clock-domain
+crossing goes through a synchronizer.** Two precise senses:
+
+- For a *fixed* tick schedule, the result is poll-order-independent as above (per-domain phase keying
+  is what decouples the domains).
+- Across *different* relative rates, what is preserved is **functional correctness**, not the exact
+  trace: a synchronized signal is monotone (no glitches), data is not corrupted, and events
+  eventually propagate — while the exact cycle of an event legitimately shifts with the rate.
+
+Worked example: `examples/cdc/two_domain_hierarchy.rs` checks this rate-independent CDC invariant
+(monotone + eventually-asserts) across 2:1 / 3:1 / 1:1 interleavings, and
+`tests/two_domain_hierarchy_cdc.rs` anchors the dual-clock timing to an independent hand-written SV
+reference under a two-clock Verilator testbench. An **unsynchronized** crossing is rejected — by the
+phantom domain types for compiled code, and by the transpiler's call-site CDC check for the
+text-based path (impl-plan item 4).
+
+## Allowed awaits
+
+In `#[hardware]` code the only permitted `await` is a direct `clk.tick().await` (or a small set of
+Copper-defined hardware waits). Every loop path must reach one — the reachability well-formedness
+condition below, a hard compile error otherwise.
 
 ## The control-flow-graph (CFG) model
 
@@ -121,30 +208,4 @@ single authoritative pass, not two that must agree. Its register output is valid
 `det_110101`/`lfsr`) and (b) against the **transpiler's own emitted flip-flops**
 (`copper-codegen/tests/register_reconciliation.rs`: codegen ≡ this set + only its synthesized
 phase/pc counter, corpus-wide). See `SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` item 2.
-
-## Maybe?? — RESOLVED 2026-07-29 (see SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md)
-> These were tentative musings toward making the **simulator consume FSM IR** (option b). That
-> direction was **decided against**: the chosen architecture is **c2 + "just Rust"** — the default
-> simulator always *executes plain Rust*; a shared CFG analysis *informs* it (register/timing
-> facts) but the sim never *interprets* an IR. Reason: sim/transpiler independence is load-bearing
-> (it is what makes the same-source equivalence non-circular — paper T6 — and is LEAD contribution
-> #1). A CHIR interpreter may exist only as an optional **validation-only backend, never the
-> default** (SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md item 5). The lines below are kept for history; read
-> "FSM IR is the semantics" as *the FSM/cycle semantics are the reference the transpiler targets*,
-> NOT as *the sim executes an IR*.
-
-Rust async syntax is frontend notation.
-FSM IR is the semantic core.
-Simulator and Verilog backend both consume FSM IR.
-
-On tick:
-    state_reg and data_regs commit
-    output combinational logic for the new state settles
-    observations see the settled post-edge outputs
-
-Might want to add
-- blocking reads
-- nonblocking reads
-
-Async syntax is the frontend; FSM IR is the semantics.
 

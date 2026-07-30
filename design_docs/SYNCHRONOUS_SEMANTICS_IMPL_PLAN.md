@@ -433,7 +433,19 @@ Resulting dual-clock shape (async FIFO): a parent with no ticks, instantiating `
 domain to pull in the other side's pointer — no new syntax, no multiple-driver problem, reuses the
 synchronizer exemption at a new call site.
 
-### 5. Update `SYNCHRONOUS_SEMANTICS.md` with the formal semantics
+### 5. Update `SYNCHRONOUS_SEMANTICS.md` with the formal semantics — DONE (2026-07-30)
+
+`SYNCHRONOUS_SEMANTICS.md` rewritten: the draft bullet notes and the stale "FSM IR is the semantic
+core" musings are gone, replaced by grounded sections — **Execution model (c2 + "just Rust")**; **the
+clock tick phases** (pre-edge settle → edge → post-edge settle → observation, with the post-edge
+continuation convention and per-domain phase keying, cited to `HardwareExecutor::tick_clock`);
+**cycle boundaries / FSM states**; **`Out` vs `RegOut`** output timing; **static input read timing**
+(item 3's `Deferred`/`Immediate` `classify_reads`); and **poll-order generalized to cross-domain
+interleave independence** (fixed-schedule bit-identity vs across-rate functional-correctness, with the
+`two_domain_hierarchy` worked example). The CFG model / liveness / reachability / nested-loop sections
+(from item 2) are retained. Every claim is grounded in cited code and exercised by the suite.
+
+Original scope notes:
 
 Replace the draft bullet notes with: the CFG model; cycle-boundary/FSM-state definitions (stated
 independent of any construction); the generalized liveness rule; the reachability well-formedness
