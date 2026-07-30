@@ -259,7 +259,13 @@ the shared analysis both the transpiler and the sim macro consume (see G6).**
   so the *sim* now rejects the latch at compile time, matching the transpiler's own late
   `vlir_lower::check_no_latches` (`any − all`). Corpus: all 11 real combinational modules pass; a
   constructed partial one is rejected with "would infer a latch". **Structural combinational-loop
-  detection is still TODO** (a different graph — intra-cycle signal dataflow, not the control CFG).
+  detection — DEFERRED to item 6** (2026-07-29 finding, user-approved): it is *not* an item-2
+  intra-CFG add. Intra-module comb loops are essentially unexpressible (a `let a = b; let b = a;`
+  cycle is a use-before-def Rust rejects). The meaningful case is **cross-module** (X.out→Y.in→X, or
+  a submodule-wiring cycle) — which needs the **inter-module producer→consumer wiring DAG** item 6
+  builds (the executor holds `DirtyHandle`s, not edges), so the item-2 intra-module control CFG
+  cannot see it. Meanwhile the sim already catches it at runtime (executor `consecutive_dirty` →
+  `OSCILLATION_THRESHOLD` panic, `copper-sim/src/executor.rs:210`). See item 6.
 - **DONE (minimal)** — A **per-module FSM report** falls out of the CFG (`Cfg::fsm_report`: tick
   boundaries, clock receivers, inferred registers). A richer states/transitions dump can grow from
   the same `nodes`.
@@ -333,6 +339,12 @@ once per phase in dependency order — the compiled/levelized model of modern fa
 - **Distinct from the item-2 CFG:** this is the *inter-module wiring DAG* (scheduling); item 2 is
   *intra-module control flow* (liveness across ticks). Same family, different graphs — don't
   conflate.
+- **Home of structural combinational-loop detection** (moved here from item 2, 2026-07-29). Once the
+  producer→consumer wiring graph exists, a static comb-loop check falls out: reject an SCC of comb
+  edges that doesn't pass through a register / memory-latency / synchronizer. It could not live in
+  item 2 — intra-module comb loops are unexpressible (Rust rejects the use-before-def), so the only
+  real comb loops are cross-module, invisible to the intra-module CFG. Until then the sim's runtime
+  `OSCILLATION_THRESHOLD` panic (`copper-sim/src/executor.rs:210`) is the safety net.
 
 ### 7. CHIR interpreter as a validation-only backend (OPTIONAL — never the default sim)
 
