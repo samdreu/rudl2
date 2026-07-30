@@ -131,6 +131,17 @@ pub fn transpile_source(
         }
     };
 
+    // c2 (gate G6): the transpiler consumes the SAME shared analysis, on the SAME
+    // input (`&syn::ItemFn`), that the sim macro consumes — one authoritative
+    // register/CFG analysis, not two that must agree. Read-only for now; item 2
+    // routes register inference and item 3 routes read-timing through this.
+    let inferred_registers = copper_analysis::infer_registers(target);
+    log::debug!(
+        "copper-analysis inferred registers for `{}`: {:?}",
+        target.sig.ident,
+        inferred_registers
+    );
+
     let mut fir = capture_frontend_ir(target, &hardware_fns).map_err(|e| format!("{e:?}"))?;
     fir.enums.extend(file_enums);
     inject_file_scope(&mut fir, &file_scope);

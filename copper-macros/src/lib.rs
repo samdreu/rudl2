@@ -778,6 +778,18 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
                     return err.to_compile_error().into();
                 }
             }
+            // c2 (gate G6): the sim macro consumes the SHARED analysis crate — the
+            // same one the transpiler consumes — proving a proc-macro can depend on
+            // it with no dependency cycle. Read-only for now (item 3 will bake these
+            // register/read-timing facts into the generated code); computed on the
+            // pristine ItemFn before we rewrite it.
+            let inferred_registers = copper_analysis::infer_registers(&input_fn);
+            log::debug!(
+                "copper-analysis inferred registers for `{}`: {:?}",
+                input_fn.sig.ident,
+                inferred_registers
+            );
+
             let mut f = input_fn;
             if let Err(err) = inject_synced_reads(&mut f) {
                 return err.to_compile_error().into();

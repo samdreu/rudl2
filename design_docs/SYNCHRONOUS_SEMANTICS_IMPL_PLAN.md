@@ -10,8 +10,10 @@
 > **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **IN PROGRESS**;
 > items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
 > `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
-> `tests/golden_traces.rs`), and **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
-> contribution 1 re-scopes; recorded in `paper/`); G2/G5/G6 open.
+> `tests/golden_traces.rs`), **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
+> contribution 1 re-scopes; recorded in `paper/`), and **G6 DONE** (c2 feasible — new
+> `copper-analysis` crate consumed by both macro + codegen, no cycle; `syn::ItemFn` input);
+> G2/G5 (decisions) open.
 
 ## Architecture decision (the foundation) — c2 + "just Rust"
 
@@ -85,7 +87,7 @@ honestly.
 The two priorities — **proven/evidence-backed novelty** and **correctness** — make these gates to
 clear before the c2 refactor + read-timing retirement (items 3/6 and the c2-sharing of item 2)
 proceed. They do *not* block continuing the item-2 CFG scaffolding already in progress on the
-branch. G1/G3/G4/G6 are do-first tasks (**G1, G3, G4 DONE**; G6 open); G2/G5 are decisions to record.
+branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions still to record.
 
 - **G1 — Timing-pattern coverage matrix + fill the `det_010` gap (correctness). DONE — see
   `design_docs/TIMING_COVERAGE_MATRIX.md`.** c2 makes sim-vs-transpiler *timing* agree by
@@ -131,13 +133,30 @@ branch. G1/G3/G4/G6 are do-first tasks (**G1, G3, G4 DONE**; G6 open); G2/G5 are
   reg-match vs independent SV*" (G2); item 3 → "no runtime timing oracle; timing correct against the
   *expanded* hardware anchor set" (G1); cross-cutting → "poll-order independent, *proven by fuzzer*"
   (G3).
-- **G6 — Prove c2's dependency structure on a vertical slice first (feasibility).** The open unknown:
-  *can the `copper-macros` proc-macro depend on the shared analysis crate without circular/
-  compile-time problems?* Drive **one** multi-tick FSM end-to-end (source → shared CFG → register
-  inference → structural reg-check vs reference SV) before the full crate refactor. If the proc-macro
-  dependency proves untenable, that's cheap to learn here and reopens c1. Settle in the same slice
-  whether the CFG extends the existing `control_extract` (`copper-codegen/src/lib.rs`) or is a new
-  pass it consumes.
+- **G6 — Prove c2's dependency structure on a vertical slice first (feasibility). DONE — c2 is
+  feasible; c1 stays closed.** The open unknown ("can the `copper-macros` proc-macro depend on the
+  shared analysis crate without circular/compile-time problems?") is answered **yes**. New crate
+  `copper-analysis` (deps: **`copper-core` + `syn` only** — both already macro deps, so ~zero new
+  transitive cost) is consumed by **both** `copper-macros` (`hardware` sequential arm) and
+  `copper-codegen` (`transpile_source`); the full workspace builds with **no cycle** (`copper-core`
+  is a leaf). Register inference driven end-to-end on `mac_fsm` and **structurally reg-matched
+  against the independent `tests/fixtures/timing_probe_sv/mac_fsm.sv`** ({stage, product, c_latch,
+  result}) — also a live demonstration of G2's structural-match method.
+  **Sub-decisions settled by the slice:**
+  - *Where the shared analysis lives* → a **new light crate `copper-analysis`**, not an extension of
+    heavy `copper-codegen` (which cannot be a proc-macro dependency without bloating every build).
+  - *Analysis input* → **`syn::ItemFn`** — the representation BOTH front-ends already hold (the macro
+    receives it; `transpile_source` builds it via `parse_file`, and `capture_frontend_ir` already
+    keys off `&syn::ItemFn`). So there is **no front-end-unification problem for the analysis**; FIR
+    stays codegen's downstream lowering IR (a FIR-based entry `registers_from_fir` is stubbed for
+    item 2 if a richer CFG is wanted).
+  - *Extend `control_extract` vs new pass* → **new pass in `copper-analysis` that codegen consumes**;
+    `control_extract` can later be refactored to consume the shared CFG rather than owning its own.
+  NOTE: `infer_registers` here is the **minimal** control-flow criterion (pre-loop state reassigned
+  inside the loop); item 2 generalizes it to full backward liveness (registers born inside the loop
+  and live across an interior await, e.g. `mac_pipeline`). The slice's calls are read-only (log
+  only); item 2/3 route real facts through them. **The three sub-decisions above are USER-APPROVED
+  (2026-07-29) as the item-2 foundation.**
 
 ## Implementation items (sequenced)
 
@@ -312,11 +331,16 @@ not a rewrite of `tick_clock`.
   What remains is the `det_010`-class heuristic *fragility*, addressed by item 3's static timing.
 - **Reusing rustc's async-fn coroutine as an FSM-IR target** — investigated and rejected (item 7).
 
-## Open sub-decisions (not yet settled)
+## Open sub-decisions
 
-- Where the shared analysis crate physically lives and how `copper-macros` depends on it without a
-  heavy compile-time cost (G6 vertical slice decides this).
-- Whether item 2's CFG extends codegen's existing `control_extract` or is a new pass it consumes.
-- Exact form of the per-read timing fact the CFG emits (tick-distance integer vs edge-phase tag).
+- ~~Where the shared analysis crate physically lives and how `copper-macros` depends on it without a
+  heavy compile-time cost~~ **SETTLED by G6:** new light crate `copper-analysis` (`copper-core` +
+  `syn` only); both `copper-macros` and `copper-codegen` depend on it; no cycle (`copper-core` is a
+  leaf); analysis input is `syn::ItemFn` (both front-ends already hold it).
+- ~~Whether item 2's CFG extends codegen's existing `control_extract` or is a new pass it consumes~~
+  **SETTLED by G6:** a **new pass in `copper-analysis`** that codegen consumes; `control_extract`
+  (in heavy `copper-codegen`) cannot be a proc-macro dependency, so the authoritative CFG lives in
+  the light shared crate and `control_extract` is later refactored to consume it.
+- Exact form of the per-read timing fact the CFG emits (tick-distance integer vs edge-phase tag). *(open)*
 - Sequencing of item 4 (multi-clock) relative to item 3 (retire `synced_read`) — largely
-  independent; order by whichever capability is wanted first.
+  independent; order by whichever capability is wanted first. *(open)*

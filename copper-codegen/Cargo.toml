@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
+copper-analysis = { version = "0.1.0", path = "../copper-analysis" }
 log = "0.4.29"
 paste = "1.0.15"
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }

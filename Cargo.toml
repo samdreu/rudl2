@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["copper-core", "copper-macros", "copper-codegen", "copper-sim"]
+members = ["copper-core", "copper-analysis", "copper-macros", "copper-codegen", "copper-sim"]
 
 [package]
 name = "copper"

@@ -1,0 +1,16 @@
+# copper-analysis — shared compile-time control/liveness analysis (c2, gate G6).
+#
+# Deliberately LIGHT: depends only on copper-core (a leaf crate) and syn. This is
+# what lets BOTH the copper-macros proc-macro and the copper-codegen transpiler
+# depend on it with no dependency cycle and negligible extra compile cost — the
+# feasibility question G6 exists to answer. The authoritative CFG / register
+# inference / FSM report (item 2) will live here so the sim macro and the
+# transpiler consume ONE analysis rather than two that must agree.
+[package]
+name = "copper-analysis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+copper-core = { version = "0.1.0", path = "../copper-core" }
+syn = { version = "2.0.114", features = ["full", "visit"] }
