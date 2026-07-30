@@ -387,8 +387,30 @@ shipped, end-to-end:
   transpiled hierarchy AND the independent reference match the Copper sim trace cycle-for-cycle. The
   example checks the rate-independent CDC invariant (monotone + eventually-asserts) across 2:1/3:1/1:1.
   Tests: `copper-codegen/tests/structural_hierarchy.rs` (5) + `tests/two_domain_hierarchy_cdc.rs` (3).
-- **Remaining / deferred**: parent-runs-in-sim (executor auto-spawn/auto-wire) — deferred; the
-  stronger async-FIFO reference (vs the counter+synchronizer hierarchy) — optional future anchor.
+#### Item 4 follow-ups (deferred — tracked, not on any critical path)
+
+Both are explicit *decisions to defer*, not gaps in what shipped. The structural parent is a
+correct, verified transpilation construct today; these only extend it.
+
+- **4a — Parent-runs-in-sim (executor auto-spawn/auto-wire).** Teach the executor to run a
+  `#[hardware(structural)]` parent as a unit: its body's `wire::<T,D>(..)` net declarations and
+  child instantiation calls become real spawned+wired tasks, so one source form drives *both* the
+  sim and the transpiler (today the macro emits the structural parent unchanged and does **not**
+  spawn it — the sim hand-wires the children in the testbench, as `two_domain_hierarchy.rs`'s `main`
+  does). **Priority: low / ergonomics only** — the sim is already correct hand-wired
+  (`two_domain_counter`/`two_domain_hierarchy` pass), so this buys convenience and a single-source
+  story, not correctness. **Cost:** new executor/macro machinery to turn the parent body into
+  spawned wired tasks (the macro currently emits it inert); nothing in item 4 touched `copper-sim`.
+  Revisit only if the one-source convenience is wanted. See [[copper_item4_hierarchy_decision]].
+- **4b — Async-FIFO independent reference (stronger anchor).** The landed anchor
+  (`tests/two_domain_hierarchy_cdc.rs`) checks the counter+2FF-synchronizer+consumer hierarchy
+  against an independent hand-written SV (`examples/cdc/sv/two_domain_hierarchy.sv`). A genuine
+  **dual-clock async FIFO** (gray-coded rd/wr pointers each crossing through a `sync_2ff`, full/empty
+  flags) is the canonical CDC design and a stronger G1 pattern-5 anchor. **Priority: optional** —
+  the current anchor already fills the pattern-5 gap; the FIFO would broaden it (multi-bit pointer
+  crossing, gray-code, backpressure) and is the shape the original plan named. Reuses the exact
+  structural mechanism already built (parent instantiates `wr_side`/`rd_side`, each with its own
+  `sync_2ff`); the new work is the FIFO datapath + an independent hand-written FIFO SV reference.
 
 Original task notes (now realized as the structural category rather than by mutating the existing
 single-output submodule path):
