@@ -19,18 +19,24 @@ software engineer already uses — `async`/`await` — describe sequential hardw
 can the very same source be both simulated and synthesized, provably in agreement?**
 
 Copper is a hardware description language embedded in Rust. A sequential module is an ordinary
-`async fn`; a clock edge is `clk.tick().await`; the state that must survive an edge is exactly
-the set of local variables live across that `.await`. Crucially, Copper does not implement a
-state-machine compiler for this: Rust's own `async` lowering transforms the function into a
-`Future` whose fields are the live-across-await variables — that generated state machine *is*
-the FSM, and its fields *are* the registers. The same source text is compiled by `rustc` into
-a cycle-accurate simulation and, independently, lowered by Copper's transpiler
-(FIR → CHIR → SHIR → VLIR) to SystemVerilog; the two are checked for behavioral equivalence
-under Verilator. Critically, the simulator's cycle-level timing is itself **anchored to
-independent, hand-written SystemVerilog references** for the primitive sequential constructs
-(flip-flop, enabled register, synchronous-read RAM), so "cycle-accurate" means *matches
-hardware* rather than *matches our own transpiler* — the same-source equivalence is a
-correctness property, not a self-consistency check.
+`async fn`; a clock edge is `clk.tick().await`; the state that must survive an edge is the set
+of local variables live across that `.await`. Crucially, Copper does not implement a
+state-machine compiler for *simulation*: Rust's own `async` lowering already transforms the
+function into a `Future` whose state advances one clock cycle per `.await`, and Copper's
+executor runs that coroutine directly as a cycle-accurate FSM. The synthesizable register set —
+the values that must survive the edge — is a *property of the design*, computed by Copper's own
+liveness analysis; it is deliberately **not** read off rustc's `Future` layout, which is a
+conservative superset (retained-but-unread state that affects future *size* but not simulation
+behavior; see §Threats T1). The same source text is then lowered **independently** by Copper's
+transpiler (FIR → CHIR → SHIR → VLIR) to a SystemVerilog state machine, and the two are checked
+for behavioral equivalence under Verilator — the transpiler *reconstructs* the FSM from the
+source rather than reusing rustc's coroutine, which is precisely what makes the agreement a
+cross-check between two independent derivations rather than a tautology. Critically, the
+simulator's cycle-level timing is itself **anchored to independent, hand-written SystemVerilog
+references** for the primitive sequential constructs (flip-flop, enabled register,
+synchronous-read RAM), so "cycle-accurate" means *matches hardware* rather than *matches our own
+transpiler* — the same-source equivalence is a correctness property, not a self-consistency
+check.
 
 On top of this, Copper uses Rust's type and ownership systems for structural safety. Clock
 domains are phantom type parameters (`Clock<D>`, `In<T,D>`, `Out<T,D>`), so a signal produced
@@ -42,9 +48,16 @@ exactly one driver, with no separate analysis pass.
 ## Contributions (draft list)
 
 1. **`async`/`await` as an FSM description surface for hardware.** We show that a general-
-   purpose language's coroutine lowering can serve directly as a hardware state-machine
-   encoding: variables live across `clk.tick().await` become the registers of the synthesized
-   FSM. `[Evidence: traffic_light_fsm, uart/rx; macro is validation-only — copper-macros/src/lib.rs.]`
+   purpose language's coroutine lowering can serve directly as the *execution* of a synchronous
+   FSM: Copper runs rustc's own `async`-lowered coroutine as a cycle-accurate simulation in which
+   suspension points are clock edges and the values live across them are the registers of the
+   design. Two scope boundaries keep this honest: (i) the *synthesizable* register set is refined
+   by Copper's own liveness analysis, **not** read off rustc's over-capturing `Future` layout
+   (§Threats T1); and (ii) the *synthesized* SystemVerilog FSM is produced by Copper's transpiler
+   as an independent lowering (contribution 2), **not** by reusing rustc's coroutine. rustc's
+   lowering is thus the load-bearing mechanism for the hardware-anchored *reference simulation* and
+   the semantic correspondence — not for the emitted netlist.
+   `[Evidence: traffic_light_fsm, uart/rx; macro is validation-only — copper-macros/src/lib.rs.]`
 
 2. **A same-source correspondence between simulation and synthesis, checked by construction —
    and anchored to hardware.** The identical Rust source is executed for cycle-accurate
