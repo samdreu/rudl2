@@ -48,3 +48,11 @@ fn if_tick_extracts_to_explicit_fsm() {
 fn branch_merge_extracts_to_explicit_fsm() {
     assert_extracts_to("branch_merge", "branch_merge_explicit");
 }
+
+/// Ticks *inside* `match` arms, with a mid-arm tick in one arm — exercises the
+/// match-arm generalization of `lower_into` (descend into arms; allocate a fresh
+/// `pc` state for the second cycle of the `Double` arm).
+#[test]
+fn match_tick_extracts_to_explicit_fsm() {
+    assert_extracts_to("match_tick", "match_tick_explicit");
+}

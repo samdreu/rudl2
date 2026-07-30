@@ -8,6 +8,13 @@
 // EXECUTION_MODEL_RECONCILIATION.md). This is the det_010_awaits→det_010 method,
 // applied to the simplest straight-line + if/else cases.
 
+// FSM state enum for the match-nested-tick case (Case 3).
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Single,
+    Double,
+}
+
 // ── Case 1: if_tick — asymmetric tick counts (then: 1 tick, else: 2). ──────────
 
 #[hardware(sequential)]
@@ -102,6 +109,69 @@ async fn branch_merge_explicit(
             }
             1u8 => {
                 tail_o.write(Logic::One);
+                pc = 0;
+            }
+            _ => {}
+        }
+        clk.tick().await;
+    }
+}
+
+// ── Case 3: match_tick — ticks INSIDE `match` arms, one arm with a mid-arm tick. ─
+// Exercises the match-arm generalization of `lower_into`: descending into arms (not
+// just `if`) and allocating a fresh `pc` state for the `Double` arm's second cycle.
+
+#[hardware(sequential)]
+async fn match_tick(
+    clk: Clock<MainClk>,
+    a: In<Bits<8>, MainClk>,
+    b: In<Bits<8>, MainClk>,
+    out: Out<Bits<8>, MainClk>,
+) {
+    let mut mode = Mode::Single;
+    loop {
+        match mode {
+            Mode::Single => {
+                out.write(a.read());
+                mode = Mode::Double;
+                clk.tick().await;
+            }
+            Mode::Double => {
+                out.write(a.read());
+                clk.tick().await;
+                out.write(b.read());
+                mode = Mode::Single;
+                clk.tick().await;
+            }
+        }
+    }
+}
+
+#[hardware(sequential)]
+async fn match_tick_explicit(
+    clk: Clock<MainClk>,
+    a: In<Bits<8>, MainClk>,
+    b: In<Bits<8>, MainClk>,
+    out: Out<Bits<8>, MainClk>,
+) {
+    let mut mode = Mode::Single;
+    let mut pc: u8 = 0;
+    loop {
+        match pc {
+            0u8 => match mode {
+                Mode::Single => {
+                    out.write(a.read());
+                    mode = Mode::Double;
+                    pc = 0;
+                }
+                Mode::Double => {
+                    out.write(a.read());
+                    pc = 1;
+                }
+            },
+            1u8 => {
+                out.write(b.read());
+                mode = Mode::Single;
                 pc = 0;
             }
             _ => {}

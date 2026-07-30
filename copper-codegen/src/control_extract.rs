@@ -201,7 +201,31 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
             return; // rest handled inside both arms
         }
 
-        // Plain combinational statement (incl. `if`s with no tick).
+        if let Some(match_expr) = as_match_with_tick(stmt) {
+            let rest = &stmts[i + 1..];
+
+            // Same rule as `if`, generalized to N arms: the continuation after the
+            // `match` is inlined into *every* arm, and each arm is lowered on its own
+            // (a tick in one arm advances `pc`; a tick-free arm inlines the rest in
+            // the same cycle). Duplication cost is per-arm, as the `if` case notes.
+            let mut new_arms = Vec::with_capacity(match_expr.arms.len());
+            for arm in &match_expr.arms {
+                let mut arm_stmts = arm_body_stmts(arm);
+                arm_stmts.extend_from_slice(rest);
+                let mut arm_body = Vec::new();
+                lower_into(&arm_stmts, &mut arm_body, sm);
+                new_arms.push(ExprMatchArm {
+                    pattern_text: arm.pattern_text.clone(),
+                    guard: arm.guard.clone(),
+                    body: Box::new(block_expr(arm_body, arm.span)),
+                    span: arm.span,
+                });
+            }
+            target.push(match_stmt(match_expr, new_arms));
+            return; // rest handled inside every arm
+        }
+
+        // Plain combinational statement (incl. `if`/`match` with no tick).
         target.push(stmt.clone());
     }
 
@@ -277,6 +301,27 @@ fn else_branch_stmts(if_expr: &ExprIf) -> Vec<RawStmt> {
     }
 }
 
+/// `match <scrutinee> { <arms> }`, reusing the source scrutinee.
+fn match_stmt(src: &ExprMatch, arms: Vec<ExprMatchArm>) -> RawStmt {
+    expr_stmt(
+        ExprType::Match(ExprMatch {
+            scrutinee: src.scrutinee.clone(),
+            arms,
+            span: src.span,
+        }),
+        src.span,
+    )
+}
+
+/// The statements of a `match` arm body. A non-block arm body (`Pat => expr`) is
+/// wrapped back into a single statement for `lower_into` to re-descend.
+fn arm_body_stmts(arm: &ExprMatchArm) -> Vec<RawStmt> {
+    match arm.body.as_ref() {
+        ExprType::Block(blk) => blk.stmts.clone(),
+        other => vec![expr_stmt(other.clone(), arm.span)],
+    }
+}
+
 // ── Detection ─────────────────────────────────────────────────────────────────
 
 fn is_loop_stmt(s: &RawStmt) -> bool {
@@ -298,6 +343,18 @@ fn as_if_with_tick(s: &RawStmt) -> Option<&ExprIf> {
         if let ExprType::If(if_expr) = &es.expr {
             if expr_contains_tick(&es.expr) {
                 return Some(if_expr);
+            }
+        }
+    }
+    None
+}
+
+/// `Some(match_expr)` when `s` is a `match` some arm of which (any depth) ticks.
+fn as_match_with_tick(s: &RawStmt) -> Option<&ExprMatch> {
+    if let RawStmtKind::Expr(es) = &s.kind {
+        if let ExprType::Match(match_expr) = &es.expr {
+            if expr_contains_tick(&es.expr) {
+                return Some(match_expr);
             }
         }
     }
@@ -331,6 +388,7 @@ fn find_tick_in_expr(e: &ExprType) -> Option<RawStmt> {
         ExprType::If(f) => find_tick_stmt(&f.then_block)
             .or_else(|| f.else_branch.as_deref().and_then(find_tick_in_expr)),
         ExprType::Block(b) => find_tick_stmt(&b.stmts),
+        ExprType::Match(m) => m.arms.iter().find_map(|a| find_tick_in_expr(&a.body)),
         _ => None,
     }
 }

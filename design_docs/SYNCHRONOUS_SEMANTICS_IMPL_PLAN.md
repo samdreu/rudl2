@@ -238,9 +238,14 @@ the shared analysis both the transpiler and the sim macro consume (see G6).**
   macro/transpile entry, before `control_extract`, so a zero-tick branch is rejected first. (The
   fallthrough line itself is left in place; deleting it is safe cleanup once `control_extract` is
   refactored to consume the shared CFG.)
-- **TODO (codegen)** — Generalize `as_if_with_tick`/`lower_into`'s branch duplication
-  (`control_extract.rs:168-211`) from `If` only to `Match` arms. (The *analysis* CFG already expands
-  match arms; this is the separate FSM-*lowering* generalization in codegen.)
+- **DONE (codegen, 2026-07-29)** — Generalized `lower_into`'s branch duplication from `If` only to
+  `Match` arms (`control_extract.rs`): `as_match_with_tick` + a match case mirroring the `if` case
+  over N arms (continuation inlined into every arm; a mid-arm tick allocates a fresh `pc` state),
+  and `find_tick_in_expr` now descends into `Match` (a match-nested tick previously *panicked* at
+  the "gate guarantees at least one tick" `expect`). Verified STRUCTURALLY (the convention for
+  control-extraction, immune to the output-timing reconciliation): `tests/control_extraction_*`'s
+  new `match_tick` extracts to byte-identical SV as the hand-written explicit `match pc` FSM
+  `match_tick_explicit`, incl. a mid-arm tick. Register reconciliation extends to it (19 modules).
 - **DONE** — Generalize register promotion to a real **backward liveness** over the CFG
   (`Cfg::registers`): a local is a register iff it is *defined inside the loop* and *live across a
   tick edge*. Generalizes the G6 slice's pre-loop-only criterion to registers born inside the loop
