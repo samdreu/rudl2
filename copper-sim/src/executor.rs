@@ -363,8 +363,6 @@ impl HardwareExecutor {
     /// This includes a pre-edge settle phase where all tasks are polled to allow combinational logic to run, 
     /// then the clock is advanced, and then a post-edge settle phase where tasks are polled again to allow sequential logic to update based on the new clock edge.
     pub fn tick_clock<Domain: ClockDomain>(&mut self, clk: &mut Clock<Domain>) {
-        crate::synced_read::bump_call_id::<Domain>();
-
         // Post-edge continuation convention: a `clk.tick()` resolves in the
         // POST-edge settle, so a reaction's post-tick code runs in the SAME
         // `tick_clock`, AFTER the advance. A register clocked at edge N is thus

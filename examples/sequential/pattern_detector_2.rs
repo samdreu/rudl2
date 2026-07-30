@@ -1,5 +1,5 @@
 use copper_core::types::{Logic, Clock, ClockDomain};
-use copper_core::port::{In, Out, wire};
+use copper_core::port::{In, Out, RegOut, wire};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
@@ -46,12 +46,19 @@ async fn det_010 (
     }
 }
 
+// `out_o` is a `RegOut`: this coding drives its detection output *before* a tick
+// (`out_o.write(One); clk.tick().await;`), a write-before-tick Moore output — the
+// case `RegOut` exists for (CLAUDE.md; verified on `sipo_block`). With plain `Out`
+// the next iteration's leading `out_o.write(Zero)` clobbers the detection in the
+// same `tick_clock`'s post-edge before it is observed. The read timing (which
+// cycle each `in_i.read()` samples) is handled separately by the macro's static
+// edge-phase classification (`copper_analysis::classify_reads`, impl-plan item 3).
 #[hardware(sequential)]
 async fn det_010_awaits (
     clk: Clock<MainClk>,
     rstn: In<Logic, MainClk>,
     in_i: In<Logic, MainClk>,
-    out_o: Out<Logic, MainClk>,
+    out_o: RegOut<Logic, MainClk>,
 ) {
     loop {
         out_o.write(Logic::Zero);
@@ -111,35 +118,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use copper_core::port::registered_wire;
 
-    // Under the post-edge execution convention the two codings are cycle-identical
-    // again: a register clocked at edge N is observed in cycle N, so det_010's
-    // post-tick `out.write(state)` and det_010_awaits's write-at-detection agree.
-    // (They diverged only under the interim atomic/pre-edge model.)
-    // See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.
-    //
-    // Re-broken by the mid-phase "leading read" fix in `synced_read.rs`
-    // (`SyncedRead::leading_pre_edge_call_id`): deferring a virgin mid-phase read
-    // to the next pre-edge is a phase shift, not just a time shift, and in
-    // `det_010_awaits`'s `while in_i.read() == Zero { .. }` — whose exit can
-    // happen on its very first check (no leading zero bits) or after several
-    // (a repeat read, bypassing the deferral via `wrapped_since == false`) —
-    // that shift cascades differently depending on which path was taken,
-    // eventually letting two clock edges resolve inside one `tick_clock` call.
-    // This is exactly the class of bug `design_docs/OUTDATED/
-    // EXECUTION_MODEL_RECONCILIATION.md` says needs real dataflow knowledge
-    // ("how many ticks until the read's result is registered") that a
-    // runtime phase/call_id heuristic can't have — tracked as out of scope for
-    // the per-domain-keying plan and deferred to its item 5 (the CHIR/FSM-IR
-    // interpreter, built from item 2's real CFG, replacing this raw-futures +
-    // heuristic execution model). Not re-derived from independent hardware
-    // (unlike `sipo_block`, which the same fix correctly resolves) — this test
-    // only checks two Copper codings against each other.
+    // The two codings are cycle-identical: the canonical single-tick Moore machine
+    // and the variable-iteration `while in_i.read() == Zero { tick }` coding produce
+    // the same output on every cycle. This held only under the interim models until
+    // the runtime `synced_read` heuristic could not compute "how many ticks until a
+    // read's result is registered" and cascaded the variable-iteration while-loop's
+    // phase differently by path (`design_docs/OUTDATED/
+    // EXECUTION_MODEL_RECONCILIATION.md`). Impl-plan item 3 replaced that heuristic
+    // with the macro's static edge-phase classification of each read site
+    // (`copper_analysis::classify_reads`), so the machine now samples inputs on the
+    // correct cycles regardless of iteration count — and `det_010_awaits` uses
+    // `RegOut` for its write-before-tick output. Both fixes together make the two
+    // codings agree; the hardware-anchored version of this check is
+    // `tests/det_010_independent_golden.rs` (against `pattern_detector_010.sv`).
     #[test]
-    #[ignore = "mid-phase read-timing heuristic: a virgin-mid-phase-read deferral \
-                shifts phase parity and cascades through det_010_awaits's \
-                variable-iteration while-loop differently depending on the input \
-                stream — see the comment above and EXECUTION_MODEL_RECONCILIATION.md"]
     fn det_010_variants_match_transition_table() {
         let mut clk = Clock::<MainClk>::new();
         let mut exec = HardwareExecutor::new();
@@ -150,7 +144,9 @@ mod tests {
 
         let (rstn_drv_b, rstn_b) = wire::<Logic, MainClk>(Logic::One);
         let (in_drv_b, in_b) = wire::<Logic, MainClk>(Logic::Zero);
-        let (out_drv_b, out_obs_b) = wire::<Logic, MainClk>(Logic::Zero);
+        // det_010_awaits drives its Moore output before a tick → RegOut (see the
+        // module note); registered_wire gives the matching registered observation.
+        let (out_drv_b, out_obs_b) = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
 
         let dh_a = out_drv_a.dirty_handle();
         let dh_b = out_drv_b.dirty_handle();

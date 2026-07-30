@@ -1,5 +1,6 @@
 // Read-timing regression fixtures: multi-tick loops with CROSS-TICK input reads —
-// the exact case the synced_read fix targets (EXECUTION_MODEL_RECONCILIATION.md).
+// the exact case the static read-timing classification targets
+// (`copper_analysis::classify_reads`, impl-plan item 3; EXECUTION_MODEL_RECONCILIATION.md).
 // Each output is a held register aliased to `assign out = <reg>` (combinational),
 // so these isolate the READ-timing axis from the still-open output-timing axis.
 

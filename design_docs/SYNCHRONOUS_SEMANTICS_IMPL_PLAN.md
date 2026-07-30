@@ -25,7 +25,10 @@
 > detection → **item 6** (cross-module, needs the inter-module wiring DAG; runtime oscillation
 > covers it); retiring `split_at_ticks` so codegen *consumes* the set → behavior-neutral churn,
 > skipped (the sets provably agree); nested-loop *codegen* support (codegen rejects nested loops —
-> sim-only). Items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
+> sim-only). **Item 3 DONE (2026-07-30)** — the runtime read-timing oracle (`synced_read.rs`) is
+> retired for the macro's static per-read edge-phase classification (`copper_analysis::classify_reads`);
+> `det_010_awaits_matches_independent_verilog` is un-ignored & passing; see the item 3 section. Items
+> 4–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
 > `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
 > `tests/golden_traces.rs`), **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
 > contribution 1 re-scopes; recorded in `paper/`), **G6 DONE** (c2 feasible — new
@@ -200,7 +203,7 @@ existing and green — this is what keeps the claims *evidence-backed* rather th
 |---|---|---|---|---|
 | 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2), **wired into `tests/common::EquivalenceTest`** for 4 independent references: `mac_fsm` (name-exact), `det_010`/`det_110101`/`lfsr` (storage-equivalent). **Reconciled with codegen** — `copper-codegen/tests/register_reconciliation.rs` proves, corpus-wide (17 sequential modules), that codegen's emitted flip-flops equal the shared inference (+ only the synthetic phase/pc counter). So the shared analysis is now the authoritative *spec* for codegen's register set. | C1 | **DONE**; codegen *consuming* the set directly (retiring `split_at_ticks`) is a behavior-neutral follow-up (the sets already agree) |
 | 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression that uneven-per-branch-tick designs pass — `copper-analysis` unit tests (`tickless_fallthrough_rejected`, `uneven_but_both_tick_accepted`, …) + corpus test (`tests/real_examples.rs`: 38 modules pass); enforced in both front-ends; caught the real `det_010_awaits` tickless spin | C1 | **DONE** |
-| 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); specifically un-ignoring `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` | C1/C2 | anchor in place (G1); claim pending item 3 |
+| 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` **un-ignored & passing**; `synced_read.rs` deleted; whole anchor set + G3 golden traces (no re-bless) + poll-order fuzzer green | C1/C2 | **DONE** (2026-07-30) |
 | 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | Trace/transpile/Verilator equivalence vs an **independent hand-written async-FIFO SV** + a **clock-interleave fuzzer** (≥2 relative tick rates ⇒ equal results) — fills the G1 pattern-5 (CDC) gap | C1/C4 | pending item 4 |
 | 5 | The formal semantics (CFG model, liveness rule, reachability, cross-domain interleave independence) are *stated*, construction-independent | `SYNCHRONOUS_SEMANTICS.md` rewrite with the `control_extract.rs:208-210` finding as a worked example | — | pending item 5 |
 | 6 | Levelized (topo-once) scheduling gives the **same settled values** as iterate-to-fixpoint, and makes poll-order independence *structural* | Suite green under levelized scheduler + the **poll-order fuzzer becomes moot** (canonical order) | C4 | pending item 6 |
@@ -307,7 +310,7 @@ depth in codegen (nested-loop synthesis), not the item-2 analysis, which is comp
   `UnsupportedConstruct`), so nested-loop *register* precision has no consumer — the win is a
   compile-time reachability error instead of a runtime oscillation hang.
 
-### 3. Retire `synced_read` via CFG-derived compile-time timing facts (gated on item 2 + G1)
+### 3. Retire `synced_read` via CFG-derived compile-time timing facts (DONE — 2026-07-30)
 
 The shared CFG classifies each read site statically (which edge registers its result / tick
 distance), and the macro bakes that classification into the generated *plain-Rust* sim code,
@@ -317,6 +320,42 @@ heuristic structurally lacks). **Prerequisite:** because c2 makes sim-vs-transpi
 agreement true-by-construction, timing correctness rests entirely on the hardware anchor — **expand
 the anchor set (G1) before this item.** Datapath equivalence (sim-vs-transpiler) is unaffected and
 stays a genuine cross-check.
+
+**What shipped.** The **edge-phase tag** form was chosen (user decision, 2026-07-30) over a
+tick-distance integer — the sim needs only the phase-alignment decision. New in `copper-analysis`:
+`ReadTiming{Deferred, Immediate}` + `classify_reads(&ItemFn) -> Vec<ReadTiming>` (`cfg.rs`), a
+per-`In`-read classifier in source order. **The rule:** a read is `Deferred` (sample at the next
+pre-edge — the registering edge) iff a tick occurs *after* it within the loop iteration's control
+flow (a leading/pre-tick read); otherwise `Immediate` (a trailing/post-tick read that consumes the
+value the just-past edge produced). The macro (`ReadRewriter`, `copper-macros`) consumes the tags by
+index and emits, per site, `{ pre_edge_barrier::<D>().await; port.read() }` (Deferred) or a plain
+`port.read()` (Immediate). **The runtime oracle is deleted:** `copper-sim/src/synced_read.rs` is
+gone, along with the wrap counter, per-site `ReadTracker`, per-domain `CALL_ID`/`bump_call_id`, and
+the `leading_pre_edge_call_id` machinery — item 2's reachability check already subsumes the old
+`same_call` anti-spin guard (a tickless loop is now a compile error, so a deferred read can only
+suspend across a real tick, never busy-spin).
+
+**Empirical adjudication (the discipline).** All hardware anchors stay green under Verilator —
+`mac_pipeline` (loop-top defers), `sipo_block` (BaseJump mid-phase reads), `traffic_light` (trailing
+post-tick read fires immediately), `counter`/`lfsr`/`shift_register`/`pattern_detector`, `dual_port_ram`
+(same-cycle double read), the CDC synchronizer path (`two_domain_counter`, `flag_crossing`,
+foreign-domain reads via the `tick_domain_of` fallback), and the nested-loop `rv32i_cpu`/`uart_system`.
+The **G3 frozen golden traces pass without re-blessing** — bit-for-bit no behavioral drift on the
+covered modules, i.e. the static classification reproduces the old heuristic exactly where it was
+already correct. The **poll-order fuzzer** stays green. **Provable claim closed:**
+`det_010_awaits_matches_independent_verilog` is **un-ignored and passing** against the independent
+`pattern_detector_010.sv` — the static classification makes the variable-iteration
+`while in_i.read() == 0 { tick }` machine detect on the correct cycles (5, 9, 13), which the runtime
+heuristic could not.
+
+**One finding worth recording (the two axes are separate).** With correct read timing, `det_010_awaits`
+detects on the right cycles but its *output* was clobbered: it drives `out_o.write(One)` *before* a
+tick, and the next iteration's leading `out_o.write(Zero)` overwrote it in the same `tick_clock`'s
+post-edge. That is the **output-timing axis** — `det_010_awaits`'s output is a write-before-tick Moore
+output and must be `RegOut` (the plain `Out` was a latent bug the old read mis-timing had masked).
+Switching it to `RegOut` (the sanctioned mechanism, already verified on `sipo_block`) makes it match
+the golden. Read timing (item 3) and output timing (`RegOut`) are orthogonal; the classifier gets the
+sampling cycle right independently of the output register.
 
 ### 4. Hierarchical clocked submodule instantiation (the multi-clock enabler)
 
@@ -447,6 +486,9 @@ not a rewrite of `tick_clock`.
   **SETTLED by G6:** a **new pass in `copper-analysis`** that codegen consumes; `control_extract`
   (in heavy `copper-codegen`) cannot be a proc-macro dependency, so the authoritative CFG lives in
   the light shared crate and `control_extract` is later refactored to consume it.
-- Exact form of the per-read timing fact the CFG emits (tick-distance integer vs edge-phase tag). *(open)*
+- ~~Exact form of the per-read timing fact the CFG emits (tick-distance integer vs edge-phase tag).~~
+  **SETTLED (item 3, 2026-07-30): edge-phase tag** (`ReadTiming{Deferred, Immediate}`) — the sim needs
+  only the phase-alignment decision, not a numeric distance; a distance integer was over-built for the
+  consumer.
 - Sequencing of item 4 (multi-clock) relative to item 3 (retire `synced_read`) — largely
   independent; order by whichever capability is wanted first. *(open)*

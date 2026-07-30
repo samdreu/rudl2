@@ -23,7 +23,7 @@
 
 mod common;
 
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, Out, RegOut};
 use copper_core::{Clock, ClockDomain, Logic};
 use copper_macros::hardware;
 use copper_sim::{make_cycle, HardwareExecutor, HardwareTest, SimulationTrace};
@@ -38,14 +38,22 @@ const GOLDEN_SV: &str = "examples/sequential/sv/pattern_detector_010.sv";
 include!("fixtures/det_010_dut.rs");
 
 // The variable-iteration-loop coding — mirrors `det_010_awaits` in
-// examples/sequential/pattern_detector_2.rs. Kept here so the ignored anchor
-// below is self-contained; if the example's coding changes, update both.
+// examples/sequential/pattern_detector_2.rs. Kept here so the anchor below is
+// self-contained; if the example's coding changes, update both.
+//
+// `out_o` is a `RegOut`, not a plain `Out`: this coding drives its detection
+// output *before* a tick (`out_o.write(One); clk.tick().await;`), a write-before-
+// tick Moore output — the exact case `RegOut` exists for (CLAUDE.md; verified on
+// `sipo_block`). With plain `Out` the next iteration's leading `out_o.write(Zero)`
+// clobbers the detection in the same `tick_clock`'s post-edge before it is
+// observed. This is the *output*-timing axis; item 3's read-timing classification
+// independently makes the machine detect on the correct cycles (5, 9, 13).
 #[hardware(sequential)]
 async fn det_010_awaits(
     clk: Clock<MainClk>,
     rstn: In<Logic, MainClk>,
     in_i: In<Logic, MainClk>,
-    out_o: Out<Logic, MainClk>,
+    out_o: RegOut<Logic, MainClk>,
 ) {
     loop {
         out_o.write(Logic::Zero);
@@ -127,21 +135,22 @@ fn coverage_stream() -> Vec<(Logic, Logic)> {
 /// same coverage stream.
 fn run_against_golden(
     module: &str,
+    // The closure spawns the DUT and returns its output observation handle — it
+    // owns the output wiring so each coding can pick plain `Out` (combinational,
+    // post-tick) or `RegOut` (registered, write-before-tick) as its shape requires.
     spawn: impl FnOnce(
         &mut HardwareExecutor,
         Clock<MainClk>,
         In<Logic, MainClk>,
         In<Logic, MainClk>,
-        Out<Logic, MainClk>,
-    ),
+    ) -> In<Logic, MainClk>,
 ) {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
     let (rstn_drv, rstn_in) = wire::<Logic, MainClk>(Logic::One);
     let (in_drv, in_in) = wire::<Logic, MainClk>(Logic::Zero);
-    let (out_drv, out_obs) = wire::<Logic, MainClk>(Logic::Zero);
-    spawn(&mut exec, clk.clone(), rstn_in, in_in, out_drv);
+    let out_obs = spawn(&mut exec, clk.clone(), rstn_in, in_in);
 
     // The Verilator top module is `det_010` (the golden's module name) for both
     // codings — they are checked against the same reference hardware.
@@ -177,25 +186,28 @@ fn run_against_golden(
 /// detector now has a real hardware reference.
 #[test]
 fn det_010_matches_independent_verilog() {
-    run_against_golden("det_010", |exec, clk, rstn, in_i, out_o| {
-        let dh = out_o.dirty_handle();
-        exec.spawn_wired(det_010(clk, rstn, in_i, out_o), vec![dh]);
+    run_against_golden("det_010", |exec, clk, rstn, in_i| {
+        let (out_drv, out_obs) = wire::<Logic, MainClk>(Logic::Zero);
+        let dh = out_drv.dirty_handle();
+        exec.spawn_wired(det_010(clk, rstn, in_i, out_drv), vec![dh]);
+        out_obs
     });
 }
 
-/// The variable-iteration-loop coding must eventually match the SAME independent
-/// golden. It does not today — the runtime read-timing heuristic phase-shifts the
-/// `while in_i.read() == 0 { tick }` loop (see pattern_detector_2.rs). Un-ignore
-/// when impl-plan item 3 replaces the heuristic with CFG-derived static timing;
-/// passing this is that item's provable, hardware-anchored claim.
+/// The variable-iteration-loop coding matches the SAME independent golden
+/// cycle-by-cycle under Verilator. This is **impl-plan item 3's provable claim**:
+/// replacing the runtime `synced_read` heuristic with CFG-derived static read
+/// timing (`copper_analysis::classify_reads`) makes the variable-iteration
+/// `while in_i.read() == 0 { tick }` machine sample its inputs on the correct
+/// cycles, so it detects the "010" pattern where the independent hardware does.
+/// (The output uses `RegOut` — the write-before-tick Moore output axis — see the
+/// module note above; that is orthogonal to the read timing this claim is about.)
 #[test]
-#[ignore = "variable-iteration read-timing: det_010_awaits diverges from the \
-            independent 010 golden under the runtime synced_read heuristic. \
-            Closing this against pattern_detector_010.sv is impl-plan item 3's \
-            provable claim (SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md)."]
 fn det_010_awaits_matches_independent_verilog() {
-    run_against_golden("det_010_awaits", |exec, clk, rstn, in_i, out_o| {
-        let dh = out_o.dirty_handle();
-        exec.spawn_wired(det_010_awaits(clk, rstn, in_i, out_o), vec![dh]);
+    run_against_golden("det_010_awaits", |exec, clk, rstn, in_i| {
+        let (out_drv, out_obs) = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
+        let dh = out_drv.dirty_handle();
+        exec.spawn_wired(det_010_awaits(clk, rstn, in_i, out_drv), vec![dh]);
+        out_obs
     });
 }

@@ -387,31 +387,6 @@ fn has_top_level_loop(block: &syn::Block) -> bool {
         .any(|s| matches!(s, syn::Stmt::Expr(syn::Expr::Loop(_), _)))
 }
 
-/// Finds a direct `.tick().await` in a block or statement — does not recurse into
-/// nested `loop` blocks (those are handled independently by `LoopDeltaInjector`).
-struct DirectTickFinder(bool);
-
-impl<'ast> Visit<'ast> for DirectTickFinder {
-    fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
-        if let syn::Expr::MethodCall(method) = &*node.base {
-            if method.method == "tick" && method.args.is_empty() {
-                self.0 = true;
-            }
-        }
-        syn::visit::visit_expr_await(self, node);
-    }
-    fn visit_expr_loop(&mut self, _node: &'ast syn::ExprLoop) {
-        // stop here — inner loops are processed independently
-    }
-}
-
-/// Returns true if `block` directly contains a `.tick().await`.
-fn block_has_tick_await_direct(block: &syn::Block) -> bool {
-    let mut finder = DirectTickFinder(false);
-    finder.visit_block(block);
-    finder.0
-}
-
 /// Returns the names of every `In<T, D>`-typed parameter, in declaration order.
 fn in_param_names(sig: &syn::Signature) -> Vec<String> {
     sig.inputs
@@ -484,66 +459,40 @@ fn find_unprotectable_in_uses(block: &syn::Block, in_params: &HashSet<String>) -
     finder.found
 }
 
-/// Increments a hidden `__copper_wrap` counter at the top of every `loop`
-/// block that directly contains a `.tick().await`, and resets the hidden
-/// `__copper_wrap_leading_read` flag (see
-/// `SyncedRead::leading_pre_edge_call_id`) alongside it — a new iteration
-/// hasn't consumed any edge yet. `__copper_wrap` is function-scoped (declared
-/// once, by the caller, before this runs) and never reset — even loops entered
-/// many times (e.g. a "wait for ready" loop nested inside an outer
-/// per-instruction loop) just keep counting up, which is what keeps
-/// `SyncedReadTracker`'s "has this port's reader wrapped since its last
-/// success" check correct on re-entry: a counter that reset per-entry could go
-/// backwards relative to a tracker's last-seen value and block a read that
-/// should succeed immediately. (Resetting `__copper_wrap_leading_read` to
-/// `None` here isn't strictly required for correctness — it's compared against
-/// the current call_id, which never repeats — but keeps it from holding a
-/// stale value indefinitely.)
-struct WrapCounterInjector;
-
-impl VisitMut for WrapCounterInjector {
-    fn visit_expr_loop_mut(&mut self, node: &mut syn::ExprLoop) {
-        let needs_wrap = block_has_tick_await_direct(&node.body);
-        syn::visit_mut::visit_expr_loop_mut(self, node); // nested loops handled independently
-        if needs_wrap {
-            let reset_leading: syn::Stmt = syn::parse_quote! { __copper_wrap_leading_read.set(None); };
-            node.body.stmts.insert(0, reset_leading);
-            let incr: syn::Stmt = syn::parse_quote! { __copper_wrap += 1; };
-            node.body.stmts.insert(0, incr);
-        }
-    }
-}
-
 /// Rewrites every `<param>.read()` call — for `<param>` one of this function's
-/// `In<T, D>` parameters — into a call through the per-read-*site* freshness
-/// check, using a tracker unique to this call site, the enclosing loop's
-/// `__copper_wrap` counter, and the domain (`tick_domain_of[name]`) whose
-/// phase/call-id gates this specific read (see `inject_synced_reads` for how
-/// that's chosen — it is usually `name`'s own declared domain, but not
-/// always). Only call after confirming (via `find_unprotectable_in_uses`) that
-/// every use of every `In` parameter is one of these recognized call sites.
+/// `In<T, D>` parameters — according to its **static edge-phase classification**
+/// (`copper_analysis::classify_reads`, item 3), the compile-time replacement for
+/// the old runtime read-freshness oracle:
 ///
-/// Each call site gets its OWN tracker (`__copper_tracker_<name>_<site index>`)
-/// rather than sharing one per parameter — a loop that reads the same port at
-/// more than one position in an iteration (e.g. a SIPO deserializer: one
-/// loop-top read plus a "mid-phase" read after each of several ticks) would
-/// otherwise have later reads inherit the earlier read's already-succeeded-
-/// this-wrap bookkeeping. `wrap_at_last_success` only changes once per loop
-/// re-entry, so a shared tracker can't tell "the same call site being read
-/// again this iteration" (must not block — nothing new to wait for) apart from
-/// "a genuinely different call site, whose tick just resolved, being read for
-/// the first time this iteration" (must settle at the right phase like any
-/// other read) — the shared tracker always took the former, silently
-/// promoting later reads to fire immediately with a stale, one-cycle-early
-/// value. See `examples/basejump/sipo_block.rs`.
-struct SyncedReadRewriter<'a> {
+/// * [`ReadTiming::Deferred`] — a leading/pre-tick read whose result registers at
+///   an upcoming edge: emit `{ pre_edge_barrier::<D>().await; port.read() }`, so it
+///   samples at the next pre-edge settle (the registering edge), matching the
+///   transpiled FSM's input register.
+/// * [`ReadTiming::Immediate`] — a trailing/post-tick read that consumes the value
+///   the just-past edge produced: emit a plain `port.read()`.
+///
+/// `D` is `tick_domain_of[name]` — the clock domain whose phase gates this read
+/// (usually the port's own domain; see `inject_synced_reads`). Tags are consumed by
+/// **index** in source order: `timings[i]` is the i-th `In`-param read this rewriter
+/// reaches (its read leaves are visited left-to-right, the order `classify_reads`
+/// emits). There is no per-read runtime state — no wrap counter, tracker, or
+/// call-id — so at runtime the read is just the accepted phase machinery.
+///
+/// Only call after confirming (via `find_unprotectable_in_uses`) that every use of
+/// every `In` parameter is one of these recognized `.read()` call sites.
+///
+/// [`ReadTiming::Deferred`]: copper_analysis::ReadTiming::Deferred
+/// [`ReadTiming::Immediate`]: copper_analysis::ReadTiming::Immediate
+struct ReadRewriter<'a> {
     in_params: &'a HashSet<String>,
     tick_domain_of: &'a HashMap<String, Type>,
-    next_site_id: HashMap<String, u32>,
-    trackers: Vec<syn::Ident>,
+    /// Static edge-phase tags, in source order — consumed by `next`.
+    timings: &'a [copper_analysis::ReadTiming],
+    /// Index of the next `In`-param read; must reach `timings.len()` when done.
+    next: usize,
 }
 
-impl<'a> VisitMut for SyncedReadRewriter<'a> {
+impl<'a> VisitMut for ReadRewriter<'a> {
     fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
         syn::visit_mut::visit_expr_mut(self, expr);
 
@@ -560,18 +509,20 @@ impl<'a> VisitMut for SyncedReadRewriter<'a> {
         };
 
         if let Some(name) = matched_name {
-            let site_id = self.next_site_id.entry(name.clone()).or_insert(0);
-            let this_id = *site_id;
-            *site_id += 1;
+            let timing = self.timings.get(self.next).copied();
+            self.next += 1;
 
             let port_ident = format_ident!("{}", name);
-            let tracker_ident = format_ident!("__copper_tracker_{}_{}", name, this_id);
-            self.trackers.push(tracker_ident.clone());
             let tick_domain = &self.tick_domain_of[&name];
-            *expr = syn::parse_quote! {
-                ::copper_sim::synced_read::__private::synced_read::<_, _, #tick_domain>(
-                    &#port_ident, &#tracker_ident, __copper_wrap, &__copper_wrap_leading_read,
-                ).await
+            *expr = match timing {
+                Some(copper_analysis::ReadTiming::Deferred) => syn::parse_quote! {
+                    {
+                        ::copper_sim::pre_edge_barrier::<#tick_domain>().await;
+                        #port_ident.read()
+                    }
+                },
+                // Immediate — or, defensively, an unclassified index: a plain read.
+                _ => syn::parse_quote! { #port_ident.read() },
             };
         }
     }
@@ -675,29 +626,26 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
         tick_domain_of.insert(name, tick_domain);
     }
 
-    // Rewrite read call sites first — each one claims its own tracker identifier
-    // (see `SyncedReadRewriter`), so the set of trackers to declare is only known
-    // once this pass has run.
-    let mut rewriter = SyncedReadRewriter {
+    // Static edge-phase classification (item 3): computed on `f` as it stands here
+    // — pristine, before any read rewrite — in the same source order the rewriter
+    // reaches read leaves, so tag `i` lines up with the i-th rewritten read.
+    let timings = copper_analysis::classify_reads(f);
+
+    let mut rewriter = ReadRewriter {
         in_params: &in_params,
         tick_domain_of: &tick_domain_of,
-        next_site_id: HashMap::new(),
-        trackers: Vec::new(),
+        timings: &timings,
+        next: 0,
     };
     rewriter.visit_block_mut(&mut f.block);
-
-    let mut wrap_decl: Vec<syn::Stmt> = vec![
-        syn::parse_quote! { let mut __copper_wrap: u64 = 0; },
-        syn::parse_quote! { let __copper_wrap_leading_read: ::std::cell::Cell<Option<u64>> = ::std::cell::Cell::new(None); },
-    ];
-    for tracker_ident in &rewriter.trackers {
-        wrap_decl.push(syn::parse_quote! {
-            let #tracker_ident = ::copper_sim::synced_read::__private::ReadTracker::new();
-        });
-    }
-    f.block.stmts.splice(0..0, wrap_decl);
-
-    WrapCounterInjector.visit_block_mut(&mut f.block);
+    debug_assert_eq!(
+        rewriter.next,
+        timings.len(),
+        "read-timing tags ({}) != rewritten In-param reads ({}) — classify_reads and \
+         the macro rewriter disagree on the read set",
+        timings.len(),
+        rewriter.next,
+    );
 
     Ok(())
 }
@@ -789,9 +737,10 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             }
             // c2 (gate G6): the sim macro consumes the SHARED analysis crate — the
             // same one the transpiler consumes — proving a proc-macro can depend on
-            // it with no dependency cycle. Read-only for now (item 3 will bake these
-            // register/read-timing facts into the generated code); computed on the
-            // pristine ItemFn before we rewrite it.
+            // it with no dependency cycle. The inferred register set is logged for
+            // the FSM report; `inject_synced_reads` (item 3) additionally consumes
+            // the crate's `classify_reads` to bake per-read edge-phase timing into
+            // the generated code. Computed on the pristine ItemFn before we rewrite.
             let inferred_registers = copper_analysis::infer_registers(&input_fn);
             log::debug!(
                 "copper-analysis inferred registers for `{}`: {:?}",

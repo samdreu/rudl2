@@ -32,7 +32,7 @@ use syn::ItemFn;
 
 mod cfg;
 
-pub use cfg::{Cfg, EdgeKind};
+pub use cfg::{classify_reads, Cfg, EdgeKind, ReadTiming};
 
 /// Infer the synthesizable **register set** of a sequential hardware module from
 /// its control flow, via full backward liveness over the module's CFG ([`Cfg`]).

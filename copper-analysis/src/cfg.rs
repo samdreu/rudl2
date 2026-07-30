@@ -909,6 +909,283 @@ fn is_assign_op(op: &BinOp) -> bool {
     )
 }
 
+// ── read-timing classification (item 3) ─────────────────────────────────────
+//
+// The compile-time replacement for the runtime read-freshness oracle
+// (`copper-sim/src/synced_read.rs`). Each `In`-parameter `.read()` site is
+// classified statically as [`ReadTiming::Deferred`] or [`ReadTiming::Immediate`]
+// by its position relative to clock ticks in the loop iteration; the macro bakes
+// that classification into the generated sim code (a deferred read gets a
+// `pre_edge_barrier().await` before it; an immediate read is a plain `.read()`),
+// so at runtime there is no timing heuristic — just the accepted phase machinery.
+//
+// **The rule.** A read is `Deferred` iff a clock tick occurs *after* it within
+// the loop iteration's control flow (some continuation path from the read reaches
+// a `clk.tick().await` before the iteration closes) — a "leading"/pre-tick read
+// that registers its input at that edge, so it samples at the next pre-edge
+// settle. Otherwise it is `Immediate` — a trailing/post-tick read that consumes
+// the value the just-past edge produced and fires without deferral.
+//
+// This reproduces the timing the current heuristic gets right (loop-top reads in
+// `mac_pipeline`/`sipo_block` defer; the trailing next-state reads in `counter`/
+// `traffic_light` fire immediately) and fixes the class it gets wrong (the
+// variable-iteration `while in_i.read() == 0 { tick }` reads in `det_010_awaits`,
+// which a runtime phase/call-id heuristic phase-shifts by path history — see the
+// impl plan's item 3).
+
+/// The compile-time edge-phase classification of one `In`-parameter `.read()`
+/// site. See the module note above for the rule and rationale.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadTiming {
+    /// A "leading"/pre-tick read: a clock tick follows it within the iteration, so
+    /// its result is registered at that edge. Sampled at the next pre-edge settle
+    /// (deferred on loop re-entry). Generated code: `pre_edge_barrier().await`
+    /// before the `.read()`.
+    Deferred,
+    /// A trailing/post-tick read: no tick follows it before the iteration closes,
+    /// so it consumes the value the just-past edge produced. Sampled immediately.
+    /// Generated code: a plain `.read()`.
+    Immediate,
+}
+
+/// Classify every `In`-parameter `.read()` site of `f`, in source (left-to-right,
+/// pre-order) order — the identical order `copper-macros`'s read rewriter visits
+/// them, so the two correlate by index without relying on spans (which do not
+/// survive the transpiler's re-parse). Returns an empty vector for a function with
+/// no `In` parameters (a free-running module has nothing to classify).
+///
+/// The i-th entry is the timing of the i-th `In`-param read; the macro assigns the
+/// i-th tag to the i-th read it rewrites.
+pub fn classify_reads(f: &ItemFn) -> Vec<ReadTiming> {
+    let in_params = in_param_names(f);
+    if in_params.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // The whole body is walked (reads before the top-level loop are sampled once
+    // at spawn, where Deferred and Immediate coincide — both land at the initial
+    // pre-edge). `tail_has_tick = false`: after the last statement of a loop
+    // iteration control returns to the head, and the next iteration's tick is not
+    // "after" this read within *this* iteration — which is exactly why a trailing
+    // next-state read (`counter`, `traffic_light`) is Immediate, not Deferred.
+    classify_block(&f.block.stmts, false, &in_params, &mut out);
+    out
+}
+
+/// The names of the function's `In<T, D>` parameters (outer type `In`). Mirrors
+/// the set `copper-macros` rewrites, so classification and rewrite cover the
+/// identical read sites.
+fn in_param_names(f: &ItemFn) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for arg in &f.sig.inputs {
+        if let syn::FnArg::Typed(pt) = arg {
+            let is_in = matches!(&*pt.ty, syn::Type::Path(tp)
+                if tp.path.segments.last().is_some_and(|s| s.ident == "In"));
+            if is_in {
+                pat_bindings(&pt.pat, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// Classify the reads of a straight-line block. `tail_has_tick` is whether a tick
+/// occurs *after* this block completes, in the enclosing continuation. Statements
+/// are processed in source order (so emitted read indices match the macro), and
+/// for each statement `after` is whether any tick follows it — either later in
+/// this block or in the tail.
+fn classify_block(
+    stmts: &[Stmt],
+    tail_has_tick: bool,
+    in_params: &BTreeSet<String>,
+    out: &mut Vec<ReadTiming>,
+) {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let after = tail_has_tick || stmts[i + 1..].iter().any(stmt_has_tick);
+        classify_stmt(stmt, after, in_params, out);
+    }
+}
+
+fn classify_stmt(
+    stmt: &Stmt,
+    after: bool,
+    in_params: &BTreeSet<String>,
+    out: &mut Vec<ReadTiming>,
+) {
+    match stmt {
+        Stmt::Local(l) => {
+            if let Some(init) = &l.init {
+                classify_expr(&init.expr, after, in_params, out);
+                if let Some((_, diverge)) = &init.diverge {
+                    classify_expr(diverge, after, in_params, out);
+                }
+            }
+        }
+        Stmt::Expr(e, _) => classify_expr(e, after, in_params, out),
+        // Reads inside a macro token stream are *not* rewritten by the macro
+        // (`syn` does not descend into macro tokens), so they are not classified
+        // either — keeping the two sides' read sets identical.
+        Stmt::Macro(_) | Stmt::Item(_) => {}
+    }
+}
+
+/// Classify the reads of an expression. `after` = whether a tick follows this
+/// whole expression in the iteration. Control-flow constructs (`if`/`match`/loops)
+/// are handled explicitly so a read in a condition/scrutinee sees a tick that
+/// lives in a *branch* (that is what makes `det_010_awaits`'s nested-`if` reads
+/// Deferred). Every other expression is a value expression with no interior tick
+/// (ticks are statements in hardware bodies), so all its reads share `after`.
+fn classify_expr(
+    expr: &Expr,
+    after: bool,
+    in_params: &BTreeSet<String>,
+    out: &mut Vec<ReadTiming>,
+) {
+    // A `clk.tick().await` contributes no `In`-param read.
+    if tick_clock(expr).is_some() {
+        return;
+    }
+    match expr {
+        // `<in_param>.read()` — the classified site.
+        Expr::MethodCall(mc) if mc.method == "read" && mc.args.is_empty() => {
+            if let Some(name) = simple_ident(&mc.receiver) {
+                if in_params.contains(&name) {
+                    out.push(if after {
+                        ReadTiming::Deferred
+                    } else {
+                        ReadTiming::Immediate
+                    });
+                    return;
+                }
+            }
+            // A `.read()` on something that is not a bare `In` param (e.g. a method
+            // chain): still descend so any nested `In` reads are covered.
+            classify_expr(&mc.receiver, after, in_params, out);
+        }
+        Expr::If(ei) => {
+            let then_tick = block_has_tick(&ei.then_branch.stmts);
+            let else_tick = ei
+                .else_branch
+                .as_ref()
+                .is_some_and(|(_, e)| expr_has_tick(e));
+            // A condition read is Deferred if a tick follows the whole `if` OR a
+            // tick lives in either branch (the read gates that tick's edge).
+            classify_expr(&ei.cond, after || then_tick || else_tick, in_params, out);
+            classify_block(&ei.then_branch.stmts, after, in_params, out);
+            if let Some((_, e)) = &ei.else_branch {
+                classify_expr(e, after, in_params, out);
+            }
+        }
+        Expr::Match(em) => {
+            let arm_tick = em.arms.iter().any(|a| {
+                expr_has_tick(&a.body)
+                    || a.guard.as_ref().is_some_and(|(_, g)| expr_has_tick(g))
+            });
+            classify_expr(&em.expr, after || arm_tick, in_params, out);
+            for arm in &em.arms {
+                if let Some((_, g)) = &arm.guard {
+                    classify_expr(g, after, in_params, out);
+                }
+                classify_expr(&arm.body, after, in_params, out);
+            }
+        }
+        // A `while cond { body }`: a condition read is Deferred if the body ticks
+        // (the read gates the body's edge) or a tick follows the loop. The body is
+        // a fresh iteration (`tail_has_tick = false`), like the top-level loop.
+        Expr::While(w) => {
+            classify_expr(
+                &w.cond,
+                after || block_has_tick(&w.body.stmts),
+                in_params,
+                out,
+            );
+            classify_block(&w.body.stmts, false, in_params, out);
+        }
+        Expr::ForLoop(fl) => {
+            classify_expr(&fl.expr, after, in_params, out);
+            classify_block(&fl.body.stmts, false, in_params, out);
+        }
+        Expr::Loop(l) => classify_block(&l.body.stmts, false, in_params, out),
+        Expr::Block(b) => classify_block(&b.block.stmts, after, in_params, out),
+        // Any other expression is a value expression: no interior tick, so all its
+        // `In` reads share `after`. Flat-collect them in source order (the same
+        // order the macro's `visit_expr_mut` reaches the read leaves).
+        _ => {
+            let timing = if after {
+                ReadTiming::Deferred
+            } else {
+                ReadTiming::Immediate
+            };
+            collect_reads_flat(expr, timing, in_params, out)
+        }
+    }
+}
+
+/// Emit `timing` for every `In`-param `.read()` reachable in `expr`, in the source
+/// order `syn`'s visitor yields (which matches the macro's rewrite order). Used for
+/// value expressions, where there is no interior tick to change the timing.
+fn collect_reads_flat(
+    expr: &Expr,
+    timing: ReadTiming,
+    in_params: &BTreeSet<String>,
+    out: &mut Vec<ReadTiming>,
+) {
+    struct Flat<'a> {
+        timing: ReadTiming,
+        in_params: &'a BTreeSet<String>,
+        out: &'a mut Vec<ReadTiming>,
+    }
+    impl<'ast> Visit<'ast> for Flat<'_> {
+        fn visit_expr_method_call(&mut self, mc: &'ast syn::ExprMethodCall) {
+            if mc.method == "read" && mc.args.is_empty() {
+                if let Some(name) = simple_ident(&mc.receiver) {
+                    if self.in_params.contains(&name) {
+                        self.out.push(self.timing);
+                        return;
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, mc);
+        }
+    }
+    Flat {
+        timing,
+        in_params,
+        out,
+    }
+    .visit_expr(expr);
+}
+
+/// Whether a statement contains a `clk.tick().await` anywhere within it.
+fn stmt_has_tick(stmt: &Stmt) -> bool {
+    struct FindTick(bool);
+    impl<'ast> Visit<'ast> for FindTick {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            if self.0 {
+                return;
+            }
+            if tick_clock(e).is_some() {
+                self.0 = true;
+                return;
+            }
+            syn::visit::visit_expr(self, e);
+        }
+    }
+    let mut f = FindTick(false);
+    f.visit_stmt(stmt);
+    f.0
+}
+
+/// Whether an expression contains a tick anywhere within it.
+fn expr_has_tick(expr: &Expr) -> bool {
+    first_tick_clock(expr).is_some()
+}
+
+/// Whether a block's statements contain a tick.
+fn block_has_tick(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_tick)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,5 +1618,184 @@ mod tests {
         "#;
         // The public router skips sequential modules entirely.
         assert!(crate::check_definite_assignment(&parse(src)).is_ok());
+    }
+
+    // ── read-timing classification (item 3) ─────────────────────────────────
+
+    use ReadTiming::{Deferred, Immediate};
+
+    fn timings(src: &str) -> Vec<ReadTiming> {
+        crate::classify_reads(&parse(src))
+    }
+
+    /// Loop-top reads before a tick are Deferred (register at the edge). `dff_en`'s
+    /// `en`/`d` reads follow the tick with no further tick before close → Immediate
+    /// (they consume the value the edge produced — the enabled-register idiom).
+    #[test]
+    fn trailing_reads_are_immediate() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn dff_en(clk: Clock<C>, d: In<Bits<8>, C>, en: In<Logic, C>, q: Out<Bits<8>, C>) {
+                loop {
+                    clk.tick().await;
+                    if en.read() == Logic::One { q.write(d.read()); }
+                }
+            }
+        "#;
+        // Source order: en, d — both after the only tick, none follows → Immediate.
+        assert_eq!(timings(src), [Immediate, Immediate]);
+    }
+
+    /// `mac_pipeline`: three loop-top reads (`a`, `b`, `c`) all precede ticks →
+    /// Deferred. No reads follow the last tick.
+    #[test]
+    fn loop_top_reads_are_deferred() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn mac_pipeline(clk: Clock<C>, a: In<Bits<8>, C>, b: In<Bits<8>, C>, c: In<Bits<8>, C>, out: Out<Bits<8>, C>) {
+                loop {
+                    let product = a.read() * b.read();
+                    let c_s = c.read();
+                    clk.tick().await;
+                    let sum = product + c_s;
+                    clk.tick().await;
+                    out.write(sum);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(timings(src), [Deferred, Deferred, Deferred]);
+    }
+
+    /// `traffic_light`: `request.read()` is the trailing next-state read — after the
+    /// tick, nothing follows before the iteration closes → Immediate.
+    #[test]
+    fn traffic_light_request_is_immediate() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn tl(clk: Clock<C>, request: In<Logic, C>, r: Out<Logic, C>) {
+                let mut phase = Phase::Green;
+                let mut timer: u8 = 0;
+                loop {
+                    match phase { Phase::Green => { r.write(Logic::One); } _ => { r.write(Logic::Zero); } }
+                    clk.tick().await;
+                    (phase, timer) = match (phase, timer, request.read()) {
+                        (Phase::Green, _, Logic::One) => (Phase::Yellow, 0),
+                        _ => (Phase::Green, 0),
+                    };
+                }
+            }
+        "#;
+        assert_eq!(timings(src), [Immediate]);
+    }
+
+    /// `det_010` canonical: `rstn`/`in_i` are read before the tick → Deferred.
+    #[test]
+    fn det_010_canonical_reads_deferred() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn det_010(clk: Clock<C>, rstn: In<Logic, C>, in_i: In<Logic, C>, out_o: Out<Logic, C>) {
+                let mut state = State::A;
+                loop {
+                    if rstn.read() == Logic::Zero { state = State::A; }
+                    else { state = match (state, in_i.read()) { _ => State::A, }; }
+                    clk.tick().await;
+                    if matches!(state, State::D) { out_o.write(Logic::One); }
+                    else { out_o.write(Logic::Zero); }
+                }
+            }
+        "#;
+        // rstn (outer cond, branches tick) and in_i (match scrutinee, tick follows).
+        assert_eq!(timings(src), [Deferred, Deferred]);
+    }
+
+    /// The item-3 target: every `In` read in `det_010_awaits` — including the
+    /// `while in_i.read() == 0 { tick }` condition and the nested-`if` reads — is
+    /// Deferred, because a tick lives after each within its branch/loop. This is the
+    /// classification the runtime heuristic could not compute.
+    #[test]
+    fn det_010_awaits_all_reads_deferred() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn det_010_awaits(clk: Clock<C>, rstn: In<Logic, C>, in_i: In<Logic, C>, out_o: Out<Logic, C>) {
+                loop {
+                    out_o.write(Logic::Zero);
+                    if rstn.read() == Logic::Zero {
+                        out_o.write(Logic::Zero);
+                        clk.tick().await;
+                    } else if in_i.read() == Logic::Zero {
+                        clk.tick().await;
+                        while in_i.read() == Logic::Zero {
+                            clk.tick().await;
+                        }
+                        if in_i.read() == Logic::One {
+                            clk.tick().await;
+                            if in_i.read() == Logic::Zero {
+                                out_o.write(Logic::One);
+                                clk.tick().await;
+                            }
+                        }
+                    } else {
+                        clk.tick().await;
+                    }
+                }
+            }
+        "#;
+        // Source order: rstn, in_i(else-if cond), in_i(while cond), in_i(if), in_i(inner if).
+        assert_eq!(timings(src), [Deferred, Deferred, Deferred, Deferred, Deferred]);
+    }
+
+    /// `sipo_block`: the loop-top read and all three mid-phase reads precede a tick
+    /// (the final tick follows the last read) → all Deferred.
+    #[test]
+    fn sipo_block_mid_phase_reads_deferred() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn sipo(clk: Clock<C>, data_i: In<Bits<4>, C>, data_o: RegOut<Bits<16>, C>) {
+                loop {
+                    let w0 = data_i.read();
+                    clk.tick().await;
+                    let w1 = data_i.read();
+                    clk.tick().await;
+                    let w2 = data_i.read();
+                    clk.tick().await;
+                    let w3 = data_i.read();
+                    data_o.write(pack(w0, w1, w2, w3));
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(timings(src), [Deferred, Deferred, Deferred, Deferred]);
+    }
+
+    /// A same-cycle double-read of one port (both before the tick) → both Deferred,
+    /// classified independently by position (no shared tracker needed anymore).
+    #[test]
+    fn multiple_reads_same_port_before_tick() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                loop {
+                    let x = a.read();
+                    let y = a.read();
+                    o.write(x + y);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(timings(src), [Deferred, Deferred]);
+    }
+
+    /// No `In` parameters → nothing to classify.
+    #[test]
+    fn no_in_params_empty() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn free(clk: Clock<C>, o: Out<Bits<8>, C>) {
+                let mut v = Bits::from_u32(0);
+                loop { o.write(v); clk.tick().await; v = v + Bits::from_u32(1); }
+            }
+        "#;
+        assert_eq!(timings(src), Vec::<ReadTiming>::new());
     }
 }

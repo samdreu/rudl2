@@ -27,8 +27,10 @@ const DUT_SRC: &str = include_str!("fixtures/mac_pipeline_dut.rs");
 // RECONCILED (2026-07-24): the multi-tick input-read timing gap is fixed. The
 // simulator now samples cross-tick reads at the registering edge (the pre-edge of
 // the tick_clock the read belongs to), matching the transpiled phase FSM and
-// independent hand-written Verilog — see EXECUTION_MODEL_RECONCILIATION.md and the
-// `copper-sim/src/synced_read.rs` fix. Inputs are read every 3 cycles at phase 0
+// independent hand-written Verilog — see EXECUTION_MODEL_RECONCILIATION.md. The
+// loop-top reads are classified `Deferred` by `copper_analysis::classify_reads`
+// (impl-plan item 3), which is what samples them at the registering edge. Inputs
+// are read every 3 cycles at phase 0
 // (cycles 0, 3, 6), so the stimulus places its three input groups there.
 #[test]
 fn mac_pipeline_sim_matches_transpiled_verilog() {
