@@ -30,10 +30,34 @@ Last verified against source: 2026-07-16.
 
 **LEAD (implemented + differentiated):**
 1. **async/await as the FSM surface, realized by the host compiler's coroutine lowering.**
-   No competitor does this (Arch = declarative state blocks; Spade = pipeline stages;
-   Clash = Mealy functions; Anvil = `wait`/events). Framing: *we don't build an FSM
-   compiler — rustc's async transform is the FSM, and the live-across-await variables are
-   the registers.*
+   Among the *typed-HDL / RTL-generator* competitors, none does this (Arch = declarative state
+   blocks; Spade = pipeline stages; Clash = Mealy functions; Anvil = `wait`/events; RHDL = SSA
+   lowering + explicit registers). Framing: *we don't build an FSM compiler — rustc's async
+   transform is the FSM, and the live-across-await variables are the registers.*
+   **PRIOR-ART CORRECTION (2026-07-29, verified via web + RHDL LATTE'25 + Prost LATTE'26 + MyHDL
+   0.11 manual): drop any blanket "no competitor uses coroutines for hardware" claim — it is
+   false, and the coroutine-as-synthesizable-FSM *idea itself* is no longer uniquely ours.**
+   MyHDL (Python generators, `yield`=resume-condition; simulate-by-running + convert to Verilog)
+   and cocotb (`async`/`await` + `await RisingEdge(clk)`, testbench-only) precede us on the raw
+   coroutine mechanism. **More significantly, Prost (LATTE '26) independently proposes the exact
+   thesis** — coroutines as the fundamental synchronous-circuit abstraction, locals=registers,
+   suspension=cycle boundary, procedural multi-cycle algorithm synthesized to Verilog next-state
+   logic, Rust-`async`-syntax-inspired, even the same "each loop must contain ≥1 wait"
+   well-formedness rule. **Contribution 1 therefore re-scopes: the novelty is NOT "coroutine as a
+   synthesizable multi-cycle FSM" (Prost states that too) but the specific realization.** The
+   *defensible* conjunction (see `related_work.md`): (a) **embedded in Rust, reusing `rustc`'s own
+   `async` lowering as the FSM** — no bespoke coroutine compiler — vs Prost's bespoke language +
+   compiler that only borrows Rust's syntax; (b) registers = the **general-purpose compiler's
+   captured live-across-suspension state**, not explicit `Signal`s + an edge decorator (MyHDL) nor
+   a bespoke compiler's state values (Prost); (c) `async` used for **design, not verification**
+   (vs cocotb); (d) same source **run by `rustc` and transpiled, verified equivalent + anchored to
+   third-party BaseJump hardware** — no equivalence/anchoring story exists in Prost or MyHDL. Also
+   note MyHDL's *synthesizable/RTL* subset excludes multi-`yield` cycle-slicing (its convertible
+   subset is broader than the RTL-synthesis subset; synthesizable sequential = single-edge
+   `always_seq` + explicit enum-state FSM). Also **RETIRE "it's
+   just Rust"/"simulate by running the host language" as standalone novelty** — RHDL uses "it's
+   just Rust" verbatim, and Clash/RHDL both simulate-by-running; those are supporting properties
+   of claim (a)–(d), not headline claims.
 2. **Same literal source → cycle-accurate sim AND SystemVerilog, verified equivalent.**
    Frame as a *correctness* property (backed by the equivalence harness), NOT as "unified
    sim/synth" (table stakes — Chisel/PyMTL/Clash/Bluespec all claim that).

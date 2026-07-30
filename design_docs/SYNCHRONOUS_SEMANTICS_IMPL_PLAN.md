@@ -9,8 +9,9 @@
 >
 > **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **IN PROGRESS**;
 > items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
-> `tests/det_010_independent_golden.rs`) and **G3 DONE** (`tests/poll_order_fuzz.rs` +
-> `tests/golden_traces.rs`); G2/G4/G5/G6 open.
+> `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
+> `tests/golden_traces.rs`), and **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
+> contribution 1 re-scopes; recorded in `paper/`); G2/G5/G6 open.
 
 ## Architecture decision (the foundation) — c2 + "just Rust"
 
@@ -84,7 +85,7 @@ honestly.
 The two priorities — **proven/evidence-backed novelty** and **correctness** — make these gates to
 clear before the c2 refactor + read-timing retirement (items 3/6 and the c2-sharing of item 2)
 proceed. They do *not* block continuing the item-2 CFG scaffolding already in progress on the
-branch. G1/G3/G4/G6 are do-first tasks (**G1, G3 DONE**; G4/G6 open); G2/G5 are decisions to record.
+branch. G1/G3/G4/G6 are do-first tasks (**G1, G3, G4 DONE**; G6 open); G2/G5 are decisions to record.
 
 - **G1 — Timing-pattern coverage matrix + fill the `det_010` gap (correctness). DONE — see
   `design_docs/TIMING_COVERAGE_MATRIX.md`.** c2 makes sim-vs-transpiler *timing* agree by
@@ -113,10 +114,18 @@ branch. G1/G3/G4/G6 are do-first tasks (**G1, G3 DONE**; G4/G6 open); G2/G5 are 
   bit-exact snapshots for counter/lfsr/shift_register/det_110101/det_010/mac_pipeline (spanning the
   matrix), with a `BLESS_GOLDEN=1` re-bless path and a verified tamper-detection tripwire. Both
   superseded-by-design once item 6 makes poll order canonical.
-- **G4 — Resolve the MyHDL prior-art boundary (novelty).** The #1 open item in
-  `paper/intro_contributions.md`; it gates the contribution this work supports. If MyHDL's
-  *synthesizable* subset admits multi-`yield` sliced-algorithm generators, contribution 1 re-scopes.
-  Cheap; do it before investing.
+- **G4 — Resolve the MyHDL prior-art boundary (novelty). DONE (2026-07-29) — with a bigger find.**
+  MyHDL boundary **verified and holds**: its convertible subset is broader than its RTL-synthesis
+  subset, and its synthesizable sequential/FSM idiom is single-edge `always_seq` + explicit
+  enum-state case; multi-`yield` cycle-slicing is convertible-only, not RTL-synthesizable. **But the
+  companion check ("no async-based synthesizable Rust HDL since") surfaced Prost (LATTE '26)** — a
+  coroutine-based HDL that independently states contribution 1's core thesis (locals=registers,
+  suspension=cycle, procedural multi-cycle algorithm → synthesizable Verilog, Rust-`async`-inspired,
+  same loop-must-wait rule). **Consequence: contribution 1 must re-scope** — novelty is the embedded
+  *reuse of rustc's own async lowering* + verified same-source sim/synth equivalence + third-party
+  hardware anchoring, none of which Prost has (bespoke language+compiler, 3-page vision paper, no
+  eval). Recorded in `paper/related_work.md`, `paper/00_claims_audit.md` (LEAD #1),
+  `paper/intro_contributions.md`. **Open decision: exact contribution-1 re-wording (user's call).**
 - **G5 — Write the exact provable claim per item before coding (novelty; decision).** Each claim
   names its artifact: item 2 → "register set inferred from control flow, *proven by structural
   reg-match vs independent SV*" (G2); item 3 → "no runtime timing oracle; timing correct against the

@@ -93,6 +93,22 @@ exactly one driver, with no separate analysis pass.
   annotation as a characterized boundary is stronger and safer than a zero-annotation superlative.
 
 ## Open items before this is submittable
+- [x] **MyHDL prior-art boundary — VERIFIED (2026-07-29), boundary holds.** Confirmed against the
+      MyHDL 0.11 manual: the *convertible* subset is explicitly broader than the *RTL-synthesis*
+      subset, and MyHDL's synthesizable sequential/FSM idiom is a single-edge `always_seq`/`always`
+      process over an explicitly enumerated `enum` state (a hand-written FSM). Multi-`yield`
+      cycle-sliced generators are convertible-only (to behavioral HDL), not RTL-synthesizable. So
+      MyHDL does not offer the cycle-sliced coroutine algorithm as a *synthesizable* surface.
+- [ ] **RE-SCOPE contribution 1 for Prost (LATTE '26) — NEW, load-bearing.** The "no async-based
+      synthesizable Rust HDL" check surfaced **Prost** (Riedl/Scheipel/Baunach, LATTE '26), which
+      independently proposes coroutines-as-synthesizable-FSM with locals=registers,
+      suspension=cycle, procedural multi-cycle algorithm → Verilog, Rust-`async`-syntax-inspired,
+      and the same loop-must-wait well-formedness rule. **The coroutine-as-FSM idea is thus no
+      longer uniquely ours.** Contribution 1 must be re-worded so its novelty is the *realization*:
+      embedded in Rust reusing `rustc`'s own `async` lowering (no bespoke compiler) + verified
+      same-source sim/synth equivalence + third-party hardware anchoring — none of which Prost has
+      (it is a bespoke language + compiler, a 3-page vision paper, no eval). Prost is now cited and
+      distinguished in `related_work.md`; DECISION NEEDED on the exact contribution-1 phrasing.
 - [ ] Expand transpiler coverage and the equivalence-verified example set (bounds the eval).
 - [ ] Decide whether to add a soundness/semantics argument for the async-lowering ↔ transpiler
       correspondence, or lean on empirical equivalence (reviewer risk either way).
