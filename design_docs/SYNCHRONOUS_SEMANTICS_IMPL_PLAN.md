@@ -187,7 +187,7 @@ existing and green — this is what keeps the claims *evidence-backed* rather th
 
 | Item | Provable claim | Proof artifact (the thing that must be green) | Paper | Status |
 |---|---|---|---|---|
-| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2), now **wired into `tests/common::EquivalenceTest`** (`with_reference_registers`) and running in the equivalence suite for 4 independent references: `mac_fsm` (name-exact vs `mac_fsm.sv`), `det_010`/`det_110101`/`lfsr` (storage-equivalent vs `pattern_detector_010.sv`/`pattern_detector.sv`/`lfsr.sv`). General **backward liveness** green (`Cfg::registers`; `mac_pipeline` interior-await regs, tuple assigns) | C1 | **DONE** (proof green in-harness); reg-set *routed into codegen lowering* = follow-on |
+| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2), **wired into `tests/common::EquivalenceTest`** for 4 independent references: `mac_fsm` (name-exact), `det_010`/`det_110101`/`lfsr` (storage-equivalent). **Reconciled with codegen** — `copper-codegen/tests/register_reconciliation.rs` proves, corpus-wide (17 sequential modules), that codegen's emitted flip-flops equal the shared inference (+ only the synthetic phase/pc counter). So the shared analysis is now the authoritative *spec* for codegen's register set. | C1 | **DONE**; codegen *consuming* the set directly (retiring `split_at_ticks`) is a behavior-neutral follow-up (the sets already agree) |
 | 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression that uneven-per-branch-tick designs pass — `copper-analysis` unit tests (`tickless_fallthrough_rejected`, `uneven_but_both_tick_accepted`, …) + corpus test (`tests/real_examples.rs`: 38 modules pass); enforced in both front-ends; caught the real `det_010_awaits` tickless spin | C1 | **DONE** |
 | 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); specifically un-ignoring `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` | C1/C2 | anchor in place (G1); claim pending item 3 |
 | 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | Trace/transpile/Verilator equivalence vs an **independent hand-written async-FIFO SV** + a **clock-interleave fuzzer** (≥2 relative tick rates ⇒ equal results) — fills the G1 pattern-5 (CDC) gap | C1/C4 | pending item 4 |
@@ -246,8 +246,13 @@ the shared analysis both the transpiler and the sim macro consume (see G6).**
   tick edge*. Generalizes the G6 slice's pre-loop-only criterion to registers born inside the loop
   and live across an *interior* await (`mac_pipeline`'s pipeline regs) and to tuple-assign targets
   (`traffic_light`'s `(phase, timer)`). This is the T1 answer — the synthesizable register set,
-  computed independently of rustc's over-capture. (`shir_lower.rs`'s linear `split_at_ticks` is not
-  yet retired; codegen still lowers via it — routing it through this set is the follow-on.)
+  computed independently of rustc's over-capture. **Reconciled with codegen** (2026-07-29):
+  `copper-codegen/tests/register_reconciliation.rs` proves corpus-wide (17 sequential modules) that
+  codegen's emitted flip-flops (`chir_lower` pre-loop `let mut` ∪ `shir_lower::find_promoted_wires`)
+  equal this shared set, plus only codegen's synthetic phase/pc counter — so the analysis is the
+  authoritative *spec* and any future drift fails the test. `shir_lower.rs`'s linear `split_at_ticks`
+  is not yet *retired* (codegen still recomputes rather than consuming the shared set), but that is
+  now a behavior-neutral refactor since the two provably agree.
 - **definite-assignment DONE (re-scoped); comb-loop TODO.** Building this surfaced a semantics
   correction (verified, not argued): a **sequential** `Out` legitimately *holds* when unwritten — a
   partial/conditional `.write()` is an **enabled register**, confirmed `sim ≡ BaseJump` on
