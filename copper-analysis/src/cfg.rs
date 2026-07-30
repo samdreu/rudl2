@@ -107,6 +107,12 @@ pub struct Cfg {
     /// loop (definite-assignment does not apply — a sequential `Out` legitimately
     /// *holds* when unwritten, i.e. is an enabled register).
     exit: Option<usize>,
+    /// Sub-CFGs of tick-containing nested loops, checked recursively by
+    /// [`check_reachability`](Self::check_reachability). In the *parent* graph the
+    /// nested loop stays a single conservatively-folded node (so its possible
+    /// 0-iteration exit never false-rejects the outer loop); its own body's
+    /// tickless-cycle well-formedness is enforced here instead.
+    nested_ticking_loops: Vec<Cfg>,
 }
 
 impl Cfg {
@@ -123,10 +129,7 @@ impl Cfg {
 
         let comb_outputs = combinational_outputs(f);
 
-        let mut b = Builder {
-            nodes: Vec::new(),
-            outputs: comb_outputs.clone(),
-        };
+        let mut b = Builder::new(comb_outputs.clone());
         // The head is node 0: an empty node whose successor is the first body node.
         // Every back-edge (trailing tick, fall-through) targets it.
         let head = b.new_node(Node::empty(loop_span));
@@ -139,6 +142,7 @@ impl Cfg {
             defined_in_loop,
             comb_outputs,
             exit: None,
+            nested_ticking_loops: b.nested,
         })
     }
 
@@ -150,10 +154,7 @@ impl Cfg {
     /// rejects. Structure: `head → body → exit` sink, no back-edge.
     pub fn build_combinational(f: &ItemFn) -> Cfg {
         let comb_outputs = combinational_outputs(f);
-        let mut b = Builder {
-            nodes: Vec::new(),
-            outputs: comb_outputs.clone(),
-        };
+        let mut b = Builder::new(comb_outputs.clone());
         let span = f.sig.ident.span();
         let exit = b.new_node(Node::empty(span));
         let head = b.build_block(&f.block.stmts, exit);
@@ -163,6 +164,7 @@ impl Cfg {
             defined_in_loop: BTreeSet::new(),
             comb_outputs,
             exit: Some(exit),
+            nested_ticking_loops: b.nested,
         }
     }
 
@@ -239,6 +241,13 @@ impl Cfg {
                 color[n] = Color::Black;
                 stack.pop();
             }
+        }
+        // Recurse into each tick-containing nested loop: its body must satisfy the
+        // same tickless-cycle invariant (a clocked nested loop whose body can cycle
+        // without ticking spins forever). Folded conservatively in *this* graph, so
+        // this recursion is where nested-loop malformedness is actually caught.
+        for sub in &self.nested_ticking_loops {
+            sub.check_reachability()?;
         }
         Ok(())
     }
@@ -411,12 +420,57 @@ struct Builder {
     /// The module's combinational output ports, so terminal `port.write(…)` nodes
     /// can be tagged with the port they drive (definite-assignment).
     outputs: BTreeSet<String>,
+    /// Sub-CFGs of **tick-containing nested loops** — built alongside the (still
+    /// folded) parent node so [`Cfg::check_reachability`] can recurse into each one
+    /// and enforce the tickless-cycle invariant *inside* the nested loop. Only
+    /// tick-containing loops are recorded; a tick-free nested loop is combinational
+    /// (unrolled) and not subject to the "must reach a tick" rule.
+    nested: Vec<Cfg>,
+    /// Enclosing-loop targets while building a nested loop body: `(continue, break)`
+    /// node indices. `continue`/fall-through routes to the loop head, `break` to the
+    /// loop's exit sink — so a `break` before a tick does not read as a tickless
+    /// cycle. Empty while building a top-level (hardware) loop, which never breaks.
+    loop_ctx: Vec<(usize, usize)>,
+}
+
+impl Builder {
+    fn new(outputs: BTreeSet<String>) -> Builder {
+        Builder {
+            nodes: Vec::new(),
+            outputs,
+            nested: Vec::new(),
+            loop_ctx: Vec::new(),
+        }
+    }
 }
 
 impl Builder {
     fn new_node(&mut self, node: Node) -> usize {
         self.nodes.push(node);
         self.nodes.len() - 1
+    }
+
+    /// Build a real sub-CFG of a nested loop's body: `head → body → head` with a
+    /// dedicated exit sink as the `break` target. Fresh `Builder`, so it collects
+    /// its own grandchild nested loops. Used only for reachability of the nested
+    /// loop (no register/output analysis), so `defined_in_loop`/`comb_outputs`/
+    /// `exit` are empty/`None`.
+    fn nested_loop_cfg(&self, body: &[Stmt], span: Span) -> Cfg {
+        let mut b = Builder::new(self.outputs.clone());
+        let head = b.new_node(Node::empty(span));
+        let brk = b.new_node(Node::empty(span)); // exit sink for `break`
+        b.loop_ctx.push((head, brk));
+        let body_entry = b.build_block(body, head); // fall-through / `continue` → head
+        b.loop_ctx.pop();
+        b.nodes[head].succs.push((body_entry, EdgeKind::Comb));
+        Cfg {
+            nodes: b.nodes,
+            head,
+            defined_in_loop: BTreeSet::new(),
+            comb_outputs: BTreeSet::new(),
+            exit: None,
+            nested_ticking_loops: b.nested,
+        }
     }
 
     /// Build a straight-line block, threading `next` as the successor of the last
@@ -513,18 +567,35 @@ impl Builder {
             }
             // A bare block is just its statements.
             Expr::Block(b) => self.build_block(&b.block.stmts, next),
-            // A **nested** loop (`for` / `while` / `loop`) is folded into a single
-            // opaque node in v1 — a genuine basic-block builder for nested back-edges
-            // is the follow-on phase (AST duplication doesn't terminate on a
-            // back-edge). The fold must be *rejection-sound*: if the nested loop's
-            // body contains a tick, traversing it crosses a clock edge, so its
-            // out-edge is a **Tick** edge (and the node counts as a boundary for
-            // liveness) — otherwise a design that only ticks inside a `for`/`while`
-            // (e.g. `uart_tx`, `rv32i_cpu`) would be falsely flagged as a tickless
-            // cycle. A tick-free nested loop stays combinational. This conservatively
-            // *under*-reports malformedness inside nested loops (accepted for v1);
-            // it never falsely rejects a legitimate design. `defs` is left empty
-            // (don't kill across an opaque region); all interior reads become `uses`.
+            // `break` / `continue` inside a nested loop body: route to that loop's
+            // exit sink / head (from `loop_ctx`), not to the fall-through `next`, so
+            // a `break` before a tick is not misread as a tickless cycle. At the top
+            // level `loop_ctx` is empty (a hardware loop never breaks) → fall through.
+            Expr::Break(b) => {
+                let target = self.loop_ctx.last().map_or(next, |&(_, brk)| brk);
+                self.new_node(Node {
+                    succs: vec![(target, EdgeKind::Comb)],
+                    ..Node::empty(b.span())
+                })
+            }
+            Expr::Continue(c) => {
+                let target = self.loop_ctx.last().map_or(next, |&(cont, _)| cont);
+                self.new_node(Node {
+                    succs: vec![(target, EdgeKind::Comb)],
+                    ..Node::empty(c.span())
+                })
+            }
+            // A **nested** loop (`for` / `while` / `loop`). In the *parent* graph it
+            // stays folded into a single node (rejection-sound: a possible
+            // 0-iteration exit must not make the outer loop look tickless — a design
+            // that only ticks inside a `for`/`while`, e.g. `uart_tx`/`rv32i_cpu`,
+            // stays well-formed). If it *contains a tick* its out-edge is a **Tick**
+            // edge (a clock boundary for the parent's liveness) and — new in the
+            // nested-loop builder — its body is *also* built as a real sub-CFG
+            // (`nested`) so the tickless-cycle invariant is enforced *inside* it
+            // (recursively, with `break`/`continue` modeled). A tick-free nested loop
+            // is combinational (unrolled) and neither ticks nor is checked. `defs`
+            // stays empty (don't kill across the opaque region); interior reads → `uses`.
             Expr::While(_) | Expr::ForLoop(_) | Expr::Loop(_) => {
                 let mut uses = BTreeSet::new();
                 collect_reads(expr, &mut uses);
@@ -533,6 +604,10 @@ impl Builder {
                     Some(_) => (true, EdgeKind::Tick),
                     None => (false, EdgeKind::Comb),
                 };
+                if is_tick {
+                    let sub = self.nested_loop_cfg(loop_body_stmts(expr), expr.span());
+                    self.nested.push(sub);
+                }
                 self.new_node(Node {
                     uses,
                     is_tick,
@@ -760,6 +835,16 @@ fn top_level_loop(f: &ItemFn) -> Option<(Vec<Stmt>, Span)> {
         Stmt::Expr(Expr::Loop(l), _) => Some((l.body.stmts.clone(), l.span())),
         _ => None,
     })
+}
+
+/// The statement list of a nested `while` / `for` / `loop` body.
+fn loop_body_stmts(expr: &Expr) -> &[Stmt] {
+    match expr {
+        Expr::While(w) => &w.body.stmts,
+        Expr::ForLoop(f) => &f.body.stmts,
+        Expr::Loop(l) => &l.body.stmts,
+        _ => &[],
+    }
 }
 
 /// `Some(clock_name)` iff `expr` is `<clock>.tick().await`. The clock receiver
@@ -1050,6 +1135,120 @@ mod tests {
             }
         "#;
         assert!(check(src).is_err());
+    }
+
+    // ── nested-loop reachability (recursive) ────────────────────────────────
+
+    /// The nested-loop builder's payoff: a tick inside one branch of a nested
+    /// loop, with no tick on the other path — the inner loop spins without ticking
+    /// when the condition holds. v1 folded the inner loop opaquely and *missed*
+    /// this; the recursive sub-CFG check now rejects it.
+    #[test]
+    fn nested_loop_tickless_inner_cycle_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, c: In<Logic, C>) {
+                loop {
+                    loop {
+                        if c.read() == Logic::One { clk.tick().await; }
+                    }
+                }
+            }
+        "#;
+        assert!(check(src).is_err(), "a nested loop that can cycle without ticking must be rejected");
+    }
+
+    /// The canonical well-formed nested loop (rv32i / uart shape): tick first, then
+    /// an exit test. Every inner iteration ticks before it can break.
+    #[test]
+    fn nested_loop_tick_then_break_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, ready: In<Logic, C>, o: Out<Logic, C>) {
+                loop {
+                    loop {
+                        clk.tick().await;
+                        if ready.read() == Logic::One { break; }
+                    }
+                    o.write(Logic::One);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(check(src).is_ok());
+    }
+
+    /// `break` before the tick must not read as a tickless cycle: the break path
+    /// exits the loop (to the sink), it does not return to the inner head.
+    #[test]
+    fn nested_loop_break_before_tick_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, r: In<Logic, C>, o: Out<Logic, C>) {
+                loop {
+                    loop {
+                        if r.read() == Logic::One { break; }
+                        clk.tick().await;
+                    }
+                    o.write(Logic::One);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(check(src).is_ok());
+    }
+
+    /// `continue` that skips the only tick creates a tickless inner cycle.
+    #[test]
+    fn nested_loop_continue_before_tick_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, c: In<Logic, C>) {
+                loop {
+                    loop {
+                        if c.read() == Logic::One { continue; }
+                        clk.tick().await;
+                    }
+                }
+            }
+        "#;
+        assert!(check(src).is_err());
+    }
+
+    /// A `while` whose body has a tickless path is caught by the recursion, even
+    /// though the *outer* loop is well-formed (the while is folded as ticking there).
+    #[test]
+    fn nested_while_tickless_path_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, cond: In<Logic, C>, c: In<Logic, C>) {
+                loop {
+                    while cond.read() == Logic::One {
+                        if c.read() == Logic::One { clk.tick().await; }
+                    }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(check(src).is_err());
+    }
+
+    /// A tick-free nested loop is combinational (an unrolled `for`) and is NOT
+    /// subject to the must-tick rule — its `body → head` is not a clocked cycle.
+    #[test]
+    fn tick_free_nested_loop_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, o: Out<Bits<8>, C>) {
+                loop {
+                    let mut acc = Bits::from_u32(0);
+                    for i in 0..8 { acc = acc + Bits::from_u32(1); }
+                    o.write(acc);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(check(src).is_ok());
     }
 
     // ── definite assignment (combinational modules only) ────────────────────

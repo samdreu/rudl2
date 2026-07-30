@@ -275,9 +275,18 @@ the shared analysis both the transpiler and the sim macro consume (see G6).**
   boundaries, clock receivers, inferred registers). A richer states/transitions dump can grow from
   the same `nodes`.
 - **v1 scope:** full multi-await FSM lowering (not narrowed to one-await-per-loop). Match-arm
-  generalization ships in v1; **nested-loop CFG construction** (a genuine basic-block builder,
-  since AST-duplication doesn't terminate on back-edges) is the one follow-on phase after v1 lands
-  and is verified.
+  generalization ships in v1.
+- **Nested-loop CFG construction — DONE for reachability (2026-07-29).** Each *tick-containing*
+  nested `for`/`while`/`loop` now also gets a real sub-CFG (`Builder::nested_loop_cfg`, with
+  `break`→exit-sink / `continue`→head modeled) that `Cfg::check_reachability` recurses into — so a
+  tickless cycle *inside* a nested loop is rejected (unit-tested; e.g. `loop { loop { if c { tick } } }`),
+  where v1 folded it opaquely and missed it. The parent graph still folds the nested loop
+  conservatively (a possible 0-iteration exit must not false-reject the outer loop — `uart_tx`,
+  `rv32i_cpu` stay well-formed and still simulate 10/10), so this *tightens* detection without new
+  false positives. Tick-free nested loops are combinational (unrolled) and not checked. Note this is
+  **sim-only value**: codegen rejects nested loops outright (`while`/nested-`loop` are
+  `UnsupportedConstruct`), so nested-loop *register* precision has no consumer — the win is a
+  compile-time reachability error instead of a runtime oscillation hang.
 
 ### 3. Retire `synced_read` via CFG-derived compile-time timing facts (gated on item 2 + G1)
 
