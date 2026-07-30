@@ -7,14 +7,25 @@
 > `paper/threats_to_validity.md` (T1, T6), `paper/00_claims_audit.md` (LEAD #1),
 > `paper/related_work.md` (coroutine prior art).
 >
-> **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **IN PROGRESS** —
-> its *heart* has landed in `copper-analysis` (a real CFG over `syn::ItemFn`; **backward-liveness
-> register inference** generalizing the G6 slice to interior-await registers; the **reachability
-> well-formedness check**, now enforced as a hard spanned compile error in *both* `copper-macros`
-> and `copper-codegen`). Regression: all 38 real sequential modules pass; the check caught one
-> genuine tickless-spin bug (`det_010_awaits`, since fixed). Remaining item-2 work is codegen-side:
-> `control_extract` match-arm duplication, definite-assignment + combinational-loop detection, and
-> the nested-loop basic-block builder. Items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
+> **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **DONE (analysis +
+> well-formedness; 2026-07-30)** — landed in `copper-analysis` as a real CFG over `syn::ItemFn`
+> consumed by both front-ends, across 7 commits (`f4d144d`, `f3eb72e`, `c03022f`, `b4a8325`,
+> `fb45929`, `51ec9dc`, `d32c788`). What shipped and is enforced/verified:
+> **(a) backward-liveness register inference** (interior-await regs + tuple assigns), validated
+> against 4 independent hand-written SVs (G2 reg-match, wired into `EquivalenceTest`) *and*
+> reconciled against codegen's own emitted flip-flops (`register_reconciliation.rs`, 17+ modules ≡
+> the shared set + only synthetic phase/pc); **(b) reachability well-formedness** — hard spanned
+> compile error in `copper-macros` + `copper-codegen` (caught the real `det_010_awaits` tickless
+> spin, since fixed; all 38 real sequential modules pass); **(c) definite-assignment** for
+> `#[hardware(combinational)]` modules, enforced in the macro (re-scoped after finding a sequential
+> `Out` legitimately *holds* — enabled register, `sim ≡ BaseJump`); **(d) nested-loop CFG builder**
+> — recursive reachability inside nested loops; **(e) control_extract match-arm FSM lowering**
+> (structurally verified). Formalized in `SYNCHRONOUS_SEMANTICS.md` (CFG model) and
+> `paper/threats_to_validity.md` (T1). **Deferred / out of scope (decided):** combinational-loop
+> detection → **item 6** (cross-module, needs the inter-module wiring DAG; runtime oscillation
+> covers it); retiring `split_at_ticks` so codegen *consumes* the set → behavior-neutral churn,
+> skipped (the sets provably agree); nested-loop *codegen* support (codegen rejects nested loops —
+> sim-only). Items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
 > `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
 > `tests/golden_traces.rs`), **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
 > contribution 1 re-scopes; recorded in `paper/`), **G6 DONE** (c2 feasible — new
@@ -218,10 +229,13 @@ registration. **Still to investigate** (not yet planned concretely): "restore ph
 resolution" — confirm whether it's a live bug or a superseded note against current
 `tick_clock`/`ClockTick::poll`.
 
-### 2. Reachability/liveness CFG + register inference + FSM report (IN PROGRESS — the heart)
+### 2. Reachability/liveness CFG + register inference + FSM report (DONE — analysis + well-formedness)
 
 Replace shape-restriction soundness with a real analysis. **Under c2 this CFG must be factored as
-the shared analysis both the transpiler and the sim macro consume (see G6).**
+the shared analysis both the transpiler and the sim macro consume (see G6).** **Status (2026-07-30):
+the CFG and its analyses are landed, enforced in both front-ends, and verified — see the per-bullet
+markers below and the top-of-file Progress summary.** The single remaining open thread is *feature*
+depth in codegen (nested-loop synthesis), not the item-2 analysis, which is complete.
 
 - **DONE** — Model each loop as a CFG (`E_comb` vs `E_tick` edges, tick edges labeled by actual
   clock receiver identity). Landed as `copper-analysis/src/cfg.rs` (`Cfg::build` over `syn::ItemFn`).
@@ -258,7 +272,7 @@ the shared analysis both the transpiler and the sim macro consume (see G6).**
   authoritative *spec* and any future drift fails the test. `shir_lower.rs`'s linear `split_at_ticks`
   is not yet *retired* (codegen still recomputes rather than consuming the shared set), but that is
   now a behavior-neutral refactor since the two provably agree.
-- **definite-assignment DONE (re-scoped); comb-loop TODO.** Building this surfaced a semantics
+- **definite-assignment DONE (re-scoped); comb-loop DEFERRED → item 6.** Building this surfaced a semantics
   correction (verified, not argued): a **sequential** `Out` legitimately *holds* when unwritten — a
   partial/conditional `.write()` is an **enabled register**, confirmed `sim ≡ BaseJump` on
   `bsg_dff_en`. So "assign on all paths" is **not** valid for sequential modules (it would reject
