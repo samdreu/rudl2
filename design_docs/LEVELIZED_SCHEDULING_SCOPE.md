@@ -12,8 +12,9 @@ dirty flag) with a **static inter-module dependency graph**, topo-sorted so each
 **once per phase in dependency order** — the levelized/compiled model of modern cycle-based
 simulators (Verilator), vs the dynamic event-queue model of classic kernels.
 
-**This is performance + robustness, not correctness.** The current model already produces correct,
-hardware-anchored results (BaseJump equivalence, the full example suite). The payoffs:
+**The *feature's purpose* is performance + robustness, not a correctness fix** — the current model
+already produces correct, hardware-anchored results (BaseJump equivalence, the full example suite).
+The payoffs:
 
 - cost drops ≈`O(tasks × logic-depth)` → ≈`O(tasks)` per phase;
 - **poll-order independence becomes structural** — a canonical order replaces the
@@ -22,8 +23,41 @@ hardware-anchored results (BaseJump equivalence, the full example suite). The pa
   panic) — its designated home (moved here from item 2: intra-module comb loops are unexpressible,
   so the only real comb loops are cross-module, visible only in this inter-module wiring graph).
 
+**But the *migration itself* is held to a correctness-first bar (non-negotiable — see below).** The
+new scheduler must be provably behavior-identical to the current one on every design, validated
+differentially and continuously, so a regression cannot slip in to be debugged later. "Not urgent"
+refers to *timing*, never to rigor: this is an architecture investment whose whole point is to make
+the invariant *structural*, which is worthless if the migration itself introduces divergence.
+
+## Correctness discipline (non-negotiable)
+
+The current fixpoint scheduler is the correctness oracle for this change; the levelized scheduler is
+only allowed to ship once it is **provably indistinguishable** from it. The mechanism:
+
+- **Differential equivalence harness (the spine).** A test mode runs the *same* design + stimulus
+  under **both** schedulers and asserts identical observable output **and** identical settled signal
+  values at **every phase of every cycle** (not just end-of-run) — so a divergence is localized to
+  the exact design, cycle, and phase that breaks. Run across the **entire** corpus: all examples, the
+  poll-order-fuzzer designs, the golden-trace designs, and every equivalence test. A single mismatch
+  blocks the change.
+- **Both schedulers stay in the tree, permanently.** Like the `PollOrder` knob, the fixpoint
+  scheduler is not deleted when levelized becomes default — it remains as the differential oracle and
+  a permanent regression guard, so any future divergence is caught by construction, not in the field.
+- **Never reject a design the current model accepts.** Static comb-loop detection (phase 5) must
+  reject **exactly** the SCCs the runtime `OSCILLATION_THRESHOLD` already catches — no false
+  positives on currently-passing designs. When edge classification is uncertain, **prefer
+  SCC-iteration over erroring**: correctness (reproduce the fixpoint result) wins over the
+  performance of a single pass. A static error is emitted only for a loop the runtime model also
+  cannot resolve.
+- **Behavior-neutral phases first.** Phase 1 only *records* the graph; scheduling is unchanged, so it
+  cannot regress. Phase 2 lands the scheduler **opt-in** (default stays fixpoint) — it changes
+  nothing in production until the differential harness is green corpus-wide.
+- **The G3 guardrails are the ship gate.** Frozen golden traces (bit-exact, **no re-bless**), the
+  poll-order fuzzer, and independent BaseJump equivalence must all stay green with the levelized
+  scheduler before the default flips.
+
 Not urgent at current example sizes; an architecture investment. The graph-acquisition plumbing
-dominates the cost.
+dominates the cost — but correctness of the migration is the gating requirement, not performance.
 
 ## Gate (item 3) — confirmed clear
 
@@ -91,13 +125,18 @@ item-3 analysis already classifies comb-vs-registered per port and can supply th
    `Out::wire_id()`; extend the spawn API with input wire-ids; sweep the ~49 spawn sites. Behavior
    unchanged (still iterate-to-fixpoint) — this phase only *records* the graph.
 2. **Build DAG + topo order, behind an opt-in scheduler mode** mirroring the existing `PollOrder`
-   knob (default stays iterate-to-fixpoint). Levelized pass = one topo-ordered poll per phase.
+   knob (default stays iterate-to-fixpoint). Levelized pass = one topo-ordered poll per phase. Land
+   the **differential equivalence harness** in the same phase and run it corpus-wide from day one —
+   the scheduler is developed *against* it, so divergence is caught the moment it appears.
 3. **SCCs.** Tarjan over comb edges; single-pass for the acyclic part, iterate-to-fixpoint **only
-   within** an SCC (registers / memory latency / synchronizer break cycles).
-4. **Validate + flip default.** The levelized order must reproduce, bit-for-bit: the G3 golden
-   traces (`tests/golden_traces.rs`, no re-bless), the poll-order fuzzer (`tests/poll_order_fuzz.rs`),
-   and BaseJump equivalence. Then it becomes the default and the fuzzer is retired (poll-order
-   independence is now structural).
+   within** an SCC (registers / memory latency / synchronizer break cycles). Uncertain classification
+   biases toward SCC-iteration (reproduce the fixpoint result), never toward a single pass that could
+   diverge.
+4. **Validate + flip default.** Gate on the differential harness green across the **entire** corpus,
+   plus bit-for-bit reproduction of the G3 golden traces (`tests/golden_traces.rs`, no re-bless), the
+   poll-order fuzzer (`tests/poll_order_fuzz.rs`), and BaseJump equivalence. Only then does levelized
+   become the default; the fixpoint scheduler stays as the permanent differential oracle, and the
+   fuzzer is retired (poll-order independence is now structural).
 5. **Static comb-loop detection.** Reject a comb-edge SCC not broken by a register / memory-latency /
    synchronizer, with a clear error — replacing the runtime `OSCILLATION_THRESHOLD` panic
    (`executor.rs`). Add a constructed cross-module comb-loop regression.
