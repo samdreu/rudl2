@@ -15,7 +15,7 @@ pub use testing::{HardwareTest, TestResult, make_cycle};
 
 pub mod executor;
 
-pub use executor::{HardwareExecutor, HardwareModule, ModuleInfo};
+pub use executor::{HardwareExecutor, HardwareModule, ModuleInfo, PollOrder};
 
 #[doc(hidden)]
 pub mod synced_read;

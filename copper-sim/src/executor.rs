@@ -59,6 +59,44 @@ pub struct HardwareExecutor {
     cycle: u64,
     // modules included in the execution model
     modules: HashMap<String, ModuleInfo>,
+    // order in which poll_tasks visits tasks within each delta cycle
+    poll_order: PollOrder,
+}
+
+/// Order in which [`HardwareExecutor::poll_tasks`] visits tasks within a delta
+/// cycle.
+///
+/// The whole project rests on the invariant (CLAUDE.md,
+/// `design_docs/SYNCHRONOUS_SEMANTICS.md`) that **a well-formed design simulates
+/// identically under any poll order** — the sim must not depend on Rust async
+/// poll order. Production always uses [`PollOrder::Insertion`]; the other
+/// variants exist so a fuzzer can drive the same design under adversarial orders
+/// and assert identical observable results (gate G3 in
+/// `design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`). Changing the order must
+/// never change the settled values of a well-formed design; it can only change
+/// how many delta-cycle passes the fixed-point loop takes to get there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PollOrder {
+    /// Spawn order (the default; production behavior).
+    #[default]
+    Insertion,
+    /// Reverse spawn order — a fixed adversarial permutation, cheap to reason about.
+    Reversed,
+    /// Reshuffle the visit order every delta cycle with a deterministic PRNG
+    /// seeded by this value. The strongest guard: it perturbs order *within* the
+    /// settle loop, not just across runs, and is reproducible for a given seed.
+    Seeded(u64),
+}
+
+/// SplitMix64 — a tiny, dependency-free deterministic PRNG for [`PollOrder::Seeded`]
+/// shuffling. Not cryptographic; just needs to be reproducible and well-spread.
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 struct TaskEntry {
@@ -87,6 +125,44 @@ impl HardwareExecutor {
             tasks: Vec::new(),
             cycle: 0,
             modules: HashMap::new(),
+            poll_order: PollOrder::Insertion,
+        }
+    }
+
+    /// Set the order in which [`Self::poll_tasks`] visits tasks. Production code
+    /// never needs this (the default is [`PollOrder::Insertion`]); it exists for
+    /// the poll-order fuzzer (gate G3). See [`PollOrder`].
+    pub fn set_poll_order(&mut self, order: PollOrder) {
+        self.poll_order = order;
+    }
+
+    /// Builder form of [`Self::set_poll_order`].
+    pub fn with_poll_order(mut self, order: PollOrder) -> Self {
+        self.poll_order = order;
+        self
+    }
+
+    /// The task-visit order for delta cycle `delta` under the current
+    /// [`PollOrder`]. Returned as an owned index permutation so the caller can
+    /// then borrow `self.tasks` mutably while iterating it.
+    fn visit_order(&self, delta: usize) -> Vec<usize> {
+        let n = self.tasks.len();
+        match self.poll_order {
+            PollOrder::Insertion => (0..n).collect(),
+            PollOrder::Reversed => (0..n).rev().collect(),
+            PollOrder::Seeded(seed) => {
+                let mut idx: Vec<usize> = (0..n).collect();
+                // Re-seed per delta cycle so the order varies across the settle
+                // loop, not just across runs.
+                let mut state =
+                    splitmix64(seed ^ (delta as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                for i in (1..n).rev() {
+                    state = splitmix64(state);
+                    let j = (state % (i as u64 + 1)) as usize;
+                    idx.swap(i, j);
+                }
+                idx
+            }
         }
     }
 
@@ -236,8 +312,10 @@ impl HardwareExecutor {
                 "Delta-cycle limit ({MAX_DELTA_CYCLES}) exceeded — combinational loop not resolved"
             );
 
+            let order = self.visit_order(delta);
             let mut any_dirty = false;
-            for (i, task) in self.tasks.iter_mut().enumerate() {
+            for &i in &order {
+                let task = &mut self.tasks[i];
                 assert!(
                     task.future.as_mut().poll(&mut context).is_pending(),
                     "hardware module task {i} completed (its future returned Poll::Ready) — a \
@@ -492,6 +570,46 @@ mod tests {
 
         exec.tick_clock(&mut clk);
         assert_eq!(in_.read(), 1, "module ran even without dirty tracking");
+    }
+
+    #[test]
+    fn poll_order_does_not_change_cross_task_settle() {
+        // counter → passthrough is the poll-order-sensitive case: under a reversed
+        // order the consumer (passthrough) is polled before the producer (counter)
+        // within a delta cycle, so it reads a stale value and needs another pass.
+        // The settled value after tick_clock must be identical regardless.
+        use super::PollOrder;
+        fn run(order: PollOrder) -> Vec<u8> {
+            let mut clk = Clock::<TestClk>::new();
+            let mut exec = HardwareExecutor::new();
+            exec.set_poll_order(order);
+
+            let (counter_out, counter_in) = wire::<u8, ()>(0);
+            let cd = counter_out.dirty_handle();
+            exec.spawn_wired(wired_counter(clk.clone(), counter_out), vec![cd]);
+
+            let (pass_out, pass_in) = wire::<u8, ()>(0);
+            let pd = pass_out.dirty_handle();
+            exec.spawn_wired(wired_passthrough(counter_in, pass_out), vec![pd]);
+
+            (0..5)
+                .map(|_| {
+                    exec.tick_clock(&mut clk);
+                    pass_in.read()
+                })
+                .collect()
+        }
+
+        let baseline = run(PollOrder::Insertion);
+        assert_eq!(baseline, vec![1, 2, 3, 4, 5]);
+        assert_eq!(run(PollOrder::Reversed), baseline, "reversed poll order diverged");
+        for seed in [1u64, 7, 42, 1234] {
+            assert_eq!(
+                run(PollOrder::Seeded(seed)),
+                baseline,
+                "seeded poll order {seed} diverged"
+            );
+        }
     }
 
     #[test]
