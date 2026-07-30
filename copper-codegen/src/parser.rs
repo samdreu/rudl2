@@ -110,6 +110,7 @@ fn capture_hardware_mode(design_fn: &ItemFn) -> Option<HardwareMode> {
         "sequential" => Some(HardwareMode::Sequential),
         "combinational" => Some(HardwareMode::Combinational),
         "synchronizer" => Some(HardwareMode::Synchronizer),
+        "structural" => Some(HardwareMode::Structural),
         _ => None,
     }
 }
@@ -209,7 +210,11 @@ fn capture_generic_param(param: &syn::GenericParam) -> GenericParamMeta {
 }
 
 fn classify_module(design_fn: &ItemFn) -> FrontendClassification {
-    if design_fn.sig.asyncness.is_some() {
+    // A structural parent is also async, so async-ness alone can't distinguish it —
+    // it is identified by the declared `#[hardware(structural)]` mode.
+    if capture_hardware_mode(design_fn) == Some(HardwareMode::Structural) {
+        FrontendClassification::StructuralFn
+    } else if design_fn.sig.asyncness.is_some() {
         FrontendClassification::AsyncSequentialFn
     } else {
         FrontendClassification::CombinationalFn

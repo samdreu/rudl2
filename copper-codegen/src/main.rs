@@ -12,11 +12,13 @@
 //!   -o <path>         write output to a file (default: stdout)
 //!   --module <name>   which module to emit (required if the file has >1)
 //!   --profile <p>     verilator (default) | generic | yosys
+//!   --hierarchy       also emit every submodule the target transitively
+//!                     instantiates (deepest-first) — a self-contained design
 //!   --list            list the hardware modules found, then exit
 
 use std::process::ExitCode;
 
-use copper_codegen::{is_hardware_fn, transpile_source, EmitConfig};
+use copper_codegen::{is_hardware_fn, transpile_source, transpile_source_hierarchy, EmitConfig};
 use copper_core::vlir::ToolchainProfile;
 use syn::Item;
 
@@ -37,6 +39,7 @@ struct Cli {
     module: Option<String>,
     profile: ToolchainProfile,
     list: bool,
+    hierarchy: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -45,6 +48,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut module = None;
     let mut profile = ToolchainProfile::Verilator;
     let mut list = false;
+    let mut hierarchy = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -67,6 +71,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 };
             }
             "--list" => list = true,
+            "--hierarchy" | "--recursive" => hierarchy = true,
             "-h" | "--help" => return Err("see header of src/main.rs for usage".to_string()),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
             other => {
@@ -85,6 +90,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         module,
         profile,
         list,
+        hierarchy,
     })
 }
 
@@ -108,7 +114,11 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 
     let config = EmitConfig { profile: cli.profile, ..Default::default() };
-    let sv = transpile_source(&src, cli.module.as_deref(), &config)?;
+    let sv = if cli.hierarchy {
+        transpile_source_hierarchy(&src, cli.module.as_deref(), &config)?
+    } else {
+        transpile_source(&src, cli.module.as_deref(), &config)?
+    };
 
     match &cli.output {
         Some(path) => {

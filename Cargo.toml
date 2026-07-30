@@ -90,6 +90,10 @@ name = "two_domain_counter"
 path = "examples/cdc/two_domain_counter.rs"
 
 [[example]]
+name = "two_domain_hierarchy"
+path = "examples/cdc/two_domain_hierarchy.rs"
+
+[[example]]
 name = "flag_crossing"
 path = "examples/cdc/flag_crossing.rs"
 

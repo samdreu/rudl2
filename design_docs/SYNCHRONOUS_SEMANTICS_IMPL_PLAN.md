@@ -204,7 +204,7 @@ existing and green — this is what keeps the claims *evidence-backed* rather th
 | 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2), **wired into `tests/common::EquivalenceTest`** for 4 independent references: `mac_fsm` (name-exact), `det_010`/`det_110101`/`lfsr` (storage-equivalent). **Reconciled with codegen** — `copper-codegen/tests/register_reconciliation.rs` proves, corpus-wide (17 sequential modules), that codegen's emitted flip-flops equal the shared inference (+ only the synthetic phase/pc counter). So the shared analysis is now the authoritative *spec* for codegen's register set. | C1 | **DONE**; codegen *consuming* the set directly (retiring `split_at_ticks`) is a behavior-neutral follow-up (the sets already agree) |
 | 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression that uneven-per-branch-tick designs pass — `copper-analysis` unit tests (`tickless_fallthrough_rejected`, `uneven_but_both_tick_accepted`, …) + corpus test (`tests/real_examples.rs`: 38 modules pass); enforced in both front-ends; caught the real `det_010_awaits` tickless spin | C1 | **DONE** |
 | 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` **un-ignored & passing**; `synced_read.rs` deleted; whole anchor set + G3 golden traces (no re-bless) + poll-order fuzzer green | C1/C2 | **DONE** (2026-07-30) |
-| 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | Trace/transpile/Verilator equivalence vs an **independent hand-written async-FIFO SV** + a **clock-interleave fuzzer** (≥2 relative tick rates ⇒ equal results) — fills the G1 pattern-5 (CDC) gap | C1/C4 | pending item 4 |
+| 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | **DONE** — `tests/two_domain_hierarchy_cdc.rs` proves, under a custom **dual-clock** Verilator TB, that both the transpiled `two_domain_top` hierarchy AND an **independent hand-written reference** (`examples/cdc/sv/two_domain_hierarchy.sv`) match the Copper sim trace cycle-for-cycle; `examples/cdc/two_domain_hierarchy.rs` checks the rate-independent CDC invariant across 2:1/3:1/1:1 — fills the G1 pattern-5 (CDC) gap. (Transpile-only structural parent; sim-as-unit deferred. Async-FIFO is an optional stronger anchor.) | C1/C4 | **DONE** (2026-07-30) |
 | 5 | The formal semantics (CFG model, liveness rule, reachability, cross-domain interleave independence) are *stated*, construction-independent | `SYNCHRONOUS_SEMANTICS.md` rewrite with the `control_extract.rs:208-210` finding as a worked example | — | pending item 5 |
 | 6 | Levelized (topo-once) scheduling gives the **same settled values** as iterate-to-fixpoint, and makes poll-order independence *structural* | Suite green under levelized scheduler + the **poll-order fuzzer becomes moot** (canonical order) | C4 | pending item 6 |
 | cross | **Poll-order independence** — a well-formed design simulates identically under any poll order | **Poll-order fuzzer** (G3): `tests/poll_order_fuzz.rs` (insertion ≡ reversed ≡ seeded) | C1/C2 | DONE |
@@ -357,7 +357,41 @@ Switching it to `RegOut` (the sanctioned mechanism, already verified on `sipo_bl
 the golden. Read timing (item 3) and output timing (`RegOut`) are orthogonal; the classifier gets the
 sampling cycle right independently of the output register.
 
-### 4. Hierarchical clocked submodule instantiation (the multi-clock enabler)
+### 4. Hierarchical clocked submodule instantiation (the multi-clock enabler) — DONE (transpile-only structural parent; 2026-07-30)
+
+**Status: landed as a new `#[hardware(structural)]` module category (transpile-only;
+sim-as-unit deferred by decision — the sim already simulates dual-clock designs correctly
+hand-wired, so a parent-runs-in-sim capability is pure ergonomics, not correctness).** What
+shipped, end-to-end:
+- **New structural module category** through the whole pipeline: `HardwareMode::Structural` +
+  `FrontendClassification::StructuralFn` (`frontend_ir`, `parser.rs`); `CHIRBody::Structural` →
+  `SHIRBody::Structural` → `VLIRBody::Structural` → `emit.rs::structural_body`. A structural parent
+  is a pure hierarchy — clocks in, no `always_ff`/loop/tick — that instantiates clocked children.
+- **Port-connection submodule model** (replacing the single-output expression model at structural
+  call sites): `CHIR/SHIR/VLIRSubmoduleInst` gained `clocks` (`.clk(parent_sig)`), `port_nets`
+  (named in/out connections, multi-output), and `output_port`. Clocks are threaded, not filtered.
+  Surface syntax: `let n = wire::<T,D>(init);` declares an internal net; children reference `n.0`
+  (driver) / `n.1` (observer) → one SV net (the FIR `LocalStmt` can't hold a tuple pattern).
+- **Multi-module co-emission**: `transpile_source_hierarchy()` (+ CLI `--hierarchy`) emits the
+  parent plus every transitively-instantiated child, deepest-first — a self-contained design.
+- **Call-site CDC check** at the transpiler (text-based, so it re-derives the rule the phantom
+  types already enforce for compiled code, mirroring the `check_reachability` precedent): each
+  connected signal's clock domain must equal the child port's declared domain, so a foreign net
+  wired into a regular child is rejected while a `#[hardware(synchronizer)]` child passes.
+- **Macro acceptance**: `#[hardware(structural)]` compiles (emitted unchanged; not spawned in sim;
+  requires ≥1 clock).
+- **Anchor (fills G1 pattern-5 CDC gap)**: `examples/cdc/two_domain_hierarchy.rs` (structural parent
+  over fast_counter/flag_sync/slow_consumer) + independent hand-written reference
+  `examples/cdc/sv/two_domain_hierarchy.sv`. `tests/two_domain_hierarchy_cdc.rs` uses a **custom
+  dual-clock Verilator testbench** (the built-in harness is single-clock) to prove BOTH the
+  transpiled hierarchy AND the independent reference match the Copper sim trace cycle-for-cycle. The
+  example checks the rate-independent CDC invariant (monotone + eventually-asserts) across 2:1/3:1/1:1.
+  Tests: `copper-codegen/tests/structural_hierarchy.rs` (5) + `tests/two_domain_hierarchy_cdc.rs` (3).
+- **Remaining / deferred**: parent-runs-in-sim (executor auto-spawn/auto-wire) — deferred; the
+  stronger async-FIFO reference (vs the counter+synchronizer hierarchy) — optional future anchor.
+
+Original task notes (now realized as the structural category rather than by mutating the existing
+single-output submodule path):
 
 - `chir_lower.rs::lower_hardware_call` (2556-2616): stop filtering out `Clock<...>` args (2573-2578)
   — thread the clock argument into `CHIRSubmoduleInst`.

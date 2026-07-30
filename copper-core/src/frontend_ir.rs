@@ -109,6 +109,12 @@ pub enum HardwareMode {
     Sequential,
     Combinational,
     Synchronizer,
+    /// A pure-hierarchy parent: receives one or more `Clock`s and *instantiates*
+    /// clocked submodules, threading each child's clock through. It has no
+    /// `always_ff` of its own — no top-level loop, no `tick`. This is the
+    /// multi-clock enabler (item 4): a parent with no native clock domain that
+    /// wires independently-clocked children into one coherent component.
+    Structural,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +195,11 @@ pub struct RawTypeRef {
 pub enum FrontendClassification {
     CombinationalFn,
     AsyncSequentialFn,
+    /// A pure-hierarchy parent (`#[hardware(structural)]`): submodule
+    /// instantiations + internal wiring, no top-level loop/tick. Cannot be
+    /// inferred from async-ness alone (a structural parent is also async), so it
+    /// is set only from the declared `#[hardware(structural)]` mode.
+    StructuralFn,
 }
 
 #[derive(Debug, Clone)]

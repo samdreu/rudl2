@@ -1,7 +1,7 @@
 use copper_core::chir::{
     CHIRBinOp, CHIRBody, CHIRCaseArm, CHIRCombBody, CHIRExpr, CHIRLit, CHIRLowerError,
     CHIRMatchArm, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
-    CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
+    CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
     ExprCall, ExprIndex, ExprStruct, ExprType, FrontendClassification, FrontendFnIR,
@@ -29,6 +29,9 @@ pub fn lower_to_chir(
         }
         FrontendClassification::AsyncSequentialFn => {
             CHIRBody::Sequential(lower_seq_body(fir, hardware_fns, registry)?)
+        }
+        FrontendClassification::StructuralFn => {
+            CHIRBody::Structural(lower_structural_body(fir, registry)?)
         }
     };
 
@@ -1207,6 +1210,244 @@ fn lower_seq_body(
         submodules: ctx.submodules,
         loop_body,
     })
+}
+
+// ── Structural body (item 4: hierarchical clocked instantiation) ──────────────
+
+/// Lower a `#[hardware(structural)]` parent: a pure hierarchy of clocked
+/// submodule instances wired together by internal nets. No registers, no loop.
+///
+/// Two body forms are recognised, in source order:
+///   * `let <net> = wire::<T, D>(<init>);` — declares an internal net wiring
+///     children together; its width comes from `T`. Use sites reference the
+///     driver as `<net>.0` and the observer as `<net>.1`; both resolve to the
+///     one SV net named `<net>`.
+///   * `child(<args>...)` — a submodule instantiation (a hardware-module call in
+///     statement position). Args are positional against the child's declared
+///     params: `Clock` params become clock port connections, every other port
+///     (In/Out) becomes a named net connection.
+fn lower_structural_body(
+    fir: &FrontendModuleIR,
+    registry: &ModuleRegistry,
+) -> Result<CHIRStructuralBody, CHIRLowerError> {
+    let mut nets: Vec<(String, CHIRType)> = Vec::new();
+    let mut submodules: Vec<CHIRSubmoduleInst> = Vec::new();
+    let mut inst_counters: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    // signal → clock domain, for the call-site CDC check. Seeded with the
+    // parent's own ports and clocks; internal nets are added as they are declared.
+    let mut signal_domains: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in &fir.signature.params {
+        if let Some(d) = domain_of_type_text(&p.ty.ty_text) {
+            signal_domains.insert(p.name.clone(), d);
+        }
+    }
+
+    for stmt in &fir.raw_statements {
+        match &stmt.kind {
+            RawStmtKind::Local(local) => {
+                let Some(init) = &local.init else {
+                    return Err(CHIRLowerError::UnsupportedConstruct {
+                        description: "structural module: `let` without initializer".to_string(),
+                        span: local.span,
+                        suggested_rewrite: Some("declare internal nets with `let n = wire::<T, D>(init);`".to_string()),
+                    });
+                };
+                let (ty, domain) = parse_wire_net(init, local.span)?;
+                if let Some(d) = domain {
+                    signal_domains.insert(local.name.clone(), d);
+                }
+                nets.push((local.name.clone(), ty));
+            }
+            RawStmtKind::Expr(expr_stmt) => {
+                let ExprType::Call(call) = &expr_stmt.expr else {
+                    return Err(CHIRLowerError::UnsupportedConstruct {
+                        description: "structural module body may only contain net declarations and submodule instantiations".to_string(),
+                        span: expr_stmt.span,
+                        suggested_rewrite: None,
+                    });
+                };
+                if !call.is_hardware_module {
+                    return Err(CHIRLowerError::UnsupportedConstruct {
+                        description: "structural module: call is not a #[hardware] submodule".to_string(),
+                        span: call.span,
+                        suggested_rewrite: None,
+                    });
+                }
+                submodules.push(lower_structural_inst(call, registry, &mut inst_counters, &signal_domains)?);
+            }
+            RawStmtKind::Item(_) => {}
+        }
+    }
+
+    Ok(CHIRStructuralBody { nets, submodules })
+}
+
+/// Parse the data type `T` and clock domain `D` of an internal net declared by
+/// `wire::<T, D>(init)`. `D` is `None` only when the turbofish omits it.
+fn parse_wire_net(init: &ExprType, span: SourceSpan) -> Result<(CHIRType, Option<String>), CHIRLowerError> {
+    let ExprType::Call(call) = init else {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: "structural net must be initialized with `wire::<T, D>(init)`".to_string(),
+            span,
+            suggested_rewrite: None,
+        });
+    };
+    let ExprType::Path(p) = call.func.as_ref() else {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: "structural net initializer must be a `wire::<T, D>(..)` call".to_string(),
+            span,
+            suggested_rewrite: None,
+        });
+    };
+    // path_text is like `wire :: < Logic , ClkFast >` (possibly module-qualified).
+    let text: String = p.path_text.chars().filter(|c| !c.is_whitespace()).collect();
+    if !text.contains("wire::<") {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: "structural net must be declared with an explicit `wire::<T, D>(init)` type".to_string(),
+            span,
+            suggested_rewrite: Some("annotate the net type: `let n = wire::<Bits<8>, D>(init);`".to_string()),
+        });
+    }
+    let after = &text[text.find("wire::<").unwrap() + "wire::<".len()..];
+    let inner = after.strip_suffix('>').unwrap_or(after);
+    // `T, D` split at the top level.
+    let parts = split_top_level_commas(inner);
+    let t = parts.first().copied().unwrap_or_default();
+    let domain = parts.get(1).map(|d| d.trim().to_string());
+    Ok((resolve_type(t, span)?, domain))
+}
+
+/// The clock domain a port/clock type text is in, if determinable.
+/// `In<T,D>` / `Out<T,D>` / `RegOut<T,D>` → `D` (the 2nd generic arg; the
+/// unit domain `()` for the one-arg shorthand `In<T>`). `Clock<D>` → `D`.
+/// Any other type → `None`.
+fn domain_of_type_text(ty_text: &str) -> Option<String> {
+    let compact: String = ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+    let lt = compact.find('<')?;
+    let gt = compact.rfind('>')?;
+    if gt <= lt + 1 {
+        return None;
+    }
+    let args = split_top_level_commas(&compact[lt + 1..gt]);
+    if compact.starts_with("Clock<") {
+        args.first().map(|s| s.trim().to_string())
+    } else if compact.starts_with("In<") || compact.starts_with("Out<") || compact.starts_with("RegOut<") {
+        Some(args.get(1).map(|s| s.trim().to_string()).unwrap_or_else(|| "()".to_string()))
+    } else {
+        None
+    }
+}
+
+/// Lower one submodule instantiation in a structural body.
+fn lower_structural_inst(
+    call: &ExprCall,
+    registry: &ModuleRegistry,
+    inst_counters: &mut std::collections::HashMap<String, usize>,
+    signal_domains: &std::collections::HashMap<String, String>,
+) -> Result<CHIRSubmoduleInst, CHIRLowerError> {
+    let module_name = match call.func.as_ref() {
+        ExprType::Path(p) => p.path_text.trim().to_string(),
+        _ => return Err(CHIRLowerError::UnsupportedConstruct {
+            description: "structural instantiation with non-identifier callee".to_string(),
+            span: call.span,
+            suggested_rewrite: None,
+        }),
+    };
+
+    let count = inst_counters.entry(module_name.clone()).or_insert(0);
+    let inst_name = format!("{}_{}", module_name, count);
+    *count += 1;
+
+    let callee = registry.get(&module_name).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("structural instantiation of unknown module `{module_name}`"),
+        span: call.span,
+        suggested_rewrite: None,
+    })?;
+
+    let params = &callee.signature.params;
+    if call.args.len() != params.len() {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "structural instantiation of `{}` passes {} args but the module has {} ports \
+                 (pass every clock and data port positionally)",
+                module_name, call.args.len(), params.len()
+            ),
+            span: call.span,
+            suggested_rewrite: None,
+        });
+    }
+
+    let mut clocks: Vec<(String, String)> = Vec::new();
+    let mut port_nets: Vec<(String, String)> = Vec::new();
+    for (param, arg) in params.iter().zip(call.args.iter()) {
+        let signal = structural_signal_name(arg, call.span)?;
+
+        // Call-site CDC / domain-consistency check. The connected signal's clock
+        // domain must equal the child port's declared domain. For compiled code
+        // the phantom domain types enforce this already (wiring a `ClkFast` net
+        // into a `ClkSlow` port is a nominal type error); the transpiler is
+        // text-based and never type-checks, so it re-derives the same rule here —
+        // mirroring how it re-runs `check_reachability`. A regular child's ports
+        // are all its own clock domain, so a foreign net wired into one is
+        // rejected here; a `#[hardware(synchronizer)]` child legitimately
+        // declares a foreign-domain input, so its net domains still match and it
+        // passes — the sanctioned crossing point.
+        if let (Some(port_dom), Some(sig_dom)) =
+            (domain_of_type_text(&param.ty.ty_text), signal_domains.get(&signal))
+        {
+            if &port_dom != sig_dom {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "clock-domain crossing: wiring `{signal}` (domain `{sig_dom}`) into `{module_name}` \
+                         port `{}` (domain `{port_dom}`). A regular module may not cross clock domains — \
+                         bring the signal across with a `#[hardware(synchronizer)]` child (e.g. `copper::sync_2ff`), \
+                         then wire that synchronizer's output here",
+                        param.name
+                    ),
+                    span: call.span,
+                    suggested_rewrite: None,
+                });
+            }
+        }
+
+        let compact: String = param.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.starts_with("Clock<") {
+            clocks.push((param.name.clone(), signal));
+        } else {
+            port_nets.push((param.name.clone(), signal));
+        }
+    }
+
+    Ok(CHIRSubmoduleInst {
+        inst_name,
+        module_name,
+        inputs: Vec::new(),
+        output_wire: String::new(),
+        output_ty: CHIRType::UInt { width: Width::Concrete(1) },
+        clocks,
+        port_nets,
+        output_port: None,
+        span: call.span,
+    })
+}
+
+/// Resolve a structural instantiation argument to a signal name: a parent port
+/// (`count_out`), an internal net's driver/observer (`flag.0` / `flag.1` → `flag`),
+/// or a cloned clock (`wr_clk.clone()` → `wr_clk`).
+fn structural_signal_name(arg: &ExprType, span: SourceSpan) -> Result<String, CHIRLowerError> {
+    match arg {
+        ExprType::Path(p) => Ok(p.path_text.trim().to_string()),
+        ExprType::Field(f) => structural_signal_name(f.base.as_ref(), span),
+        ExprType::MethodCall(mc) if mc.method == "clone" => {
+            structural_signal_name(mc.receiver.as_ref(), span)
+        }
+        _ => Err(CHIRLowerError::UnsupportedConstruct {
+            description: "structural port argument must be a port name, an internal net (`net.0`/`net.1`), or a cloned clock".to_string(),
+            span,
+            suggested_rewrite: None,
+        }),
+    }
 }
 
 // ── Lowering context ──────────────────────────────────────────────────────────
@@ -2609,6 +2850,12 @@ fn lower_hardware_call(
         inputs,
         output_wire: output_wire.clone(),
         output_ty,
+        // Legacy expression model: clock is filtered above, output uses the
+        // conventional `.out`, no direct net connections. The structural
+        // (statement/port) form populates these instead — see `lower_structural_body`.
+        clocks: Vec::new(),
+        port_nets: Vec::new(),
+        output_port: None,
         span: call.span,
     });
 
@@ -2746,6 +2993,28 @@ fn validate_module(module: &CHIRModule) -> Result<(), CHIRLowerError> {
                 known.insert(sub.output_wire.clone());
             }
             validate_stmts(&body.loop_body, &mut known, module.span)?;
+        }
+        CHIRBody::Structural(body) => {
+            // Internal nets and parent ports are the resolvable names; each
+            // submodule's clock/port connections must reference one of them.
+            for (net, _) in &body.nets {
+                known.insert(net.clone());
+            }
+            for sub in &body.submodules {
+                for (_, sig) in sub.clocks.iter().chain(sub.port_nets.iter()) {
+                    if !known.contains(sig) {
+                        return Err(CHIRLowerError::UnsupportedConstruct {
+                            description: format!(
+                                "structural instance `{}` connects to unknown signal `{}` \
+                                 (declare it as a parent port or `let {} = wire::<..>(..)`)",
+                                sub.inst_name, sig, sig
+                            ),
+                            span: sub.span,
+                            suggested_rewrite: None,
+                        });
+                    }
+                }
+            }
         }
     }
 

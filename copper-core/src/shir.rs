@@ -43,6 +43,15 @@ pub enum SHIRPortKind {
 pub enum SHIRBody {
     Combinational(SHIRCombBody),
     Sequential(SHIRSeqBody),
+    Structural(SHIRStructuralBody),
+}
+
+/// Pure-hierarchy parent body — internal nets + clocked submodule instances.
+/// 1:1 with `CHIRStructuralBody` (no timing regions to lower).
+#[derive(Debug)]
+pub struct SHIRStructuralBody {
+    pub nets: Vec<(String, CHIRType)>,
+    pub submodules: Vec<SHIRSubmoduleInst>,
 }
 
 // ── Combinational body ────────────────────────────────────────────────────────
@@ -86,6 +95,12 @@ pub struct SHIRSubmoduleInst {
     pub inputs: Vec<(String, SHIRExpr)>,
     pub output_wire: String,
     pub output_ty: CHIRType,
+    /// `(child_clock_port, parent_clock_signal)` — see `CHIRSubmoduleInst::clocks`.
+    pub clocks: Vec<(String, String)>,
+    /// `(child_port, net_name)` — see `CHIRSubmoduleInst::port_nets`.
+    pub port_nets: Vec<(String, String)>,
+    /// Child output port name for the expression form — see `CHIRSubmoduleInst::output_port`.
+    pub output_port: Option<String>,
 }
 
 // ── Phase ─────────────────────────────────────────────────────────────────────

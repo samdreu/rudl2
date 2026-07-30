@@ -64,6 +64,55 @@ pub fn transpile_source(
     module: Option<&str>,
     config: &EmitConfig,
 ) -> Result<String, String> {
+    let prepared = prepare_source(src)?;
+    let target = prepared.select_target(module)?;
+    transpile_target(target, &prepared, config)
+}
+
+/// Like [`transpile_source`], but emits the selected module **plus every
+/// `#[hardware]` submodule it transitively instantiates**, deepest-first, into
+/// one self-contained SystemVerilog string. This is what a hierarchical design
+/// (item 4's structural parent + its clocked children) needs for a standalone
+/// Verilator run — a `module` that instantiates `fast_counter`/`sync_2ff`/… would
+/// otherwise reference undefined modules. For a leaf module (no submodules) the
+/// output equals `transpile_source`'s (just the one module).
+pub fn transpile_source_hierarchy(
+    src: &str,
+    module: Option<&str>,
+    config: &EmitConfig,
+) -> Result<String, String> {
+    let prepared = prepare_source(src)?;
+    let target = prepared.select_target(module)?;
+    let order = prepared.hierarchy_emit_order(&target.sig.ident.to_string());
+
+    let mut out = String::new();
+    for (i, name) in order.iter().enumerate() {
+        let f = prepared
+            .modules
+            .iter()
+            .find(|m| &m.sig.ident.to_string() == name)
+            .ok_or_else(|| format!("internal error: module '{name}' vanished from registry"))?;
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&transpile_target(f, &prepared, config)?);
+    }
+    Ok(out)
+}
+
+/// Shared setup for the source-string entry points: parse, reject unattributed
+/// hardware-signature functions, collect the hardware modules, and build the FIR
+/// registry (with file-scope enums/items injected) used for submodule resolution.
+struct PreparedSource {
+    modules: Vec<syn::ItemFn>,
+    names: Vec<String>,
+    hardware_fns: std::collections::HashSet<String>,
+    registry: ModuleRegistry,
+    file_enums: Vec<copper_core::frontend_ir::ItemEnum>,
+    file_scope: parser::FileScope,
+}
+
+fn prepare_source(src: &str) -> Result<PreparedSource, String> {
     use std::collections::{HashMap, HashSet};
 
     let file = syn::parse_file(src).map_err(|e| format!("parse error: {e}"))?;
@@ -116,21 +165,73 @@ pub fn transpile_source(
         }
     }
 
-    let target = match module {
-        Some(name) => modules
-            .iter()
-            .find(|f| f.sig.ident == name)
-            .ok_or_else(|| format!("module '{name}' not found; available: {}", names.join(", ")))?,
-        None if modules.len() == 1 => &modules[0],
-        None => {
-            return Err(format!(
-                "{} modules found; specify one. Available: {}",
-                modules.len(),
-                names.join(", ")
-            ))
-        }
-    };
+    Ok(PreparedSource { modules, names, hardware_fns, registry, file_enums, file_scope })
+}
 
+impl PreparedSource {
+    fn select_target(&self, module: Option<&str>) -> Result<&syn::ItemFn, String> {
+        match module {
+            Some(name) => self
+                .modules
+                .iter()
+                .find(|f| f.sig.ident == name)
+                .ok_or_else(|| format!("module '{name}' not found; available: {}", self.names.join(", "))),
+            None if self.modules.len() == 1 => Ok(&self.modules[0]),
+            None => Err(format!(
+                "{} modules found; specify one. Available: {}",
+                self.modules.len(),
+                self.names.join(", ")
+            )),
+        }
+    }
+
+    /// The `#[hardware]` submodules `name` directly instantiates, read off its
+    /// lowered CHIR (the authoritative submodule set for every body kind).
+    fn direct_deps(&self, name: &str) -> Vec<String> {
+        use copper_core::chir::CHIRBody;
+        let Some(fir) = self.registry.get(name) else { return Vec::new() };
+        let Ok(chir) = lower_to_chir(fir, &self.hardware_fns, &self.registry) else {
+            return Vec::new();
+        };
+        let subs = match &chir.body {
+            CHIRBody::Combinational(b) => &b.submodules,
+            CHIRBody::Sequential(b) => &b.submodules,
+            CHIRBody::Structural(b) => &b.submodules,
+        };
+        let mut names: Vec<String> = subs.iter().map(|s| s.module_name.clone()).collect();
+        names.dedup();
+        names
+    }
+
+    /// Post-order DFS from `target`: every transitively-instantiated child
+    /// appears before its parent, `target` last, each module once. A dependency
+    /// not present in the file (an external module) is skipped — emit only what
+    /// this file defines.
+    fn hierarchy_emit_order(&self, target: &str) -> Vec<String> {
+        let mut order = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.visit_deps(target, &mut visited, &mut order);
+        order
+    }
+
+    fn visit_deps(&self, name: &str, visited: &mut std::collections::HashSet<String>, order: &mut Vec<String>) {
+        if !self.hardware_fns.contains(name) || !visited.insert(name.to_string()) {
+            return;
+        }
+        for dep in self.direct_deps(name) {
+            self.visit_deps(&dep, visited, order);
+        }
+        order.push(name.to_string());
+    }
+}
+
+/// Run the per-module transpile: the shared reachability well-formedness check,
+/// register inference (logged), then FIR → SV.
+fn transpile_target(
+    target: &syn::ItemFn,
+    prepared: &PreparedSource,
+    config: &EmitConfig,
+) -> Result<String, String> {
     // c2 (item 2): the transpiler enforces the SAME reachability well-formedness
     // the sim macro does, from the SAME shared analysis on the SAME `&syn::ItemFn`
     // — a tickless loop path is rejected here too (one authoritative check, both
@@ -149,10 +250,10 @@ pub fn transpile_source(
         inferred_registers
     );
 
-    let mut fir = capture_frontend_ir(target, &hardware_fns).map_err(|e| format!("{e:?}"))?;
-    fir.enums.extend(file_enums);
-    inject_file_scope(&mut fir, &file_scope);
-    transpile_fir(&fir, &hardware_fns, &registry, config)
+    let mut fir = capture_frontend_ir(target, &prepared.hardware_fns).map_err(|e| format!("{e:?}"))?;
+    fir.enums.extend(prepared.file_enums.iter().cloned());
+    inject_file_scope(&mut fir, &prepared.file_scope);
+    transpile_fir(&fir, &prepared.hardware_fns, &prepared.registry, config)
 }
 
 /// Copy captured file-scope items into a module's FIR, mirroring the `enums`

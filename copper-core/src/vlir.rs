@@ -68,6 +68,15 @@ pub enum VLIRPortKind {
 pub enum VLIRBody {
     Combinational(VLIRCombBody),
     Sequential(VLIRSeqBody),
+    Structural(VLIRStructuralBody),
+}
+
+/// Pure-hierarchy parent — internal net decls + clocked submodule instances.
+#[derive(Debug)]
+pub struct VLIRStructuralBody {
+    /// Internal `logic` nets wiring children together: `(name, width)`.
+    pub nets: Vec<(String, Width)>,
+    pub submodules: Vec<VLIRSubmoduleInst>,
 }
 
 // ── Combinational body ──────────────────────────────────────────────────────
@@ -109,6 +118,12 @@ pub struct VLIRSubmoduleInst {
     pub inputs: Vec<(String, VLIRExpr)>,
     pub output_wire: String,
     pub output_width: Width,
+    /// `(child_clock_port, parent_clock_signal)` — emit wires `.clk(sig)`.
+    pub clocks: Vec<(String, String)>,
+    /// `(child_port, net_name)` — direct net connections (structural form).
+    pub port_nets: Vec<(String, String)>,
+    /// Child output port name for the single-output expression form.
+    pub output_port: Option<String>,
 }
 
 #[derive(Debug)]

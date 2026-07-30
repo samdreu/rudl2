@@ -2,14 +2,15 @@ use std::collections::{HashMap, HashSet};
 
 use copper_core::chir::{
     CHIRBody, CHIRExpr, CHIRLit, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir,
-    CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRSubmoduleInst, CHIRType, Width,
+    CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst,
+    CHIRType, Width,
 };
 use copper_core::frontend_ir::SourceSpan;
 use copper_core::shir::{
     SHIRBody, SHIRCaseArm, SHIRCombBody, SHIRExpr, SHIRLit, SHIRLowerError, SHIRMatchArm,
     SHIRModule, SHIRPattern, SHIRPhase, SHIRPort,
     SHIRPortDir, SHIRPortKind, SHIRReg, SHIRRegUpdate, SHIRSeqBody, SHIRStmt,
-    SHIRSubmoduleInst,
+    SHIRStructuralBody, SHIRSubmoduleInst,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -23,6 +24,9 @@ pub fn lower_to_shir(chir: &CHIRModule) -> Result<SHIRModule, SHIRLowerError> {
         }
         CHIRBody::Sequential(seq) => {
             SHIRBody::Sequential(lower_seq_body(seq, chir.span)?)
+        }
+        CHIRBody::Structural(st) => {
+            SHIRBody::Structural(lower_structural_body(st)?)
         }
     };
 
@@ -201,6 +205,19 @@ fn lower_submodule(sub: &CHIRSubmoduleInst) -> Result<SHIRSubmoduleInst, SHIRLow
         inputs,
         output_wire: sub.output_wire.clone(),
         output_ty: sub.output_ty.clone(),
+        clocks: sub.clocks.clone(),
+        port_nets: sub.port_nets.clone(),
+        output_port: sub.output_port.clone(),
+    })
+}
+
+/// Structural body → SHIR. No timing regions to derive; nets and submodule
+/// instances pass through 1:1.
+fn lower_structural_body(st: &CHIRStructuralBody) -> Result<SHIRStructuralBody, SHIRLowerError> {
+    let submodules = st.submodules.iter().map(lower_submodule).collect::<Result<Vec<_>, _>>()?;
+    Ok(SHIRStructuralBody {
+        nets: st.nets.clone(),
+        submodules,
     })
 }
 

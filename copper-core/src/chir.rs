@@ -113,6 +113,19 @@ impl From<usize> for Width {
 pub enum CHIRBody {
     Combinational(CHIRCombBody),
     Sequential(CHIRSeqBody),
+    Structural(CHIRStructuralBody),
+}
+
+/// A pure-hierarchy parent body (`#[hardware(structural)]`): internal nets that
+/// wire children together, and the clocked submodule instances themselves. No
+/// registers, no loop, no `always_ff` — the parent has no native clock domain.
+#[derive(Debug, Clone)]
+pub struct CHIRStructuralBody {
+    /// Internal signals wiring children together, declared by `wire::<T,D>(init)`
+    /// in the source. `(net_name, type)`.
+    pub nets: Vec<(String, CHIRType)>,
+    /// The clocked submodule instantiations, in source order.
+    pub submodules: Vec<CHIRSubmoduleInst>,
 }
 
 /// Combinational module body.
@@ -155,6 +168,21 @@ pub struct CHIRSubmoduleInst {
     pub inputs: Vec<(String, CHIRExpr)>,
     pub output_wire: String,
     pub output_ty: CHIRType,
+    /// Clock port connections: `(child_clock_port_name, parent_clock_signal)`.
+    /// Empty for a submodule used as a combinational expression inside a normal
+    /// module (the legacy expression model). A structurally-instantiated clocked
+    /// child carries its clock port(s) here so emit can wire `.clk(parent_clk)`.
+    pub clocks: Vec<(String, String)>,
+    /// Port connections whose value is an internal net / parent port name rather
+    /// than a lowered expression — `(child_port_name, net_name)`. Used by the
+    /// structural (statement/port) instantiation form for both extra outputs and
+    /// net-valued inputs. The legacy expression form leaves this empty and uses
+    /// `inputs` + `output_wire`.
+    pub port_nets: Vec<(String, String)>,
+    /// The child's *output* port name for the single-output expression form
+    /// (emit wires `.<output_port>(output_wire)`). `None` when the child's
+    /// outputs are all carried in `port_nets` (structural form).
+    pub output_port: Option<String>,
     pub span: SourceSpan,
 }
 

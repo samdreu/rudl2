@@ -12,12 +12,12 @@ use std::collections::{HashMap, HashSet};
 use copper_core::chir::{CHIRBinOp, CHIRType, CHIRUnOp, Width};
 use copper_core::shir::{
     SHIRBody, SHIRCombBody, SHIRExpr, SHIRLit, SHIRModule, SHIRPhase, SHIRPortDir, SHIRPortKind,
-    SHIRRegUpdate, SHIRSeqBody, SHIRStmt, SHIRSubmoduleInst,
+    SHIRRegUpdate, SHIRSeqBody, SHIRStmt, SHIRStructuralBody, SHIRSubmoduleInst,
 };
 use copper_core::vlir::{
     VLIRAlwaysFF, VLIRBinOp, VLIRCaseArm, VLIRBody, VLIRCombBody, VLIRCombPhase, VLIRContinuousAssign, VLIRExpr,
     VLIRFFCaseArm, VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind, VLIRRegDecl, VLIRSeqBody, VLIRStmt,
-    VLIRSubmoduleInst, VLIRUnOp,
+    VLIRStructuralBody, VLIRSubmoduleInst, VLIRUnOp,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -122,6 +122,7 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
     let body = match &shir.body {
         SHIRBody::Combinational(c) => VLIRBody::Combinational(lower_comb(c, &leg)?),
         SHIRBody::Sequential(s) => VLIRBody::Sequential(lower_seq(s, &leg, &registered_outs)?),
+        SHIRBody::Structural(st) => VLIRBody::Structural(lower_structural(st, &leg)?),
     };
 
     let params = shir
@@ -141,6 +142,14 @@ fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
     hoist_branch_local_defaults(&mut comb_stmts);
     check_no_latches(&comb_stmts)?;
     Ok(VLIRCombBody { submodules, comb_stmts, output_assigns })
+}
+
+// ── Structural body ─────────────────────────────────────────────────────────
+
+fn lower_structural(st: &SHIRStructuralBody, leg: &Legalizer) -> LowerResult<VLIRStructuralBody> {
+    let nets = st.nets.iter().map(|(n, ty)| (leg.get(n), width_of(ty))).collect();
+    let submodules = st.submodules.iter().map(|s| lower_submodule(s, leg)).collect::<LowerResult<_>>()?;
+    Ok(VLIRStructuralBody { nets, submodules })
 }
 
 // ── Sequential body ─────────────────────────────────────────────────────────
@@ -446,6 +455,11 @@ fn lower_submodule(m: &SHIRSubmoduleInst, leg: &Legalizer) -> LowerResult<VLIRSu
             .collect::<LowerResult<_>>()?,
         output_wire: leg.get(&m.output_wire),
         output_width: width_of(&m.output_ty),
+        // Legalize both sides: child port names and the parent-side signal/net
+        // names must match the identifiers emitted elsewhere in the module.
+        clocks: m.clocks.iter().map(|(p, s)| (leg.get(p), leg.get(s))).collect(),
+        port_nets: m.port_nets.iter().map(|(p, n)| (leg.get(p), leg.get(n))).collect(),
+        output_port: m.output_port.as_ref().map(|p| leg.get(p)),
     })
 }
 
@@ -1051,6 +1065,19 @@ fn collect_and_legalize_body_names(body: &SHIRBody, leg: &mut Legalizer) {
             }
             for phase in &s.phases {
                 collect_stmt_names(&phase.pre_edge, leg);
+            }
+        }
+        SHIRBody::Structural(st) => {
+            for (net, _) in &st.nets {
+                leg.legalize(net);
+            }
+            for m in &st.submodules {
+                leg.legalize(&m.inst_name);
+                leg.legalize(&m.module_name);
+                for (port, sig) in m.clocks.iter().chain(m.port_nets.iter()) {
+                    leg.legalize(port);
+                    leg.legalize(sig);
+                }
             }
         }
     }

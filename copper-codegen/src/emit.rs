@@ -9,7 +9,7 @@ use copper_core::chir::Width;
 use copper_core::vlir::{
     ToolchainProfile, VLIRAlwaysFF, VLIRBinOp, VLIRBody, VLIRCombBody, VLIRCombPhase,
     VLIRContinuousAssign, VLIRExpr, VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind,
-    VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRSubmoduleInst, VLIRUnOp,
+    VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRStructuralBody, VLIRSubmoduleInst, VLIRUnOp,
 };
 
 pub struct EmitConfig {
@@ -45,6 +45,7 @@ impl Emitter<'_> {
         match &m.body {
             VLIRBody::Combinational(c) => self.comb_body(c),
             VLIRBody::Sequential(s) => self.seq_body(s),
+            VLIRBody::Structural(st) => self.structural_body(st),
         }
         self.out.push_str("endmodule\n");
     }
@@ -215,7 +216,28 @@ impl Emitter<'_> {
 
     fn submodules(&mut self, subs: &[VLIRSubmoduleInst]) {
         for s in subs {
-            // Declare the instance's output wire immediately before the instance.
+            // Structural (statement/port) form: every connection is a named port
+            // wired to an existing net/port — clocks first, then data ports. No
+            // instance-local output wire to declare (the nets are declared by the
+            // parent's `structural_body`).
+            if !s.clocks.is_empty() || !s.port_nets.is_empty() {
+                self.out.push_str(&format!("{}{} {} (\n", self.indent(1), s.module_name, s.inst_name));
+                let conns: Vec<(String, String)> = s.clocks.iter()
+                    .chain(s.port_nets.iter())
+                    .map(|(p, n)| (p.clone(), n.clone()))
+                    .collect();
+                let last = conns.len().saturating_sub(1);
+                for (i, (port, net)) in conns.iter().enumerate() {
+                    let comma = if i == last { "" } else { "," };
+                    self.out.push_str(&format!("{}.{} ({}){}\n", self.indent(2), port, net, comma));
+                }
+                self.out.push_str(&format!("{});\n\n", self.indent(1)));
+                continue;
+            }
+
+            // Legacy expression form: a single combinational output wire the
+            // caller reads. Declare the instance's output wire immediately before
+            // the instance, then wire inputs + the output port.
             self.out.push_str(&format!(
                 "{}logic {}{};\n",
                 self.indent(1),
@@ -223,16 +245,26 @@ impl Emitter<'_> {
                 s.output_wire
             ));
             self.out.push_str(&format!("{}{} {} (\n", self.indent(1), s.module_name, s.inst_name));
-            // Named input connections, then the output port. Note: SHIR carries
-            // only the callee output *wire*, not its port name; M1 has no
-            // submodules, so we use the conventional `.out`. Threading the real
-            // callee output port name is tracked for the hierarchy milestone (M3).
             for (port, val) in &s.inputs {
                 self.out.push_str(&format!("{}.{} ({}),\n", self.indent(2), port, expr_str(val)));
             }
-            self.out.push_str(&format!("{}.out ({})\n", self.indent(2), s.output_wire));
+            let out_port = s.output_port.as_deref().unwrap_or("out");
+            self.out.push_str(&format!("{}.{} ({})\n", self.indent(2), out_port, s.output_wire));
             self.out.push_str(&format!("{});\n\n", self.indent(1)));
         }
+    }
+
+    // ── Structural body ───────────────────────────────────────────────────────
+
+    fn structural_body(&mut self, st: &VLIRStructuralBody) {
+        // Internal nets wiring children together.
+        for (name, width) in &st.nets {
+            self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range_str(width), name));
+        }
+        if !st.nets.is_empty() {
+            self.out.push('\n');
+        }
+        self.submodules(&st.submodules);
     }
 
     // ── always_ff ───────────────────────────────────────────────────────────

@@ -10,6 +10,12 @@ enum HardwareMode {
     /// sanctioned domain-crossing point, so it is *exempt* from the CDC check and
     /// may declare a foreign-domain input. See `sync_2ff` and `copper-core/src/cdc.rs`.
     Synchronizer,
+    /// A pure-hierarchy parent (item 4): receives one or more `Clock`s and
+    /// instantiates clocked submodules, threading each child's clock through. No
+    /// `always_ff`, no top-level loop, no `tick` of its own. Transpile-only for
+    /// now — a structural parent is not spawned in the sim (its children are
+    /// hand-wired in the testbench), so the macro emits it unchanged.
+    Structural,
 }
 
 impl HardwareMode {
@@ -25,9 +31,10 @@ fn parse_hardware_mode(args: TokenStream) -> Result<HardwareMode, Error> {
         "sequential" => Ok(HardwareMode::Sequential),
         "combinational" => Ok(HardwareMode::Combinational),
         "synchronizer" => Ok(HardwareMode::Synchronizer),
+        "structural" => Ok(HardwareMode::Structural),
         _ => Err(Error::new(
             proc_macro2::Span::call_site(),
-            "Unsupported #[hardware(...)] argument. Supported: sequential, combinational, synchronizer",
+            "Unsupported #[hardware(...)] argument. Supported: sequential, combinational, synchronizer, structural",
         )),
     }
 }
@@ -769,6 +776,20 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             wrap_in_module(&mut f);
             quote! { #f }.into()
         }
+        HardwareMode::Structural => {
+            // Pure-hierarchy parent (item 4). Transpile-only for now: the parent
+            // instantiates clocked children and has no loop/tick/registers of its
+            // own, so there is nothing to rewrite for the sim. It is NOT wrapped as
+            // a `HardwareModule` — a structural parent is not spawned (its children
+            // are hand-wired in the testbench); the transpiler reads the parent
+            // from source and lowers it via `#[hardware(structural)]`. The CDC
+            // discipline at its instantiation call sites is enforced there (the
+            // transpiler is text-based and re-derives it), and for compiled code
+            // the phantom domain types already reject a mismatched wire. Emit the
+            // function unchanged so it compiles alongside its children.
+            let f = input_fn;
+            quote! { #f }.into()
+        }
     }
 }
 
@@ -846,6 +867,15 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         return Err(Error::new_spanned(
             &input_fn.sig,
             "#[hardware(sequential)] must have at least one Clock<D> parameter",
+        ));
+    }
+
+    // A structural parent must have at least one Clock<D> to thread to its
+    // children — that is the whole point (the multi-clock hierarchy enabler).
+    if matches!(hardware_mode, HardwareMode::Structural) && !has_clock {
+        return Err(Error::new_spanned(
+            &input_fn.sig,
+            "#[hardware(structural)] must have at least one Clock<D> parameter to thread to its children",
         ));
     }
 
