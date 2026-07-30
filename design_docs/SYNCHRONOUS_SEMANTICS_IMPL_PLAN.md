@@ -458,6 +458,16 @@ the c2 + just-Rust decision as the execution model.
 
 ### 6. Levelized dependency-graph scheduling (gated on item 3)
 
+> **Scoped (2026-07-30) — see `design_docs/LEVELIZED_SCHEDULING_SCOPE.md`.** Item-3 gate confirmed
+> clear (no within-phase re-poll requirement remains: `PreEdgeBarrier` is phase-constant within a
+> settle). Graph-acquisition decision: **additive spawn API** (`In::wire_id()`; spawn takes input
+> wire-ids; ~49 spawn-site sweep) — chosen over port instrumentation for precision. Key risk:
+> comb-vs-sequential edge classification (plain `Out` = comb sink, `RegOut` = phase source) to avoid
+> false cycles on legal sequential feedback. Phased: (1) wire-id + read/write registration,
+> behavior-neutral; (2) DAG + topo behind an opt-in scheduler mode (like `PollOrder`); (3) SCC
+> handling; (4) validate vs G3 golden traces + fuzzer + BaseJump, flip default, retire fuzzer;
+> (5) static comb-loop detection. Not yet started.
+
 Replace the naive iterate-to-fixpoint settle (`poll_tasks` polls every module repeatedly until no
 dirty flag) with a **static inter-module dependency graph**, topo-sorted so each module is polled
 once per phase in dependency order — the compiled/levelized model of modern fast simulators
