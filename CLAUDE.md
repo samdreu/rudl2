@@ -73,11 +73,14 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
 - **`copper-analysis`** — the shared compile-time control/liveness analysis (the
   c2 architecture; depends only on `copper-core` + `syn`). Keys off `syn::ItemFn`
   — the representation *both* front-ends already hold — so the sim macro and the
-  transpiler consume **one** authoritative analysis (register inference, and in
-  progress the reachability CFG + FSM report) rather than two that must agree. See
-  `design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` (item 2). Currently
-  `infer_registers` (control-flow register inference) + the G2 structural
-  reg-match helpers; consumed by both `copper-macros` and `copper-codegen`.
+  transpiler consume **one** authoritative analysis rather than two that must
+  agree. See `design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` (item 2). Provides
+  `Cfg` (a real control-flow graph over `syn::ItemFn`, `E_comb`/`E_tick` edges),
+  `infer_registers` (backward-liveness register inference — a local is a register
+  iff it is defined-in-loop ∧ live-across-a-tick), `check_reachability` (every loop
+  path must reach a `clk.tick().await`, enforced as a hard spanned compile error in
+  **both** front-ends), and the G2 structural reg-match helpers. Consumed by both
+  `copper-macros` and `copper-codegen`.
 - **`copper-macros`** — the `#[hardware(sequential|combinational|synchronizer)]`
   proc macro. Validates the signature, enforces CDC rules at compile time,
   injects per-read freshness guards, wraps combinational bodies in the

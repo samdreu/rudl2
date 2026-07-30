@@ -1,0 +1,869 @@
+//! The intra-module **control-flow graph** (CFG) — item 2 of
+//! `design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`, the analysis both the sim
+//! macro and the transpiler consume (c2, gate G6).
+//!
+//! A `#[hardware(sequential)]` module is an `async fn` whose body is a top-level
+//! `loop`. This module models that loop as a real CFG over the `syn` AST and runs
+//! two analyses on it:
+//!
+//! * **Backward liveness → register inference** ([`Cfg::registers`]). A local is a
+//!   flip-flop iff (a) it is *defined inside the loop* and (b) its value is *live
+//!   across a clock edge* — the pre-tick value is read post-tick. This is the T1
+//!   answer (the synthesizable register set computed from control flow, not read
+//!   off rustc's over-capturing `Future` layout), and it generalizes the G6 slice's
+//!   minimal "pre-loop binding reassigned in loop" criterion to registers *born
+//!   inside* the loop and live across an interior `.await` (e.g. `mac_pipeline`'s
+//!   pipeline registers).
+//!
+//! * **Reachability well-formedness** ([`Cfg::check_reachability`]). Copper's core
+//!   invariant — *every path through a hardware loop must eventually reach a tick*
+//!   — is not checked anywhere today; it holds only as an accident of the
+//!   single-trailing-tick construction. Here it is a real analysis: delete every
+//!   tick edge and the reachable subgraph must be acyclic (a DFS back-edge check).
+//!   A tickless cycle is a zero-time combinational loop and is rejected.
+//!
+//! **Edges** are classified [`EdgeKind::Comb`] (same-cycle control flow) or
+//! [`EdgeKind::Tick`] (the edge *out of* a `clk.tick().await`, a clock-cycle
+//! boundary). Tick edges are labeled with the clock **receiver identity** (the
+//! groundwork item 4 needs to tag which domain a boundary belongs to — today's
+//! `control_extract.rs` matches ticks by method name only, losing the receiver).
+//!
+//! **v1 scope.** Straight-line code, statement-position `if`/`else` (incl.
+//! `else if`) and `match` arms, and ticks anywhere among them. A genuine
+//! basic-block builder for *nested* loops (AST duplication doesn't terminate on
+//! back-edges) is the one follow-on phase after v1 lands and is verified — a nested
+//! loop is folded here into a single opaque node.
+
+use std::collections::BTreeSet;
+
+use proc_macro2::{Span, TokenStream, TokenTree};
+use syn::spanned::Spanned;
+use syn::visit::Visit;
+use syn::{BinOp, Expr, ItemFn, Pat, Stmt};
+
+/// How control reaches the successor of a CFG node.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EdgeKind {
+    /// Same clock cycle — ordinary (combinational) control flow.
+    Comb,
+    /// Crosses a clock edge — the edge *out of* a `clk.tick().await`.
+    Tick,
+}
+
+/// One CFG node. Kept at single-statement granularity so `defs`/`uses` are clean
+/// for the liveness dataflow (use-before-def within a node is handled by the
+/// `use ∪ (out − def)` transfer, so `let x = f(x)` keeps `x` live-in correctly).
+struct Node {
+    /// Variables written here (full binds/assignments only — a partial write
+    /// `x[i] = …` is a read-modify-write, so `x` is a *use*, not a killing def).
+    defs: BTreeSet<String>,
+    /// Variables read here.
+    uses: BTreeSet<String>,
+    /// True iff this node is a `clk.tick().await` (its out-edge is [`EdgeKind::Tick`]).
+    is_tick: bool,
+    /// The clock receiver identity of a tick node (e.g. `clk`) — item 4's domain tag.
+    tick_clock: Option<String>,
+    /// Successors and how control reaches them.
+    succs: Vec<(usize, EdgeKind)>,
+    /// Source span, for spanned diagnostics.
+    span: Span,
+}
+
+/// The control-flow graph of a module's top-level `loop`.
+pub struct Cfg {
+    nodes: Vec<Node>,
+    /// The loop-head node (empty; the DFS/liveness entry). Every "fall off the end
+    /// of the body" and every trailing tick routes back here.
+    head: usize,
+    /// Register *candidates*: locals with a def site (let-binding or assignment)
+    /// **inside** the loop. Pre-loop-only bindings (constants/wires like `lfsr`'s
+    /// `xor_mask`) are excluded here, which is what stops them from being counted
+    /// as registers even though they are live across ticks.
+    defined_in_loop: BTreeSet<String>,
+}
+
+impl Cfg {
+    /// Build the CFG of `f`'s top-level `loop`, or `None` if `f` has no top-level
+    /// loop (nothing sequential to analyze).
+    pub fn build(f: &ItemFn) -> Option<Cfg> {
+        let (loop_body, loop_span) = top_level_loop(f)?;
+
+        let mut defined_in_loop = BTreeSet::new();
+        let mut d = DefinedInLoop { set: &mut defined_in_loop };
+        for stmt in &loop_body {
+            d.visit_stmt(stmt);
+        }
+
+        let mut b = Builder { nodes: Vec::new() };
+        // The head is node 0: an empty node whose successor is the first body node.
+        // Every back-edge (trailing tick, fall-through) targets it.
+        let head = b.new_node(Node {
+            defs: BTreeSet::new(),
+            uses: BTreeSet::new(),
+            is_tick: false,
+            tick_clock: None,
+            succs: Vec::new(),
+            span: loop_span,
+        });
+        let body_entry = b.build_block(&loop_body, head);
+        b.nodes[head].succs.push((body_entry, EdgeKind::Comb));
+
+        Some(Cfg {
+            nodes: b.nodes,
+            head,
+            defined_in_loop,
+        })
+    }
+
+    /// The inferred **register set** — sorted for stable structural comparison.
+    ///
+    /// A candidate (defined in the loop) is a register iff its value is live across
+    /// some tick edge, i.e. it is in the live-out set of a tick node. Same-cycle
+    /// combinational temps (redefined at the loop head before any post-tick use)
+    /// are killed by that redefinition and correctly excluded.
+    pub fn registers(&self) -> Vec<String> {
+        let live_out = self.liveness();
+        let mut across_tick = BTreeSet::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.is_tick {
+                across_tick.extend(live_out[i].iter().cloned());
+            }
+        }
+        self.defined_in_loop
+            .intersection(&across_tick)
+            .cloned()
+            .collect()
+    }
+
+    /// Enforce the reachability invariant: with every tick edge deleted, the graph
+    /// reachable from the loop head must be acyclic. A remaining cycle is a path
+    /// that returns to the top of the loop without ever awaiting a clock tick — a
+    /// zero-time combinational loop. Returns the span of the offending node and a
+    /// message on violation.
+    pub fn check_reachability(&self) -> Result<(), (Span, String)> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
+        let mut color = vec![Color::White; self.nodes.len()];
+
+        // Iterative DFS (avoid recursion depth limits on large bodies). The stack
+        // holds (node, next-successor-index); a Gray successor over a Comb edge is a
+        // back-edge — a tickless cycle.
+        let mut stack: Vec<(usize, usize)> = vec![(self.head, 0)];
+        color[self.head] = Color::Gray;
+        while let Some(&mut (n, ref mut si)) = stack.last_mut() {
+            // Advance to the next Comb successor of n.
+            let mut advanced = false;
+            while *si < self.nodes[n].succs.len() {
+                let (s, kind) = self.nodes[n].succs[*si];
+                *si += 1;
+                if kind != EdgeKind::Comb {
+                    continue;
+                }
+                match color[s] {
+                    Color::Gray => {
+                        return Err((
+                            self.nodes[n].span,
+                            "this control-flow path returns to the top of the loop without \
+                             awaiting a clock tick — every path through a `#[hardware]` loop must \
+                             reach `clk.tick().await`, otherwise it is a zero-time combinational \
+                             cycle"
+                                .to_string(),
+                        ));
+                    }
+                    Color::White => {
+                        color[s] = Color::Gray;
+                        stack.push((s, 0));
+                        advanced = true;
+                        break;
+                    }
+                    Color::Black => {}
+                }
+            }
+            if !advanced && stack.last().is_some_and(|&(m, _)| m == n) {
+                // Exhausted n's successors.
+                color[n] = Color::Black;
+                stack.pop();
+            }
+        }
+        Ok(())
+    }
+
+    /// Backward-liveness fixpoint. Returns `live_out[i]` for every node. Edge kind is
+    /// irrelevant to the propagation — a value used after a tick is still live
+    /// *across* it, which is exactly what register inference keys on.
+    fn liveness(&self) -> Vec<BTreeSet<String>> {
+        let n = self.nodes.len();
+        let mut live_in: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+        let mut live_out: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+        loop {
+            let mut changed = false;
+            // Reverse node order speeds convergence (successors tend to have higher
+            // indices in this forward-built graph); correctness is order-independent.
+            for i in (0..n).rev() {
+                let mut out = BTreeSet::new();
+                for &(s, _) in &self.nodes[i].succs {
+                    out.extend(live_in[s].iter().cloned());
+                }
+                let mut in_ = self.nodes[i].uses.clone();
+                for v in &out {
+                    if !self.nodes[i].defs.contains(v) {
+                        in_.insert(v.clone());
+                    }
+                }
+                if out != live_out[i] {
+                    live_out[i] = out;
+                    changed = true;
+                }
+                if in_ != live_in[i] {
+                    live_in[i] = in_;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        live_out
+    }
+
+    /// A minimal FSM report that falls out of the CFG for free (the item-2 byproduct
+    /// tracked in `TODO`): the tick count (≈ number of cycle boundaries), the clock
+    /// receivers seen, and the inferred registers. Kept intentionally small; a
+    /// richer states/transitions dump can grow from the same `nodes` later.
+    pub fn fsm_report(&self, module: &str) -> String {
+        let ticks = self.nodes.iter().filter(|n| n.is_tick).count();
+        let mut clocks: BTreeSet<&str> = BTreeSet::new();
+        for n in &self.nodes {
+            if let Some(c) = &n.tick_clock {
+                clocks.insert(c);
+            }
+        }
+        format!(
+            "module {module}: {ticks} tick boundary(ies), clock(s) {:?}, registers {:?}",
+            clocks.into_iter().collect::<Vec<_>>(),
+            self.registers()
+        )
+    }
+}
+
+// ── CFG construction ────────────────────────────────────────────────────────
+
+struct Builder {
+    nodes: Vec<Node>,
+}
+
+impl Builder {
+    fn new_node(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// Build a straight-line block, threading `next` as the successor of the last
+    /// statement. Processed in reverse so each statement's successor is already
+    /// built when the statement is lowered; returns the entry node of the block.
+    fn build_block(&mut self, stmts: &[Stmt], next: usize) -> usize {
+        let mut cur = next;
+        for stmt in stmts.iter().rev() {
+            cur = self.build_stmt(stmt, cur);
+        }
+        cur
+    }
+
+    fn build_stmt(&mut self, stmt: &Stmt, next: usize) -> usize {
+        match stmt {
+            Stmt::Local(local) => {
+                let mut defs = BTreeSet::new();
+                pat_bindings(&local.pat, &mut defs);
+                let mut uses = BTreeSet::new();
+                if let Some(init) = &local.init {
+                    collect_reads(&init.expr, &mut uses);
+                }
+                self.terminal(defs, uses, local.span(), next)
+            }
+            Stmt::Expr(expr, _) => self.build_expr(expr, next),
+            Stmt::Macro(m) => {
+                let mut uses = BTreeSet::new();
+                collect_token_idents(&m.mac.tokens, &mut uses);
+                self.terminal(BTreeSet::new(), uses, m.span(), next)
+            }
+            Stmt::Item(item) => self.terminal(BTreeSet::new(), BTreeSet::new(), item.span(), next),
+        }
+    }
+
+    /// Lower a statement-position expression, expanding `if`/`match`/`tick`
+    /// structurally so ticks nested in branches produce real tick edges.
+    fn build_expr(&mut self, expr: &Expr, next: usize) -> usize {
+        if let Some(clock) = tick_clock(expr) {
+            return self.new_node(Node {
+                defs: BTreeSet::new(),
+                uses: BTreeSet::from([clock.clone()]),
+                is_tick: true,
+                tick_clock: Some(clock),
+                succs: vec![(next, EdgeKind::Tick)],
+                span: expr.span(),
+            });
+        }
+        match expr {
+            Expr::If(ei) => {
+                let then_entry = self.build_block(&ei.then_branch.stmts, next);
+                let else_entry = match &ei.else_branch {
+                    Some((_, e)) => self.build_expr(e, next),
+                    None => next,
+                };
+                let mut uses = BTreeSet::new();
+                collect_reads(&ei.cond, &mut uses);
+                self.new_node(Node {
+                    defs: BTreeSet::new(),
+                    uses,
+                    is_tick: false,
+                    tick_clock: None,
+                    succs: vec![(then_entry, EdgeKind::Comb), (else_entry, EdgeKind::Comb)],
+                    span: ei.span(),
+                })
+            }
+            Expr::Match(em) => {
+                let mut succs = Vec::with_capacity(em.arms.len());
+                for arm in &em.arms {
+                    let body_entry = self.build_expr(&arm.body, next);
+                    let mut arm_defs = BTreeSet::new();
+                    pat_bindings(&arm.pat, &mut arm_defs);
+                    let mut arm_uses = BTreeSet::new();
+                    if let Some((_, guard)) = &arm.guard {
+                        collect_reads(guard, &mut arm_uses);
+                    }
+                    // A pattern binding / guard needs its own entry node so its
+                    // defs/uses sit on the path into the arm; otherwise route
+                    // straight to the arm body.
+                    let entry = if arm_defs.is_empty() && arm_uses.is_empty() {
+                        body_entry
+                    } else {
+                        self.new_node(Node {
+                            defs: arm_defs,
+                            uses: arm_uses,
+                            is_tick: false,
+                            tick_clock: None,
+                            succs: vec![(body_entry, EdgeKind::Comb)],
+                            span: arm.pat.span(),
+                        })
+                    };
+                    succs.push((entry, EdgeKind::Comb));
+                }
+                let mut uses = BTreeSet::new();
+                collect_reads(&em.expr, &mut uses);
+                self.new_node(Node {
+                    defs: BTreeSet::new(),
+                    uses,
+                    is_tick: false,
+                    tick_clock: None,
+                    succs,
+                    span: em.span(),
+                })
+            }
+            // A bare block is just its statements.
+            Expr::Block(b) => self.build_block(&b.block.stmts, next),
+            // A **nested** loop (`for` / `while` / `loop`) is folded into a single
+            // opaque node in v1 — a genuine basic-block builder for nested back-edges
+            // is the follow-on phase (AST duplication doesn't terminate on a
+            // back-edge). The fold must be *rejection-sound*: if the nested loop's
+            // body contains a tick, traversing it crosses a clock edge, so its
+            // out-edge is a **Tick** edge (and the node counts as a boundary for
+            // liveness) — otherwise a design that only ticks inside a `for`/`while`
+            // (e.g. `uart_tx`, `rv32i_cpu`) would be falsely flagged as a tickless
+            // cycle. A tick-free nested loop stays combinational. This conservatively
+            // *under*-reports malformedness inside nested loops (accepted for v1);
+            // it never falsely rejects a legitimate design. `defs` is left empty
+            // (don't kill across an opaque region); all interior reads become `uses`.
+            Expr::While(_) | Expr::ForLoop(_) | Expr::Loop(_) => {
+                let mut uses = BTreeSet::new();
+                collect_reads(expr, &mut uses);
+                let clock = first_tick_clock(expr);
+                let (is_tick, kind) = match &clock {
+                    Some(_) => (true, EdgeKind::Tick),
+                    None => (false, EdgeKind::Comb),
+                };
+                self.new_node(Node {
+                    defs: BTreeSet::new(),
+                    uses,
+                    is_tick,
+                    tick_clock: clock,
+                    succs: vec![(next, kind)],
+                    span: expr.span(),
+                })
+            }
+            // Assignment / compound-assign / method call / `port.write(..)` / other
+            // terminal expression: one node, combinational edge to the continuation.
+            _ => {
+                let (defs, uses) = terminal_defs_uses(expr);
+                self.terminal(defs, uses, expr.span(), next)
+            }
+        }
+    }
+
+    fn terminal(
+        &mut self,
+        defs: BTreeSet<String>,
+        uses: BTreeSet<String>,
+        span: Span,
+        next: usize,
+    ) -> usize {
+        self.new_node(Node {
+            defs,
+            uses,
+            is_tick: false,
+            tick_clock: None,
+            succs: vec![(next, EdgeKind::Comb)],
+            span,
+        })
+    }
+}
+
+// ── def / use extraction ────────────────────────────────────────────────────
+
+/// The `(defs, uses)` of a terminal (non-branch, non-tick) statement expression.
+fn terminal_defs_uses(expr: &Expr) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut defs = BTreeSet::new();
+    let mut uses = BTreeSet::new();
+    match expr {
+        Expr::Assign(a) => {
+            assign_lhs(&a.left, &mut defs, &mut uses);
+            collect_reads(&a.right, &mut uses);
+        }
+        Expr::Binary(b) if is_assign_op(&b.op) => {
+            // Compound assign `x += y`: reads and writes `x`.
+            if let Some(id) = simple_ident(&b.left) {
+                defs.insert(id.clone());
+                uses.insert(id);
+            } else {
+                collect_reads(&b.left, &mut uses);
+            }
+            collect_reads(&b.right, &mut uses);
+        }
+        _ => collect_reads(expr, &mut uses),
+    }
+    (defs, uses)
+}
+
+/// Split an assignment LHS into killing defs vs read-modify-write uses. A bare
+/// `x` (or a tuple of them) is a full def; `x[i]`/`x.f` is a partial write, so `x`
+/// stays a *use* (it isn't killed) — but see [`DefinedInLoop`], which still counts
+/// `x` as assigned-in-loop so a partially-written register is a register candidate.
+fn assign_lhs(left: &Expr, defs: &mut BTreeSet<String>, uses: &mut BTreeSet<String>) {
+    match left {
+        Expr::Path(_) => {
+            if let Some(id) = simple_ident(left) {
+                defs.insert(id);
+            }
+        }
+        Expr::Tuple(t) => {
+            for elem in &t.elems {
+                assign_lhs(elem, defs, uses);
+            }
+        }
+        Expr::Index(i) => {
+            collect_reads(&i.expr, uses);
+            collect_reads(&i.index, uses);
+        }
+        Expr::Field(f) => collect_reads(&f.base, uses),
+        other => collect_reads(other, uses),
+    }
+}
+
+/// Every variable **read** in `expr` (single-segment path identifiers). Method
+/// names, multi-segment paths (enum variants like `State::A`), and struct-literal
+/// field names are not idents-as-reads and are skipped; macro token streams are
+/// scanned for idents (over-approx, but only affects vars that are also
+/// assigned-in-loop, which is rare enough to be harmless in v1).
+fn collect_reads(expr: &Expr, out: &mut BTreeSet<String>) {
+    struct Reads<'a>(&'a mut BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Reads<'_> {
+        fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+            if p.qself.is_none() && p.path.segments.len() == 1 {
+                self.0.insert(p.path.segments[0].ident.to_string());
+            }
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            collect_token_idents(&m.tokens, self.0);
+        }
+    }
+    Reads(out).visit_expr(expr);
+}
+
+/// Insert every identifier token appearing in a macro's token stream.
+fn collect_token_idents(tokens: &TokenStream, out: &mut BTreeSet<String>) {
+    for tt in tokens.clone() {
+        match tt {
+            TokenTree::Ident(id) => {
+                out.insert(id.to_string());
+            }
+            TokenTree::Group(g) => collect_token_idents(&g.stream(), out),
+            _ => {}
+        }
+    }
+}
+
+/// Collect the identifiers bound by a pattern (recursively).
+fn pat_bindings(pat: &Pat, out: &mut BTreeSet<String>) {
+    match pat {
+        Pat::Ident(pi) => {
+            out.insert(pi.ident.to_string());
+            if let Some((_, sub)) = &pi.subpat {
+                pat_bindings(sub, out);
+            }
+        }
+        Pat::Type(pt) => pat_bindings(&pt.pat, out),
+        Pat::Reference(r) => pat_bindings(&r.pat, out),
+        Pat::Paren(p) => pat_bindings(&p.pat, out),
+        Pat::Tuple(t) => t.elems.iter().for_each(|e| pat_bindings(e, out)),
+        Pat::TupleStruct(ts) => ts.elems.iter().for_each(|e| pat_bindings(e, out)),
+        Pat::Slice(s) => s.elems.iter().for_each(|e| pat_bindings(e, out)),
+        Pat::Or(o) => o.cases.iter().for_each(|c| pat_bindings(c, out)),
+        Pat::Struct(s) => s.fields.iter().for_each(|f| pat_bindings(&f.pat, out)),
+        _ => {}
+    }
+}
+
+/// Visitor collecting the register **candidates**: every variable with a def site
+/// (let-binding or assignment target, including partial-write and tuple targets)
+/// anywhere inside the loop body. Deliberately *not* collecting match-arm pattern
+/// bindings — those are transient arm-local names, not persistent state.
+struct DefinedInLoop<'a> {
+    set: &'a mut BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for DefinedInLoop<'_> {
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        pat_bindings(&l.pat, self.set);
+        syn::visit::visit_local(self, l);
+    }
+    fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        assign_targets(&a.left, self.set);
+        syn::visit::visit_expr_assign(self, a);
+    }
+    fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+        if is_assign_op(&b.op) {
+            assign_targets(&b.left, self.set);
+        }
+        syn::visit::visit_expr_binary(self, b);
+    }
+}
+
+/// The base variable names written by an assignment LHS — bare, tuple, indexed, or
+/// field — so a partially-written register still counts as assigned-in-loop.
+fn assign_targets(left: &Expr, out: &mut BTreeSet<String>) {
+    match left {
+        Expr::Path(_) => {
+            if let Some(id) = simple_ident(left) {
+                out.insert(id);
+            }
+        }
+        Expr::Tuple(t) => t.elems.iter().for_each(|e| assign_targets(e, out)),
+        Expr::Index(i) => assign_targets(&i.expr, out),
+        Expr::Field(f) => assign_targets(&f.base, out),
+        _ => {}
+    }
+}
+
+// ── small syntactic helpers ─────────────────────────────────────────────────
+
+/// The statement list and span of the module's top-level `loop { … }`, if any.
+fn top_level_loop(f: &ItemFn) -> Option<(Vec<Stmt>, Span)> {
+    f.block.stmts.iter().find_map(|s| match s {
+        Stmt::Expr(Expr::Loop(l), _) => Some((l.body.stmts.clone(), l.span())),
+        _ => None,
+    })
+}
+
+/// `Some(clock_name)` iff `expr` is `<clock>.tick().await`. The clock receiver
+/// identity is preserved (item 4's per-domain tick tag); a non-simple receiver
+/// yields the placeholder `"<clock>"`.
+fn tick_clock(expr: &Expr) -> Option<String> {
+    let Expr::Await(a) = expr else { return None };
+    let Expr::MethodCall(mc) = a.base.as_ref() else {
+        return None;
+    };
+    if mc.method != "tick" || !mc.args.is_empty() {
+        return None;
+    }
+    Some(simple_ident(&mc.receiver).unwrap_or_else(|| "<clock>".to_string()))
+}
+
+/// The clock receiver of the first `<clock>.tick().await` anywhere inside `expr`,
+/// or `None` if `expr` contains no tick. Used to decide whether a folded nested
+/// loop crosses a clock edge (and, for item 4, which domain it belongs to).
+fn first_tick_clock(expr: &Expr) -> Option<String> {
+    struct FindTick(Option<String>);
+    impl<'ast> Visit<'ast> for FindTick {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            if self.0.is_some() {
+                return;
+            }
+            if let Some(c) = tick_clock(e) {
+                self.0 = Some(c);
+                return;
+            }
+            syn::visit::visit_expr(self, e);
+        }
+    }
+    let mut f = FindTick(None);
+    f.visit_expr(expr);
+    f.0
+}
+
+/// The single identifier of a bare path expression (`x`), else `None`.
+fn simple_ident(e: &Expr) -> Option<String> {
+    if let Expr::Path(p) = e {
+        if p.qself.is_none() && p.path.segments.len() == 1 {
+            return Some(p.path.segments[0].ident.to_string());
+        }
+    }
+    None
+}
+
+fn is_assign_op(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::AddAssign(_)
+            | BinOp::SubAssign(_)
+            | BinOp::MulAssign(_)
+            | BinOp::DivAssign(_)
+            | BinOp::RemAssign(_)
+            | BinOp::BitXorAssign(_)
+            | BinOp::BitAndAssign(_)
+            | BinOp::BitOrAssign(_)
+            | BinOp::ShlAssign(_)
+            | BinOp::ShrAssign(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> ItemFn {
+        syn::parse_str(src).expect("parse ItemFn")
+    }
+
+    fn regs(src: &str) -> Vec<String> {
+        Cfg::build(&parse(src)).map(|c| c.registers()).unwrap_or_default()
+    }
+
+    // ── register inference (backward liveness) ──────────────────────────────
+
+    /// `mac_fsm`: four pre-loop locals, all reassigned in the loop and read a
+    /// cycle later — the G6-slice shape, still correct under general liveness.
+    #[test]
+    fn mac_fsm_registers() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn mac_fsm(clk: Clock<C>, a: In<Bits<8>, C>, b: In<Bits<8>, C>, c: In<Bits<8>, C>, out: RegOut<Bits<8>, C>) {
+                let mut stage = Stage::Load;
+                let mut product: Bits<8> = Bits::from_lit::<0>();
+                let mut c_latch: Bits<8> = Bits::from_lit::<0>();
+                let mut result: Bits<8> = Bits::from_lit::<0>();
+                loop {
+                    match stage {
+                        Stage::Load => { product = a.read() * b.read(); c_latch = c.read(); stage = Stage::Mul; }
+                        Stage::Mul  => { result = product.clone() + c_latch.clone(); stage = Stage::Out; }
+                        Stage::Out  => { out.write(result.clone()); stage = Stage::Load; }
+                    }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(regs(src), ["c_latch", "product", "result", "stage"]);
+    }
+
+    /// The item-2 generalization: `mac_pipeline`'s registers are **born inside the
+    /// loop** (`let` in the body) and live across *interior* awaits — the G6 slice's
+    /// pre-loop-only criterion missed all three. Backward liveness catches them.
+    #[test]
+    fn mac_pipeline_interior_await_registers() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn mac_pipeline(clk: Clock<C>, a: In<Bits<8>, C>, b: In<Bits<8>, C>, c: In<Bits<8>, C>, out: Out<Bits<8>, C>) {
+                loop {
+                    let product = a.read() * b.read();
+                    let c_s = c.read();
+                    clk.tick().await;
+                    let sum = product + c_s;
+                    clk.tick().await;
+                    out.write(sum);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(regs(src), ["c_s", "product", "sum"]);
+    }
+
+    /// A pre-loop constant only *read* in the loop is a wire, not a register —
+    /// excluded because it has no def site inside the loop (even though it is live
+    /// across ticks).
+    #[test]
+    fn constant_excluded() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, o: Out<Bits<32>, C>) {
+                let mask = Bits::from_u32(7);
+                let mut state = Bits::from_u32(1);
+                loop {
+                    state = state ^ mask;
+                    o.write(state);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(regs(src), ["state"]);
+    }
+
+    /// A same-cycle combinational temp (`let t = …; use t; tick`) is redefined at
+    /// the loop head before any post-tick use, so it is killed and not a register.
+    #[test]
+    fn combinational_temp_excluded() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut acc = Bits::from_u32(0);
+                loop {
+                    let t = a.read() + acc;
+                    o.write(t);
+                    acc = t;
+                    clk.tick().await;
+                }
+            }
+        "#;
+        // `acc` crosses the tick (register); `t` is same-cycle (wire).
+        assert_eq!(regs(src), ["acc"]);
+    }
+
+    /// Tuple-destructuring assignment `(phase, timer) = match …` (traffic_light):
+    /// both targets are registers.
+    #[test]
+    fn tuple_assign_targets_are_registers() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn tl(clk: Clock<C>, req: In<Logic, C>, r: Out<Logic, C>) {
+                let mut phase = Phase::Green;
+                let mut timer: u8 = 0;
+                loop {
+                    match phase { Phase::Green => { r.write(Logic::One); } _ => { r.write(Logic::Zero); } }
+                    clk.tick().await;
+                    (phase, timer) = match (phase, timer, req.read()) {
+                        (Phase::Green, _, Logic::One) => (Phase::Yellow, 0),
+                        (Phase::Yellow, t, _) if t < 1 => (Phase::Yellow, t + 1),
+                        _ => (Phase::Green, 0),
+                    };
+                }
+            }
+        "#;
+        assert_eq!(regs(src), ["phase", "timer"]);
+    }
+
+    /// A tick nested inside one branch, the register read after the merge: `state`
+    /// is live across the interior tick (det_010 shape).
+    #[test]
+    fn branch_tick_state_register() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn det(clk: Clock<C>, rstn: In<Logic, C>, in_i: In<Logic, C>, out_o: Out<Logic, C>) {
+                let mut state = State::A;
+                loop {
+                    if rstn.read() == Logic::Zero { state = State::A; }
+                    else { state = next(state, in_i.read()); }
+                    clk.tick().await;
+                    if matches!(state, State::D) { out_o.write(Logic::One); }
+                    else { out_o.write(Logic::Zero); }
+                }
+            }
+        "#;
+        assert_eq!(regs(src), ["state"]);
+    }
+
+    // ── reachability well-formedness ────────────────────────────────────────
+
+    fn check(src: &str) -> Result<(), String> {
+        Cfg::build(&parse(src))
+            .expect("has a loop")
+            .check_reachability()
+            .map_err(|(_, m)| m)
+    }
+
+    /// A branch that ticks with no matching else tick falls through to the loop
+    /// head combinationally — a zero-time cycle. Rejected.
+    #[test]
+    fn tickless_fallthrough_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, cond: In<Logic, C>) {
+                loop {
+                    if cond.read() == Logic::One { clk.tick().await; }
+                }
+            }
+        "#;
+        assert!(check(src).is_err(), "a tickless fall-through path must be rejected");
+    }
+
+    /// An empty loop never ticks. Rejected.
+    #[test]
+    fn empty_loop_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn spin(clk: Clock<C>) { loop {} }
+        "#;
+        assert!(check(src).is_err());
+    }
+
+    /// Uneven per-branch tick counts are legitimate: every path still crosses a
+    /// tick, so the design is well-formed. This is the regression the plan calls
+    /// out — the check must not reject asymmetric-but-sound designs.
+    #[test]
+    fn uneven_but_both_tick_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, cond: In<Logic, C>) {
+                loop {
+                    if cond.read() == Logic::One { clk.tick().await; }
+                    else { clk.tick().await; clk.tick().await; }
+                }
+            }
+        "#;
+        assert!(check(src).is_ok(), "asymmetric-but-ticking branches are well-formed");
+    }
+
+    /// A trailing unconditional tick after a branch: both arms merge and reach the
+    /// tick. Well-formed (mac_fsm / traffic_light shape).
+    #[test]
+    fn trailing_tick_after_branch_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, cond: In<Logic, C>, o: Out<Logic, C>) {
+                loop {
+                    if cond.read() == Logic::One { o.write(Logic::One); }
+                    else { o.write(Logic::Zero); }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(check(src).is_ok());
+    }
+
+    /// A match where one arm ticks and another falls through is rejected.
+    #[test]
+    fn match_arm_without_tick_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, sel: In<Bits<2>, C>) {
+                loop {
+                    match sel.read() {
+                        s if s == Bits::from_u32(0) => { clk.tick().await; }
+                        _ => { }
+                    }
+                }
+            }
+        "#;
+        assert!(check(src).is_err());
+    }
+}

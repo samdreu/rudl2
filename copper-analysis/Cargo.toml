@@ -14,3 +14,4 @@ edition = "2024"
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
 syn = { version = "2.0.114", features = ["full", "visit"] }
+proc-macro2 = "1.0"

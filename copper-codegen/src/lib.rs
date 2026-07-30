@@ -131,6 +131,13 @@ pub fn transpile_source(
         }
     };
 
+    // c2 (item 2): the transpiler enforces the SAME reachability well-formedness
+    // the sim macro does, from the SAME shared analysis on the SAME `&syn::ItemFn`
+    // — a tickless loop path is rejected here too (one authoritative check, both
+    // front-ends). In practice a module reaching the transpiler already compiled
+    // through the macro's check; this keeps the standalone CLI honest.
+    copper_analysis::check_reachability(target).map_err(|e| e.to_string())?;
+
     // c2 (gate G6): the transpiler consumes the SAME shared analysis, on the SAME
     // input (`&syn::ItemFn`), that the sim macro consumes — one authoritative
     // register/CFG analysis, not two that must agree. Read-only for now; item 2

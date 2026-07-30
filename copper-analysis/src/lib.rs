@@ -18,51 +18,52 @@
 //! depending only on `copper-core` + `syn` (both of which `copper-macros` already
 //! pulls in) introduces **no cycle** and **no new heavy transitive dependency**.
 //!
-//! **Scope of THIS module (a feasibility slice, not item 2).**
-//! [`infer_registers`] implements the minimal, principled control-flow criterion
-//! that suffices to drive one multi-tick FSM (`mac_fsm`) end-to-end and match its
-//! independent hand-written reference SystemVerilog reg-for-reg. The production
-//! item-2 pass generalizes this to full backward liveness over a real CFG (see
-//! [`registers_from_fir`]).
+//! **Scope of THIS module (item 2).**
+//! [`infer_registers`] is now full **backward liveness over a real CFG** (see
+//! [`cfg`]) — it generalizes the G6 slice's minimal "pre-loop binding reassigned in
+//! loop" criterion to registers *born inside* the loop and live across an interior
+//! `.await` (e.g. `mac_pipeline`'s pipeline registers). The same CFG also powers
+//! [`check_reachability`], the well-formedness check that every path through a
+//! hardware loop must reach a tick.
 
 use std::collections::BTreeSet;
 
-use syn::visit::Visit;
-use syn::{BinOp, Expr, ItemFn, Pat, Stmt};
+use syn::ItemFn;
+
+mod cfg;
+
+pub use cfg::{Cfg, EdgeKind};
 
 /// Infer the synthesizable **register set** of a sequential hardware module from
-/// its control flow.
+/// its control flow, via full backward liveness over the module's CFG ([`Cfg`]).
 ///
-/// Criterion (minimal, item-2 generalizes it): a local binding declared *before*
-/// the module's top-level `loop` and **reassigned inside** that loop is a
-/// register — its value must survive the clock edge (`clk.tick().await`) to the
-/// next iteration. A pre-loop binding that is only *read* in the loop is a
-/// constant/wire, not a register (e.g. `lfsr`'s `xor_mask`).
+/// Criterion: a local is a flip-flop iff it is (a) *defined inside* the top-level
+/// loop (a `let` binding or an assignment target) and (b) *live across a clock
+/// edge* — its pre-tick value is read post-tick. This is the T1 answer: the
+/// synthesizable register set computed from control flow, not read off rustc's
+/// over-capturing `Future` layout.
 ///
-/// Returns register names sorted (stable output for structural comparison).
-///
-/// Not yet handled here (item 2's job): registers *born inside* the loop and live
-/// across an interior `.await` (e.g. `mac_pipeline`'s `product`/`c_s`/`sum`), and
-/// bit-indexed partial assignments. This slice targets the pre-loop-state FSM
-/// shape, whose independent SV golden declares its registers explicitly.
+/// A pre-loop binding only *read* in the loop is a constant/wire, not a register
+/// (e.g. `lfsr`'s `xor_mask`) — excluded by (a). A same-cycle combinational temp is
+/// excluded by (b). Returns register names sorted (stable structural output).
 pub fn infer_registers(f: &ItemFn) -> Vec<String> {
-    let Some(loop_body) = top_level_loop_body(f) else {
-        return Vec::new();
-    };
+    Cfg::build(f).map(|c| c.registers()).unwrap_or_default()
+}
 
-    // Candidate state: bindings declared before the top-level loop.
-    let pre_loop: BTreeSet<String> = pre_loop_bindings(f);
-
-    // Of those, the ones assigned inside the loop cross the tick → registers.
-    let mut assigned = AssignCollector::default();
-    for stmt in &loop_body {
-        assigned.visit_stmt(stmt);
+/// Enforce the reachability well-formedness invariant: **every path through the
+/// module's top-level loop must reach a `clk.tick().await`**. Deleting all tick
+/// edges from the CFG must leave the reachable subgraph acyclic; a remaining cycle
+/// is a path that returns to the loop head without ticking — a zero-time
+/// combinational loop — and is rejected with a spanned [`syn::Error`].
+///
+/// A module with no top-level loop has nothing to check and is `Ok`.
+pub fn check_reachability(f: &ItemFn) -> Result<(), syn::Error> {
+    match Cfg::build(f) {
+        Some(cfg) => cfg
+            .check_reachability()
+            .map_err(|(span, msg)| syn::Error::new(span, msg)),
+        None => Ok(()),
     }
-
-    pre_loop
-        .intersection(&assigned.names)
-        .cloned()
-        .collect::<Vec<_>>()
 }
 
 /// The **sequential register set** of an independent hand-written reference
@@ -216,95 +217,7 @@ fn output_port_names(text: &str) -> BTreeSet<String> {
 /// pin the intended type dependency on `copper-core`'s IR, confirming the shared
 /// crate compiles against the same FIR both front-ends build.
 pub fn registers_from_fir(_ir: &copper_core::frontend_ir::FrontendModuleIR) -> Vec<String> {
-    unimplemented!("item 2: backward liveness over the CFG built from the shared FIR")
-}
-
-/// The statement list of the module's top-level `loop { .. }`, if any.
-fn top_level_loop_body(f: &ItemFn) -> Option<Vec<Stmt>> {
-    f.block.stmts.iter().find_map(|s| match s {
-        Stmt::Expr(Expr::Loop(l), _) => Some(l.body.stmts.clone()),
-        _ => None,
-    })
-}
-
-/// Names bound by `let [mut] name [: T] = ..` statements appearing before the
-/// top-level loop.
-fn pre_loop_bindings(f: &ItemFn) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for stmt in &f.block.stmts {
-        match stmt {
-            Stmt::Expr(Expr::Loop(_), _) => break, // reached the loop
-            Stmt::Local(local) => {
-                if let Some(name) = binding_ident(&local.pat) {
-                    names.insert(name);
-                }
-            }
-            _ => {}
-        }
-    }
-    names
-}
-
-/// The identifier bound by a simple `let` pattern (`x` or `x: T`), if it is one.
-fn binding_ident(pat: &Pat) -> Option<String> {
-    match pat {
-        Pat::Ident(pi) => Some(pi.ident.to_string()),
-        Pat::Type(pt) => binding_ident(&pt.pat),
-        _ => None,
-    }
-}
-
-/// Collects the names of variables that are assignment *targets* — both plain
-/// `x = ..` and compound `x += ..` etc. — anywhere it visits.
-#[derive(Default)]
-struct AssignCollector {
-    names: BTreeSet<String>,
-}
-
-impl<'ast> Visit<'ast> for AssignCollector {
-    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
-        if let Some(name) = simple_path_ident(&node.left) {
-            self.names.insert(name);
-        }
-        syn::visit::visit_expr_assign(self, node);
-    }
-
-    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
-        // syn 2.0 models compound assignment (`+=`, `-=`, …) as a binary op.
-        if is_assign_op(&node.op) {
-            if let Some(name) = simple_path_ident(&node.left) {
-                self.names.insert(name);
-            }
-        }
-        syn::visit::visit_expr_binary(self, node);
-    }
-}
-
-/// The single identifier of a bare path expression (`x`), else `None` (skips
-/// `x[i]`, `x.field`, etc. — bit/field assigns to an already-counted register).
-fn simple_path_ident(e: &Expr) -> Option<String> {
-    if let Expr::Path(p) = e {
-        if p.path.segments.len() == 1 && p.qself.is_none() {
-            return Some(p.path.segments[0].ident.to_string());
-        }
-    }
-    None
-}
-
-fn is_assign_op(op: &BinOp) -> bool {
-    matches!(
-        op,
-        BinOp::AddAssign(_)
-            | BinOp::SubAssign(_)
-            | BinOp::MulAssign(_)
-            | BinOp::DivAssign(_)
-            | BinOp::RemAssign(_)
-            | BinOp::BitXorAssign(_)
-            | BinOp::BitAndAssign(_)
-            | BinOp::BitOrAssign(_)
-            | BinOp::ShlAssign(_)
-            | BinOp::ShrAssign(_)
-    )
+    unimplemented!("item 2 follow-on: backward liveness over a CFG built from the shared FIR")
 }
 
 #[cfg(test)]

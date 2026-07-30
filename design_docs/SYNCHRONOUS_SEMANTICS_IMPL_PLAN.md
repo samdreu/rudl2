@@ -7,8 +7,14 @@
 > `paper/threats_to_validity.md` (T1, T6), `paper/00_claims_audit.md` (LEAD #1),
 > `paper/related_work.md` (coroutine prior art).
 >
-> **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **IN PROGRESS**;
-> items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
+> **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **IN PROGRESS** —
+> its *heart* has landed in `copper-analysis` (a real CFG over `syn::ItemFn`; **backward-liveness
+> register inference** generalizing the G6 slice to interior-await registers; the **reachability
+> well-formedness check**, now enforced as a hard spanned compile error in *both* `copper-macros`
+> and `copper-codegen`). Regression: all 38 real sequential modules pass; the check caught one
+> genuine tickless-spin bug (`det_010_awaits`, since fixed). Remaining item-2 work is codegen-side:
+> `control_extract` match-arm duplication, definite-assignment + combinational-loop detection, and
+> the nested-loop basic-block builder. Items 3–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
 > `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
 > `tests/golden_traces.rs`), **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
 > contribution 1 re-scopes; recorded in `paper/`), **G6 DONE** (c2 feasible — new
@@ -180,8 +186,8 @@ existing and green — this is what keeps the claims *evidence-backed* rather th
 
 | Item | Provable claim | Proof artifact (the thing that must be green) | Paper | Status |
 |---|---|---|---|---|
-| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2): `copper-analysis::assert_registers_match_reference_sv` — name-exact for faithful refs (`mac_fsm.sv`), storage-equivalent for independent refs; wired into `tests/common::EquivalenceTest` | C1 | artifact built (G2); claim pending item-2 general liveness |
-| 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression tests that uneven-per-branch-tick designs still pass | C1 | pending item 2 |
+| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2): `copper-analysis::assert_registers_match_reference_sv` — name-exact for faithful refs (`mac_fsm.sv`), storage-equivalent for independent refs. General **backward liveness** now green (`Cfg::registers`; `mac_pipeline` interior-await regs, tuple assigns) | C1 | **general liveness DONE**; reg-set routed into codegen lowering = follow-on |
+| 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression that uneven-per-branch-tick designs pass — `copper-analysis` unit tests (`tickless_fallthrough_rejected`, `uneven_but_both_tick_accepted`, …) + corpus test (`tests/real_examples.rs`: 38 modules pass); enforced in both front-ends; caught the real `det_010_awaits` tickless spin | C1 | **DONE** |
 | 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); specifically un-ignoring `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` | C1/C2 | anchor in place (G1); claim pending item 3 |
 | 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | Trace/transpile/Verilator equivalence vs an **independent hand-written async-FIFO SV** + a **clock-interleave fuzzer** (≥2 relative tick rates ⇒ equal results) — fills the G1 pattern-5 (CDC) gap | C1/C4 | pending item 4 |
 | 5 | The formal semantics (CFG model, liveness rule, reachability, cross-domain interleave independence) are *stated*, construction-independent | `SYNCHRONOUS_SEMANTICS.md` rewrite with the `control_extract.rs:208-210` finding as a worked example | — | pending item 5 |
@@ -216,27 +222,37 @@ resolution" — confirm whether it's a live bug or a superseded note against cur
 Replace shape-restriction soundness with a real analysis. **Under c2 this CFG must be factored as
 the shared analysis both the transpiler and the sim macro consume (see G6).**
 
-- Model each loop as a CFG (`E_comb` vs `E_tick` edges, tick edges labeled by actual clock
-  receiver identity — `is_tick_await`/`is_tick_stmt` in `control_extract.rs:286-293` match by
-  method name only, not receiver; fix as groundwork for item 4's clock tagging too).
-- Well-formedness: deleting all `E_tick` edges must leave the reachable subgraph acyclic (every
-  cycle crosses a tick) — a DFS back-edge check, recursive per nested loop. Real pass (new function
-  in `control_extract.rs`), a hard, spanned compile error.
-- **Replaces** the silent fallthrough at `control_extract.rs:208-210` (currently emits
-  `pc_assign(0, ...)` unconditionally) — a zero-tick branch must be rejected, not given a free
-  phantom cycle.
-- Generalize `as_if_with_tick`/`lower_into`'s branch duplication (`control_extract.rs:168-211`)
-  from `If` only to `Match` arms (N arms instead of 2; same duplication-cost caveat).
-- Generalize register promotion from `shir_lower.rs`'s linear `split_at_ticks`/segment-index
-  bookkeeping (226-257, 395-411) to a real **backward liveness** over the state graph (a var is a
-  register iff every path connecting a def and a use crosses a tick). This is the T1 answer — the
-  synthesizable register set, computed independently of rustc's over-capture.
-- Same CFG also drives **definite-assignment checking** (every combinational output assigned on all
-  paths) and **structural combinational-loop detection** (IR-level dependency graph rejecting a
-  combinational cycle that doesn't pass through a register/memory-latency/synchronizer). Build
-  alongside, not separately.
-- Produce a **per-module FSM report** (states, inferred registers, transitions, output logic) as a
-  byproduct — falls out of the CFG data structures essentially for free.
+- **DONE** — Model each loop as a CFG (`E_comb` vs `E_tick` edges, tick edges labeled by actual
+  clock receiver identity). Landed as `copper-analysis/src/cfg.rs` (`Cfg::build` over `syn::ItemFn`).
+  `tick_clock` preserves the receiver identity that `control_extract.rs`'s method-name-only
+  `is_tick_await` loses — the groundwork item 4's clock tagging needs.
+- **DONE** — Well-formedness: deleting all `E_tick` edges must leave the reachable subgraph acyclic
+  (every cycle crosses a tick) — a DFS back-edge check (`Cfg::check_reachability`). Exposed as
+  `copper_analysis::check_reachability`, now a **hard, spanned compile error** enforced in *both*
+  `copper-macros` (sim) and `copper-codegen` (transpile). Nested loops are folded rejection-soundly
+  in v1 (a tick-containing `for`/`while`/`loop` counts as tick-crossing, so designs that only tick
+  inside a nested loop — `uart_tx`, `rv32i_cpu` — are not falsely rejected).
+- **DONE (guarded)** — The silent fallthrough at `control_extract.rs:208-210` (emits `pc_assign(0)`
+  unconditionally) is now *unreachable for malformed input*: the reachability check runs at the
+  macro/transpile entry, before `control_extract`, so a zero-tick branch is rejected first. (The
+  fallthrough line itself is left in place; deleting it is safe cleanup once `control_extract` is
+  refactored to consume the shared CFG.)
+- **TODO (codegen)** — Generalize `as_if_with_tick`/`lower_into`'s branch duplication
+  (`control_extract.rs:168-211`) from `If` only to `Match` arms. (The *analysis* CFG already expands
+  match arms; this is the separate FSM-*lowering* generalization in codegen.)
+- **DONE** — Generalize register promotion to a real **backward liveness** over the CFG
+  (`Cfg::registers`): a local is a register iff it is *defined inside the loop* and *live across a
+  tick edge*. Generalizes the G6 slice's pre-loop-only criterion to registers born inside the loop
+  and live across an *interior* await (`mac_pipeline`'s pipeline regs) and to tuple-assign targets
+  (`traffic_light`'s `(phase, timer)`). This is the T1 answer — the synthesizable register set,
+  computed independently of rustc's over-capture. (`shir_lower.rs`'s linear `split_at_ticks` is not
+  yet retired; codegen still lowers via it — routing it through this set is the follow-on.)
+- **TODO** — Same CFG also drives **definite-assignment checking** (every combinational output
+  assigned on all paths) and **structural combinational-loop detection**. Build alongside, on the
+  same `Cfg`.
+- **DONE (minimal)** — A **per-module FSM report** falls out of the CFG (`Cfg::fsm_report`: tick
+  boundaries, clock receivers, inferred registers). A richer states/transitions dump can grow from
+  the same `nodes`.
 - **v1 scope:** full multi-await FSM lowering (not narrowed to one-await-per-loop). Match-arm
   generalization ships in v1; **nested-loop CFG construction** (a genuine basic-block builder,
   since AST-duplication doesn't terminate on back-edges) is the one follow-on phase after v1 lands

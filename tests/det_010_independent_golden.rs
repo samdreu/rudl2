@@ -64,6 +64,13 @@ async fn det_010_awaits(
                     clk.tick().await;
                 }
             }
+        } else {
+            // Idle: not in reset and no leading `0` yet (in_i == 1). Wait one
+            // cycle and re-check. Previously this path fell through with *no*
+            // tick — a zero-time combinational spin the reachability check now
+            // rejects; the missing idle tick is the fix. (Mirrors the coding in
+            // examples/sequential/pattern_detector_2.rs — keep both in sync.)
+            clk.tick().await;
         }
     }
 }

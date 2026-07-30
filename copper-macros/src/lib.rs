@@ -778,6 +778,15 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
                     return err.to_compile_error().into();
                 }
             }
+            // c2 (item 2): reachability well-formedness — every path through the
+            // module's top-level loop must reach a `clk.tick().await`. A tickless
+            // path is a zero-time combinational cycle (it would hang the sim); it is
+            // now a hard, spanned compile error rather than an accident silently
+            // masked by the single-trailing-tick construction. Checked on the
+            // pristine ItemFn, before any rewrite.
+            if let Err(err) = copper_analysis::check_reachability(&input_fn) {
+                return err.to_compile_error().into();
+            }
             // c2 (gate G6): the sim macro consumes the SHARED analysis crate — the
             // same one the transpiler consumes — proving a proc-macro can depend on
             // it with no dependency cycle. Read-only for now (item 3 will bake these

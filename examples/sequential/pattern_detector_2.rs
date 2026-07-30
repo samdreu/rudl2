@@ -70,6 +70,13 @@ async fn det_010_awaits (
                     clk.tick().await;
                 }
             }
+        } else {
+            // Idle: not in reset and no leading `0` yet (in_i == 1). Wait one
+            // cycle and re-check. Previously this path fell through with *no*
+            // tick — a zero-time combinational spin (feeding `1` while idle would
+            // hang the sim). The reachability well-formedness check flags exactly
+            // this; the missing idle tick is the fix.
+            clk.tick().await;
         }
     }
 }
