@@ -62,12 +62,22 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
 
 ## Architecture
 
-### The four crates
+### The five crates
 
 - **`copper-core`** — the type system and every IR in the pipeline. Hardware
   types (`Logic`, `Bits<N>`, `Clock<D>`, ports `In`/`Out`/`RegOut`, `Memory`),
   the phantom clock-domain machinery (`cdc.rs`), and the IR structs
-  (`frontend_ir`, `chir`, `shir`, `vlir`). No proc-macro or codegen logic.
+  (`frontend_ir`, `chir`, `shir`, `vlir`). No proc-macro or codegen logic. A leaf
+  crate (no workspace dependencies) — which is what lets both the proc-macro and
+  the transpiler share analysis over it without a dependency cycle.
+- **`copper-analysis`** — the shared compile-time control/liveness analysis (the
+  c2 architecture; depends only on `copper-core` + `syn`). Keys off `syn::ItemFn`
+  — the representation *both* front-ends already hold — so the sim macro and the
+  transpiler consume **one** authoritative analysis (register inference, and in
+  progress the reachability CFG + FSM report) rather than two that must agree. See
+  `design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` (item 2). Currently
+  `infer_registers` (control-flow register inference) + the G2 structural
+  reg-match helpers; consumed by both `copper-macros` and `copper-codegen`.
 - **`copper-macros`** — the `#[hardware(sequential|combinational|synchronizer)]`
   proc macro. Validates the signature, enforces CDC rules at compile time,
   injects per-read freshness guards, wraps combinational bodies in the
@@ -76,7 +86,9 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
 - **`copper-codegen`** — the transpiler and the `copper-transpile` CLI
   (`bin/`, `main.rs`). Owns the lowering pipeline and Verilog emission.
 - **`copper-sim`** — the async simulation executor and the Verilator
-  equivalence verifier (`verification.rs`, `verify_with_verilator`).
+  equivalence verifier (`verification.rs`, `verify_with_verilator`). The executor
+  visits tasks in a configurable `PollOrder` (default `Insertion`; `Reversed` /
+  `Seeded` exist for the poll-order-independence fuzzer).
 
 The **root `copper` crate** (`src/`) is the hardware standard library —
 reusable `#[hardware]` modules like `sync_2ff` that must live *downstream* of
