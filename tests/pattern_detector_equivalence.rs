@@ -39,7 +39,13 @@ fn next_state(state: u8, rstn: bool, bit: bool) -> u8 {
 
 #[test]
 fn pattern_detector_sim_matches_transpiled_verilog() {
-    let mut eq = EquivalenceTest::new("det_110101", DUT_SRC);
+    // Also G2 structural reg-match vs the independent chipverify.com reference:
+    // its flip-flop is `cur_state` (output `out` is combinational), a different
+    // name from Copper's `state` — StorageEquivalent (count = 1).
+    let mut eq = EquivalenceTest::new("det_110101", DUT_SRC).with_reference_registers(
+        "examples/sequential/sv/pattern_detector.sv",
+        copper_analysis::RegMatch::StorageEquivalent,
+    );
 
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();

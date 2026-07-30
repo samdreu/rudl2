@@ -36,7 +36,15 @@ fn next_lfsr(state: u32, yumi: bool) -> u32 {
 
 #[test]
 fn lfsr_sim_matches_transpiled_verilog() {
-    let mut eq = EquivalenceTest::new("lfsr", DUT_SRC);
+    // Also G2 structural reg-match vs the independent BaseJump STL reference: its
+    // flip-flop is `o_r` (`xor_mask`/`o_n` are combinational `assign`s), vs Copper's
+    // `state` — StorageEquivalent (count = 1). Directly exercises constant
+    // exclusion: `xor_mask` is a pre-loop constant, correctly NOT a register on
+    // either side.
+    let mut eq = EquivalenceTest::new("lfsr", DUT_SRC).with_reference_registers(
+        "examples/sequential/sv/lfsr.sv",
+        copper_analysis::RegMatch::StorageEquivalent,
+    );
 
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();

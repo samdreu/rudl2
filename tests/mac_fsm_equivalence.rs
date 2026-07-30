@@ -23,7 +23,12 @@ const DUT_SRC: &str = include_str!("fixtures/mac_fsm_dut.rs");
 // Verilator. See design_docs/REGISTERED_OUTPUTS.md.
 #[test]
 fn mac_fsm_sim_matches_transpiled_verilog() {
-    let mut eq = EquivalenceTest::new("mac_fsm", DUT_SRC);
+    // Also G2 structural reg-match: mac_fsm.sv is a faithful translation mirroring
+    // the design's names, so NameExact — {stage, product, c_latch, result}.
+    let mut eq = EquivalenceTest::new("mac_fsm", DUT_SRC).with_reference_registers(
+        "tests/fixtures/timing_probe_sv/mac_fsm.sv",
+        copper_analysis::RegMatch::NameExact,
+    );
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
     let (a_drv, a_in) = wire::<Bits<8>, MainClk>(Bits::zero());

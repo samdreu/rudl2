@@ -15,6 +15,12 @@ copper-sim = { path = "copper-sim" }
 env_logger = "0.11.8"
 log = "0.4.29"
 
+[dev-dependencies]
+# The shared control/liveness analysis — the equivalence harness uses it to
+# structurally reg-match inferred registers against independent hand-written SV
+# (G2 of design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md).
+copper-analysis = { path = "copper-analysis" }
+
 [[example]]
 name = "one_bit_comparator"
 path = "examples/combinational/one_bit_comparator.rs"

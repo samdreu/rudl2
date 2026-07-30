@@ -124,10 +124,11 @@ recorded — DONE**).
     Copper's `state`: names cannot match, count does).
   **Capability built & exercised** in `copper-analysis`: `reference_sv_registers`, `RegMatch`, and
   `assert_registers_match_reference_sv` (unit-tested on `mac_fsm` name-exact + `det_010`
-  storage-equivalent). **Hook for item 2:** `tests/common::EquivalenceTest` calls
-  `assert_registers_match_reference_sv` once item 2 wires inference into the transpile pipeline
-  (today it asserts behavior + Verilator, not the reg set). This is the artifact behind item 2's G5
-  claim.
+  storage-equivalent). **Wired for item 2 (DONE):** `tests/common::EquivalenceTest` now exposes
+  `with_reference_registers(reference_sv, mode)` and, in `finish`, calls
+  `copper_analysis::assert_source_registers_match_reference_sv` — so the equivalence suite asserts
+  the inferred reg set against the independent reference alongside behavior + Verilator, for
+  `mac_fsm`/`det_010`/`det_110101`/`lfsr`. This is the artifact behind item 2's G5 claim.
 - **G3 — Guardrails land before the refactor (correctness). DONE.** Both artifacts landed: (1) a
   **poll-order fuzzer** — `HardwareExecutor` gained a test-only `PollOrder` knob
   (`Insertion` default = unchanged production behavior; `Reversed`; `Seeded(u64)` reshuffles every
@@ -186,7 +187,7 @@ existing and green — this is what keeps the claims *evidence-backed* rather th
 
 | Item | Provable claim | Proof artifact (the thing that must be green) | Paper | Status |
 |---|---|---|---|---|
-| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2): `copper-analysis::assert_registers_match_reference_sv` — name-exact for faithful refs (`mac_fsm.sv`), storage-equivalent for independent refs. General **backward liveness** now green (`Cfg::registers`; `mac_pipeline` interior-await regs, tuple assigns) | C1 | **general liveness DONE**; reg-set routed into codegen lowering = follow-on |
+| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2), now **wired into `tests/common::EquivalenceTest`** (`with_reference_registers`) and running in the equivalence suite for 4 independent references: `mac_fsm` (name-exact vs `mac_fsm.sv`), `det_010`/`det_110101`/`lfsr` (storage-equivalent vs `pattern_detector_010.sv`/`pattern_detector.sv`/`lfsr.sv`). General **backward liveness** green (`Cfg::registers`; `mac_pipeline` interior-await regs, tuple assigns) | C1 | **DONE** (proof green in-harness); reg-set *routed into codegen lowering* = follow-on |
 | 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression that uneven-per-branch-tick designs pass — `copper-analysis` unit tests (`tickless_fallthrough_rejected`, `uneven_but_both_tick_accepted`, …) + corpus test (`tests/real_examples.rs`: 38 modules pass); enforced in both front-ends; caught the real `det_010_awaits` tickless spin | C1 | **DONE** |
 | 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); specifically un-ignoring `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` | C1/C2 | anchor in place (G1); claim pending item 3 |
 | 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | Trace/transpile/Verilator equivalence vs an **independent hand-written async-FIFO SV** + a **clock-interleave fuzzer** (≥2 relative tick rates ⇒ equal results) — fills the G1 pattern-5 (CDC) gap | C1/C4 | pending item 4 |

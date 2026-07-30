@@ -29,7 +29,13 @@ fn next(state: u8, rstn: bool, input: bool) -> u8 {
 // timing. See design_docs/ATOMIC_INSTANT_EXECUTOR.md.
 #[test]
 fn det_010_sim_matches_transpiled_verilog() {
-    let mut eq = EquivalenceTest::new("det_010", DUT_SRC);
+    // Also G2 structural reg-match: pattern_detector_010.sv is a genuinely
+    // independent two-process Moore machine whose flip-flop is `cur_state` (vs
+    // Copper's `state`), so names can't match — StorageEquivalent (count = 1).
+    let mut eq = EquivalenceTest::new("det_010", DUT_SRC).with_reference_registers(
+        "examples/sequential/sv/pattern_detector_010.sv",
+        copper_analysis::RegMatch::StorageEquivalent,
+    );
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
     let (rstn_drv, rstn_in) = wire::<Logic, MainClk>(Logic::One);

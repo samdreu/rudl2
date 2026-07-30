@@ -104,16 +104,35 @@ pub enum RegMatch {
     StorageEquivalent,
 }
 
-/// Assert that the register set inferred from `dut_src` matches the sequential
-/// registers of reference SystemVerilog `sv` under `mode`. The reusable G2
-/// harness capability; `tests/common` will call this once item 2 wires inference
-/// into the transpile pipeline.
+/// Assert that the register set inferred from `dut_src` (a **single** hardware fn)
+/// matches the sequential registers of reference SystemVerilog `sv` under `mode`.
+/// Convenience for hand-written single-fn snippets (the unit tests).
 pub fn assert_registers_match_reference_sv(dut_src: &str, sv: &str, mode: RegMatch) {
-    let inferred: BTreeSet<String> = infer_registers(
-        &syn::parse_str(dut_src).expect("DUT source parses as a single hardware fn"),
-    )
-    .into_iter()
-    .collect();
+    let f: ItemFn = syn::parse_str(dut_src).expect("DUT source parses as a single hardware fn");
+    assert_fn_registers_match_reference_sv(&f, sv, mode);
+}
+
+/// Assert the registers of a hardware **module located in a source file** match a
+/// reference SV under `mode`. This is the G2 harness entry point:
+/// `tests/common::EquivalenceTest` calls it with the fixture source (which carries
+/// enums/`use`s alongside the fn) and an *independent hand-written* reference SV,
+/// making register-inference correctness a checked part of the equivalence suite.
+///
+/// `module` selects the `#[hardware]` fn by name; `None` requires the file to hold
+/// exactly one.
+pub fn assert_source_registers_match_reference_sv(
+    src: &str,
+    module: Option<&str>,
+    sv: &str,
+    mode: RegMatch,
+) {
+    let f = find_hardware_fn(src, module);
+    assert_fn_registers_match_reference_sv(&f, sv, mode);
+}
+
+/// The [`ItemFn`]-level assert both convenience wrappers delegate to.
+pub fn assert_fn_registers_match_reference_sv(f: &ItemFn, sv: &str, mode: RegMatch) {
+    let inferred: BTreeSet<String> = infer_registers(f).into_iter().collect();
     let reference = reference_sv_registers(sv);
     match mode {
         RegMatch::NameExact => assert_eq!(
@@ -129,6 +148,42 @@ pub fn assert_registers_match_reference_sv(dut_src: &str, sv: &str, mode: RegMat
             reference.len()
         ),
     }
+}
+
+/// Locate a `#[hardware(...)]` function in a source file — by `module` name, or
+/// the sole one when `module` is `None`. Panics with a clear message otherwise
+/// (this is a test-harness helper, so a missing/ambiguous module is a test bug).
+fn find_hardware_fn(src: &str, module: Option<&str>) -> ItemFn {
+    let file = syn::parse_file(src).expect("DUT source parses as a Rust file");
+    let hw: Vec<&syn::ItemFn> = file
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            syn::Item::Fn(f) if is_hardware_fn(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    match module {
+        Some(name) => hw
+            .into_iter()
+            .find(|f| f.sig.ident == name)
+            .unwrap_or_else(|| panic!("no #[hardware] fn named `{name}` in source"))
+            .clone(),
+        None => match hw.as_slice() {
+            [only] => (*only).clone(),
+            other => panic!(
+                "expected exactly one #[hardware] fn (found {}); pass a module name",
+                other.len()
+            ),
+        },
+    }
+}
+
+/// Whether `f` carries a `#[hardware(...)]` attribute.
+fn is_hardware_fn(f: &ItemFn) -> bool {
+    f.attrs
+        .iter()
+        .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "hardware"))
 }
 
 /// Drop `//` line comments and `[..]` width specs so the register extractors see

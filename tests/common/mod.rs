@@ -54,6 +54,13 @@ pub struct EquivalenceTest {
     test: HardwareTest,
     expected: Vec<CycleData>,
     cycle: usize,
+    /// The DUT source + selected module, retained so `finish` can run the G2
+    /// structural register-inference check (`None` for `sim_only`, which has no src).
+    src: Option<String>,
+    module: Option<String>,
+    /// A G2 reg-match request set by `with_reference_registers`: the path to an
+    /// *independent hand-written* reference SV and the match mode.
+    reg_check: Option<(String, copper_analysis::RegMatch)>,
 }
 
 impl EquivalenceTest {
@@ -72,7 +79,25 @@ impl EquivalenceTest {
             ),
             expected: Vec::new(),
             cycle: 0,
+            src: Some(src.to_string()),
+            module: module.map(str::to_string),
+            reg_check: None,
         }
+    }
+
+    /// Also structurally reg-match the DUT's **inferred** register set (from the
+    /// shared control/liveness analysis) against an *independent hand-written*
+    /// reference SV's sequential flip-flops (G2 of the impl plan). `mode` is
+    /// `NameExact` for a faithful translation that mirrors the design's names,
+    /// `StorageEquivalent` (count) for a genuinely independent reference. Asserted
+    /// in `finish`; the reference must NOT be the transpiler's own output (circular).
+    pub fn with_reference_registers(
+        mut self,
+        reference_sv_path: &str,
+        mode: copper_analysis::RegMatch,
+    ) -> Self {
+        self.reg_check = Some((reference_sv_path.to_string(), mode));
+        self
     }
 
     /// Override the transpiled module's SystemVerilog parameters for the Verilator
@@ -94,6 +119,9 @@ impl EquivalenceTest {
             test: HardwareTest::new(module_name),
             expected: Vec::new(),
             cycle: 0,
+            src: None,
+            module: None,
+            reg_check: None,
         }
     }
 
@@ -112,9 +140,25 @@ impl EquivalenceTest {
         self.cycle += 1;
     }
 
-    /// Assert the simulator matched the reference model, and that the generated
-    /// SystemVerilog matches the simulator under Verilator.
+    /// Assert the simulator matched the reference model, that the generated
+    /// SystemVerilog matches the simulator under Verilator, and — if
+    /// `with_reference_registers` was set — that the inferred register set
+    /// structurally matches the independent reference SV (G2).
     pub fn finish(self) {
+        if let Some((ref_sv_path, mode)) = &self.reg_check {
+            let src = self
+                .src
+                .as_deref()
+                .expect("with_reference_registers requires a DUT source (not sim_only)");
+            let sv = std::fs::read_to_string(ref_sv_path)
+                .unwrap_or_else(|e| panic!("read reference SV {ref_sv_path}: {e}"));
+            copper_analysis::assert_source_registers_match_reference_sv(
+                src,
+                self.module.as_deref(),
+                &sv,
+                *mode,
+            );
+        }
         let expected = SimulationTrace::from_cycles(self.expected);
         self.test.finish_with_expected(&expected).assert_passed();
     }
