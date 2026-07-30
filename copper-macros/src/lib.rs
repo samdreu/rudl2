@@ -807,6 +807,15 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             quote! { #f }.into()
         }
         HardwareMode::Combinational => {
+            // c2 (item 2): definite assignment — a combinational `Out` must be
+            // driven on all control paths or none; a partial (conditional) write
+            // infers a latch. The transpiler already rejects this late
+            // (`check_no_latches`); enforcing it here means the *sim* rejects it at
+            // compile time too, from the same shared analysis. Checked on the
+            // pristine fn, before the body is wrapped in the delta loop.
+            if let Err(err) = copper_analysis::check_definite_assignment(&input_fn) {
+                return err.to_compile_error().into();
+            }
             let mut f = wrap_combinational(input_fn);
             wrap_in_module(&mut f);
             quote! { #f }.into()

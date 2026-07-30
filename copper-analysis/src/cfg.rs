@@ -65,8 +65,26 @@ struct Node {
     tick_clock: Option<String>,
     /// Successors and how control reaches them.
     succs: Vec<(usize, EdgeKind)>,
+    /// Combinational output ports (`Out<…>`, not `RegOut`) driven here via
+    /// `port.write(…)` — the def/use of *ports* the definite-assignment check keys on.
+    writes: BTreeSet<String>,
     /// Source span, for spanned diagnostics.
     span: Span,
+}
+
+impl Node {
+    /// An empty node at `span`; combine with struct-update (`..Node::empty(span)`).
+    fn empty(span: Span) -> Node {
+        Node {
+            defs: BTreeSet::new(),
+            uses: BTreeSet::new(),
+            is_tick: false,
+            tick_clock: None,
+            succs: Vec::new(),
+            writes: BTreeSet::new(),
+            span,
+        }
+    }
 }
 
 /// The control-flow graph of a module's top-level `loop`.
@@ -80,6 +98,15 @@ pub struct Cfg {
     /// `xor_mask`) are excluded here, which is what stops them from being counted
     /// as registers even though they are live across ticks.
     defined_in_loop: BTreeSet<String>,
+    /// The module's **combinational** output ports (`Out<…>`, excluding `RegOut`),
+    /// from the signature — the ports the definite-assignment check requires to be
+    /// driven on all paths (or none) per cycle.
+    comb_outputs: BTreeSet<String>,
+    /// The exit sink for a **combinational** body (loop-free): the single point all
+    /// paths reach, where definite-assignment is checked. `None` for a sequential
+    /// loop (definite-assignment does not apply — a sequential `Out` legitimately
+    /// *holds* when unwritten, i.e. is an enabled register).
+    exit: Option<usize>,
 }
 
 impl Cfg {
@@ -94,17 +121,15 @@ impl Cfg {
             d.visit_stmt(stmt);
         }
 
-        let mut b = Builder { nodes: Vec::new() };
+        let comb_outputs = combinational_outputs(f);
+
+        let mut b = Builder {
+            nodes: Vec::new(),
+            outputs: comb_outputs.clone(),
+        };
         // The head is node 0: an empty node whose successor is the first body node.
         // Every back-edge (trailing tick, fall-through) targets it.
-        let head = b.new_node(Node {
-            defs: BTreeSet::new(),
-            uses: BTreeSet::new(),
-            is_tick: false,
-            tick_clock: None,
-            succs: Vec::new(),
-            span: loop_span,
-        });
+        let head = b.new_node(Node::empty(loop_span));
         let body_entry = b.build_block(&loop_body, head);
         b.nodes[head].succs.push((body_entry, EdgeKind::Comb));
 
@@ -112,7 +137,33 @@ impl Cfg {
             nodes: b.nodes,
             head,
             defined_in_loop,
+            comb_outputs,
+            exit: None,
         })
+    }
+
+    /// Build the CFG of a **combinational** module body (`#[hardware(combinational)]`
+    /// — a loop-free `fn` whose outputs are pure combinational functions of its
+    /// inputs). Unlike a sequential module there is no clock, no tick, and no state
+    /// to hold, so an output left unassigned on some control path is a genuine
+    /// **latch** — which [`check_definite_assignment`](Self::check_definite_assignment)
+    /// rejects. Structure: `head → body → exit` sink, no back-edge.
+    pub fn build_combinational(f: &ItemFn) -> Cfg {
+        let comb_outputs = combinational_outputs(f);
+        let mut b = Builder {
+            nodes: Vec::new(),
+            outputs: comb_outputs.clone(),
+        };
+        let span = f.sig.ident.span();
+        let exit = b.new_node(Node::empty(span));
+        let head = b.build_block(&f.block.stmts, exit);
+        Cfg {
+            nodes: b.nodes,
+            head,
+            defined_in_loop: BTreeSet::new(),
+            comb_outputs,
+            exit: Some(exit),
+        }
     }
 
     /// The inferred **register set** — sorted for stable structural comparison.
@@ -192,6 +243,109 @@ impl Cfg {
         Ok(())
     }
 
+    /// Enforce **definite assignment** for a **combinational** module's outputs: a
+    /// combinational `Out` port must be driven on *all* control paths or *none* —
+    /// never some-but-not-all. A partial (conditional) write in a combinational body
+    /// infers a **latch** (there is no clock to register it and no prior value to
+    /// legitimately hold). This mirrors, at the syntax level and in the sim macro,
+    /// the transpiler's own late `check_no_latches` (`vlir_lower.rs`, `any − all`) —
+    /// so the sim rejects the latch at compile time instead of only at transpile.
+    ///
+    /// **Only applies to combinational bodies** (built via [`build_combinational`],
+    /// so `exit` is `Some`). For a sequential loop (`exit == None`) this is a no-op:
+    /// a sequential `Out` legitimately holds when unwritten (an *enabled register* —
+    /// verified `sim ≡ BaseJump` on `bsg_dff_en`), so "assign on all paths" must not
+    /// be imposed there.
+    ///
+    /// Criterion (`MAY − MUST` at the exit): an output written on some path to the
+    /// body's exit but not all was partially assigned. Folded nested loops are
+    /// treated as driving every output (opaque, never a *false* latch). Outputs
+    /// *never* written are not flagged (they may be driven by a submodule).
+    ///
+    /// [`build_combinational`]: Self::build_combinational
+    pub fn check_definite_assignment(&self) -> Result<(), (Span, String)> {
+        let Some(exit) = self.exit else {
+            return Ok(()); // sequential: `Out` holds when unwritten — not a latch.
+        };
+        if self.comb_outputs.is_empty() {
+            return Ok(());
+        }
+        let n = self.nodes.len();
+        let mut preds: Vec<Vec<(usize, EdgeKind)>> = vec![Vec::new(); n];
+        for (i, node) in self.nodes.iter().enumerate() {
+            for &(s, kind) in &node.succs {
+                preds[s].push((i, kind));
+            }
+        }
+
+        // MAY-write (union; a tick edge contributes nothing — new cycle).
+        let mut may: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                let mut out = BTreeSet::new();
+                for &(p, kind) in &preds[i] {
+                    if kind != EdgeKind::Tick {
+                        out.extend(may[p].iter().cloned());
+                    }
+                }
+                out.extend(self.nodes[i].writes.iter().cloned());
+                if out != may[i] {
+                    may[i] = out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // MUST-write (intersection; a tick edge contributes ∅; init to TOP).
+        let mut must: Vec<BTreeSet<String>> = vec![self.comb_outputs.clone(); n];
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                let mut acc: Option<BTreeSet<String>> = None;
+                for &(p, kind) in &preds[i] {
+                    let contrib = if kind == EdgeKind::Tick {
+                        BTreeSet::new()
+                    } else {
+                        must[p].clone()
+                    };
+                    acc = Some(match acc {
+                        None => contrib,
+                        Some(a) => a.intersection(&contrib).cloned().collect(),
+                    });
+                }
+                let mut out = acc.unwrap_or_default();
+                out.extend(self.nodes[i].writes.iter().cloned());
+                if out != must[i] {
+                    must[i] = out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // At the body's exit, an output written on some path but not all was
+        // partially assigned — a latch. Report deterministically (sorted BTreeSet).
+        for o in &self.comb_outputs {
+            if may[exit].contains(o) && !must[exit].contains(o) {
+                return Err((
+                    self.nodes[exit].span,
+                    format!(
+                        "would infer a latch: combinational output `{o}` is assigned on some \
+                         control paths but not all. Assign `{o}` on every path (add the missing \
+                         branch / `_` arm)"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Backward-liveness fixpoint. Returns `live_out[i]` for every node. Edge kind is
     /// irrelevant to the propagation — a value used after a tick is still live
     /// *across* it, which is exactly what register inference keys on.
@@ -254,6 +408,9 @@ impl Cfg {
 
 struct Builder {
     nodes: Vec<Node>,
+    /// The module's combinational output ports, so terminal `port.write(…)` nodes
+    /// can be tagged with the port they drive (definite-assignment).
+    outputs: BTreeSet<String>,
 }
 
 impl Builder {
@@ -299,12 +456,11 @@ impl Builder {
     fn build_expr(&mut self, expr: &Expr, next: usize) -> usize {
         if let Some(clock) = tick_clock(expr) {
             return self.new_node(Node {
-                defs: BTreeSet::new(),
                 uses: BTreeSet::from([clock.clone()]),
                 is_tick: true,
                 tick_clock: Some(clock),
                 succs: vec![(next, EdgeKind::Tick)],
-                span: expr.span(),
+                ..Node::empty(expr.span())
             });
         }
         match expr {
@@ -317,12 +473,9 @@ impl Builder {
                 let mut uses = BTreeSet::new();
                 collect_reads(&ei.cond, &mut uses);
                 self.new_node(Node {
-                    defs: BTreeSet::new(),
                     uses,
-                    is_tick: false,
-                    tick_clock: None,
                     succs: vec![(then_entry, EdgeKind::Comb), (else_entry, EdgeKind::Comb)],
-                    span: ei.span(),
+                    ..Node::empty(ei.span())
                 })
             }
             Expr::Match(em) => {
@@ -344,10 +497,8 @@ impl Builder {
                         self.new_node(Node {
                             defs: arm_defs,
                             uses: arm_uses,
-                            is_tick: false,
-                            tick_clock: None,
                             succs: vec![(body_entry, EdgeKind::Comb)],
-                            span: arm.pat.span(),
+                            ..Node::empty(arm.pat.span())
                         })
                     };
                     succs.push((entry, EdgeKind::Comb));
@@ -355,12 +506,9 @@ impl Builder {
                 let mut uses = BTreeSet::new();
                 collect_reads(&em.expr, &mut uses);
                 self.new_node(Node {
-                    defs: BTreeSet::new(),
                     uses,
-                    is_tick: false,
-                    tick_clock: None,
                     succs,
-                    span: em.span(),
+                    ..Node::empty(em.span())
                 })
             }
             // A bare block is just its statements.
@@ -386,19 +534,31 @@ impl Builder {
                     None => (false, EdgeKind::Comb),
                 };
                 self.new_node(Node {
-                    defs: BTreeSet::new(),
                     uses,
                     is_tick,
                     tick_clock: clock,
                     succs: vec![(next, kind)],
-                    span: expr.span(),
+                    // Opaque region: conservatively assume it drives every output
+                    // (so the definite-assignment check never *false*-flags a partial
+                    // write around a folded loop — it under-reports here, by design).
+                    writes: self.outputs.clone(),
+                    ..Node::empty(expr.span())
                 })
             }
             // Assignment / compound-assign / method call / `port.write(..)` / other
             // terminal expression: one node, combinational edge to the continuation.
             _ => {
                 let (defs, uses) = terminal_defs_uses(expr);
-                self.terminal(defs, uses, expr.span(), next)
+                let writes = output_write_target(expr, &self.outputs)
+                    .into_iter()
+                    .collect();
+                self.new_node(Node {
+                    defs,
+                    uses,
+                    succs: vec![(next, EdgeKind::Comb)],
+                    writes,
+                    ..Node::empty(expr.span())
+                })
             }
         }
     }
@@ -413,10 +573,8 @@ impl Builder {
         self.new_node(Node {
             defs,
             uses,
-            is_tick: false,
-            tick_clock: None,
             succs: vec![(next, EdgeKind::Comb)],
-            span,
+            ..Node::empty(span)
         })
     }
 }
@@ -568,6 +726,33 @@ fn assign_targets(left: &Expr, out: &mut BTreeSet<String>) {
 }
 
 // ── small syntactic helpers ─────────────────────────────────────────────────
+
+/// The module's **combinational** output ports: signature parameters whose type
+/// is `Out<…>` (exactly — `RegOut` is a registered output and is excluded, as are
+/// `In`/`Clock`/`Memory`). These are the ports the definite-assignment check
+/// requires to be driven on all-or-no paths per cycle.
+fn combinational_outputs(f: &ItemFn) -> BTreeSet<String> {
+    let mut outs = BTreeSet::new();
+    for arg in &f.sig.inputs {
+        if let syn::FnArg::Typed(pt) = arg {
+            if matches!(&*pt.ty, syn::Type::Path(tp)
+                if tp.path.segments.last().is_some_and(|s| s.ident == "Out"))
+            {
+                pat_bindings(&pt.pat, &mut outs);
+            }
+        }
+    }
+    outs
+}
+
+/// `Some(port)` iff `expr` is `<port>.write(…)` for a `port` in `outputs`.
+fn output_write_target(expr: &Expr, outputs: &BTreeSet<String>) -> Option<String> {
+    let Expr::MethodCall(mc) = expr else { return None };
+    if mc.method != "write" {
+        return None;
+    }
+    simple_ident(&mc.receiver).filter(|r| outputs.contains(r))
+}
 
 /// The statement list and span of the module's top-level `loop { … }`, if any.
 fn top_level_loop(f: &ItemFn) -> Option<(Vec<Stmt>, Span)> {
@@ -865,5 +1050,97 @@ mod tests {
             }
         "#;
         assert!(check(src).is_err());
+    }
+
+    // ── definite assignment (combinational modules only) ────────────────────
+
+    fn da(src: &str) -> Result<(), String> {
+        Cfg::build_combinational(&parse(src))
+            .check_definite_assignment()
+            .map_err(|(_, m)| m)
+    }
+
+    /// A combinational output assigned on all paths (both `if` arms) is fine.
+    #[test]
+    fn comb_output_all_paths_ok() {
+        let src = r#"
+            #[hardware(combinational)]
+            fn m(sel: In<Logic, ()>, o: Out<Logic, ()>) {
+                if sel.read() == Logic::One { o.write(Logic::One); }
+                else { o.write(Logic::Zero); }
+            }
+        "#;
+        assert!(da(src).is_ok());
+    }
+
+    /// A straight-line unconditional write is fine.
+    #[test]
+    fn comb_output_unconditional_ok() {
+        let src = r#"
+            #[hardware(combinational)]
+            fn m(a: In<Logic, ()>, b: In<Logic, ()>, o: Out<Logic, ()>) {
+                let p = a.read() & b.read();
+                o.write(p);
+            }
+        "#;
+        assert!(da(src).is_ok());
+    }
+
+    /// A combinational output written in only one branch (no else) infers a latch.
+    #[test]
+    fn comb_output_partial_is_latch() {
+        let src = r#"
+            #[hardware(combinational)]
+            fn m(sel: In<Logic, ()>, o: Out<Logic, ()>) {
+                if sel.read() == Logic::One { o.write(Logic::One); }
+            }
+        "#;
+        assert!(da(src).is_err(), "a partial combinational output must be flagged as a latch");
+    }
+
+    /// A `match` missing a write on one arm infers a latch.
+    #[test]
+    fn comb_output_partial_match_is_latch() {
+        let src = r#"
+            #[hardware(combinational)]
+            fn m(sel: In<Bits<2>, ()>, o: Out<Logic, ()>) {
+                match sel.read() {
+                    s if s == Bits::from_u32(0) => { o.write(Logic::One); }
+                    _ => {}
+                }
+            }
+        "#;
+        assert!(da(src).is_err());
+    }
+
+    /// An output never written is not a latch here (it may be driven by a
+    /// submodule instantiation) — only a *partial* write is flagged.
+    #[test]
+    fn comb_output_never_written_not_flagged() {
+        let src = r#"
+            #[hardware(combinational)]
+            fn m(a: In<Logic, ()>, o: Out<Logic, ()>) {
+                let _ = a.read();
+            }
+        "#;
+        assert!(da(src).is_ok());
+    }
+
+    /// A sequential `Out` written conditionally is an enabled register (holds),
+    /// NOT a latch — definite-assignment must not fire on sequential modules
+    /// (verified `sim ≡ BaseJump` on `bsg_dff_en`).
+    #[test]
+    fn sequential_conditional_output_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn dff_en(clk: Clock<C>, d: In<Bits<8>, C>, en: In<Logic, C>, q: Out<Bits<8>, C>) {
+                loop {
+                    clk.tick().await;
+                    if en.read() == Logic::One { q.write(d.read()); }
+                }
+            }
+        "#;
+        // The public router skips sequential modules entirely.
+        assert!(crate::check_definite_assignment(&parse(src)).is_ok());
     }
 }

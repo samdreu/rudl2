@@ -66,6 +66,28 @@ pub fn check_reachability(f: &ItemFn) -> Result<(), syn::Error> {
     }
 }
 
+/// Enforce **definite assignment** for a **combinational** module (`#[hardware(
+/// combinational)]`): every `Out` port must be driven on all control paths or none
+/// — a some-but-not-all (conditional) assignment infers a **latch**. Rejected with
+/// a spanned [`syn::Error`]; the fix is to drive it on every path (add the missing
+/// branch / `_` arm). This is the shared (c2) version of the transpiler's own
+/// `check_no_latches`, so the sim macro rejects the latch at compile time too — not
+/// only at transpile. See [`Cfg::check_definite_assignment`].
+///
+/// A **sequential** module (has a top-level clocked loop) is *not* checked: a
+/// sequential `Out` legitimately holds when unwritten (an enabled register, verified
+/// `sim ≡ BaseJump` on `bsg_dff_en`), so imposing "assign on all paths" there would
+/// reject valid hardware.
+pub fn check_definite_assignment(f: &ItemFn) -> Result<(), syn::Error> {
+    // A top-level loop ⇒ sequential ⇒ the enabled-register idiom is valid; skip.
+    if Cfg::build(f).is_some() {
+        return Ok(());
+    }
+    Cfg::build_combinational(f)
+        .check_definite_assignment()
+        .map_err(|(span, msg)| syn::Error::new(span, msg))
+}
+
 /// The **sequential register set** of an independent hand-written reference
 /// SystemVerilog module — the reference side of G2's structural
 /// register-inference correctness check

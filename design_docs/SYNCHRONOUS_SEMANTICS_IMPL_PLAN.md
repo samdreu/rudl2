@@ -248,9 +248,18 @@ the shared analysis both the transpiler and the sim macro consume (see G6).**
   (`traffic_light`'s `(phase, timer)`). This is the T1 answer — the synthesizable register set,
   computed independently of rustc's over-capture. (`shir_lower.rs`'s linear `split_at_ticks` is not
   yet retired; codegen still lowers via it — routing it through this set is the follow-on.)
-- **TODO** — Same CFG also drives **definite-assignment checking** (every combinational output
-  assigned on all paths) and **structural combinational-loop detection**. Build alongside, on the
-  same `Cfg`.
+- **definite-assignment DONE (re-scoped); comb-loop TODO.** Building this surfaced a semantics
+  correction (verified, not argued): a **sequential** `Out` legitimately *holds* when unwritten — a
+  partial/conditional `.write()` is an **enabled register**, confirmed `sim ≡ BaseJump` on
+  `bsg_dff_en`. So "assign on all paths" is **not** valid for sequential modules (it would reject
+  `bsg_dff_en`). It *is* valid for **`#[hardware(combinational)]`** modules (no clock/state to hold
+  ⇒ a partial output is a real latch). Shipped there: `Cfg::build_combinational` +
+  `Cfg::check_definite_assignment` (`MAY − MUST` at the body exit), exposed as
+  `copper_analysis::check_definite_assignment` and **enforced in the macro's combinational arm** —
+  so the *sim* now rejects the latch at compile time, matching the transpiler's own late
+  `vlir_lower::check_no_latches` (`any − all`). Corpus: all 11 real combinational modules pass; a
+  constructed partial one is rejected with "would infer a latch". **Structural combinational-loop
+  detection is still TODO** (a different graph — intra-cycle signal dataflow, not the control CFG).
 - **DONE (minimal)** — A **per-module FSM report** falls out of the CFG (`Cfg::fsm_report`: tick
   boundaries, clock receivers, inferred registers). A richer states/transitions dump can grow from
   the same `nodes`.
