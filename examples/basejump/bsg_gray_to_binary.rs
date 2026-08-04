@@ -35,7 +35,8 @@ fn main() {
     let (g_drv, g_in) = wire::<Bits<WIDTH>, ()>(Bits::zero());
     let (b_drv, b_obs) = wire::<Bits<WIDTH>, ()>(Bits::zero());
     let dh = b_drv.dirty_handle();
-    exec.spawn_wired(bsg_gray_to_binary(g_in, b_drv), vec![dh]);
+    let reads = vec![g_in.wire_id()];
+    exec.spawn_wired(bsg_gray_to_binary(g_in, b_drv), vec![dh], reads);
 
     let mut test = HardwareTest::new("bsg_gray_to_binary")
         .with_verilog("examples/basejump/sv/bsg_gray_to_binary.sv")

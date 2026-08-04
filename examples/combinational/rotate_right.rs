@@ -47,7 +47,8 @@ fn main() {
     let (o_out, o_obs) = wire::<Bits<N>, ()>(Bits::zero());
 
     let dh = o_out.dirty_handle();
-    exec.spawn_wired(rotate_right::<N, N_LOG>(data_in, rot_in, o_out), vec![dh]);
+    let reads = vec![data_in.wire_id(), rot_in.wire_id()];
+    exec.spawn_wired(rotate_right::<N, N_LOG>(data_in, rot_in, o_out), vec![dh], reads);
 
     let mut test = HardwareTest::new("bsg_rotate_right")
         .with_verilog("examples/combinational/sv/rotate_right.sv")

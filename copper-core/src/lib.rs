@@ -29,6 +29,7 @@ pub use frontend_ir::{
 };
 pub use types::{Bits, Clock, ClockDomain, HasUnknown, Logic};
 pub use memory::{Memory, ReadMode, WriteMode};
+pub use port::{WireId, WireKind};
 
 // pub mod types;
 // pub mod verification;

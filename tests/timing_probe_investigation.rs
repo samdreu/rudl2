@@ -90,7 +90,8 @@ fn run_dff(sv: &str) -> bool {
     let (d_drv, d_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (q_drv, q_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = q_drv.dirty_handle();
-    exec.spawn_wired(dff(clk.clone(), d_in, q_drv), vec![dh]);
+    let reads = vec![d_in.wire_id()];
+    exec.spawn_wired(dff(clk.clone(), d_in, q_drv), vec![dh], reads);
     let mut test = HardwareTest::new("dff").with_verilog(sv);
     let mut sim = Vec::new();
     for &v in &inputs {
@@ -113,7 +114,8 @@ fn run_dff_after(sv: &str) -> bool {
     let (d_drv, d_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (q_drv, q_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = q_drv.dirty_handle();
-    exec.spawn_wired(dff_after(clk.clone(), d_in, q_drv), vec![dh]);
+    let reads = vec![d_in.wire_id()];
+    exec.spawn_wired(dff_after(clk.clone(), d_in, q_drv), vec![dh], reads);
     let mut test = HardwareTest::new("dff_after").with_verilog(sv);
     let mut sim = Vec::new();
     for &v in &inputs {
@@ -138,7 +140,8 @@ fn run_enff(sv: &str) -> bool {
     let (d_drv, d_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (q_drv, q_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = q_drv.dirty_handle();
-    exec.spawn_wired(enff(clk.clone(), sel_in, d_in, q_drv), vec![dh]);
+    let reads = vec![sel_in.wire_id(), d_in.wire_id()];
+    exec.spawn_wired(enff(clk.clone(), sel_in, d_in, q_drv), vec![dh], reads);
     let mut test = HardwareTest::new("enff").with_verilog(sv);
     let mut sim = Vec::new();
     for i in 0..6usize {
@@ -167,7 +170,8 @@ fn run_mac_fsm(sv: &str) -> bool {
     let (c_drv, c_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (o_drv, o_obs) = registered_wire::<Bits<8>, MainClk>(&clk, Bits::zero());
     let dh = o_drv.dirty_handle();
-    exec.spawn_wired(mac_fsm(clk.clone(), a_in, b_in, c_in, o_drv), vec![dh]);
+    let reads = vec![a_in.wire_id(), b_in.wire_id(), c_in.wire_id()];
+    exec.spawn_wired(mac_fsm(clk.clone(), a_in, b_in, c_in, o_drv), vec![dh], reads);
     let mut test = HardwareTest::new("mac_fsm").with_verilog(sv);
     let mut sim = Vec::new();
     for i in 0..9usize {
@@ -193,7 +197,7 @@ fn run_counter(sv: &str, name: &str) -> bool {
     let mut exec = HardwareExecutor::new();
     let (q_drv, q_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = q_drv.dirty_handle();
-    exec.spawn_wired(counter(clk.clone(), q_drv), vec![dh]);
+    exec.spawn_wired(counter(clk.clone(), q_drv), vec![dh], vec![]);
     let mut test = HardwareTest::new(name).with_verilog(sv);
     let mut sim = Vec::new();
     for i in 0..6usize {

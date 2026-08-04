@@ -77,9 +77,11 @@ fn main() {
         w2_drv.dirty_handle(),
         w3_drv.dirty_handle(),
     ];
+    let reads = vec![d_in.wire_id()];
     exec.spawn_wired(
         sipo_block(clk.clone(), d_in, o_drv, w0_drv, w1_drv, w2_drv, w3_drv),
         dhs,
+        reads,
     );
 
     // Golden = the independent Verilog reference only (no separate hand-derived

@@ -15,7 +15,7 @@ pub use testing::{HardwareTest, TestResult, make_cycle};
 
 pub mod executor;
 
-pub use executor::{HardwareExecutor, HardwareModule, ModuleInfo, PollOrder};
+pub use executor::{HardwareExecutor, HardwareModule, ModuleInfo, PollOrder, SchedulerMode};
 
 /// Which phase of the clock cycle `tick_clock` is currently executing.
 /// Set by the executor before each `poll_tasks()` call so that phase-aware futures
@@ -116,14 +116,19 @@ pub fn pre_edge_barrier<Domain: ClockDomain>() -> PreEdgeBarrier<Domain> {
     PreEdgeBarrier { _domain: PhantomData }
 }
 
-/// A helper macro to spawn a child module's future and track the parent-child relationship in the executor.
+/// A helper macro to spawn a child module's future and track the parent-child
+/// relationship in the executor.
+///
+/// The trailing `reads` argument is the child's input wire-ids (`vec![
+/// port.wire_id(), .. ]`), recorded for the item-6 dependency graph. Phase 1
+/// records only — it has no effect on the current scheduler.
 #[macro_export]
 macro_rules! spawn_child {
-    ($exec:expr, $parent:expr, $module_future:expr) => {{
-        $exec.spawn_child(stringify!($module_future), $parent, $module_future)
+    ($exec:expr, $parent:expr, $module_future:expr, $reads:expr) => {{
+        $exec.spawn_child(stringify!($module_future), $parent, $module_future, $reads)
     }};
-    ($exec:expr, $parent:expr, $child_name:expr, $module_future:expr) => {{
-        $exec.spawn_child($child_name, $parent, $module_future)
+    ($exec:expr, $parent:expr, $child_name:expr, $module_future:expr, $reads:expr) => {{
+        $exec.spawn_child($child_name, $parent, $module_future, $reads)
     }};
 }
 

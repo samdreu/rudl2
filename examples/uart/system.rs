@@ -127,13 +127,17 @@ fn spawn_uart(exec: &mut HardwareExecutor, clk: Clock<MainClk>) -> UartPorts {
     let dh_rx_dv   = rx_dv_out.dirty_handle();
     let dh_rx_byte = rx_byte_out.dirty_handle();
 
+    let tx_reads = vec![tx_byte_in.wire_id(), tx_start_in.wire_id()];
+    let rx_reads = vec![serial_in.wire_id()];
     exec.spawn_wired(
         uart_tx(clk.clone(), tx_byte_in, tx_start_in, serial_out, tx_busy_out),
         vec![dh_serial, dh_busy],
+        tx_reads,
     );
     exec.spawn_wired(
         uart_rx(clk.clone(), serial_in, rx_dv_out, rx_byte_out),
         vec![dh_rx_dv, dh_rx_byte],
+        rx_reads,
     );
 
     UartPorts {

@@ -44,9 +44,11 @@ fn mac_pipeline_sim_matches_transpiled_verilog() {
     let (c_drv, c_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
+    let reads = vec![a_in.wire_id(), b_in.wire_id(), c_in.wire_id()];
     exec.spawn_wired(
         mac_pipeline(clk.clone(), a_in, b_in, c_in, out_drv),
         vec![dh],
+        reads,
     );
 
     // (a, b, c) per cycle. Input groups sit on the read cycles (0, 3, 6 — phase 0);

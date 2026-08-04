@@ -86,9 +86,11 @@ fn sim_trace(fast_per_slow: usize, slow_cycles: usize) -> Vec<(u8, u8)> {
     let dh_sync_q = sync_q_port.dirty_handle();
     let dh_consumer = consumer_port.dirty_handle();
 
-    exec.spawn_wired(fast_counter(clk_fast.clone(), count_port, flag_port), vec![dh_count, dh_flag]);
-    exec.spawn_wired(flag_sync(clk_slow.clone(), flag_to_sync, sync_q_port), vec![dh_sync_q]);
-    exec.spawn_wired(slow_consumer(clk_slow.clone(), sync_to_consumer, consumer_port), vec![dh_consumer]);
+    let sync_reads = vec![flag_to_sync.wire_id()];
+    let consumer_reads = vec![sync_to_consumer.wire_id()];
+    exec.spawn_wired(fast_counter(clk_fast.clone(), count_port, flag_port), vec![dh_count, dh_flag], vec![]);
+    exec.spawn_wired(flag_sync(clk_slow.clone(), flag_to_sync, sync_q_port), vec![dh_sync_q], sync_reads);
+    exec.spawn_wired(slow_consumer(clk_slow.clone(), sync_to_consumer, consumer_port), vec![dh_consumer], consumer_reads);
 
     let mut trace = Vec::with_capacity(slow_cycles);
     for _ in 0..slow_cycles {

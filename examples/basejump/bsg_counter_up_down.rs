@@ -54,9 +54,11 @@ fn main() {
     let (dn_drv, dn_in) = wire::<Logic, MainClk>(Logic::Zero);
     let (out_drv, out_obs) = wire::<Bits<PTR_W>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
+    let reads = vec![rst_in.wire_id(), up_in.wire_id(), dn_in.wire_id()];
     exec.spawn_wired(
         bsg_counter_up_down(clk.clone(), rst_in, up_in, dn_in, out_drv),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("bsg_counter_up_down")

@@ -189,7 +189,8 @@ fn det_010_matches_independent_verilog() {
     run_against_golden("det_010", |exec, clk, rstn, in_i| {
         let (out_drv, out_obs) = wire::<Logic, MainClk>(Logic::Zero);
         let dh = out_drv.dirty_handle();
-        exec.spawn_wired(det_010(clk, rstn, in_i, out_drv), vec![dh]);
+        let reads = vec![rstn.wire_id(), in_i.wire_id()];
+        exec.spawn_wired(det_010(clk, rstn, in_i, out_drv), vec![dh], reads);
         out_obs
     });
 }
@@ -207,7 +208,8 @@ fn det_010_awaits_matches_independent_verilog() {
     run_against_golden("det_010_awaits", |exec, clk, rstn, in_i| {
         let (out_drv, out_obs) = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
         let dh = out_drv.dirty_handle();
-        exec.spawn_wired(det_010_awaits(clk, rstn, in_i, out_drv), vec![dh]);
+        let reads = vec![rstn.wire_id(), in_i.wire_id()];
+        exec.spawn_wired(det_010_awaits(clk, rstn, in_i, out_drv), vec![dh], reads);
         out_obs
     });
 }

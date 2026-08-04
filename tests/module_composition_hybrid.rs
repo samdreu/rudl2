@@ -77,17 +77,21 @@ fn sequential_modules_spawn_with_spawn_child() {
     let (mid_out, mid_in) = wire::<u8, MainClk>(0);
     let (out_drv, out_obs) = wire::<u8, MainClk>(0);
 
+    let s1_reads = vec![in_port.wire_id()];
     spawn_child!(
         exec,
         "pipeline",
         "stage_add_one",
-        stage_add_one(clk.clone(), in_port, mid_out)
+        stage_add_one(clk.clone(), in_port, mid_out),
+        s1_reads
     );
+    let s2_reads = vec![mid_in.wire_id()];
     spawn_child!(
         exec,
         "pipeline",
         "stage_double",
-        stage_double(clk.clone(), mid_in, out_drv)
+        stage_double(clk.clone(), mid_in, out_drv),
+        s2_reads
     );
 
     // Two-stage registered pipeline: affine_mix has a 2-cycle latency.
@@ -126,9 +130,9 @@ fn peer_modules_continue_using_spawn_untracked() {
     let (out2_drv, out2_obs) = wire::<u8, MainClk>(0);
     let (out3_drv, out3_obs) = wire::<u8, MainClk>(0);
 
-    exec.spawn_untracked(counter_by::<1>(clk.clone(), out1_drv));
-    exec.spawn_untracked(counter_by::<2>(clk.clone(), out2_drv));
-    exec.spawn_untracked(counter_by::<5>(clk.clone(), out3_drv));
+    exec.spawn_untracked(counter_by::<1>(clk.clone(), out1_drv), vec![]);
+    exec.spawn_untracked(counter_by::<2>(clk.clone(), out2_drv), vec![]);
+    exec.spawn_untracked(counter_by::<5>(clk.clone(), out3_drv), vec![]);
 
     let expected = [(0u8, 0u8, 0u8), (1, 2, 5), (2, 4, 10), (3, 6, 15)];
 

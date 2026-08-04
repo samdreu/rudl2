@@ -81,17 +81,22 @@ fn main() {
     let dh_sync_q   = sync_q_port.dirty_handle();
     let dh_consumer = consumer_port.dirty_handle();
 
+    let sync_reads = vec![flag_to_sync.wire_id()];
+    let consumer_reads = vec![sync_to_consumer.wire_id()];
     exec.spawn_wired(
         fast_counter(clk_fast.clone(), count_port, flag_port),
         vec![dh_count, dh_flag],
+        vec![],
     );
     exec.spawn_wired(
         sync_2ff(clk_slow.clone(), flag_to_sync, sync_q_port),
         vec![dh_sync_q],
+        sync_reads,
     );
     exec.spawn_wired(
         slow_consumer(clk_slow.clone(), sync_to_consumer, consumer_port),
         vec![dh_consumer],
+        consumer_reads,
     );
 
     // Testbench: 2:1 fast:slow ratio.

@@ -44,7 +44,8 @@ fn main() {
     let (cout_out, cout_obs) = wire::<Logic, ()>(Logic::Zero);
 
     let dhs = vec![sum_out.dirty_handle(), cout_out.dirty_handle()];
-    exec.spawn_wired(ripple_carry_adder::<N>(a_in, b_in, sum_out, cout_out), dhs);
+    let reads = vec![a_in.wire_id(), b_in.wire_id()];
+    exec.spawn_wired(ripple_carry_adder::<N>(a_in, b_in, sum_out, cout_out), dhs, reads);
 
     let mut test = HardwareTest::new("bsg_adder_ripple_carry")
         .with_verilog("examples/combinational/sv/ripple_carry_adder.sv")

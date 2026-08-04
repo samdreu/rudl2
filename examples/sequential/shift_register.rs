@@ -58,9 +58,11 @@ fn main() {
     let (out_out, out_obs)  = wire::<Bits<N>, MainClk>(Bits::zero());
 
     let dh = out_out.dirty_handle();
+    let reads = vec![d_in.wire_id(), en_in.wire_id(), dir_in.wire_id(), rstn_in.wire_id()];
     exec.spawn_wired(
         shift_register::<N, N_1>(d_in, clk.clone(), en_in, dir_in, rstn_in, out_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("shift_reg")

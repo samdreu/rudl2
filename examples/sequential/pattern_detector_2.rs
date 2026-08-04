@@ -97,7 +97,8 @@ fn main() {
     let (in_drv, in_i) = wire::<Logic, MainClk>(Logic::Zero);
     let (out_drv, out_obs) = wire::<Logic, MainClk>(Logic::Zero);
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(det_010(clk.clone(), rstn, in_i, out_drv), vec![dh]);
+    let reads = vec![rstn.wire_id(), in_i.wire_id()];
+    exec.spawn_wired(det_010(clk.clone(), rstn, in_i, out_drv), vec![dh], reads);
 
     println!("=== det_010 (detects the pattern 0,1,0) ===");
     // Assert reset (rstn low) for one cycle to reach a known state.
@@ -151,8 +152,10 @@ mod tests {
         let dh_a = out_drv_a.dirty_handle();
         let dh_b = out_drv_b.dirty_handle();
 
-        exec.spawn_wired(det_010(clk.clone(), rstn_a, in_a, out_drv_a), vec![dh_a]);
-        exec.spawn_wired(det_010_awaits(clk.clone(), rstn_b, in_b, out_drv_b), vec![dh_b]);
+        let reads_a = vec![rstn_a.wire_id(), in_a.wire_id()];
+        let reads_b = vec![rstn_b.wire_id(), in_b.wire_id()];
+        exec.spawn_wired(det_010(clk.clone(), rstn_a, in_a, out_drv_a), vec![dh_a], reads_a);
+        exec.spawn_wired(det_010_awaits(clk.clone(), rstn_b, in_b, out_drv_b), vec![dh_b], reads_b);
 
         let z = Logic::Zero;
         let o = Logic::One;

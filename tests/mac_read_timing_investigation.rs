@@ -24,7 +24,8 @@ fn mac_pipeline_sim_read_cadence() {
     let (c_drv, c_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(mac_pipeline(clk.clone(), a_in, b_in, c_in, out_drv), vec![dh]);
+    let reads = vec![a_in.wire_id(), b_in.wire_id(), c_in.wire_id()];
+    exec.spawn_wired(mac_pipeline(clk.clone(), a_in, b_in, c_in, out_drv), vec![dh], reads);
 
     let mut trace = Vec::new();
     for &av in a_vals {

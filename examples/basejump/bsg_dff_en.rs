@@ -38,7 +38,8 @@ fn main() {
     let (en_drv, en_in) = wire::<Logic, MainClk>(Logic::Zero);
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(bsg_dff_en(clk.clone(), data_in, en_in, out_drv), vec![dh]);
+    let reads = vec![data_in.wire_id(), en_in.wire_id()];
+    exec.spawn_wired(bsg_dff_en(clk.clone(), data_in, en_in, out_drv), vec![dh], reads);
 
     let mut test = HardwareTest::new("bsg_dff_en")
         .with_verilog("examples/basejump/sv/bsg_dff_en.sv")

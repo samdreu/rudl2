@@ -59,9 +59,11 @@ fn main() {
     let (out_out,  out_obs) = wire::<Logic, MainClk>(Logic::Zero);
 
     let dh = out_out.dirty_handle();
+    let reads = vec![rstn_in.wire_id(), in_in.wire_id()];
     exec.spawn_wired(
         det_110101(clk.clone(), rstn_in, in_in, out_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("det_110101")

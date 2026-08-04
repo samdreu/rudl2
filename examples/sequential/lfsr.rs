@@ -42,9 +42,11 @@ fn main() {
     let (o_out, o_obs) = wire::<Bits<32>, MainClk>(Bits::from_u32(1));
 
     let dh = o_out.dirty_handle();
+    let reads = vec![reset_i_in.wire_id(), yumi_i_in.wire_id()];
     exec.spawn_wired(
         lfsr(clk.clone(), reset_i_in, yumi_i_in, o_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("lfsr")

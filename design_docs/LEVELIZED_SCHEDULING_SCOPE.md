@@ -121,25 +121,41 @@ item-3 analysis already classifies comb-vs-registered per port and can supply th
 
 ## Phased plan (each phase independently validatable)
 
-1. **Wire identity + read/write registration.** `WireId` = cell `Arc::as_ptr`; `In::wire_id()` /
+> **Status (2026-07-30): all phases 1–5 landed on `feat/reachability-cfg`. Levelized is the
+> production default; the fixpoint scheduler is retained permanently as the differential oracle.**
+
+1. **✅ DONE — Wire identity + read/write registration.** `WireId` = cell `Arc::as_ptr`; `In::wire_id()` /
    `Out::wire_id()`; extend the spawn API with input wire-ids; sweep the ~49 spawn sites. Behavior
    unchanged (still iterate-to-fixpoint) — this phase only *records* the graph.
-2. **Build DAG + topo order, behind an opt-in scheduler mode** mirroring the existing `PollOrder`
+2. **✅ DONE — Build DAG + topo order, behind an opt-in scheduler mode** mirroring the existing `PollOrder`
    knob (default stays iterate-to-fixpoint). Levelized pass = one topo-ordered poll per phase. Land
-   the **differential equivalence harness** in the same phase and run it corpus-wide from day one —
-   the scheduler is developed *against* it, so divergence is caught the moment it appears.
-3. **SCCs.** Tarjan over comb edges; single-pass for the acyclic part, iterate-to-fixpoint **only
+   the **differential equivalence harness** (`tests/levelized_differential.rs`) in the same phase and
+   run it corpus-wide from day one — the scheduler is developed *against* it, so divergence is caught
+   the moment it appears. `WireKind` (Comb/Registered) on `DirtyHandle` is the comb-only edge discriminator.
+3. **✅ DONE — SCCs.** Tarjan over comb edges; single-pass for the acyclic part, iterate-to-fixpoint **only
    within** an SCC (registers / memory latency / synchronizer break cycles). Uncertain classification
    biases toward SCC-iteration (reproduce the fixpoint result), never toward a single pass that could
-   diverge.
-4. **Validate + flip default.** Gate on the differential harness green across the **entire** corpus,
-   plus bit-for-bit reproduction of the G3 golden traces (`tests/golden_traces.rs`, no re-bless), the
-   poll-order fuzzer (`tests/poll_order_fuzz.rs`), and BaseJump equivalence. Only then does levelized
-   become the default; the fixpoint scheduler stays as the permanent differential oracle, and the
-   fuzzer is retired (poll-order independence is now structural).
-5. **Static comb-loop detection.** Reject a comb-edge SCC not broken by a register / memory-latency /
-   synchronizer, with a clear error — replacing the runtime `OSCILLATION_THRESHOLD` panic
-   (`executor.rs`). Add a constructed cross-module comb-loop regression.
+   diverge. *Finding:* a register-broken "cycle" is a `RegOut` back-edge → no comb edge → acyclic, so
+   the only comb-graph SCCs are genuine plain-`Out` loops; convergent ones stay legal iterated SCCs.
+4. **✅ DONE — Validate + flip default.** Gated on the differential harness + the entire corpus green under
+   levelized (via the `COPPER_SCHEDULER` env override: full `cargo test --workspace` **and**
+   `smoke.sh --all-examples`), bit-for-bit G3 golden traces (`tests/golden_traces.rs`, no re-bless,
+   run under **both** schedulers), the poll-order fuzzer, and BaseJump equivalence. Levelized is now
+   the compiled default (`SchedulerMode::env_default`); the fixpoint scheduler stays as the permanent
+   differential oracle (`COPPER_SCHEDULER=fixpoint`, and pinned in the differential/golden/poll-order
+   tests). The poll-order fuzzer is *retired as a production guardrail* — pinned to Fixpoint, it now
+   guards only the oracle (poll-order independence is structural under levelized).
+5. **✅ DONE — Static comb-loop detection.** A multi-task comb-edge SCC is a combinational cycle with no
+   register / memory-latency / synchronizer to break it (those commit at the edge → no comb edge), and
+   it is *identified structurally* from the dependency graph — exposed by `HardwareExecutor::comb_cycles()`
+   (detect without running). Per the non-negotiable correctness constraint (reject **exactly** what
+   `OSCILLATION_THRESHOLD` catches — convergence is function-dependent and undecidable statically), a
+   *convergent* cycle (e.g. a set-dominant latch) is **not** rejected: it is legal and iterated to a
+   fixpoint. Only a *non-convergent* cycle errors, and only when the settle fails to converge — but now
+   `iterate_scc`'s panic names the **whole SCC** structurally and how to break it, replacing the old
+   vague single-task `OSCILLATION_THRESHOLD` panic. Regressions: a 2- and a 3-module oscillating cycle
+   (assert the structural message), plus `comb_cycles` reports the convergent latch (detected, still
+   simulates) and is empty for acyclic designs.
 
 ## Validation strategy
 

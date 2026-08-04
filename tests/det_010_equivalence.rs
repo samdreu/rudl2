@@ -42,7 +42,8 @@ fn det_010_sim_matches_transpiled_verilog() {
     let (in_drv, in_port) = wire::<Logic, MainClk>(Logic::Zero);
     let (out_drv, out_obs) = wire::<Logic, MainClk>(Logic::Zero);
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(det_010(clk.clone(), rstn_in, in_port, out_drv), vec![dh]);
+    let reads = vec![rstn_in.wire_id(), in_port.wire_id()];
+    exec.spawn_wired(det_010(clk.clone(), rstn_in, in_port, out_drv), vec![dh], reads);
 
     // (rstn, input) — from the module's own coverage table.
     let cases: &[(bool, bool)] = &[

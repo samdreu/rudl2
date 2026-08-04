@@ -51,7 +51,8 @@ fn main() {
     let (valid_out, valid_obs) = wire::<Logic, ()>(Logic::Zero);
 
     let dhs = vec![result_out.dirty_handle(), valid_out.dirty_handle()];
-    exec.spawn_wired(priority_encode::<N, N_LOG>(in_wire, result_out, valid_out), dhs);
+    let reads = vec![in_wire.wire_id()];
+    exec.spawn_wired(priority_encode::<N, N_LOG>(in_wire, result_out, valid_out), dhs, reads);
 
     let mut test = HardwareTest::new("priority_encode")
         .with_verilog("examples/combinational/sv/priority_encode.sv")

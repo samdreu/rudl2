@@ -56,9 +56,11 @@ fn shift_register_sim_matches_transpiled_verilog() {
     let (rstn_drv, rstn_in) = wire::<Logic, MainClk>(Logic::One);
     let (out_drv, out_obs) = wire::<Bits<N>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
+    let reads = vec![d_in.wire_id(), en_in.wire_id(), dir_in.wire_id(), rstn_in.wire_id()];
     exec.spawn_wired(
         shift_register::<N, N_1>(d_in, clk.clone(), en_in, dir_in, rstn_in, out_drv),
         vec![dh],
+        reads,
     );
 
     // (rstn, en, dir, d) — reset, left-shift a few bits, hold, right-shift, reset.

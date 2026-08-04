@@ -4,10 +4,58 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{Clock, ClockDomain, ClockEdgeListener};
 
-pub struct DirtyHandle(Arc<AtomicBool>);
+/// Stable identity of a wire — the address of its shared value cell.
+///
+/// Two ports share a `WireId` iff they share the same cell: an `Out`/`RegOut`
+/// writer and every `In` reader of the same wire. The executor uses this to match
+/// a producer (writes wire `W`) to its consumers (read wire `W`) when building the
+/// inter-module dependency graph (levelized scheduling, item 6). A wire's identity
+/// is its cell pointer, so it is stable for the wire's lifetime and cheap to hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WireId(pub usize);
+
+/// How a producer drives its output wire — the discriminator the executor uses to
+/// keep the dependency graph **combinational-only** (item 6).
+///
+/// A plain `Out` write lands *during* the settle, so a consumer reading that wire
+/// depends on the producer within the same phase → a real combinational edge. A
+/// `RegOut` commits at the clock edge (via its `ClockEdgeListener`), *between* the
+/// pre- and post-edge settles, so during a settle its value is constant: a
+/// registered output is a phase **source**, never a settle-phase sink, and must
+/// not induce a combinational edge (that is exactly what would create false cycles
+/// for legal sequential feedback — see `LEVELIZED_SCHEDULING_SCOPE.md`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WireKind {
+    /// Plain `Out` — a combinational sink; induces producer→consumer edges.
+    Comb,
+    /// `RegOut` — a phase source (edge-committed); induces no combinational edge.
+    Registered,
+}
+
+pub struct DirtyHandle {
+    dirty: Arc<AtomicBool>,
+    /// The wire this handle's output drives — recorded so the executor can learn
+    /// which wire a producer writes (its dependency-graph out-edges) directly from
+    /// the dirty handles a task is spawned with.
+    wire_id: WireId,
+    /// Whether that output is combinational (`Out`) or registered (`RegOut`) —
+    /// only combinational outputs are dependency-graph sinks.
+    kind: WireKind,
+}
 impl DirtyHandle {
     pub fn take(&self) -> bool {
-        self.0.swap(false, Ordering::SeqCst)
+        self.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// The wire this handle drives (a producer's dependency-graph out-edge).
+    pub fn wire_id(&self) -> WireId {
+        self.wire_id
+    }
+
+    /// Whether the driven output is combinational or registered — the executor
+    /// only draws a dependency edge for [`WireKind::Comb`] outputs.
+    pub fn wire_kind(&self) -> WireKind {
+        self.kind
     }
 }
 
@@ -28,7 +76,16 @@ impl<T: PartialEq + Clone, D> Out<T, D> {
     }
 
     pub fn dirty_handle(&self) -> DirtyHandle {
-        DirtyHandle(self.dirty.clone())
+        DirtyHandle { dirty: self.dirty.clone(), wire_id: self.wire_id(), kind: WireKind::Comb }
+    }
+}
+
+impl<T, D> Out<T, D> {
+    /// The identity of the wire this output drives. Equal to the [`WireId`] of
+    /// every `In` reading the same wire, so the executor can match producer to
+    /// consumer.
+    pub fn wire_id(&self) -> WireId {
+        WireId(Arc::as_ptr(&self.inner) as usize)
     }
 }
 
@@ -47,6 +104,15 @@ impl<T, D> Clone for In<T, D> {
 impl<T: Clone, D> In<T, D> {
     pub fn read(&self) -> T {
         self.inner.lock().unwrap().clone()
+    }
+}
+
+impl<T, D> In<T, D> {
+    /// The identity of the wire this input reads. Equal to the [`WireId`] of the
+    /// `Out`/`RegOut` that drives the same wire, so the executor can record this
+    /// task's dependency-graph in-edges from the `In` handles it is spawned with.
+    pub fn wire_id(&self) -> WireId {
+        WireId(Arc::as_ptr(&self.inner) as usize)
     }
 }
 
@@ -114,7 +180,22 @@ impl<T: Clone + PartialEq + Send + Sync, D> RegOut<T, D> {
     }
 
     pub fn dirty_handle(&self) -> DirtyHandle {
-        DirtyHandle(self.shared.dirty.clone())
+        DirtyHandle {
+            dirty: self.shared.dirty.clone(),
+            wire_id: self.wire_id(),
+            kind: WireKind::Registered,
+        }
+    }
+}
+
+impl<T, D> RegOut<T, D> {
+    /// The identity of the wire this registered output drives — the committed
+    /// cell the reader observes, so it matches the [`WireId`] of every `In` on the
+    /// same wire. (A `RegOut` commits at the clock edge, so it is a phase *source*
+    /// rather than a combinational sink — the executor uses that distinction when
+    /// classifying dependency edges, item 6.)
+    pub fn wire_id(&self) -> WireId {
+        WireId(Arc::as_ptr(&self.shared.committed) as usize)
     }
 }
 

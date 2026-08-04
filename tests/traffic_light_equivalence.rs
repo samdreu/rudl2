@@ -57,7 +57,8 @@ fn traffic_light_sim_matches_transpiled_verilog() {
     let (yel_o, yel_obs) = wire::<Logic, MainClk>(Logic::Zero);
     let (grn_o, grn_obs) = wire::<Logic, MainClk>(Logic::Zero);
     let dhs = vec![red_o.dirty_handle(), yel_o.dirty_handle(), grn_o.dirty_handle()];
-    exec.spawn_wired(traffic_light(clk.clone(), req_in, red_o, yel_o, grn_o), dhs);
+    let reads = vec![req_in.wire_id()];
+    exec.spawn_wired(traffic_light(clk.clone(), req_in, red_o, yel_o, grn_o), dhs, reads);
 
     // Hold with no request, then request and ride the full cycle back to Green.
     let requests: Vec<bool> = std::iter::repeat(false)

@@ -56,9 +56,14 @@ fn main() {
     let (dob_out,   dob_obs)   = wire::<Bits<16>, MainClk>(Bits::zero());
 
     let dh: DirtyHandle = dob_out.dirty_handle();
+    let reads = vec![
+        ena_in.wire_id(), enb_in.wire_id(), wea_in.wire_id(),
+        addra_in.wire_id(), addrb_in.wire_id(), dia_in.wire_id(),
+    ];
     exec.spawn_wired(
         dual_port_ram(clk.clone(), ena_in, enb_in, wea_in, addra_in, addrb_in, dia_in, doa_out, dob_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("dual_port_ram")

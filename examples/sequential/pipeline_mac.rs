@@ -115,13 +115,17 @@ fn main() {
     let dh_f = fsm_out.dirty_handle();
     let dh_p = pip_out.dirty_handle();
 
+    let mac_reads = vec![a_in.wire_id(), b_in.wire_id(), c_in.wire_id()];
+    let pip_reads = mac_reads.clone();
     exec.spawn_wired(
         mac_fsm(clk.clone(), a_in.clone(), b_in.clone(), c_in.clone(), fsm_out),
         vec![dh_f],
+        mac_reads,
     );
     exec.spawn_wired(
         mac_pipeline(clk.clone(), a_in, b_in, c_in, pip_out),
         vec![dh_p],
+        pip_reads,
     );
 
     // ── Drive inputs ──────────────────────────────────────────────────────────

@@ -75,9 +75,12 @@ fn main() {
     let dh_event = event_out.dirty_handle();
     let dh_synced = synced_out.dirty_handle();
     let dh_seen = seen_out.dirty_handle();
-    exec.spawn_wired(event_source(clk_fast.clone(), trig_in, event_out), vec![dh_event]);
-    exec.spawn_wired(sync_2ff(clk_slow.clone(), event_in, synced_out), vec![dh_synced]);
-    exec.spawn_wired(event_sink(clk_slow.clone(), synced_in, seen_out), vec![dh_seen]);
+    let source_reads = vec![trig_in.wire_id()];
+    let sync_reads = vec![event_in.wire_id()];
+    let sink_reads = vec![synced_in.wire_id()];
+    exec.spawn_wired(event_source(clk_fast.clone(), trig_in, event_out), vec![dh_event], source_reads);
+    exec.spawn_wired(sync_2ff(clk_slow.clone(), event_in, synced_out), vec![dh_synced], sync_reads);
+    exec.spawn_wired(event_sink(clk_slow.clone(), synced_in, seen_out), vec![dh_seen], sink_reads);
 
     let mut test = HardwareTest::new("flag_crossing");
 

@@ -43,7 +43,8 @@ fn rotate_right_sim_matches_transpiled_verilog() {
     let (rot_drv, rot_in) = wire::<Bits<N_LOG>, ()>(Bits::zero());
     let (o_drv, o_obs) = wire::<Bits<N>, ()>(Bits::zero());
     let dh = o_drv.dirty_handle();
-    exec.spawn_wired(rotate_right::<N, N_LOG>(data_in, rot_in, o_drv), vec![dh]);
+    let reads = vec![data_in.wire_id(), rot_in.wire_id()];
+    exec.spawn_wired(rotate_right::<N, N_LOG>(data_in, rot_in, o_drv), vec![dh], reads);
 
     // (data, rot) — a spread of patterns and rotation amounts.
     let cases: &[(u8, usize)] = &[

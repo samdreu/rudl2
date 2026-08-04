@@ -30,7 +30,8 @@ macro_rules! sim_trace {
         let (inp_drv, inp_in) = wire::<Bits<8>, MainClk>(Bits::zero());
         let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
         let dh = out_drv.dirty_handle();
-        exec.spawn_wired($module(clk.clone(), inp_in, out_drv), vec![dh]);
+        let reads = vec![inp_in.wire_id()];
+        exec.spawn_wired($module(clk.clone(), inp_in, out_drv), vec![dh], reads);
         let mut trace = Vec::new();
         for &v in INPUTS {
             inp_drv.write(Bits::from_u8(v));
@@ -88,7 +89,8 @@ fn probe_fsm_sim_matches_verilog() {
     let (inp_drv, inp_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(probe_fsm(clk.clone(), inp_in, out_drv), vec![dh]);
+    let reads = vec![inp_in.wire_id()];
+    exec.spawn_wired(probe_fsm(clk.clone(), inp_in, out_drv), vec![dh], reads);
     // Reference = the module's own simulator output (this test asks only whether
     // the transpiled Verilog agrees with the sim for the single-tick coding).
     let mut sim_out = Vec::new();
@@ -103,7 +105,8 @@ fn probe_fsm_sim_matches_verilog() {
     let (inp_drv2, inp_in2) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv2, out_obs2) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh2 = out_drv2.dirty_handle();
-    exec2.spawn_wired(probe_fsm(clk2.clone(), inp_in2, out_drv2), vec![dh2]);
+    let reads2 = vec![inp_in2.wire_id()];
+    exec2.spawn_wired(probe_fsm(clk2.clone(), inp_in2, out_drv2), vec![dh2], reads2);
     for (i, &v) in INPUTS.iter().enumerate() {
         inp_drv2.write(Bits::from_u8(v));
         exec2.tick_clock(&mut clk2);

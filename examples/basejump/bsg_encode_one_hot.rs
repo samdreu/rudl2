@@ -44,7 +44,8 @@ fn main() {
     let (v_drv, v_obs) = wire::<Logic, ()>(Logic::Zero);
     let dh_a = addr_drv.dirty_handle();
     let dh_v = v_drv.dirty_handle();
-    exec.spawn_wired(bsg_encode_one_hot(i_in, addr_drv, v_drv), vec![dh_a, dh_v]);
+    let reads = vec![i_in.wire_id()];
+    exec.spawn_wired(bsg_encode_one_hot(i_in, addr_drv, v_drv), vec![dh_a, dh_v], reads);
 
     let mut test = HardwareTest::new("bsg_encode_one_hot")
         .with_verilog("examples/basejump/sv/bsg_encode_one_hot.sv")

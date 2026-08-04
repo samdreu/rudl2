@@ -53,7 +53,8 @@ fn lfsr_sim_matches_transpiled_verilog() {
     let (yumi_drv, yumi_in) = wire::<Logic, MainClk>(Logic::Zero);
     let (o_out, o_obs) = wire::<Bits<32>, MainClk>(Bits::from_u32(1));
     let dh = o_out.dirty_handle();
-    exec.spawn_wired(lfsr(clk.clone(), reset_in, yumi_in, o_out), vec![dh]);
+    let reads = vec![reset_in.wire_id(), yumi_in.wire_id()];
+    exec.spawn_wired(lfsr(clk.clone(), reset_in, yumi_in, o_out), vec![dh], reads);
 
     // One reset cycle, then advance.
     let stimulus: Vec<(Logic, Logic)> = std::iter::once((Logic::One, Logic::Zero))

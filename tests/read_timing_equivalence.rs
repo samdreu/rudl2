@@ -34,7 +34,8 @@ fn sample_hold_2_sim_matches_verilog() {
     let (in_drv, in_port) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(sample_hold_2(clk.clone(), in_port, out_drv), vec![dh]);
+    let reads = vec![in_port.wire_id()];
+    exec.spawn_wired(sample_hold_2(clk.clone(), in_port, out_drv), vec![dh], reads);
     for (n, &v) in inputs.iter().enumerate() {
         in_drv.write(Bits::from_u8(v));
         exec.tick_clock(&mut clk);
@@ -67,7 +68,8 @@ fn accum_2_sim_matches_verilog() {
     let (s_drv, s_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(accum_2(clk.clone(), s_in, out_drv), vec![dh]);
+    let reads = vec![s_in.wire_id()];
+    exec.spawn_wired(accum_2(clk.clone(), s_in, out_drv), vec![dh], reads);
     let mut acc: u8 = 0;
     for (n, &v) in step.iter().enumerate() {
         s_drv.write(Bits::from_u8(v));
@@ -96,7 +98,8 @@ fn sum_hold_2_sim_matches_verilog() {
     let (b_drv, b_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(sum_hold_2(clk.clone(), a_in, b_in, out_drv), vec![dh]);
+    let reads = vec![a_in.wire_id(), b_in.wire_id()];
+    exec.spawn_wired(sum_hold_2(clk.clone(), a_in, b_in, out_drv), vec![dh], reads);
     for n in 0..a.len() {
         a_drv.write(Bits::from_u8(a[n]));
         b_drv.write(Bits::from_u8(b[n]));

@@ -36,7 +36,8 @@ fn mac_fsm_sim_matches_transpiled_verilog() {
     let (c_drv, c_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_drv, out_obs): (RegOut<Bits<8>, MainClk>, _) = registered_wire(&clk, Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(mac_fsm(clk.clone(), a_in, b_in, c_in, out_drv), vec![dh]);
+    let reads = vec![a_in.wire_id(), b_in.wire_id(), c_in.wire_id()];
+    exec.spawn_wired(mac_fsm(clk.clone(), a_in, b_in, c_in, out_drv), vec![dh], reads);
     // mac_fsm samples inputs in its Load state, which recurs every 3 cycles (0,3,6);
     // hold each input group across its 3-cycle window so each MAC is well-defined.
     // out = a*b+c, driven in the Out state (cycles 2,5,8) and held (RegOut): the

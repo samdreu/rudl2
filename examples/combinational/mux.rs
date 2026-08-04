@@ -49,9 +49,11 @@ fn main() {
 
     let dh = data_out.dirty_handle();
 
+    let reads = vec![data_in.wire_id(), sel_in.wire_id()];
     executor.spawn_wired(
         mux::<WIDTH, ELS, LG_ELS>(data_in, sel_in, data_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("bsg_mux")

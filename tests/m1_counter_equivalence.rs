@@ -27,7 +27,8 @@ fn counter_sim_matches_transpiled_verilog() {
     let (step_drv, step_in) = wire::<Bits<8>, MainClk>(Bits::zero());
     let (out_out, out_obs) = wire::<Bits<8>, MainClk>(Bits::zero());
     let dh = out_out.dirty_handle();
-    exec.spawn_wired(counter(clk.clone(), step_in, out_out), vec![dh]);
+    let reads = vec![step_in.wire_id()];
+    exec.spawn_wired(counter(clk.clone(), step_in, out_out), vec![dh], reads);
 
     // Reference: `out.write(count)` happens after `count += step` on each resumed
     // tick, so the value observed after cycle i is the running sum inclusive of

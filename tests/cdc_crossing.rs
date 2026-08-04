@@ -33,7 +33,8 @@ fn sync_2ff_crosses_delayed_not_combinational() {
     let (d_drv, d_in) = wire::<Logic, Fast>(Logic::Zero);
     let (q_out, q_obs) = wire::<Logic, Slow>(Logic::Zero);
     let dh = q_out.dirty_handle();
-    exec.spawn_wired(sync_2ff(clk.clone(), d_in, q_out), vec![dh]);
+    let reads = vec![d_in.wire_id()];
+    exec.spawn_wired(sync_2ff(clk.clone(), d_in, q_out), vec![dh], reads);
 
     // A pulse train on the fast-domain input.
     let stimulus = [false, true, true, true, false, false, true, false, true, true];
@@ -62,7 +63,8 @@ fn sync_2ff_settles_to_a_held_input() {
     let (d_drv, d_in) = wire::<Logic, Fast>(Logic::Zero);
     let (q_out, q_obs) = wire::<Logic, Slow>(Logic::Zero);
     let dh = q_out.dirty_handle();
-    exec.spawn_wired(sync_2ff(clk.clone(), d_in, q_out), vec![dh]);
+    let reads = vec![d_in.wire_id()];
+    exec.spawn_wired(sync_2ff(clk.clone(), d_in, q_out), vec![dh], reads);
 
     // Hold the input high; after the synchronizer latency the output is high and
     // stays high.

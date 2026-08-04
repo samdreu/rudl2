@@ -28,6 +28,7 @@ fn regout_defers_one_cycle_under_postedge() {
             }
         }),
         vec![dh],
+        vec![],
     );
     let mut plain = Vec::new();
     for _ in 0..5 {
@@ -51,6 +52,7 @@ fn regout_defers_one_cycle_under_postedge() {
             }
         }),
         vec![dh2],
+        vec![],
     );
     let mut reg = Vec::new();
     for _ in 0..5 {

@@ -98,9 +98,11 @@ fn main() {
 
     let dh_dv   = dv_out.dirty_handle();
     let dh_byte = byte_out.dirty_handle();
+    let reads = vec![serial_in.wire_id()];
     exec.spawn_wired(
         rx(clk.clone(), serial_in, dv_out, byte_out),
         vec![dh_dv, dh_byte],
+        reads,
     );
 
     // One complete 8N1 UART frame as a clock-by-clock waveform (start + 8 data + stop).

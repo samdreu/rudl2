@@ -73,10 +73,11 @@ fn probe_mem_latency() {
         let (ad_drv, ad_in) = wire::<Bits<8>, MainClk>(Bits::zero());
         let (o_drv, o_obs) = wire::<Bits<16>, MainClk>(Bits::zero());
         let dh = o_drv.dirty_handle();
+        let reads = vec![enb_in.wire_id(), ad_in.wire_id()];
         if straddle {
-            exec.spawn_wired(ram_straddle(clk.clone(), enb_in, ad_in, o_drv), vec![dh]);
+            exec.spawn_wired(ram_straddle(clk.clone(), enb_in, ad_in, o_drv), vec![dh], reads);
         } else {
-            exec.spawn_wired(ram_prewrite(clk.clone(), enb_in, ad_in, o_drv), vec![dh]);
+            exec.spawn_wired(ram_prewrite(clk.clone(), enb_in, ad_in, o_drv), vec![dh], reads);
         }
         let mut test = HardwareTest::new("ram1").with_verilog("tests/fixtures/timing_probe_sv/ram1.sv");
         let mut sim = Vec::new();

@@ -7,10 +7,14 @@
 //! (`PollOrder`) and asserts the observable traces are byte-identical to the
 //! insertion-order baseline.
 //!
-//! This is a regression guard *before* the item-3 refactor. Item 6 (levelized
-//! scheduling) later makes the order canonical, at which point this guard becomes
-//! moot — until then, any change that makes a settled value depend on poll order
-//! is a real bug and must fail here.
+//! **Post item-6:** the levelized scheduler (now the production default) makes
+//! poll-order independence *structural* — it settles in a canonical topological
+//! order and ignores `PollOrder` entirely — so this fuzzer is no longer a
+//! production guardrail. It is retained, **pinned to the fixpoint scheduler**, to
+//! guard the permanent differential *oracle's* poll-order independence: if the
+//! oracle ever became order-dependent, the levelized-vs-fixpoint differential
+//! comparison would silently lose its footing. Any change that makes a fixpoint
+//! settled value depend on poll order is a real bug and must fail here.
 //!
 //! Futures are single-use, so each poll order rebuilds the design from scratch;
 //! the closures below are the "design + stimulus", parameterized by `PollOrder`.
@@ -18,7 +22,7 @@
 use copper_core::port::{wire, In, Out};
 use copper_core::types::{Bits, Clock, ClockDomain};
 use copper_macros::hardware;
-use copper_sim::{HardwareExecutor, PollOrder};
+use copper_sim::{HardwareExecutor, PollOrder, SchedulerMode};
 
 struct ClkA;
 impl ClockDomain for ClkA {}
@@ -86,7 +90,12 @@ fn add_one(in_i: In<Bits<8>, ClkA>, out: Out<Bits<8>, ClkA>) {
 fn combinational_chain_is_poll_order_independent() {
     fn run(order: PollOrder) -> Vec<u128> {
         let mut clk = Clock::<ClkA>::new();
-        let mut exec = HardwareExecutor::new();
+        // Pinned to Fixpoint: the levelized scheduler ignores PollOrder (it uses a
+        // canonical topological order), so this fuzzer now guards the fixpoint
+        // *oracle's* poll-order independence. Item 6 made that invariant structural
+        // for the production (levelized) path, so this is no longer a production
+        // guardrail — it is retained only to protect the differential oracle.
+        let mut exec = HardwareExecutor::new().with_scheduler_mode(SchedulerMode::Fixpoint);
         exec.set_poll_order(order);
 
         let (c_out, c_in) = wire::<Bits<8>, ClkA>(Bits::from_lit::<0>());
@@ -97,9 +106,11 @@ fn combinational_chain_is_poll_order_independent() {
         let ad = a_out.dirty_handle();
         let bd = b_out.dirty_handle();
 
-        exec.spawn_wired(counter_a(clk.clone(), c_out), vec![cd]);
-        exec.spawn_wired(add_one(c_in, a_out), vec![ad]);
-        exec.spawn_wired(add_one(a_in, b_out), vec![bd]);
+        let a_reads = vec![c_in.wire_id()];
+        let b_reads = vec![a_in.wire_id()];
+        exec.spawn_wired(counter_a(clk.clone(), c_out), vec![cd], vec![]);
+        exec.spawn_wired(add_one(c_in, a_out), vec![ad], a_reads);
+        exec.spawn_wired(add_one(a_in, b_out), vec![bd], b_reads);
 
         (0..6)
             .map(|_| {
@@ -126,15 +137,20 @@ fn multi_domain_counters_are_poll_order_independent() {
     fn run(order: PollOrder, schedule: &[u8]) -> Vec<u128> {
         let mut clk_a = Clock::<ClkA>::new();
         let mut clk_b = Clock::<ClkB>::new();
-        let mut exec = HardwareExecutor::new();
+        // Pinned to Fixpoint: the levelized scheduler ignores PollOrder (it uses a
+        // canonical topological order), so this fuzzer now guards the fixpoint
+        // *oracle's* poll-order independence. Item 6 made that invariant structural
+        // for the production (levelized) path, so this is no longer a production
+        // guardrail — it is retained only to protect the differential oracle.
+        let mut exec = HardwareExecutor::new().with_scheduler_mode(SchedulerMode::Fixpoint);
         exec.set_poll_order(order);
 
         let (a_out, a_in) = wire::<Bits<8>, ClkA>(Bits::from_lit::<0>());
         let (b_out, b_in) = wire::<Bits<8>, ClkB>(Bits::from_lit::<0>());
         let ad = a_out.dirty_handle();
         let bd = b_out.dirty_handle();
-        exec.spawn_wired(counter_a(clk_a.clone(), a_out), vec![ad]);
-        exec.spawn_wired(counter_b(clk_b.clone(), b_out), vec![bd]);
+        exec.spawn_wired(counter_a(clk_a.clone(), a_out), vec![ad], vec![]);
+        exec.spawn_wired(counter_b(clk_b.clone(), b_out), vec![bd], vec![]);
 
         let mut trace = Vec::new();
         for &which in schedule {

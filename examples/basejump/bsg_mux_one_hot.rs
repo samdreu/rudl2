@@ -41,7 +41,8 @@ fn main() {
     let (sel_drv, sel_in) = wire::<Bits<ELS>, ()>(Bits::zero());
     let (out_drv, out_obs) = wire::<Bits<WIDTH>, ()>(Bits::zero());
     let dh = out_drv.dirty_handle();
-    exec.spawn_wired(bsg_mux_one_hot(data_in, sel_in, out_drv), vec![dh]);
+    let reads = vec![data_in.wire_id(), sel_in.wire_id()];
+    exec.spawn_wired(bsg_mux_one_hot(data_in, sel_in, out_drv), vec![dh], reads);
 
     let mut test = HardwareTest::new("bsg_mux_one_hot")
         .with_verilog("examples/basejump/sv/bsg_mux_one_hot.sv")

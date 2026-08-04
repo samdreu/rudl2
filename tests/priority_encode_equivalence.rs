@@ -45,9 +45,11 @@ fn priority_encode_sim_matches_transpiled_verilog() {
     let (valid_drv, valid_obs) = wire::<Logic, ()>(Logic::Zero);
     let dh_r = res_drv.dirty_handle();
     let dh_v = valid_drv.dirty_handle();
+    let reads = vec![in_port.wire_id()];
     exec.spawn_wired(
         priority_encode::<N, N_LOG>(in_port, res_drv, valid_drv),
         vec![dh_r, dh_v],
+        reads,
     );
 
     let cases: &[u8] = &[

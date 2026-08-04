@@ -49,7 +49,8 @@ fn main() {
     let (b_drv, b_in) = wire::<Bits<WIDTH>, ()>(one_hot(0));
     let (o_drv, o_obs) = wire::<Bits<OUT_W>, ()>(Bits::zero());
     let dh = o_drv.dirty_handle();
-    exec.spawn_wired(bsg_adder_one_hot(a_in, b_in, o_drv), vec![dh]);
+    let reads = vec![a_in.wire_id(), b_in.wire_id()];
+    exec.spawn_wired(bsg_adder_one_hot(a_in, b_in, o_drv), vec![dh], reads);
 
     let mut test = HardwareTest::new("bsg_adder_one_hot")
         .with_verilog("examples/basejump/sv/bsg_adder_one_hot.sv")
