@@ -16,7 +16,7 @@ const fn safe_clog2(n: usize) -> usize {
 }
 
 #[hardware(combinational)]
-fn priority_encode<const N: usize, const N_LOG: usize>(
+pub fn priority_encode<const N: usize, const N_LOG: usize>(
     inputs: In<Bits<N>, ()>,
     result: Out<Bits<N_LOG>, ()>,
     valid: Out<Logic, ()>,

@@ -18,7 +18,7 @@ const fn safe_clog2(n: usize) -> usize {
 }
 
 #[hardware(combinational)]
-fn rotate_right<const N: usize, const N_LOG: usize>(
+pub fn rotate_right<const N: usize, const N_LOG: usize>(
     data_i: In<Bits<N>, ()>,
     rot_i: In<Bits<N_LOG>, ()>,
     o: Out<Bits<N>, ()>,

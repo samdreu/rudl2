@@ -59,12 +59,24 @@ impl DirtyHandle {
     }
 }
 
-// Non-Clone - one writer per wire, enforced by the compiler
+/// A wire's single **write** handle.
+///
+/// `Out` is deliberately **not `Clone`**: a wire has exactly one driver, so a
+/// second writer — a multi-driver conflict — is a *compile error*, not a run-time
+/// race. This is the executable spec for that invariant (cf. `In`, which *is*
+/// `Clone` because many readers are fine):
+///
+/// ```compile_fail
+/// use copper_core::port::wire;
+/// use copper_core::Logic;
+/// let (out, _in) = wire::<Logic, ()>(Logic::Zero);
+/// let _second_driver = out.clone(); // error: `Out<Logic>` is not `Clone`
+/// ```
 pub struct Out<T, D = ()> {
     inner: Arc<Mutex<T>>,
     dirty: Arc<AtomicBool>,
     _domain: PhantomData<D>
-} 
+}
 
 impl<T: PartialEq + Clone, D> Out<T, D> {
     pub fn write(&self, value: T) {
