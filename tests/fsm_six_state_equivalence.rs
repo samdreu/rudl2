@@ -6,12 +6,11 @@
 //! state index as three `Logic` Moore-output bits. Random `en` stimulus wraps the
 //! ring several times.
 //!
-//! NOTE — runs `sim_only` (no Verilator cross-check). The transpiler currently
-//! lowers this FSM's Moore output into `always_ff` (registered, one cycle late)
-//! instead of a combinational `always_comb` decode, so sim≡SV FAILS while the sim
-//! itself is correct. That is a tracked CODEGEN bug (see `TODO` TRANSPILATION);
-//! this test verifies the simulation semantics meanwhile and is ready to become a
-//! full equivalence test (`EquivalenceTest::new` + `.finish()`) the day it is fixed.
+//! Full sim ≡ transpiled-SV equivalence: the Moore output decode is combinational
+//! (`always_comb`) from the state register, so it matches the simulator's same-cycle
+//! semantics. (This was previously `sim_only`, blocked on the registered-Moore-output
+//! codegen bug; that fix — a top-of-`always_comb` default for outputs decoded from a
+//! non-exhaustive state `case` — unblocked it.)
 //!
 //! See `tests/common/mod.rs` for the shared harness and how to read a failure.
 
@@ -27,10 +26,11 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 include!("fixtures/seq6_dut.rs");
+const DUT_SRC: &str = include_str!("fixtures/seq6_dut.rs");
 
 #[test]
-fn seq6_sim_matches_reference_model() {
-    let mut eq = EquivalenceTest::sim_only("seq6");
+fn seq6_sim_matches_transpiled_verilog() {
+    let mut eq = EquivalenceTest::new("seq6", DUT_SRC);
 
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();

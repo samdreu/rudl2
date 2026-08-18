@@ -184,6 +184,12 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         // Output continuous assigns are module-level; collect from every phase.
         output_assigns.append(&mut outs);
 
+        // Keep a Moore output combinational when it is only "conditional" because
+        // the state `case` has unreachable encodings (non-power-of-two state count,
+        // or a wide state var): give it a top-of-block default so it is driven on
+        // all paths, instead of letting the check below register it (one cycle late).
+        hoist_moore_output_defaults(&mut stmts);
+
         // A conditionally-driven output holds between writes → an implicit-hold
         // register. Move its drives from `always_comb` (where an undriven path is
         // a latch) to `always_ff` (`if (guard) out <= v`, holding otherwise),
@@ -758,6 +764,109 @@ fn ports_driven_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
 fn conditional_output_ports(stmts: &[VLIRStmt]) -> HashSet<String> {
     let all = ports_driven_all_paths(stmts);
     ports_driven_any_path(stmts).difference(&all).cloned().collect()
+}
+
+/// Give a Moore output decoded from a state `case` a defined default at the TOP of
+/// `always_comb` (`out = <first-arm value>; case(state) … endcase`), so it reads as
+/// combinational instead of being wrongly registered.
+///
+/// A `case` over a state register whose encoding leaves unreachable values (e.g. 6
+/// states in a 3-bit register, or a `u8` program counter with two states) is not
+/// exhaustive, so [`ports_driven_all_paths`] refuses to count *any* output as fully
+/// driven — even one written on every explicit arm — and the caller then moves it
+/// to `always_ff`, lagging it one cycle. A top-of-block default assignment closes
+/// that unreachable path: the output is now driven on all paths and stays
+/// combinational, matching the simulator's same-cycle Moore semantics.
+///
+/// Deliberately narrow, to preserve the two behaviours that must NOT change:
+///   * only ports that are *currently conditional* are touched — a design like
+///     `traffic_light` (exhaustive `case`, nothing conditional) is left byte-for-byte
+///     identical;
+///   * only ports driven on *every explicit arm* are hoisted — a genuine
+///     enabled-register hold (`bsg_dff_en`, driven in only some arms) is not, and
+///     still lands in `always_ff`.
+///
+/// The default value is cloned from the first arm that drives the port with a direct
+/// assignment; its value is irrelevant (those `case` values are unreachable), it
+/// only needs to be well-typed.
+fn hoist_moore_output_defaults(stmts: &mut Vec<VLIRStmt>) {
+    let conditional = conditional_output_ports(stmts);
+    if conditional.is_empty() {
+        return;
+    }
+
+    // First pass (immutable): decide which ports to hoist, and which no-default
+    // cases we hoisted from (they need an empty `default` for Verilator).
+    let mut to_hoist: Vec<(String, VLIRExpr)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cases_needing_default: Vec<usize> = Vec::new();
+    for (idx, s) in stmts.iter().enumerate() {
+        let VLIRStmt::Case { arms, default, .. } = s else { continue };
+        if arms.is_empty() {
+            continue;
+        }
+        // Ports driven on all paths of *every* explicit arm.
+        let mut common: Option<HashSet<String>> = None;
+        for a in arms {
+            let driven = ports_driven_all_paths(&a.stmts);
+            common = Some(match common {
+                None => driven,
+                Some(c) => c.intersection(&driven).cloned().collect(),
+            });
+        }
+        let common = common.unwrap_or_default();
+        let mut ports: Vec<&String> = common.intersection(&conditional).collect();
+        ports.sort(); // deterministic emission order
+        let mut hoisted_here = false;
+        for port in ports {
+            if !seen.insert(port.clone()) {
+                continue;
+            }
+            if let Some(value) = first_direct_port_value(arms, port) {
+                to_hoist.push((port.clone(), value));
+                hoisted_here = true;
+            }
+        }
+        if hoisted_here && default.is_none() {
+            cases_needing_default.push(idx);
+        }
+    }
+
+    if to_hoist.is_empty() {
+        return;
+    }
+
+    // The top default makes the port combinationally driven, but a `case` over a
+    // register with unreachable encodings is still incomplete — Verilator errors on
+    // CASEINCOMPLETE. Give those cases an empty `default` (the fall-through value is
+    // the hoisted top default). Mutate before the inserts below so indices hold.
+    for idx in cases_needing_default {
+        if let VLIRStmt::Case { default, .. } = &mut stmts[idx] {
+            if default.is_none() {
+                *default = Some(Vec::new());
+            }
+        }
+    }
+
+    // Prepend the defaults (first-seen order) ahead of the case that overrides them.
+    for (port_name, value) in to_hoist.into_iter().rev() {
+        stmts.insert(0, VLIRStmt::PortAssign { port_name, value });
+    }
+}
+
+/// The value assigned to `port` by the first arm that drives it with a direct,
+/// top-level `PortAssign` (not a nested/conditional drive).
+fn first_direct_port_value(arms: &[VLIRCaseArm], port: &str) -> Option<VLIRExpr> {
+    for a in arms {
+        for s in &a.stmts {
+            if let VLIRStmt::PortAssign { port_name, value } = s {
+                if port_name == port {
+                    return Some(value.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Split the target output ports' drives out of `stmts` (combinational) and into

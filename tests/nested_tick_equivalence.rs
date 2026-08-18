@@ -4,11 +4,19 @@
 //! (a control-extraction behavioral differential — the structural test only checks
 //! SV shape).
 //!
-//! Runs `sim_only`: a Verilator cross-check FAILS because the transpiler registers
-//! this FSM's Moore output (`out_o <= …` in `always_ff`) instead of decoding it
-//! combinationally, lagging the sim by one cycle — the SAME codegen bug tracked for
-//! `seq6` (see `TODO` TRANSPILATION). `trace` passes; the sim is self-consistent.
-//! Flip to a full `EquivalenceTest::for_module` + Verilator check once that's fixed.
+//! P2 nested-tick awaits. `if_tick` has a branch-nested tick (then: 1 tick, else:
+//! 2 ticks); `if_tick_explicit` is the hand-written pc-FSM twin. This asserts the
+//! branch-nested form behaves identically to the explicit FSM **in the simulator**
+//! (a control-extraction behavioral differential — the structural test only checks
+//! SV shape).
+//!
+//! Runs `sim_only`. The registered-Moore-output codegen bug (which blocked `seq6`)
+//! is now FIXED, and this FSM's output does lower to `always_comb`. But `if_tick`'s
+//! output is *Mealy* — in state `pc=0` it is `sel ? 1 : 0`, depending on the live
+//! input — and the combinational SV then disagrees with the simulator at some
+//! cycles: a SEPARATE, still-open output-timing (Mealy) reconciliation, distinct
+//! from the Moore-decode fix. So the Verilator half stays parked; the sim
+//! self-consistency (branch-nested ≡ explicit FSM) is what this asserts.
 
 mod common;
 

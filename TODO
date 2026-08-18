@@ -25,29 +25,39 @@ TRANSPILATION:
     (tests/ripple_carry_adder_equivalence.rs, tests/gray_to_binary_equivalence.rs)
     use Bits-indexing rewrites of the same designs to get real sim≡SV coverage;
     the underlying transpiler inference gap is NOT fixed, just worked around.
-  ☐ BUG (found 2026-08-03, writing the P2 six-state FSM equivalence test): a Moore
-    output decoded from a single-register FSM is lowered into `always_ff`
-    (REGISTERED, `out <= …`) instead of `always_comb` (a combinational decode of the
-    state register). The transpiled output therefore lags the simulator by one cycle
-    → `verilator: FAIL` while `trace: PASS` (sim is the source of truth, so this is a
-    transpiler bug). A multi-bit `Out<Bits<N>>` output is ADDITIONALLY widened to 32
-    bits (`code <= 32'd0`), a second defect on the same path.
-      Repro: tests/fixtures/seq6_dut.rs (`seq6`) — an enum `st` ring whose Moore
-      output is written via a statement `match st { … => out.write(const) }` before
-      `clk.tick().await`. Empirically NOT triggered by Logic-vs-Bits outputs nor by a
-      conditional-vs-unconditional transition (both ruled out). The differentiator vs
-      the WORKING `traffic_light` (which correctly emits `always_comb` outputs) is
-      that traffic_light has a SECOND state register (`timer`) and its output decodes
-      only `phase`; `seq6`'s lone `st` is both the sole register and the output
-      source, and the output writes get fused into its `always_ff`.
-      Fix later (a CODEGEN change — get sign-off first): emit the pre-tick Moore
-      output decode in `always_comb` from the current state register, as the
-      traffic_light path already does, regardless of register count. Meanwhile
-      tests/fsm_six_state_equivalence.rs runs `sim_only` (sim≡reference verified;
-      sim≡SV blocked on this bug) — flip it to a full equivalence test once fixed.
-      ALSO BLOCKS: the P2 nested-tick equivalence (tests/nested_tick_equivalence.rs,
-      if_tick) — same registered-Moore-output lag. Both flip to full Verilator
-      equivalence the day this is fixed, so a fix pays off twice.
+  ✔ FIXED (2026-08-03): Moore output decoded from a state `case` was lowered into
+    `always_ff` (REGISTERED, `out <= …`) instead of `always_comb`, lagging the
+    simulator one cycle (verilator FAIL / trace PASS).
+      TRUE ROOT CAUSE (my first "single-register" hypothesis was wrong): the trigger
+      is a NON-EXHAUSTIVE state `case` — a register whose encoding leaves unreachable
+      values (6 states in a 3-bit reg; a `u8` pc with 2 states). ports_driven_all_paths
+      refused to count ANY output as fully driven on a case with no default that isn't
+      exhaustive, so an output written on every explicit arm still looked "conditional"
+      and got moved to always_ff. traffic_light is immune only because 4 states = 2^2
+      is exactly exhaustive. (Nothing to do with register count.)
+      FIX: copper-codegen/src/vlir_lower.rs `hoist_moore_output_defaults` — for an
+      output that is currently conditional AND driven on every explicit arm, hoist a
+      top-of-`always_comb` default (`out = <first-arm value>;`) and give the case an
+      empty `default` (Verilator CASEINCOMPLETE is an error). Narrow by design:
+      exhaustive cases (traffic_light) are byte-identical; a genuine enabled-register
+      hold driven in only some arms (bsg_dff_en) is untouched and stays `always_ff`
+      (both verified). seq6 → full equivalence (tests/fsm_six_state_equivalence.rs).
+      RESIDUAL (separate, still open): see the Mealy-output item directly below.
+  ☐ BUG / OPEN (flagged 2026-08-03, surfaced while fixing the Moore-output bug
+    above): a MEALY FSM output — one that depends on a live input inside a state,
+    not only on the state register — does not reconcile between the simulator and
+    the transpiled SV. After the Moore fix, if_tick lowers to a correct-looking
+    combinational `always_comb` (`pc=0: out_o = sel ? 1 : 0`), yet Verilator still
+    disagrees with the sim at specific cycles (trace PASS / verilator FAIL).
+      Repro: tests/fixtures/control_extraction_dut.rs (`if_tick`) — branch-nested
+      tick where the `then` path writes out under a live `sel` read. The two SIM
+      forms agree (if_tick ≡ if_tick_explicit), so this is a sim-vs-SV *timing*
+      reconciliation for Mealy outputs, NOT the (now-fixed) registered-Moore bug.
+      This is the same family as the long-standing output-timing reconciliation the
+      control_extraction structural test deliberately sidesteps (it compares SV
+      shape, not behavior). Needs a decision on the canonical Mealy-output edge
+      timing before it can be fixed — a CODEGEN and/or SIM change (get sign-off).
+      Meanwhile tests/nested_tick_equivalence.rs runs sim_only.
 
 SIMULATOR:
   ☐ Add tests for semantic corner cases
@@ -180,21 +190,20 @@ P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)
      three: tests/wide_datapath_equivalence.rs (datapath16: sum/prod/diff, 500 random).
   ✔ Multiply datapath — covered by datapath16 (`*`).
   ✔ Multi-output combinational fan-in — covered by datapath16 (3 Out, shared reads).
-  ◐ Nested match / enum FSM with >4 states → tests/fsm_six_state_equivalence.rs (seq6,
-     6 enum states). Runs sim_only: sim≡reference PASSES, sim≡SV BLOCKED on the Moore-
-     output-registered CODEGEN bug (see TRANSPILATION). Flip to full equiv when fixed.
+  ✔ Nested match / enum FSM with >4 states → tests/fsm_six_state_equivalence.rs (seq6,
+     6 enum states) — FULL sim≡SV equivalence, unblocked by the Moore-output codegen
+     fix (see TRANSPILATION).
   ☐ Array-typed ports: mux (`In<[Bits<W>; ELS]>`) — UNSUPPORTED, pinned as a gap
      (unsupported_constructs.rs::array_typed_port_is_unsupported); needs codegen work.
-  ☐ Wide Bits<32>/Bits<64> specifically (datapath16 is 16-bit; 32/64 still untested).
+  ✔ Wide Bits<32>/Bits<64> → tests/wide_and_mod_datapath_equivalence.rs (wide_alu).
   ☐ Signed arithmetic / arithmetic_shift_right — asr UNSUPPORTED, pinned as a gap.
-  ☐ Divide / modulo datapath — `/` UNSUPPORTED (pinned); `%` supported but untested
-     (a Verilator equiv needs a zero-divisor guard).
+  ✔ Modulo `%` datapath → tests/wide_and_mod_datapath_equivalence.rs (mod8, zero-guard).
+     `/` remains UNSUPPORTED (pinned).
   ◐ Nested tick awaits (tick inside a branch) → tests/nested_tick_equivalence.rs
      (if_tick vs if_tick_explicit). Runs sim_only: the branch-nested form matches the
-     hand-written pc-FSM IN THE SIM (control-extraction behavioral differential), but
-     the Verilator cross-check is BLOCKED on the SAME Moore-output-registered codegen
-     bug as seq6 (out_o emitted as `out_o <= …` in always_ff, one cycle late). Flip to
-     full equivalence once that bug is fixed.
+     hand-written pc-FSM IN THE SIM. Moore-output codegen bug is now FIXED, but the
+     Verilator half stays parked on a SEPARATE issue — if_tick's output is Mealy
+     (`sel ? 1 : 0` in pc=0), an open output-timing reconciliation (see TRANSPILATION).
   ☐ RegOut Moore output (write-before-tick) equivalence, standalone (already covered
      indirectly by mac_fsm / sipo_block / pattern_detector_2 equivalence tests)
 
