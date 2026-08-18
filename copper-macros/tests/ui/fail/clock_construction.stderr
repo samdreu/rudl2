@@ -1,0 +1,19 @@
+error: a hardware module may not create a clock — clocks are provided as parameters. A fabricated clock is never driven, so the module would hang. To clock a submodule, pass a clone of a clock parameter (`clk.clone()`).
+  --> tests/ui/fail/clock_construction.rs:13:23
+   |
+13 |     let _fabricated = Clock::<MainClk>::new();
+   |                       ^^^^^
+
+warning: unused imports: `Bits` and `Clock`
+ --> tests/ui/fail/clock_construction.rs:1:19
+  |
+1 | use copper_core::{Bits, Clock, ClockDomain};
+  |                   ^^^^  ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `copper_core::port::Out`
+ --> tests/ui/fail/clock_construction.rs:2:5
+  |
+2 | use copper_core::port::Out;
+  |     ^^^^^^^^^^^^^^^^^^^^^^

@@ -52,8 +52,15 @@ SIMULATOR:
 
 MACRO:
   ☐ Require direct tick await
-  ☐ Ban shadowing of hardware parameters
-  ☐ Require only one top-level loop shape
+  ✔ Ban shadowing of hardware parameters
+    - DONE: check_no_param_shadowing (all modes) — a `let` binding (incl. tuple
+      patterns) that reuses a port name is a spanned compile error. Unit tests +
+      ui/fail/param_shadowing.rs.
+  ✔ Require only one top-level loop shape
+    - DONE: check_single_top_level_loop (sequential-like) — exactly one top-level
+      `loop`, and it must be the final statement (a second loop / trailing code is
+      unreachable). "No loop at all" was already rejected. Unit tests +
+      ui/fail/multiple_top_level_loops.rs.
   ☐ Warn on persistent state mutation before tick
   ✔ Check all combinational outputs are assigned on all paths
     - DONE: copper_analysis::check_definite_assignment, enforced in the macro's
@@ -116,14 +123,23 @@ P1 — macro compile-time guardrails (trybuild; pattern in copper-macros/tests/u
   ✔ Combinational latch (partial Out) rejected        → ui/fail/combinational_latch.rs
   ✔ Tick-free sequential loop rejected                → ui/fail/tickless_loop.rs
   ✔ Partial-tick path (CFG reachability) rejected     → ui/fail/partial_tick_path.rs
-  ☐ Ban shadowing of hardware parameters              (TODO/MACRO)
+  ✔ Ban shadowing of hardware parameters              → NEW check_no_param_shadowing;
+     ui/fail/param_shadowing.rs + unit tests (tuple-pattern shadow caught too).
+  ✔ Require a single top-level loop shape (2 loops / trailing code) → NEW
+     check_single_top_level_loop; ui/fail/multiple_top_level_loops.rs + unit tests.
+     (loop-in-branch / no-loop already rejected by the has_top_level_loop gate.)
+  ✔ CDC: domain A into a domain-B port outside a synchronizer → ui/fail/cdc_crossing.rs
+     (trybuild UI case over the pre-existing check_cdc; complements cdc.rs doctests).
+  ✔ CDC: a module CONSTRUCTING a clock → ui/fail/clock_construction.rs (over the
+     pre-existing check_no_clock_construction).
+  ✔ Unsupported idiom (panic!/Option/`?`) rejected    → ui/fail/unsupported_idiom_panic.rs
+  ✔ Pass boundary case (pre-loop reg + single loop + non-colliding local) → ui/pass/single_loop_local_ok.rs
   ☐ Reject stateful constructs in combinational modules; allow const-bound-unrollable
-  ☐ Require a single top-level loop shape (reject 2 loops / no loop / loop-in-branch)
+     [DEFERRED — needs a "what stays legal" definition; design-fuzzy, see MACRO]
   ☐ Warn on persistent-state mutation before the first tick
-  ☐ Require direct tick await (reject aliased/wrapped `clk` tick)  (may already error)
-  ☐ CDC: wiring domain A into a domain-B port outside a synchronizer → compile error
-     (cdc.rs has compile_fail DOCTESTS; add a trybuild UI case mirroring real usage)
-  ☐ CDC: a module CONSTRUCTING a clock (not receiving/cloning) → compile error
+     [DEFERRED — it's a WARNING; trybuild asserts on errors, so needs a different
+     test path (or promotion to an error). Design call pending.]
+  ☐ Require direct tick await (reject aliased/wrapped `clk` tick)  [DEFERRED]
 
 --------------------------------------------------------------------------------
 P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)

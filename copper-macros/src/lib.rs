@@ -245,6 +245,89 @@ pub(crate) fn check_no_clock_construction(f: &ItemFn) -> Result<(), Error> {
     }
 }
 
+// ── Parameter shadowing ─────────────────────────────────────────────────────
+//
+// A hardware port is a physical wire named by its parameter. A `let` binding that
+// reuses a port name hides the wire for the rest of the body: subsequent reads hit
+// the local, not the port, so a stimulus never reaches the logic and an output is
+// silently never driven. This is almost always a bug (and never necessary — rename
+// the local), so the macro rejects it at the definition site.
+
+/// Collect the identifiers bound by a pattern (handles the nested pattern forms a
+/// `let` can use: tuples, tuple-structs, refs, `mut`, type ascription, `|`).
+fn collect_pat_idents(pat: &Pat, out: &mut Vec<syn::Ident>) {
+    match pat {
+        Pat::Ident(pi) => {
+            out.push(pi.ident.clone());
+            if let Some((_, sub)) = &pi.subpat {
+                collect_pat_idents(sub, out);
+            }
+        }
+        Pat::Tuple(t) => t.elems.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::TupleStruct(t) => t.elems.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::Slice(s) => s.elems.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::Reference(r) => collect_pat_idents(&r.pat, out),
+        Pat::Type(t) => collect_pat_idents(&t.pat, out),
+        Pat::Paren(p) => collect_pat_idents(&p.pat, out),
+        Pat::Or(o) => o.cases.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::Struct(s) => s.fields.iter().for_each(|f| collect_pat_idents(&f.pat, out)),
+        _ => {}
+    }
+}
+
+/// The identifiers of every value parameter (the hardware ports).
+fn param_idents(sig: &syn::Signature) -> std::collections::HashSet<String> {
+    sig.inputs
+        .iter()
+        .filter_map(|a| match a {
+            FnArg::Typed(pt) => match &*pt.pat {
+                Pat::Ident(pi) => Some(pi.ident.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+struct ParamShadow<'a> {
+    params: &'a std::collections::HashSet<String>,
+    found: Option<(String, proc_macro2::Span)>,
+}
+
+impl<'ast, 'a> Visit<'ast> for ParamShadow<'a> {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        let mut idents = Vec::new();
+        collect_pat_idents(&local.pat, &mut idents);
+        for id in idents {
+            if self.found.is_none() && self.params.contains(&id.to_string()) {
+                self.found = Some((id.to_string(), id.span()));
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+}
+
+/// Reject a `let` binding that shadows a hardware port parameter.
+pub(crate) fn check_no_param_shadowing(f: &ItemFn) -> Result<(), Error> {
+    let params = param_idents(&f.sig);
+    if params.is_empty() {
+        return Ok(());
+    }
+    let mut v = ParamShadow { params: &params, found: None };
+    v.visit_block(f.block.as_ref());
+    match v.found {
+        Some((name, span)) => Err(Error::new(
+            span,
+            format!(
+                "`{name}` shadows the hardware port parameter of the same name; the `let` binding \
+                 hides the port for the rest of the body (reads and writes hit the local, not the \
+                 wire). Rename the local."
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 // ── Unsupported software idioms: Option / `?` / panic! ──────────────────────
 //
 // A hardware module describes gates, not software control flow. `Option`, the
@@ -392,6 +475,43 @@ fn has_top_level_loop(block: &syn::Block) -> bool {
         .stmts
         .iter()
         .any(|s| matches!(s, syn::Stmt::Expr(syn::Expr::Loop(_), _)))
+}
+
+/// Enforce the canonical sequential shape: **exactly one** top-level `loop`, and
+/// it is the **final** statement. Pre-loop `let`/const declarations (registers and
+/// constants) are fine; a *second* top-level loop or any statement *after* the
+/// infinite loop is unreachable — either two independent state machines crammed
+/// into one module or dead code. The "no loop at all" case is rejected separately
+/// by the `has_top_level_loop` gate, so this runs only when at least one exists.
+fn check_single_top_level_loop(block: &syn::Block) -> Result<(), Error> {
+    let loops: Vec<usize> = block
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, syn::Stmt::Expr(syn::Expr::Loop(_), _)))
+        .map(|(i, _)| i)
+        .collect();
+
+    if loops.len() > 1 {
+        return Err(Error::new(
+            syn::spanned::Spanned::span(&block.stmts[loops[1]]),
+            "#[hardware(sequential)] body must have exactly one top-level `loop { … }` — a \
+             hardware module is a single state machine. Merge the loops, or split this into \
+             separate modules.",
+        ));
+    }
+
+    if let Some(&pos) = loops.first() {
+        if pos != block.stmts.len() - 1 {
+            return Err(Error::new(
+                syn::spanned::Spanned::span(&block.stmts[pos + 1]),
+                "#[hardware(sequential)] `loop { … }` must be the final statement; code after \
+                 an infinite loop is unreachable. Move it inside the loop, or before it.",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Returns the names of every `In<T, D>`-typed parameter, in declaration order.
@@ -724,6 +844,11 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
         return err.to_compile_error().into();
     }
 
+    // A `let` binding may not shadow a hardware port parameter (all modes).
+    if let Err(err) = check_no_param_shadowing(&input_fn) {
+        return err.to_compile_error().into();
+    }
+
     match hardware_mode {
         HardwareMode::Sequential | HardwareMode::Synchronizer => {
             // Regular sequential modules must be single-domain; synchronizers are
@@ -943,6 +1068,13 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
         ));
     }
 
+    // Sequential-like: that single top-level loop must be the *only* one, and the
+    // last statement (a second loop or trailing code is unreachable). Runs after
+    // the gate above guaranteed at least one top-level loop.
+    if hardware_mode.is_sequential_like() {
+        check_single_top_level_loop(&input_fn.block)?;
+    }
+
     Ok(())
 }
 
@@ -950,7 +1082,8 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
 mod tests {
     use super::cdc_check::check_cdc;
     use super::{
-        check_no_clock_construction, check_no_unsupported_idioms, validate_hardware_fn, HardwareMode,
+        check_no_clock_construction, check_no_param_shadowing, check_no_unsupported_idioms,
+        validate_hardware_fn, HardwareMode,
     };
     use syn::parse_quote;
 
@@ -1244,6 +1377,61 @@ mod tests {
             }
         };
         assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_ok());
+    }
+
+    #[test]
+    fn param_shadowing_rejected() {
+        // `let out` shadows the output port `out`.
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<MainClk>, out: Out<u8>) {
+                loop { let out = 0u8; clk.tick().await; }
+            }
+        };
+        assert!(check_no_param_shadowing(&f).is_err());
+    }
+
+    #[test]
+    fn param_shadowing_in_tuple_pattern_rejected() {
+        // Shadowing hidden inside a tuple `let` is still caught.
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<MainClk>, step: In<u8>, out: Out<u8>) {
+                loop { let (step, _c) = (0u8, 1u8); out.write(step); clk.tick().await; }
+            }
+        };
+        assert!(check_no_param_shadowing(&f).is_err());
+    }
+
+    #[test]
+    fn non_shadowing_local_is_ok() {
+        // A local whose name differs from every port is fine.
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<MainClk>, step: In<u8>, out: Out<u8>) {
+                loop { let next = step.read(); out.write(next); clk.tick().await; }
+            }
+        };
+        assert!(check_no_param_shadowing(&f).is_ok());
+    }
+
+    #[test]
+    fn multiple_top_level_loops_rejected() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<MainClk>, out: Out<u8>) {
+                loop { out.write(0u8); clk.tick().await; }
+                loop { clk.tick().await; }
+            }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_err());
+    }
+
+    #[test]
+    fn code_after_top_level_loop_rejected() {
+        let f: syn::ItemFn = parse_quote! {
+            async fn m(clk: Clock<MainClk>, out: Out<u8>) {
+                loop { out.write(0u8); clk.tick().await; }
+                out.write(1u8);
+            }
+        };
+        assert!(validate_hardware_fn(&f, &HardwareMode::Sequential).is_err());
     }
 
     #[test]
