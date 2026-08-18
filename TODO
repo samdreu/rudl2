@@ -45,6 +45,9 @@ TRANSPILATION:
       traffic_light path already does, regardless of register count. Meanwhile
       tests/fsm_six_state_equivalence.rs runs `sim_only` (sim≡reference verified;
       sim≡SV blocked on this bug) — flip it to a full equivalence test once fixed.
+      ALSO BLOCKS: the P2 nested-tick equivalence (tests/nested_tick_equivalence.rs,
+      if_tick) — same registered-Moore-output lag. Both flip to full Verilator
+      equivalence the day this is fixed, so a fix pays off twice.
 
 SIMULATOR:
   ☐ Add tests for semantic corner cases
@@ -186,7 +189,12 @@ P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)
   ☐ Signed arithmetic / arithmetic_shift_right — asr UNSUPPORTED, pinned as a gap.
   ☐ Divide / modulo datapath — `/` UNSUPPORTED (pinned); `%` supported but untested
      (a Verilator equiv needs a zero-divisor guard).
-  ☐ Nested tick awaits (tick inside an inner loop/branch) — Verilator-checked timing
+  ◐ Nested tick awaits (tick inside a branch) → tests/nested_tick_equivalence.rs
+     (if_tick vs if_tick_explicit). Runs sim_only: the branch-nested form matches the
+     hand-written pc-FSM IN THE SIM (control-extraction behavioral differential), but
+     the Verilator cross-check is BLOCKED on the SAME Moore-output-registered codegen
+     bug as seq6 (out_o emitted as `out_o <= …` in always_ff, one cycle late). Flip to
+     full equivalence once that bug is fixed.
   ☐ RegOut Moore output (write-before-tick) equivalence, standalone (already covered
      indirectly by mac_fsm / sipo_block / pattern_detector_2 equivalence tests)
 
