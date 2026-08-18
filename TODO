@@ -25,6 +25,26 @@ TRANSPILATION:
     (tests/ripple_carry_adder_equivalence.rs, tests/gray_to_binary_equivalence.rs)
     use Bits-indexing rewrites of the same designs to get real sim≡SV coverage;
     the underlying transpiler inference gap is NOT fixed, just worked around.
+  ☐ BUG (found 2026-08-03, writing the P2 six-state FSM equivalence test): a Moore
+    output decoded from a single-register FSM is lowered into `always_ff`
+    (REGISTERED, `out <= …`) instead of `always_comb` (a combinational decode of the
+    state register). The transpiled output therefore lags the simulator by one cycle
+    → `verilator: FAIL` while `trace: PASS` (sim is the source of truth, so this is a
+    transpiler bug). A multi-bit `Out<Bits<N>>` output is ADDITIONALLY widened to 32
+    bits (`code <= 32'd0`), a second defect on the same path.
+      Repro: tests/fixtures/seq6_dut.rs (`seq6`) — an enum `st` ring whose Moore
+      output is written via a statement `match st { … => out.write(const) }` before
+      `clk.tick().await`. Empirically NOT triggered by Logic-vs-Bits outputs nor by a
+      conditional-vs-unconditional transition (both ruled out). The differentiator vs
+      the WORKING `traffic_light` (which correctly emits `always_comb` outputs) is
+      that traffic_light has a SECOND state register (`timer`) and its output decodes
+      only `phase`; `seq6`'s lone `st` is both the sole register and the output
+      source, and the output writes get fused into its `always_ff`.
+      Fix later (a CODEGEN change — get sign-off first): emit the pre-tick Moore
+      output decode in `always_comb` from the current state register, as the
+      traffic_light path already does, regardless of register count. Meanwhile
+      tests/fsm_six_state_equivalence.rs runs `sim_only` (sim≡reference verified;
+      sim≡SV blocked on this bug) — flip it to a full equivalence test once fixed.
 
 SIMULATOR:
   ☐ Add tests for semantic corner cases
@@ -147,15 +167,28 @@ P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)
   Already covered: counter, up_down_counter, accumulator_en, slow_counter, lfsr,
   det_010, mac_fsm, mac_pipeline, traffic_light, shift_register, pattern_detector,
   priority_encode, rotate_right, one_bit_comparator, ripple_carry_adder, gray_to_binary.
-  Construct gaps still with NO cargo-test equivalence:
-  ☐ Array-typed ports: mux (`In<[Bits<W>; ELS]>`) — flattening to SV, whole family
-  ☐ Wide datapaths (Bits<32>/Bits<64>) — width-boundary transpile + Verilator
-  ☐ Signed arithmetic / arithmetic_shift_right in a transpiled module
-  ☐ Multiply / divide / modulo datapath in hardware (transpile + Verilator)
-  ☐ Nested match / enum FSM with >4 states (encoding + reachability at scale)
+  Construct SUPPORT probed empirically via the copper-transpile CLI (2026-08-03):
+    SUPPORTED → equivalence-tested: wide datapaths, `*`, `-`/neg, `<<`/`>>`, `%`,
+      `==`, statement `match`. UNSUPPORTED → pinned in
+      copper-codegen/tests/unsupported_constructs.rs: array-typed ports, `/`,
+      `arithmetic_shift_right` (and `lt_logic`/`zero_extend` methods, noted there).
+      NOTE the `/` vs `%` asymmetry: `%` transpiles, `/` does not.
+  ✔ Wide datapath (Bits<16>) + multiply + multi-output fan-in → ONE DUT covers all
+     three: tests/wide_datapath_equivalence.rs (datapath16: sum/prod/diff, 500 random).
+  ✔ Multiply datapath — covered by datapath16 (`*`).
+  ✔ Multi-output combinational fan-in — covered by datapath16 (3 Out, shared reads).
+  ◐ Nested match / enum FSM with >4 states → tests/fsm_six_state_equivalence.rs (seq6,
+     6 enum states). Runs sim_only: sim≡reference PASSES, sim≡SV BLOCKED on the Moore-
+     output-registered CODEGEN bug (see TRANSPILATION). Flip to full equiv when fixed.
+  ☐ Array-typed ports: mux (`In<[Bits<W>; ELS]>`) — UNSUPPORTED, pinned as a gap
+     (unsupported_constructs.rs::array_typed_port_is_unsupported); needs codegen work.
+  ☐ Wide Bits<32>/Bits<64> specifically (datapath16 is 16-bit; 32/64 still untested).
+  ☐ Signed arithmetic / arithmetic_shift_right — asr UNSUPPORTED, pinned as a gap.
+  ☐ Divide / modulo datapath — `/` UNSUPPORTED (pinned); `%` supported but untested
+     (a Verilator equiv needs a zero-divisor guard).
   ☐ Nested tick awaits (tick inside an inner loop/branch) — Verilator-checked timing
-  ☐ RegOut Moore output (write-before-tick) equivalence, standalone
-  ☐ Multi-output combinational module with fan-in (2+ Out driven from shared logic)
+  ☐ RegOut Moore output (write-before-tick) equivalence, standalone (already covered
+     indirectly by mac_fsm / sipo_block / pattern_detector_2 equivalence tests)
 
 --------------------------------------------------------------------------------
 P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettled)
