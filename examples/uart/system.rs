@@ -172,6 +172,9 @@ fn send_and_wait(
     received
 }
 
+// Excluded under cfg(test) so an integration test can `include!` this file without
+// its harness `main` clashing (see examples/cpu/rv32i_cpu.rs for the rationale).
+#[cfg(not(test))]
 fn main() {
     let mut clk  = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();

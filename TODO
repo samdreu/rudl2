@@ -225,8 +225,14 @@ P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
      NOTE (found probing): the standalone transpiler PANICS on rv32i_cpu
      ("gate guarantees at least one tick", control_extract.rs:95) instead of a clean
      error — a codegen robustness bug, logged for later (needs sign-off to fix).
-  ☐ uart/rx + uart/system: serial-timing self-check (tx→rx loopback: send bytes,
-     assert received bytes; baud sampling / framing). [NEXT — this batch did CPUs]
+  ✔ uart/system: tx→rx loopback self-check → tests/uart_integration.rs.
+     - uart_single_channel_loopback: 6 bytes (framing edges) round-trip tx→rx.
+     - uart_dual_channel_no_crosstalk: two channels transmit different bytes on the
+       same cycle; each arrives on its own channel (no cross-contamination).
+     Same cfg(not(test))-main + top-level `include!` structure (self-contained file,
+     so no `mod`/`pub` needed). Sim self-check, not a Verilator equiv.
+  ☐ uart/rx standalone example — its own testbench not yet lifted (system.rs, which
+     embeds tx+rx, is the integration path and IS covered above).
 
 --------------------------------------------------------------------------------
 P6 — reset / X-propagation / robustness
