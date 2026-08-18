@@ -649,6 +649,10 @@ fn test_bubblesort() -> Vec<u32> {
 
 // ── Main Entry ─────────────────────────────────────────────────────────────────
 
+// Excluded when this file is `include!`d into an integration test (which compiles
+// with `cfg(test)`), so the test binary's own harness `main` doesn't conflict. The
+// standalone example (`cargo run --example rv32i_cpu`) still builds it normally.
+#[cfg(not(test))]
 fn main() {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  RV32I CPU - Latency Insensitive Design - Extended Test Suite  ║");

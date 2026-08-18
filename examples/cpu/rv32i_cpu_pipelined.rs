@@ -434,7 +434,7 @@ async fn rv32i_cpu_pipelined(
 
 // ── Execution engine ──────────────────────────────────────────────────────────
 
-fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
+pub fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let program_bits: Vec<Bits<32>> = program.into_iter().map(Bits::<32>::from_u32).collect();
     let mut clk  = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
@@ -504,7 +504,7 @@ fn sw  (rs1: u32, rs2: u32, off: i32) -> u32 { s_type(rs1, rs2, off, 0x2) }
 
 // ── Test programs ─────────────────────────────────────────────────────────────
 
-fn test_addi() -> Vec<u32> {
+pub fn test_addi() -> Vec<u32> {
     vec![
         addi(1, 0, 10),
         addi(2, 0, 5),
@@ -513,7 +513,7 @@ fn test_addi() -> Vec<u32> {
     ]
 }
 
-fn test_sub() -> Vec<u32> {
+pub fn test_sub() -> Vec<u32> {
     vec![
         addi(1, 0, 15),
         addi(2, 0, 10),
@@ -522,7 +522,7 @@ fn test_sub() -> Vec<u32> {
     ]
 }
 
-fn test_multiple_adds() -> Vec<u32> {
+pub fn test_multiple_adds() -> Vec<u32> {
     vec![
         addi(1, 0, 0),
         addi(1, 1, 1),
@@ -535,7 +535,7 @@ fn test_multiple_adds() -> Vec<u32> {
     ]
 }
 
-fn test_branch_taken() -> Vec<u32> {
+pub fn test_branch_taken() -> Vec<u32> {
     // PC=0:  addi x1,x0,1
     // PC=4:  beq  x0,x0,+12  → jump to PC=16
     // PC=8:  addi x10,x0,1   (skipped)
@@ -552,7 +552,7 @@ fn test_branch_taken() -> Vec<u32> {
     ]
 }
 
-fn test_branch_not_taken() -> Vec<u32> {
+pub fn test_branch_not_taken() -> Vec<u32> {
     vec![
         addi(1, 0, 5),
         addi(2, 0, 10),
@@ -562,7 +562,7 @@ fn test_branch_not_taken() -> Vec<u32> {
     ]
 }
 
-fn test_load_store() -> Vec<u32> {
+pub fn test_load_store() -> Vec<u32> {
     vec![
         addi(1, 0, 88),
         sw(0, 1, 0),
@@ -571,7 +571,7 @@ fn test_load_store() -> Vec<u32> {
     ]
 }
 
-fn test_negative_numbers() -> Vec<u32> {
+pub fn test_negative_numbers() -> Vec<u32> {
     vec![
         addi(1, 0, 10),
         addi(2, 0, -3),
@@ -580,7 +580,7 @@ fn test_negative_numbers() -> Vec<u32> {
     ]
 }
 
-fn test_zero_operations() -> Vec<u32> {
+pub fn test_zero_operations() -> Vec<u32> {
     vec![
         addi(1, 0, 0),
         addi(2, 0, 42),
@@ -589,7 +589,7 @@ fn test_zero_operations() -> Vec<u32> {
     ]
 }
 
-fn test_fibonacci() -> Vec<u32> {
+pub fn test_fibonacci() -> Vec<u32> {
     // Compute fib(10) = 55 iteratively
     // x1=prev, x2=curr, x3=countdown
     // PC=0:  x1 = 0
@@ -618,7 +618,7 @@ fn test_fibonacci() -> Vec<u32> {
     ]
 }
 
-fn test_jal() -> Vec<u32> {
+pub fn test_jal() -> Vec<u32> {
     // PC=0: addi x1,x0,7
     // PC=4: jal  x0,+8   → jump to PC=12
     // PC=8: addi x1,x0,0 (skipped)
@@ -633,7 +633,7 @@ fn test_jal() -> Vec<u32> {
     ]
 }
 
-fn test_data_hazard_forwarding() -> Vec<u32> {
+pub fn test_data_hazard_forwarding() -> Vec<u32> {
     // Back-to-back RAW: each addi reads the register written by the previous one.
     // Forwarding must supply the value without stalls.
     // x1=1, x1=x1+1=2, x1=x1+1=3 → a0=3
@@ -646,7 +646,7 @@ fn test_data_hazard_forwarding() -> Vec<u32> {
     ]
 }
 
-fn test_load_use_stall() -> Vec<u32> {
+pub fn test_load_use_stall() -> Vec<u32> {
     // lw immediately followed by a use of the loaded register.
     // Hazard unit must insert a stall bubble so forwarding from MEM/WB works.
     // Store 42 to dmem[0], load it back, add 1.
@@ -659,7 +659,7 @@ fn test_load_use_stall() -> Vec<u32> {
     ]
 }
 
-fn test_bubblesort() -> Vec<u32> {
+pub fn test_bubblesort() -> Vec<u32> {
     // Bubble-sort of [64,34,25,12,22,11,90,42,8,55]; returns sum = 363.
     // Compiled: riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -O1
     // Flat binary: .text at 0x000, .rodata (array) at 0x0C0, stack at 0xFD0-0xFFC.
@@ -690,6 +690,9 @@ fn test_bubblesort() -> Vec<u32> {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+// Excluded under cfg(test) so an integration test can `include!` this file
+// without its harness `main` clashing (see rv32i_cpu.rs for the rationale).
+#[cfg(not(test))]
 fn main() {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║          RV32I CPU - 5-Stage Pipelined - Test Suite           ║");

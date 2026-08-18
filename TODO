@@ -214,12 +214,19 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
 --------------------------------------------------------------------------------
 P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
 --------------------------------------------------------------------------------
-  ☐ rv32i_cpu: load a small known program (e.g. sum 1..N / Fibonacci), run K cycles,
-     assert architectural state (register file + data memory). Guards the flagship
-     against silent catastrophic regressions (nothing tests it under `cargo test` now).
-  ☐ rv32i_cpu_pipelined: same program, assert same architectural result as scalar
-     (differential between the two CPUs is a strong self-checking oracle).
-  ☐ uart/rx + uart/system: serial-timing equivalence (baud sampling, framing).
+  ✔ rv32i_cpu: 10 known programs (addi..bubblesort) run to halt, assert final a0.
+     → tests/rv32i_integration.rs::scalar_cpu_matches_known_results.
+  ✔ rv32i_cpu_pipelined: same 10 + the pipeline-specific ones (RAW forwarding=3,
+     load-use stall=43, jal=7) → pipelined_cpu_matches_known_results; PLUS a direct
+     scalar-vs-pipelined differential on the common programs → scalar_and_pipelined_agree.
+     Structure: cfg(not(test)) on each example `fn main` + `include!` (scalar at crate
+     root, pipelined in `mod pl` with its harness `pub`). CPUs don't transpile (Vec
+     port + Memory + submodules), so this is a sim self-check, not a Verilator equiv.
+     NOTE (found probing): the standalone transpiler PANICS on rv32i_cpu
+     ("gate guarantees at least one tick", control_extract.rs:95) instead of a clean
+     error — a codegen robustness bug, logged for later (needs sign-off to fix).
+  ☐ uart/rx + uart/system: serial-timing self-check (tx→rx loopback: send bytes,
+     assert received bytes; baud sampling / framing). [NEXT — this batch did CPUs]
 
 --------------------------------------------------------------------------------
 P6 — reset / X-propagation / robustness
