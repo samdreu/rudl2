@@ -239,6 +239,41 @@ reverted.
 Matched 7/7 variants, false-positived on `mac_fsm` and `if_tick_explicit` (§3.3).
 Reverted. Kept here because the *next* rule must explain why these survive.
 
+### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
+
+Measured by hand-writing the lowering Prost uses (combinational next-value in
+coroutine order; an output write reads the *forwarded* value) and running it under
+Verilator against the simulator. The controlled pair is V1 and V4 — **identical
+designs differing only in a leading `In` read**:
+
+| | sim | current SV | Prost-style SV |
+|---|---|---|---|
+| **V1** (no leading read) | `2 3 4 5 6 7 8 9` | `1 2 3 4 5 6 7 8` ✗ | `2 3 4 5 6 7 8 9` ✓ |
+| **V4** (leading read) | `1 2 3 4 5 6 7 8` | `1 2 3 4 5 6 7 8` ✓ | `2 3 4 5 6 7 8 9` ✗ |
+
+It **fixes D1 exactly** and **breaks the currently-correct case exactly**. Symmetric
+to §5.1: always-barrier fixed the barrier case and broke Moore outputs; Prost-style
+lowering fixes the no-barrier case and breaks the barrier-protected one.
+
+Projected corpus impact (same shape, barrier-protected, currently passing): `lfsr`,
+`det_110101`, `shift_register` — 6 module copies with equivalence tests that would
+start failing. Not individually measured; the V1/V4 pair is the controlled evidence.
+
+> **THE GENERAL RESULT — this is the important part.** No single codegen lowering can
+> match the simulator, because **the simulator is not internally consistent**: two
+> structurally identical modules behave differently depending on whether one of them
+> happens to read an input. For codegen to match, it would have to replicate that
+> incidental rule — i.e. emit different hardware for the same logic based on the
+> presence of an unrelated port read. That is not a lowering anyone should write.
+>
+> So **the simulator must be made uniform first**, and only then can codegen be
+> matched to whichever uniform semantics is chosen. Fixing either side alone is now
+> measured-and-rejected in both directions (§5.1, §5.3).
+
+Note this does **not** impugn Prost: its lowering is correct *for Prost*, whose
+alignment is uniform because it has no barrier mechanism to make it incidental. The
+defect is Copper's, and it is upstream of the lowering.
+
 ---
 
 ## 6. Requirements — what a shippable guardrail must satisfy
@@ -351,11 +386,13 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
 - **D2's disposition** — its own guardrail, a codegen change, or accepted-and-
   documented? Unlike D1 there is no independent-hardware adjudication yet; getting
   one is the prerequisite.
-- **Option (c) is back on the table.** It was previously ruled out on the strength of
-  §3.2; the correction there removes that basis, and §10.5 shows Prost does exactly
-  this. Fixing codegen to emit a combinational next-value would make the *netlist*
-  match the coroutine's own semantics rather than making the coroutine match a
-  netlist convention it never declared.
+- ~~**Option (c) is back on the table.**~~ **MEASURED AND REJECTED as a blanket
+  change — see §5.3.** Prost-style lowering fixes D1 exactly and breaks the
+  barrier-protected majority exactly. The reason generalises: the simulator is not
+  internally consistent, so *no* single lowering can match it. Both single-sided
+  fixes are now measured and rejected (§5.1 sim-only, §5.3 codegen-only). What
+  remains is (a) reject the shape, (d) make it unexpressible, or a *paired* fix that
+  makes the sim uniform **and** matches codegen to it.
 - **A fourth option, from §10: make it unexpressible.** Give register locals the
   current/next distinction that `Out`/`RegOut` already gives ports — a `Reg<T>`
   with explicit read/write. This is what MyHDL, Chisel, Amaranth, Spade and
