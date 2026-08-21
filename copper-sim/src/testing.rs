@@ -285,7 +285,13 @@ impl HardwareTest {
                     result.verilator_ok = Some(false);
                     result.errors.push("Verilator simulation did not pass all tests".to_string());
                 }
-                Err(e) if e.contains("not found") || e.contains("not installed") => {
+                // ONLY a genuinely absent binary is skippable, and it says so with
+                // an unambiguous marker. This used to match `e.contains("not found")`,
+                // which silently swallowed real build failures and reported PASS:
+                // Verilator's C++ stage emits `fatal error: 'Vfoo.h' file not found`
+                // for a broken testbench, matching that substring exactly. A stale
+                // `VERILATOR_ROOT` is likewise NOT a skip — see `verilator_status`.
+                Err(e) if crate::verification::is_missing_verilator(&e) => {
                     println!("  [verilator] not available: {}", e);
                 }
                 Err(e) => {

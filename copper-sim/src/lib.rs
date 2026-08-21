@@ -8,7 +8,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 pub mod verification;
-pub use verification::{SimulationTrace, CycleData, verify_with_verilator};
+pub use verification::{
+    is_missing_verilator, verify_with_verilator, verilator_status, CycleData, SimulationTrace,
+    VERILATOR_NOT_INSTALLED,
+};
 
 pub mod testing;
 pub use testing::{HardwareTest, TestResult, make_cycle};

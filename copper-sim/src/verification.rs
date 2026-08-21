@@ -243,6 +243,60 @@ fn logic_vec_to_int(values: &[Logic]) -> u64 {
     result
 }
 
+/// Unambiguous marker prefixing the *one* error that means "Verilator is not
+/// installed on this machine" — the only condition a caller may legitimately treat
+/// as a skip.
+///
+/// It exists because the alternative — matching prose like `contains("not found")`
+/// — silently swallowed **real** build failures. Verilator's C++ stage emits
+/// `fatal error: 'Vfoo.h' file not found` for a broken testbench, which matched that
+/// substring, so a genuinely failing equivalence check reported PASS. Callers must
+/// match this prefix and treat every other `Err` as a failure.
+pub const VERILATOR_NOT_INSTALLED: &str = "VERILATOR_NOT_INSTALLED:";
+
+/// Whether an error from [`verify_with_verilator`] means "Verilator is not installed"
+/// — the *only* condition under which a caller may skip instead of fail.
+///
+/// Deliberately an exact-prefix match on [`VERILATOR_NOT_INSTALLED`], never a
+/// substring search of the message. See the regression tests at the bottom of this
+/// file for the real Verilator output that made the substring version unsafe.
+pub fn is_missing_verilator(err: &str) -> bool {
+    err.starts_with(VERILATOR_NOT_INSTALLED)
+}
+
+/// Whether the `verilator` binary is present and runnable.
+///
+/// Distinguishes three states that must not be conflated:
+///   * `Ok(())` — present and `--version` succeeds.
+///   * `Err(msg)` starting with [`VERILATOR_NOT_INSTALLED`] — the binary could not be
+///     spawned at all. The only skippable case.
+///   * `Err(msg)` without that prefix — the binary *is* installed but fails to run
+///     (classically a stale `VERILATOR_ROOT`). That is a broken environment, not an
+///     absent tool, and must surface loudly rather than masquerade as "not installed".
+///
+/// `VERILATOR_ROOT` is cleared for the probe exactly as it is for the build below,
+/// so the probe and the thing it is probing for see the same environment.
+pub fn verilator_status() -> Result<(), String> {
+    match Command::new("verilator")
+        .arg("--version")
+        .env_remove("VERILATOR_ROOT")
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "Verilator is installed but failed to run (`verilator --version` exited {}). \
+             This is a broken environment, not a missing tool — it must not be skipped.\n{}{}",
+            o.status,
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr),
+        )),
+        Err(e) => Err(format!(
+            "{VERILATOR_NOT_INSTALLED} Verilator not found ({e}). \
+             Install with: brew install verilator (macOS) or apt-get install verilator (Linux)"
+        )),
+    }
+}
+
 /// Run Verilator simulation and compare with expected trace.
 /// The original public API — no waveform output.
 pub fn verify_with_verilator(
@@ -287,13 +341,11 @@ pub(crate) fn verify_with_verilator_traced(
 
     println!("Generated testbench: {}", tb_file);
 
-    // Check Verilator is installed
-    if Command::new("verilator").arg("--version").output().is_err() {
-        return Err(
-            "Verilator not found. Install with: brew install verilator (macOS) \
-             or apt-get install verilator (Linux)".to_string()
-        );
-    }
+    // Check Verilator is installed AND runnable. `verilator_status` separates
+    // "absent" (skippable, marked with VERILATOR_NOT_INSTALLED) from "present but
+    // broken" (must fail) — the old check used `.is_err()`, which only catches a
+    // spawn failure, and reported prose the caller had to substring-match.
+    verilator_status()?;
 
     // Module parameter overrides (`-GN=8`), so the Verilated design matches the
     // widths the simulator ran with. Built here so the strings outlive the args.
@@ -377,5 +429,63 @@ mod tests {
         assert_eq!(logic_vec_to_int(&[Logic::One]), 1);
         assert_eq!(logic_vec_to_int(&[Logic::Zero, Logic::One]), 2);
         assert_eq!(logic_vec_to_int(&[Logic::One, Logic::One]), 3);
+    }
+}
+
+
+#[cfg(test)]
+mod verilator_classification_tests {
+    use super::*;
+
+    /// The regression that matters. These are **real** messages Verilator produces
+    /// on a genuine build failure, captured from the tool. The classifier used to be
+    /// `err.contains("not found") || err.contains("not installed")`, which matched
+    /// the first one — so a broken C++ testbench was reported as "Verilator not
+    /// available", the equivalence check was skipped, and the test PASSED.
+    #[test]
+    fn real_build_failures_are_never_classified_as_missing() {
+        let build_failures = [
+            // clang, when the generated testbench includes the wrong header.
+            "Verilator compilation failed:\n../tb_good.cpp:1:10: fatal error: \
+             'Vwrong_name.h' file not found",
+            // A module the transpiler failed to emit.
+            "Verilator compilation failed:\n%Error-MODMISSING: bad.sv:2:5: \
+             Cannot find file containing module: 'missing_child'",
+            "Verilator compilation failed:\n%Error: bad2.sv:1:10: \
+             Cannot find include file: 'nope.svh'",
+            "Verilator compilation failed:\n%Error: bad3.sv:2:16: \
+             Can't find definition of variable: 'undefined_sig'",
+            // A stale VERILATOR_ROOT: installed, but unusable. Not a skip either.
+            "Verilator is installed but failed to run (`verilator --version` exited \
+             exit status: 1).\n%Error: verilator: VERILATOR_ROOT is set to inconsistent path.",
+        ];
+        for err in build_failures {
+            assert!(
+                !is_missing_verilator(err),
+                "a real build failure would be silently skipped:\n{err}"
+            );
+        }
+    }
+
+    /// The one message that *is* a legitimate skip carries the marker.
+    #[test]
+    fn the_absent_binary_message_is_classified_as_missing() {
+        let err = format!(
+            "{VERILATOR_NOT_INSTALLED} Verilator not found (No such file or directory). \
+             Install with: brew install verilator"
+        );
+        assert!(is_missing_verilator(&err));
+    }
+
+    /// `verilator_status` must not report a *working* install as missing. Vacuous
+    /// where Verilator is absent, which is the honest thing for it to be.
+    #[test]
+    fn a_working_install_is_not_reported_missing() {
+        if let Err(e) = verilator_status() {
+            assert!(
+                is_missing_verilator(&e),
+                "verilator_status failed for a reason other than absence: {e}"
+            );
+        }
     }
 }
