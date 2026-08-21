@@ -18,6 +18,9 @@ use copper_core::port::{wire, In, Out};
 use copper_core::{Bits, Clock, ClockDomain, Logic};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
+
+mod common;
+use common::verilator_available;
 use std::path::Path;
 use std::process::Command;
 
@@ -140,9 +143,7 @@ fn dual_clock_testbench(top: &str, fast_per_slow: usize, expected: &[(u8, u8)]) 
     tb
 }
 
-fn verilator_available() -> bool {
-    Command::new("verilator").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
-}
+
 
 /// Verilate `sv_file` with `top`, build against `tb_src`, run it, and return
 /// whether the self-checking testbench passed. Runs in an isolated work dir.
@@ -155,7 +156,7 @@ fn run_dual_clock_verilator(sv_file: &str, top: &str, tb_src: &str) -> Result<bo
     let tb_path = work.join(format!("tb_{top}.cpp"));
     std::fs::write(&tb_path, tb_src).map_err(|e| format!("write tb: {e}"))?;
 
-    let out = Command::new("verilator")
+    let out = common::verilator_command()
         .current_dir(&work)
         .args(["--cc", "--exe", "--build", "--top-module", top, "-Wall", "-Wno-DECLFILENAME", "-CFLAGS", "-std=c++14"])
         .arg(&sv_abs)
@@ -194,7 +195,6 @@ fn sim_trace_is_stable_and_synchronizes() {
 #[test]
 fn transpiled_hierarchy_matches_sim_under_verilator() {
     if !verilator_available() {
-        eprintln!("skipping: verilator not installed");
         return;
     }
     let expected = sim_trace(2, 10);
@@ -217,7 +217,6 @@ fn transpiled_hierarchy_matches_sim_under_verilator() {
 #[test]
 fn independent_reference_matches_sim_under_verilator() {
     if !verilator_available() {
-        eprintln!("skipping: verilator not installed");
         return;
     }
     assert!(Path::new(REFERENCE_SV).exists(), "missing independent reference {REFERENCE_SV}");

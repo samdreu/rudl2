@@ -52,9 +52,18 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
 ### Environment gotchas (important)
 
 - **Verilator is required** for examples and equivalence tests (`brew install
-  verilator`). A stale `VERILATOR_ROOT` env var on this machine breaks it — the
-  driver `unset`s it; when running `cargo run --example …` by hand, prefix with
-  `env -u VERILATOR_ROOT`.
+  verilator`). A stale `VERILATOR_ROOT` env var on this machine used to break it;
+  every Verilator invocation now clears the variable itself (`verilator_status` /
+  `verilator_command`), so `cargo test`, `cargo run --example …`, and the driver all
+  work with it set — no `env -u VERILATOR_ROOT` prefix needed. When invoking
+  `verilator` **directly** in a shell, you still need `env -u VERILATOR_ROOT`.
+- **A Verilator failure is never silently skipped.** Only a genuinely *absent*
+  binary is skippable, signalled by the `VERILATOR_NOT_INSTALLED` marker
+  (`copper-sim/src/verification.rs`). Installed-but-broken fails loudly, as does any
+  build error. If you add a test that drives Verilator directly, go through
+  `tests/common::verilator_available()` and `verilator_command()` rather than
+  spawning `verilator` yourself — a hand-rolled `--version` probe that treats a
+  non-zero exit as "not installed" reintroduces the silent skip.
 - **`copper-transpile` only handles concrete (non-generic) modules.** Generic
   modules (`const WIDTH_P: usize`, `Bits<W>`, `Clock<D>`) are monomorphized at
   example-run time by the `#[hardware]` macro, not by the standalone CLI — to

@@ -27,6 +27,38 @@ use std::path::PathBuf;
 use copper_core::Logic;
 use copper_sim::{make_cycle, CycleData, HardwareTest, SimulationTrace};
 
+/// Whether Verilator can be used, for tests that drive it directly rather than
+/// through `EquivalenceTest`.
+///
+/// Returns `false` **only** when the binary is genuinely absent (the one skippable
+/// case). If Verilator is installed but fails to run — classically a stale
+/// `VERILATOR_ROOT`, a known hazard on this project's machines (see CLAUDE.md) —
+/// this **panics** instead of returning `false`.
+///
+/// That distinction is the whole point. A probe that treats "broken" as "absent"
+/// makes a misconfigured environment indistinguishable from an unconfigured one, and
+/// the Verilator arms of a test — often the only thing anchoring it to real hardware
+/// — quietly do not run while the suite reports green.
+pub fn verilator_available() -> bool {
+    match copper_sim::verilator_status() {
+        Ok(()) => true,
+        Err(e) if e.starts_with(copper_sim::VERILATOR_NOT_INSTALLED) => {
+            eprintln!("skipping: {e}");
+            false
+        }
+        Err(e) => panic!("Verilator is present but unusable, so this test cannot be skipped:\n{e}"),
+    }
+}
+
+/// A `verilator` invocation with `VERILATOR_ROOT` cleared — always use this rather
+/// than `Command::new("verilator")`, so a stale value cannot break the build with a
+/// confusing error after `verilator_available` has already said yes.
+pub fn verilator_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("verilator");
+    cmd.env_remove("VERILATOR_ROOT");
+    cmd
+}
+
 /// Convenience: `bool` → `Logic`.
 pub fn logic(b: bool) -> Logic {
     if b {

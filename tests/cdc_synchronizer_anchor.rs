@@ -42,6 +42,9 @@ use copper_core::port::{wire, In, Out};
 use copper_core::{Clock, ClockDomain, Logic};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
+
+mod common;
+use common::verilator_available;
 use std::path::Path;
 use std::process::Command;
 
@@ -318,21 +321,6 @@ fn register_inference_matches_the_independent_reference() {
 
 // ── Verilator arms ────────────────────────────────────────────────────────────
 
-fn verilator_available() -> bool {
-    verilator_cmd().arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
-}
-
-/// A `verilator` invocation with `VERILATOR_ROOT` cleared.
-///
-/// A stale `VERILATOR_ROOT` is a known hazard on this project's machines (see
-/// CLAUDE.md); left set, `verilator --version` fails and the Verilator arms would
-/// *silently skip* rather than fail — the worst outcome for an anchor test.
-fn verilator_cmd() -> Command {
-    let mut cmd = Command::new("verilator");
-    cmd.env_remove("VERILATOR_ROOT");
-    cmd
-}
-
 /// Self-checking single-clock testbench: apply the `d` standing at each
 /// destination edge, tick `rd_clk`, and check `q` against the Copper sim.
 ///
@@ -373,7 +361,7 @@ fn run_verilator(sv_file: &Path, top: &str, tb_src: &str) -> Result<(), String> 
     let tb_path = work.join(format!("tb_{top}.cpp"));
     std::fs::write(&tb_path, tb_src).map_err(|e| format!("write tb: {e}"))?;
 
-    let out = verilator_cmd()
+    let out = common::verilator_command()
         .current_dir(&work)
         .args([
             "--cc",
@@ -432,7 +420,6 @@ fn anchor_schedule() -> Vec<Vec<u8>> {
 #[test]
 fn independent_verilog_matches_sim() {
     if !verilator_available() {
-        eprintln!("skipping: verilator not installed");
         return;
     }
     assert!(Path::new(REFERENCE_SV).exists(), "missing independent reference {REFERENCE_SV}");
@@ -450,7 +437,6 @@ fn independent_verilog_matches_sim() {
 #[test]
 fn transpiled_sync_2ff_matches_sim() {
     if !verilator_available() {
-        eprintln!("skipping: verilator not installed");
         return;
     }
     let sv = copper_codegen::transpile_source(
