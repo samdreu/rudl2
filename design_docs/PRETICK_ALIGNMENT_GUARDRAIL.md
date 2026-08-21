@@ -130,9 +130,20 @@ transpiled == independent → true
 sim        == independent → false
 ```
 
-**The simulator is the wrong side.** This is what rules out "fix codegen to emit a
-combinational next-value" as a direction: it would bend the netlist toward a
-simulator artifact.
+**Copper's simulator disagrees with both.** What this establishes is narrow and
+worth stating precisely: a hardware engineer implementing *the English description*
+("a sticky flag that asserts when the count reaches 8") writes the registered form,
+and Copper's codegen matches that. It does **not** establish that forwarding is
+inherently wrong — see the correction below.
+
+> **CORRECTION (2026-08-21, after the prior-art pass).** An earlier revision of this
+> doc concluded "the simulator is the wrong side" and used that to rule out fixing
+> codegen. That overstated the evidence. Prost — the closest prior art, and itself a
+> coroutine HDL — lowers coroutine bodies to a **combinational next-state block using
+> blocking assignments**, which *preserves* forwarding (see §10.5). Forwarding is
+> therefore a legitimate lowering for a coroutine surface, and arguably the one that
+> preserves the source's meaning. What the adjudication actually rules out is the
+> *disagreement*, not option (c).
 
 ### 3.3 Corpus status under the candidate rule
 
@@ -340,6 +351,11 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
 - **D2's disposition** — its own guardrail, a codegen change, or accepted-and-
   documented? Unlike D1 there is no independent-hardware adjudication yet; getting
   one is the prerequisite.
+- **Option (c) is back on the table.** It was previously ruled out on the strength of
+  §3.2; the correction there removes that basis, and §10.5 shows Prost does exactly
+  this. Fixing codegen to emit a combinational next-value would make the *netlist*
+  match the coroutine's own semantics rather than making the coroutine match a
+  netlist convention it never declared.
 - **A fourth option, from §10: make it unexpressible.** Give register locals the
   current/next distinction that `Out`/`RegOut` already gives ports — a `Reg<T>`
   with explicit read/write. This is what MyHDL, Chisel, Amaranth, Spade and
@@ -431,6 +447,95 @@ So the right predicate is likely **"does this value become observable at all"**,
 not "is it written to a port in this segment". That is a reachability question over
 the CFG, and it is the concrete thing to test first in phase 1.
 
+### 10.5 Prost — the closest prior art, and the only one that is *also* a coroutine HDL
+
+[Riedl, Scheipel & Baunach, **LATTE '26**] proposes coroutines as the fundamental
+abstraction of synchronous hardware — the same thesis as Copper's contribution 1,
+arrived at independently (see `paper/related_work.md`). Because it shares Copper's
+substrate, it is the single most relevant data point here, and it answers three
+questions at once.
+
+**(a) It hit the same problem and solved it structurally.** Prost signals carry an
+explicit current/next projection, with the semantics defined *in terms of the
+suspension boundary*:
+
+> "their current value can be accessed using the `.val` projection. Output signals
+> can be modified using the `.next` projection, **which will affect all `.val`
+> accesses after the next wait**."
+
+That is §10.1's answer, restated for a coroutine language — and it is precisely the
+`Out`/`RegOut` distinction Copper already has for ports. Note the asymmetry that
+matters for D1: Prost applies `.val`/`.next` to **signals**, while **local variables
+stay plain** ("Local variables correspond to registers … variable updates describe
+the datapath"). So Prost does *not* solve D1 by typing locals — see (b).
+
+**(b) Its lowering preserves forwarding, unlike Copper's.** Prost's synthesized
+next-state logic (their Listing 2) is a **combinational block using blocking
+assignments**:
+
+```verilog
+RESET: begin
+  acc = 0; byte = 0; i = 0;
+  cycles = 250;
+  cycles = cycles - 1;      // blocking — forwards, cycles becomes 249
+  next_state = STATE_0;
+end
+```
+
+Local updates are computed combinationally *in coroutine order*, with the registers
+taking the computed next values at the edge. **This is the sequential-forwarding
+semantics Copper's simulator has** — and it is exactly what Copper's codegen does
+*not* do, since it emits `r <= r + 1` non-blocking directly in `always_ff`.
+
+So the two coroutine HDLs resolve the same ambiguity in opposite directions, and
+Prost's direction is the one that preserves the source's meaning. **This is why §3.2
+carries a correction and why option (c) is back on the table in §9.** It also
+reframes D1: Copper's codegen may be the side that fails to preserve coroutine
+semantics, rather than the simulator being "wrong".
+
+**(c) Its guardrail philosophy is the one to adopt.** Prost states the design
+constraint for exactly this kind of check:
+
+> "One requirement of the Prost compiler is to reject code that cannot be
+> synthesized. Determining statically whether a program reaches a certain state is
+> **undecidable in the general case** … Therefore, we envision the compiler using a
+> **heuristic** instead, which must be **well-defined and computationally efficient
+> while rejecting as few valid programs as possible**. Currently, the compiler
+> requires each loop to contain at least one wait statement and to run for at least
+> one iteration. Future work shall develop more precise heuristics and also formally
+> verify their correctness."
+
+Three things follow directly:
+
+1. **Copper already implements Prost's one shipped guardrail.** "Each loop must
+   contain at least one wait" *is* `check_reachability` (impl-plan item 2), enforced
+   in both front-ends. Independent arrival at the same rule is worth citing.
+2. **"Rejecting as few valid programs as possible" is R1**, stated by the prior art
+   as a first-class design constraint rather than a nicety. The §5.2 rule failed
+   exactly this test — `mac_fsm` is a valid program.
+3. **A heuristic is the expected form, not a compromise.** Prost concedes the precise
+   question is undecidable and plans heuristics plus later formal verification. That
+   licenses Copper shipping a *sound-but-incomplete* rule — one that may miss cases
+   (§4 Q5's multi-tick false negative) provided it never rejects a valid program —
+   rather than holding out for an exact characterisation.
+
+**Also relevant:** Prost lists "combinational cycles are currently not expressible"
+and multi-clock as open — the same two frontiers Copper tracks (item 6's comb-loop
+detection, item 4's multi-clock).
+
+### 10.6 MyHDL — the convertible-subset discipline
+
+`SYNCHRONOUS_SEMANTICS.md` already cites MyHDL's "restrict the synthesizable subset"
+discipline as the precedent for the multi-write guardrail, and it applies here too:
+MyHDL's converter *rejects* constructs outside its convertible subset rather than
+silently emitting something that behaves differently. The G4 finding
+(`paper/related_work.md`) is the sharp version — MyHDL's **convertible** subset is
+strictly larger than its **RTL-synthesizable** subset, and its multi-`yield`
+cycle-slicing converts only to *behavioral*, non-synthesizable HDL. That is the same
+boundary Copper is negotiating, with the difference that Copper claims the
+multi-suspension shape *is* synthesizable and therefore owes a guardrail where MyHDL
+simply declined the territory.
+
 **Sources**
 - [Cummings, *Nonblocking Assignments in Verilog Synthesis, Coding Styles That Kill!* (SNUG)](https://csg.csail.mit.edu/6.375/6_375_2009_www/papers/cummings-nonblocking-snug99.pdf)
 - [Verilator — Errors and Warnings](https://verilator.org/guide/latest/warnings.html)
@@ -440,3 +545,4 @@ the CFG, and it is the concrete thing to test first in phase 1.
 - [Amaranth — Language guide (domains)](https://amaranth-lang.org/docs/amaranth/v0.4.3/lang.html)
 - [Spade: An Expression-Based HDL With Pipelines](https://spade-lang.org/osda2023.pdf)
 - [Bluespec — Rule Scheduling (UCSB course notes)](https://web.ece.ucsb.edu/its/bluespec/training/BSV/slides/Lec06_Scheduling.pdf)
+- [Riedl, Scheipel & Baunach, *Prost! Coroutine-based Hardware Description*, LATTE '26](https://capra.cs.cornell.edu/latte26/paper/latte26-final31.pdf)

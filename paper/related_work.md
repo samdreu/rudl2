@@ -302,3 +302,26 @@ This should be reported honestly rather than elided: it is the sharpest known co
 the coroutine surface, and it is the strongest argument for giving register *locals*
 the same current/next distinction Copper already gives *ports* via `Out`/`RegOut`.
 
+### Prost's guardrail, and its lowering (2026-08-21 follow-up)
+
+Two details from the Prost paper matter beyond the contribution-1 comparison above.
+
+**Prost lowers coroutine bodies with BLOCKING assignments, preserving forwarding.**
+Its synthesized next-state logic (Listing 2) computes local updates combinationally in
+coroutine order — `cycles = 250; cycles = cycles - 1;` — with registers taking the
+computed next values at the edge. Copper's transpiler instead emits `r <= r + 1`
+non-blocking directly in `always_ff`. **The two coroutine HDLs resolve the same
+ambiguity in opposite directions**, and Prost's is the one that preserves the source's
+meaning. This is the sharpest available evidence on Copper's open D1 divergence
+(`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`) and it argues the transpiler, not the
+simulator, is the side that departs from coroutine semantics.
+
+**Prost states the guardrail design constraint explicitly**, and Copper should adopt
+the framing: rejecting unsynthesizable code is "undecidable in the general case", so
+the compiler should use "a heuristic … which must be well-defined and computationally
+efficient **while rejecting as few valid programs as possible**", with formal
+verification of the heuristic left to future work. Note also that Prost's one shipped
+guardrail — "each loop must contain at least one wait statement and run for at least
+one iteration" — is *the same rule* as Copper's `check_reachability` (impl-plan item
+2), arrived at independently. Worth citing as convergent evidence that the rule is the
+right well-formedness condition for a coroutine HDL, not a Copper idiosyncrasy.
