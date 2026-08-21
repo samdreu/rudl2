@@ -43,12 +43,19 @@ async fn fast_counter(
     let mut count: Bits<8> = Bits::zero();
     let mut latched = Logic::Zero;
     loop {
-        if count[3] == Logic::One {
-            latched = Logic::One;
-        }
         count_out.write(count);
         flag_out.write(latched);
         clk.tick().await;
+        // Sticky threshold, updated AFTER the edge so it reads the pre-edge `count`
+        // exactly as `if (cnt[3]) latch <= 1'b1;` does. Updating it *before* the
+        // writes puts a register assignment in the pre-tick segment with no input
+        // read to pin the phase — the simulator then runs that segment a phase early
+        // and silently disagrees with the synthesized hardware. Measured against the
+        // independent reference in `sv/two_domain_hierarchy.sv`; see
+        // design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md.
+        if count[3] == Logic::One {
+            latched = Logic::One;
+        }
         count = count + Bits::from_lit::<1>();
     }
 }
@@ -81,8 +88,15 @@ async fn slow_consumer(
     out: Out<Logic, ClkSlow>,
 ) {
     loop {
-        out.write(flag_in.read());
         clk.tick().await;
+        // Read AFTER the tick. A pure combinational passthrough transpiles to
+        // `assign out = flag_in` (zero cycles), but a *leading* read is classified
+        // `Deferred` and samples at the pre-edge, while a clocked producer updates at
+        // the post-edge — so the leading-read form lags a cycle in the simulator and
+        // silently disagrees with its own SV. A trailing read is `Immediate` and
+        // tracks the producer, matching the netlist. See D2 in
+        // design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md.
+        out.write(flag_in.read());
     }
 }
 

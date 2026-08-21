@@ -41,18 +41,29 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The mode named by `#[hardware(<mode>, <flags>…)]`, ignoring any trailing flags.
+///
+/// Parsing with `parse_args::<syn::Ident>()` fails outright once a flag is present
+/// (e.g. `allow_pretick_alignment`), which would make such modules vanish from this
+/// scan — a check that silently stops running. Take the first token instead.
+fn hardware_mode_of(f: &ItemFn) -> Option<String> {
+    f.attrs.iter().find_map(|a| {
+        if !a.path().segments.last().is_some_and(|s| s.ident == "hardware") {
+            return None;
+        }
+        let text = a.meta.require_list().ok()?.tokens.to_string();
+        Some(text.split(',').next()?.trim().to_string())
+    })
+}
+
 /// Every `fn` carrying `#[hardware(...)]` in a clocked mode, including inside `mod`s.
 /// `combinational` has no tick and therefore no pre-tick segment.
 fn clocked_hardware_fns(items: &[Item], out: &mut Vec<ItemFn>) {
     for item in items {
         match item {
             Item::Fn(f) => {
-                let clocked = f.attrs.iter().any(|a| {
-                    a.path().segments.last().is_some_and(|s| s.ident == "hardware")
-                        && a.parse_args::<syn::Ident>()
-                            .is_ok_and(|id| id == "sequential" || id == "synchronizer")
-                });
-                if clocked {
+                let mode = hardware_mode_of(f);
+                if matches!(mode.as_deref(), Some("sequential") | Some("synchronizer")) {
                     out.push(f.clone());
                 }
             }
@@ -66,25 +77,31 @@ fn clocked_hardware_fns(items: &[Item], out: &mut Vec<ItemFn>) {
     }
 }
 
-/// The modules measured to diverge, as `file::module`. Each is a plain-`Out` design
-/// whose pre-tick segment assigns a register with no preceding `In` read.
+/// The modules the detector must flag, as `file::module`.
 ///
-/// * `fast_counter` — measured sim-vs-SV divergence, adjudicated against an
-///   independent hand-written reference; three copies (two examples + one test).
-/// * `add_then_write` / `fast_counter` in `sequential_forwarding_divergence.rs` — the
-///   pinned fixtures for the divergence itself.
+/// After the phase-3 migration these are **exactly** the fixtures that exist to
+/// *demonstrate* the divergence. Each carries
+/// `#[hardware(sequential, allow_pretick_alignment)]`, so the macro permits it while
+/// this analysis still reports it — deliberately: the opt-out silences the *error*,
+/// not the *detection*, so an opted-out module cannot quietly disappear from the
+/// corpus view.
+///
+/// * `add_then_write` / `fast_counter` in `sequential_forwarding_divergence.rs` —
+///   the pinned sim-vs-Verilator proof that the hazard is real.
 /// * `probe_fsm` — a pre-existing `#[ignore]`d divergence, measured to be the *same*
 ///   defect (a leading read on every path fixes it).
-/// * `ram_prewrite` — flagged and plausible, but its only test (`probe_mem_latency`)
-///   is `#[ignore]`d, so it has no behavioral verdict yet. Plan phase 0b.
+/// * `ram_prewrite` — flagged and plausible, but its only test
+///   (`probe_mem_latency`) is `#[ignore]`d, so it still has no behavioral verdict.
+///
+/// The real designs that used to appear here — the three `fast_counter` copies in
+/// `examples/cdc/` and `two_domain_hierarchy_cdc.rs` — were migrated to update the
+/// sticky flag *after* the tick, the form measured to match the independent
+/// hand-written SV reference.
 const EXPECTED_FLAGGED: &[&str] = &[
-    "examples/cdc/two_domain_counter.rs::fast_counter",
-    "examples/cdc/two_domain_hierarchy.rs::fast_counter",
     "tests/fixtures/probe_timing_dut.rs::probe_fsm",
     "tests/mem_latency_probe.rs::ram_prewrite",
     "tests/sequential_forwarding_divergence.rs::add_then_write",
     "tests/sequential_forwarding_divergence.rs::fast_counter",
-    "tests/two_domain_hierarchy_cdc.rs::fast_counter",
 ];
 
 #[test]

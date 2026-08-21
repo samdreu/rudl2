@@ -1,0 +1,5 @@
+error: output port `o` is driven from a register in the pre-tick segment, but that segment also assigns a register with no preceding input read to pin its clock phase — the simulator runs it one phase early and silently disagrees with the synthesized hardware. Declare `o` as `RegOut<…>` (a registered output, immune because it commits at the clock edge), or move the register update after the `clk.tick().await` so the pre-tick segment only reads state. If this module exists to DEMONSTRATE the divergence, opt out explicitly with `#[hardware(sequential, allow_pretick_alignment)]`.
+  --> tests/ui/fail/pretick_alignment.rs:16:42
+   |
+16 | async fn misaligned(clk: Clock<MainClk>, o: Out<Bits<8>, MainClk>) {
+   |                                          ^

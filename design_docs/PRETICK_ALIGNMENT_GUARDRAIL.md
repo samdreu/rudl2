@@ -1,9 +1,9 @@
 # Pre-Tick Segment Alignment — Divergence Analysis and Guardrail Plan
 
-> **Status (2026-08-21): OPEN.** Two silent `sim ≠ synthesized-SV` divergences are
-> established and pinned; no fix is landed. Two candidate fixes have been *tried and
-> rejected with evidence*. This doc is the plan for developing the static guardrail,
-> and — as importantly — the record of what must be true before one can be wired in.
+> **Status (2026-08-21): D1 GUARDED — phases 0–3 complete, gates G0–G3 met.
+> D2 remains OPEN and unguarded.** Three candidate fixes were tried and rejected with
+> measured evidence (§5) before the shippable rule was found. This doc is both the
+> plan and the record of what was ruled out and why.
 >
 > **Pinned by:** `tests/sequential_forwarding_divergence.rs` (4 tests, green; each
 > flips loudly when the corresponding divergence is fixed).
@@ -227,7 +227,13 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
   at exactly the remedy `multi_write_collapse` points at, rather than needing a
   bespoke rewriting rule per case.
 
-- **Q3 — Does D2 need its own rule, or does fixing D1 subsume it?** They are pinned
+- **Q3 — PARTLY ANSWERED.** D2 is *not* subsumed by D1's rule, and it now has a
+  known legal form (read after the tick — see phase 3c), which is what the CDC
+  designs use. It remains **unguarded**: there is still no independent-hardware
+  adjudication for it, which is the prerequisite. Its root cause is narrower than it
+  looked — `classify_reads` defers a read because *a tick follows it*, not because
+  *its result crosses the tick*; in a passthrough the value is consumed before the
+  edge and never needed deferring. Original question: They are pinned
   together only because they cancel; nothing shows they share a mechanism.
 - **Q4 — What is the correct form for a designer who wants a sticky flag?** The
   guardrail must point at a *legal* alternative. For `fast_counter` that is the
@@ -427,7 +433,45 @@ was measured (phase 0a, discharged) — it **agrees**, because every write is
 - **Gate G2:** sweep is clean — flags exactly the confirmed-divergent set, nothing
   else (R1, R2).
 
-### Phase 3 — Wiring and fixture migration (needs sign-off)
+### Phase 3 — Wiring and fixture migration — **DONE 2026-08-21**
+
+- **3a DONE** — wired into the `#[hardware(sequential)]` arm as a spanned error naming
+  the port and all three remedies. **Escape hatch decision: opt-out attribute**
+  `#[hardware(sequential, allow_pretick_alignment)]`, on the precedent that every lint
+  in this space ships a waiver (§10.2). It silences the **error, not the detection** —
+  the corpus test still counts opted-out modules, so one cannot quietly vanish.
+- **3b DONE** — `fast_counter` ×3 migrated to the post-tick sticky update (the form
+  adjudicated against independent hardware); the four demonstration fixtures carry the
+  opt-out. `fast_counter_corrected` deliberately does **not** carry it, so the
+  corrected form is proven to pass on its own merits.
+- **3c DONE — and better than planned.** The plan expected D1's fix to expose D2 and
+  force a downgrade of the anchor (R7). It did expose it — all three arms failed — but
+  **D2 also has a legal form**: a *leading* read classifies `Deferred` and samples at
+  the pre-edge while its producer updates at the post-edge; reading **after** the tick
+  classifies `Immediate` and tracks it.
+
+  | | flag_raw | sync_q | consumer |
+  |---|---|---|---|
+  | leading read (old) | 4 | 5 | **6** ✗ |
+  | trailing read | 4 | 5 | **5** ✓ |
+
+  With both corrected, `two_domain_hierarchy_cdc.rs` passes **for the right reason**
+  rather than by cancellation — verified by checking that correcting only one moves
+  the boundary 5 → 6 and breaks it. **The anchor is repaired, not downgraded.**
+- **3d DONE** — `ui/fail/pretick_alignment.rs` plus `ui/pass/pretick_alignment_ok.rs`
+  covering all four accepting clauses (post-tick update, `RegOut`, leading read,
+  constant write).
+- **Gate G3: MET** — `smoke.sh` green.
+
+**A bug introduced and caught during this phase, worth recording.** Adding the flag
+broke three attribute parsers using `parse_args::<syn::Ident>()`, which fails outright
+on two idents — so opted-out modules **silently disappeared** from
+`pretick_alignment_corpus`, `register_reconciliation` and `real_examples`. It surfaced
+only because the corpus test asserts an **exact set**: it reported all 7 modules as
+"no longer flagged" when just 3 should have been. A `>=` threshold would have passed.
+That is the same defect class this whole document is about, introduced while fixing it.
+
+### Phase 3 (original scope, for reference)
 
 - **3a** Wire into the `#[hardware(sequential)]` arm as a spanned error (R5).
 - **3b** Migrate the three `fast_counter` copies to the legal form (Q4).

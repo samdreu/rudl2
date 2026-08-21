@@ -79,6 +79,49 @@ conditions — bare tick, both-sides write, leading read comb-reaching the pre-t
 corpus-clean. A single-write-per-cycle output, a `RegOut`, and a write-straddle *without* a leading
 read (`counter`; `uart_rx`'s `rx_dv`) are all unaffected.
 
+**Pre-tick alignment guardrail.** A plain combinational `Out` **driven from a register** in the
+pre-tick segment is **rejected at compile time** when that same segment also **assigns a register
+with no `In` read preceding it**. A leading read classifies `Deferred` and injects
+`pre_edge_barrier()`, which parks the task at the barrier so the segment runs in the *pre-edge*
+phase; with no such read the task parks at the tick instead, the segment for cycle *N+1* runs during
+cycle *N*'s **post-edge settle**, and the post-edge observation of cycle *N* therefore sees *N+1*'s
+value. Codegen emits a non-blocking `r <= …`, which no flip-flop can reproduce — measured,
+`loop { r = r+1; o.write(r); tick; }` simulates `[2,3,4,…]` against the SV's `[1,2,3,…]`.
+
+The remedies are `RegOut` (immune: it commits at the edge, so *when* the write executes is
+unobservable) or moving the register update after the `clk.tick().await` so the pre-tick segment only
+*reads* state. A module that exists to demonstrate the divergence opts out explicitly with
+`#[hardware(sequential, allow_pretick_alignment)]` — the waiver every lint in this space ships
+(Verilator's `lint_off BLKSEQ`, Verible's rule waivers); it silences the error, not the detection.
+
+Detection is `copper_analysis::unprotected_pretick_out_write`. Each clause has a measured witness:
+the read must *precede* the assignment (a trailing read does not protect); mixed alignment does
+**not** protect (a read on one branch leaves another branch exposed); `RegOut` is immune (changing
+*only* the port type flips a diverging module to agreeing); and the write must read a **register** —
+a constant write is idempotent across the phase shift, which is why `branch_merge_explicit`, driving
+three plain `Out`s from an unprotected path, agrees. Known false negative: only the pre-tick segment
+is examined, so the multi-tick `accum_2` class is not caught.
+
+**This is the third member of the blocking/non-blocking family**, after `Out`-hold semantics and the
+multi-write collapse — and the three share a root cause worth stating plainly: **Copper infers the
+register/combinational boundary where every other HDL makes it explicit.** MyHDL (`sig` vs
+`sig.next`), Chisel (`Reg` vs `:=`), Amaranth (`m.d.sync` vs `m.d.comb`), Spade (`reg(clk) … = …`)
+and Bluespec (atomic rules) all separate a register's *current* value from its *next* one
+syntactically, so the hazard is unexpressible. Verilog leaves it expressible and lints it
+(`BLKSEQ`) — but those lints compare an author-written **marker** (`=` vs `<=`) against an
+author-written **block kind** (`always_comb` vs `always_ff`), two declarations checked against each
+other. Copper has neither, which is why its rules must *infer* both sides. See
+`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`.
+
+**A second, unguarded divergence (D2).** A combinational passthrough
+(`loop { out.write(inp.read()); tick; }` → `assign out = inp;`) lags one cycle in the simulator when
+its producer is another clocked task: the *leading* read classifies `Deferred` and samples at the
+pre-edge, while the producer updates at the post-edge. Reading **after** the tick classifies
+`Immediate` and matches the netlist. This is not currently guarded — it has no independent-hardware
+adjudication yet — but note the root cause is narrower than it looks: `classify_reads` marks a read
+`Deferred` because *a tick follows it*, not because *its result crosses the tick*. In a passthrough
+the value is consumed before the edge, so it never needed deferring.
+
 ## Input read timing — static edge-phase classification
 
 An `In` read is classified **statically** by its position relative to ticks, replacing the retired

@@ -41,7 +41,7 @@ async fn ram_straddle(
 // OUTPUT-BEFORE-TICK: drive dob (from the previous read) BEFORE the tick, then
 // issue the next read. dob is a pre-tick write (like counter/mac_fsm → observed
 // same cycle). Hypothesis: this collapses to 1-cycle, matching the .sv.
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn ram_prewrite(
     clk: Clock<MainClk>,
     enb: In<Logic, MainClk>,

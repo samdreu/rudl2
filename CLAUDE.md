@@ -170,11 +170,22 @@ receive/clone one.
 - Design docs live in `design_docs/`. Most have been moved to
   `design_docs/OUTDATED/`; `SYNCHRONOUS_SEMANTICS.md` is the current one.
   Treat `OUTDATED/` as historical, not authoritative.
-- **`PRETICK_ALIGNMENT_GUARDRAIL.md` is an OPEN issue with a plan** — two silent
-  `sim ≠ synth` divergences from pre-tick segment phase alignment. Read it before
-  touching read-timing, the pre/post-edge settle, or `two_domain_hierarchy_cdc.rs`
-  (which is currently green only because the two divergences cancel). It also records
-  two rejected fixes with evidence, so they are not re-tried.
+- **`PRETICK_ALIGNMENT_GUARDRAIL.md`** — D1 (pre-tick alignment) is **guarded** as of
+  2026-08-21: a plain `Out` driven from a register in the pre-tick segment is a
+  compile error when that segment also assigns a register with no preceding `In` read.
+  Fix with `RegOut`, or move the register update after the tick. A module that exists
+  to *demonstrate* the hazard opts out with
+  `#[hardware(sequential, allow_pretick_alignment)]` — this silences the error, not
+  the detection, and must never be reached for in a real design.
+  **D2 is still open and unguarded** (a combinational passthrough of a
+  post-edge-produced signal lags a cycle; read *after* the tick to avoid it). The doc
+  also records **three** rejected fixes with measured evidence so they are not
+  re-tried, and the prior-art survey in §10.
+- **When adding a `#[hardware]` mode or flag, fix every attribute parser.**
+  `parse_args::<syn::Ident>()` fails outright once a flag is present, which silently
+  drops those modules from corpus scans (`pretick_alignment_corpus`,
+  `register_reconciliation`, `real_examples` all had this). Read the first token of
+  the attribute list instead.
 - Generated artifacts (`tb_*.cpp`, `obj_dir/`, `waveforms/*.vcd`) land in the
   repo root and subdirs and are gitignored.
 - Do research on prior HDLs and hardware DSLs to get knowledge on what correct semantics

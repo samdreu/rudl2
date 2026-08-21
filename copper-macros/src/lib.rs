@@ -25,18 +25,58 @@ impl HardwareMode {
     }
 }
 
-fn parse_hardware_mode(args: TokenStream) -> Result<HardwareMode, Error> {
+/// The opt-out that suppresses the pre-tick alignment check.
+///
+/// Every lint in this space ships a waiver — Verilator's
+/// `/* verilator lint_off BLKSEQ */`, Verible's rule waivers — and the reason
+/// applies here too: the check must be expressible-but-refused for the fixtures that
+/// *demonstrate* the divergence. `tests/sequential_forwarding_divergence.rs` is the
+/// measured sim-vs-Verilator proof that the hazard is real, and it cannot hold that
+/// proof if the language rejects the program outright.
+///
+/// **This is not a general escape hatch for designs.** Reaching for it in a real
+/// module means shipping a silent sim ≠ synth divergence. The remedies are `RegOut`
+/// or moving the register update after the tick; see
+/// `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`.
+const ALLOW_PRETICK: &str = "allow_pretick_alignment";
+
+/// Parsed `#[hardware(...)]` arguments: the mode, plus any opt-out flags.
+struct HardwareArgs {
+    mode: HardwareMode,
+    /// Set by `allow_pretick_alignment` — see [`ALLOW_PRETICK`].
+    allow_pretick_alignment: bool,
+}
+
+fn parse_hardware_mode(args: TokenStream) -> Result<HardwareArgs, Error> {
     let text = args.to_string().replace(' ', "");
-    match text.as_str() {
-        "sequential" => Ok(HardwareMode::Sequential),
-        "combinational" => Ok(HardwareMode::Combinational),
-        "synchronizer" => Ok(HardwareMode::Synchronizer),
-        "structural" => Ok(HardwareMode::Structural),
-        _ => Err(Error::new(
-            proc_macro2::Span::call_site(),
-            "Unsupported #[hardware(...)] argument. Supported: sequential, combinational, synchronizer, structural",
-        )),
+    let mut parts = text.split(',').filter(|p| !p.is_empty());
+    let mode_text = parts.next().unwrap_or("");
+    let mode = match mode_text {
+        "sequential" => HardwareMode::Sequential,
+        "combinational" => HardwareMode::Combinational,
+        "synchronizer" => HardwareMode::Synchronizer,
+        "structural" => HardwareMode::Structural,
+        _ => {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                "Unsupported #[hardware(...)] argument. Supported: sequential, combinational, synchronizer, structural",
+            ))
+        }
+    };
+
+    let mut allow_pretick_alignment = false;
+    for flag in parts {
+        if flag == ALLOW_PRETICK {
+            allow_pretick_alignment = true;
+        } else {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!("Unsupported #[hardware(...)] flag `{flag}`. Supported flags: {ALLOW_PRETICK}"),
+            ));
+        }
     }
+
+    Ok(HardwareArgs { mode, allow_pretick_alignment })
 }
 
 /// Returns the outer type name (last path segment ident) for a type like `Clock<D>`, `In<T>`, `Out<T>`.
@@ -835,10 +875,11 @@ fn wrap_in_module(f: &mut ItemFn) {
 #[proc_macro_attribute]
 pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(input as ItemFn);
-    let hardware_mode = match parse_hardware_mode(args) {
-        Ok(mode) => mode,
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let HardwareArgs { mode: hardware_mode, allow_pretick_alignment } =
+        match parse_hardware_mode(args) {
+            Ok(parsed) => parsed,
+            Err(err) => return err.to_compile_error().into(),
+        };
 
     if let Err(err) = validate_hardware_fn(&input_fn, &hardware_mode) {
         return err.to_compile_error().into();
@@ -897,6 +938,39 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
                          the synthesized hardware. Declare `{port}` as `RegOut<…>` (a registered \
                          output), or split the writes into distinct FSM states so each state drives \
                          the output once."
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            // Pre-tick alignment hazard: the module assigns a register in its
+            // pre-tick segment on a path no `In` read precedes, and drives a plain
+            // combinational `Out` from a register in that same segment. With no
+            // leading read there is no `pre_edge_barrier`, so that segment runs in
+            // the PREVIOUS tick's post-edge settle and the observation is a cycle
+            // early — silently disagreeing with the synthesized `always_ff`. Reject
+            // it, pointing at `RegOut` (immune: it commits at the edge). See
+            // `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` for the measurements.
+            let misaligned = if allow_pretick_alignment {
+                Vec::new()
+            } else {
+                copper_analysis::unprotected_pretick_out_write(&input_fn)
+            };
+            if let Some(port) = misaligned.first() {
+                let span = port_param_span(&input_fn.sig, port)
+                    .unwrap_or_else(|| input_fn.sig.ident.span());
+                return Error::new(
+                    span,
+                    format!(
+                        "output port `{port}` is driven from a register in the pre-tick \
+                         segment, but that segment also assigns a register with no preceding \
+                         input read to pin its clock phase — the simulator runs it one phase \
+                         early and silently disagrees with the synthesized hardware. Declare \
+                         `{port}` as `RegOut<…>` (a registered output, immune because it \
+                         commits at the clock edge), or move the register update after the \
+                         `clk.tick().await` so the pre-tick segment only reads state. If this \
+                         module exists to DEMONSTRATE the divergence, opt out explicitly with \
+                         `#[hardware(sequential, {ALLOW_PRETICK})]`."
                     ),
                 )
                 .to_compile_error()

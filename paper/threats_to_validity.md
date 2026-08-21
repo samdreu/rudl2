@@ -142,3 +142,46 @@ SystemVerilog (BaseJump STL) and hand-written primitive references, so at least 
 constructs rest on hardware neither we nor our transpiler authored. The bound on this mitigation
 is coverage: it is only as strong as the set of anchored modules. `[VERIFY: keep in sync with
 intro_contributions.md contribution 2's evidence list.]`
+
+## T-align — the pre-tick alignment restriction (added 2026-08-21)
+
+A third restriction on the legal synthesizable subset, and the one that costs the most to admit.
+
+**The defect.** A plain combinational `Out` driven from a register in a module's pre-tick segment
+diverged silently between simulation and the transpiled netlist when that segment also assigned a
+register with no preceding input read. Measured: `loop { r = r+1; o.write(r); tick; }` simulates
+`[2,3,4,…]` against its own SV's `[1,2,3,…]`.
+
+**Why it is worth reporting rather than eliding.** The mechanism indicts the coroutine surface
+itself — contribution 1. A module's clock-phase alignment was decided by an *incidental* property:
+whether it happened to read an input before its tick, because a leading read injects a pre-edge
+barrier and nothing else does. Two structurally identical modules therefore behaved differently.
+Worse, the divergence had **corrupted an anchor**: `two_domain_hierarchy_cdc.rs` — the independent
+hardware check for the dual-clock design — was green because this defect and a second one cancelled
+inside the chain. A green anchor agreeing for the wrong reason is worse evidence than a missing one,
+and only a deliberate experiment (correcting one side and watching the boundary move) exposed it.
+
+**The fix, and its cost.** The shape is rejected at compile time
+(`copper_analysis::unprotected_pretick_out_write`), with `RegOut` or a post-tick update as the legal
+forms and an explicit `allow_pretick_alignment` waiver for fixtures that demonstrate the hazard. So
+the `sim ≡ synth` claim holds for every *accepted* program — but the accepted set is now smaller in a
+way a reader should be told about, and finding the boundary took three rejected candidate fixes
+(a uniform pre-edge barrier, a register-keyed static rule, and Prost-style codegen), each rejected on
+measured evidence rather than argument.
+
+**The honest framing for contribution 5.** Copper did not merely *rediscover* the
+blocking/non-blocking distinction — it rediscovered it **three times**, in three different
+disguises: `Out`-hold semantics, the multi-write collapse, and this. That is not a coincidence; it
+is the predictable cost of the one thing Copper does that no comparison HDL does — **inferring** the
+register/combinational boundary rather than declaring it. Every other system in the comparison
+(MyHDL, Chisel, Amaranth, Spade, Bluespec, Clash) makes the current/next distinction syntactic and
+so cannot express the hazard; Verilog can express it but lints it by comparing two author-written
+declarations, which Copper does not have. Inference buys the ergonomics that are the headline claim,
+and this is its bill. See `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` §10 for the prior-art survey
+and `SYNCHRONOUS_SEMANTICS.md` for the normative statement.
+
+**Still open (T-align-2).** A combinational passthrough of a post-edge-produced signal lags a cycle
+in the simulator and is *not* guarded — it has no independent-hardware adjudication yet. Its root
+cause is narrower than it appears: `classify_reads` defers a read because *a tick follows it*, not
+because *its result crosses the tick*.
+

@@ -82,7 +82,7 @@ const CYCLES: usize = 13;
 // ── Divergence 1: minimal case ────────────────────────────────────────────────
 
 const ADD_SRC: &str = r#"
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn add_then_write(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut r: Bits<8> = Bits::zero();
     loop {
@@ -93,7 +93,7 @@ async fn add_then_write(clk: Clock<C>, o: Out<Bits<8>, C>) {
 }
 "#;
 
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn add_then_write(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut r: Bits<8> = Bits::zero();
     loop {
@@ -264,7 +264,7 @@ fn a_leading_input_read_removes_the_divergence() {
 // ── The hardware adjudication ─────────────────────────────────────────────────
 
 const FAST_COUNTER_SRC: &str = r#"
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn fast_counter(clk: Clock<ClkFast>, count_out: Out<Bits<8>, ClkFast>, flag_out: Out<Logic, ClkFast>) {
     let mut count: Bits<8> = Bits::zero();
     let mut latched = Logic::Zero;
@@ -278,7 +278,7 @@ async fn fast_counter(clk: Clock<ClkFast>, count_out: Out<Bits<8>, ClkFast>, fla
 }
 "#;
 
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn fast_counter(
     clk: Clock<ClkFast>,
     count_out: Out<Bits<8>, ClkFast>,

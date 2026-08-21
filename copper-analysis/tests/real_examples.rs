@@ -72,7 +72,13 @@ fn combinational_hardware_fns(items: &[Item], out: &mut Vec<ItemFn>) {
 fn hardware_mode_is(f: &ItemFn, mode: &str) -> bool {
     f.attrs.iter().any(|a| {
         a.path().segments.last().is_some_and(|s| s.ident == "hardware")
-            && a.parse_args::<syn::Ident>().is_ok_and(|id| id == mode)
+            && a
+                .meta
+                .require_list()
+                .ok()
+                .map(|l| l.tokens.to_string())
+                .and_then(|t| t.split(',').next().map(|m| m.trim().to_string()))
+                .is_some_and(|m| m == mode)
     })
 }
 

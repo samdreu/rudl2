@@ -51,10 +51,17 @@ fn is_hardware(f: &ItemFn) -> bool {
 /// Excludes only `combinational`. See the scope note in the header for why
 /// `synchronizer` is included.
 fn is_clocked(f: &ItemFn) -> bool {
+    // Read the FIRST token of `#[hardware(<mode>, <flags>…)]`. `parse_args::<Ident>()`
+    // fails outright once a flag is present (e.g. `allow_pretick_alignment`), which
+    // would silently drop such modules from this reconciliation.
     f.attrs.iter().any(|a| {
-        a.path().segments.last().is_some_and(|s| s.ident == "hardware")
-            && a.parse_args::<syn::Ident>()
-                .is_ok_and(|id| id == "sequential" || id == "synchronizer")
+        if !a.path().segments.last().is_some_and(|s| s.ident == "hardware") {
+            return false;
+        }
+        let Ok(list) = a.meta.require_list() else { return false };
+        let text = list.tokens.to_string();
+        let mode = text.split(',').next().unwrap_or("").trim().to_string();
+        mode == "sequential" || mode == "synchronizer"
     })
 }
 

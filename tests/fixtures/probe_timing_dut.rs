@@ -28,7 +28,7 @@ async fn probe(
     }
 }
 
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn probe_fsm(
     clk: Clock<MainClk>,
     inp: In<Bits<8>, MainClk>,

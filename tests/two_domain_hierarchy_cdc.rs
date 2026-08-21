@@ -11,24 +11,27 @@
 //!      (`examples/cdc/sv/two_domain_hierarchy.sv`, `two_domain_ref`) — the
 //!      non-circular anchor: Copper's CDC timing vs an outside implementation.
 //!
-//! **CAVEAT (2026-08-21) — this anchor currently agrees by COINCIDENCE.** All three
-//! views really do match at the observable boundary, but not because the chain is
-//! right: two silent sim ≠ SV divergences cancel inside it.
+//! **Repaired 2026-08-21 — this anchor used to agree by COINCIDENCE.** Two silent
+//! sim ≠ SV divergences cancelled inside the chain, so all three views matched at the
+//! boundary without the chain being right:
 //!
-//!   * `fast_counter` asserts its flag one cycle EARLY in the simulator — its
-//!     sticky `latched` is updated in the pre-tick segment and read back in that
-//!     same segment, which the simulator forwards and a flip-flop cannot.
-//!     Independent hardware sides with codegen here; the simulator is wrong.
-//!   * `slow_consumer` lags one cycle LATE in the simulator — its leading read is
-//!     `Deferred` (samples at the pre-edge) while its producer updates at the
-//!     post-edge, where the transpiled `assign out = flag_in` is immediate.
+//!   * `fast_counter` asserted its flag one cycle EARLY — its sticky `latched` was
+//!     updated in the pre-tick segment with no input read to pin that segment's clock
+//!     phase (D1). Fixed by moving the update after the tick, the form measured to
+//!     match the independent reference.
+//!   * `slow_consumer` lagged one cycle LATE — its *leading* read is classified
+//!     `Deferred` and samples at the pre-edge, while its producer updates at the
+//!     post-edge, where the transpiled `assign out = flag_in` is immediate (D2).
+//!     Fixed by reading after the tick, which classifies `Immediate`.
 //!
-//! Net: the flag lands on slow cycle 5 either way. Correct EITHER divergence alone
-//! and this test must be re-blessed. Both are pinned, with the evidence and the
-//! hardware adjudication, in `tests/sequential_forwarding_divergence.rs`; the full
-//! analysis and the plan are `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` (re-blessing
-//! this test is step 3c there). Read one of them before treating a pass here as
-//! evidence the dual-clock chain is correct.
+//! Both are corrected in the design now, so the three views agree **for the right
+//! reason** rather than by cancellation. Verified: correcting only one of them moved
+//! the boundary 5 → 6 and broke this test.
+//!
+//! The underlying defects are still tracked — D1 is guarded at compile time
+//! (`copper_analysis::unprotected_pretick_out_write`), D2 is not, and the analysis
+//! behind both is `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`. The pinned
+//! measurements live in `tests/sequential_forwarding_divergence.rs`.
 //!
 //! If Verilator is not installed the Verilator arms are skipped (the sim arm and
 //! its invariant checks still run), mirroring the rest of the suite.
@@ -61,12 +64,19 @@ async fn fast_counter(
     let mut count: Bits<8> = Bits::zero();
     let mut latched = Logic::Zero;
     loop {
-        if count[3] == Logic::One {
-            latched = Logic::One;
-        }
         count_out.write(count);
         flag_out.write(latched);
         clk.tick().await;
+        // Sticky threshold, updated AFTER the edge so it reads the pre-edge `count`
+        // exactly as `if (cnt[3]) latch <= 1'b1;` does. Updating it *before* the
+        // writes puts a register assignment in the pre-tick segment with no input
+        // read to pin the phase — the simulator then runs that segment a phase early
+        // and silently disagrees with the synthesized hardware. Measured against the
+        // independent reference in `sv/two_domain_hierarchy.sv`; see
+        // design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md.
+        if count[3] == Logic::One {
+            latched = Logic::One;
+        }
         count = count + Bits::from_lit::<1>();
     }
 }
@@ -86,8 +96,15 @@ async fn flag_sync(clk: Clock<ClkSlow>, d: In<Logic, ClkFast>, q: Out<Logic, Clk
 #[hardware(sequential)]
 async fn slow_consumer(clk: Clock<ClkSlow>, flag_in: In<Logic, ClkSlow>, out: Out<Logic, ClkSlow>) {
     loop {
-        out.write(flag_in.read());
         clk.tick().await;
+        // Read AFTER the tick. A pure combinational passthrough transpiles to
+        // `assign out = flag_in` (zero cycles), but a *leading* read is classified
+        // `Deferred` and samples at the pre-edge, while a clocked producer updates at
+        // the post-edge — so the leading-read form lags a cycle in the simulator and
+        // silently disagrees with its own SV. A trailing read is `Immediate` and
+        // tracks the producer, matching the netlist. See D2 in
+        // design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md.
+        out.write(flag_in.read());
     }
 }
 
