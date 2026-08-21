@@ -16,19 +16,33 @@ the example equivalence check passes, and there is nothing to screenshot.
 
 ## Commands
 
-The driver script wraps build + CLI + representative examples and exits non-zero
-on first failure (clean run ends with `SMOKE OK`):
+The driver script is the regression command. **Bare, it runs everything** —
+build, CLI, `cargo test --workspace`, and *every* registered example — and exits
+non-zero on the first failure (clean run ends with `SMOKE OK`):
 
 ```bash
 .claude/skills/run-copper/smoke.sh
 ```
 
+It also enforces three wiring guards, because "the check silently didn't run" has
+been a recurring bug class here: **G-A** every `examples/**.rs` is registered as a
+`[[example]]`, **G-B** every registered example actually ran, **G-C** every
+`tests/*.rs` (root and per-crate) produced a test binary that ran. It prints the
+`#[ignore]`d tests on every run so a deliberately-skipped check stays visible.
+
+Subsets — all of these print `SMOKE OK (PARTIAL …)` or skip guards, so they are
+**not** a regression run:
+
 ```bash
-.claude/skills/run-copper/smoke.sh --no-examples   # build + CLI only, no Verilator
+.claude/skills/run-copper/smoke.sh --quick          # fast loop: build + CLI + 5 examples
+.claude/skills/run-copper/smoke.sh --no-examples    # build + CLI + tests, no Verilator
+.claude/skills/run-copper/smoke.sh --no-test        # skip cargo test
 .claude/skills/run-copper/smoke.sh --example lfsr   # one named example
-.claude/skills/run-copper/smoke.sh --all-examples   # every [[example]] (slow)
-.claude/skills/run-copper/smoke.sh --test           # also cargo test --workspace
 ```
+
+Note an example's `main()` is a real self-check — several assert against
+independent BaseJump Verilog and `exit(1)` on mismatch — and `cargo test` only
+*builds* examples, never runs them. That is why examples are in the default path.
 
 Underlying cargo commands:
 
