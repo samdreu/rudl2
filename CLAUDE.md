@@ -156,6 +156,11 @@ receive/clone one.
 - Design docs live in `design_docs/`. Most have been moved to
   `design_docs/OUTDATED/`; `SYNCHRONOUS_SEMANTICS.md` is the current one.
   Treat `OUTDATED/` as historical, not authoritative.
+- **`PRETICK_ALIGNMENT_GUARDRAIL.md` is an OPEN issue with a plan** — two silent
+  `sim ≠ synth` divergences from pre-tick segment phase alignment. Read it before
+  touching read-timing, the pre/post-edge settle, or `two_domain_hierarchy_cdc.rs`
+  (which is currently green only because the two divergences cancel). It also records
+  two rejected fixes with evidence, so they are not re-tried.
 - Generated artifacts (`tb_*.cpp`, `obj_dir/`, `waveforms/*.vcd`) land in the
   repo root and subdirs and are gitignored.
 - Do research on prior HDLs and hardware DSLs to get knowledge on what correct semantics

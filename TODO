@@ -285,10 +285,88 @@ P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettle
      a_register + post_tick_temp_dying_in_its_own_segment_is_not_a_register); and
      cdc_synchronizer_anchor.rs::register_inference_matches_the_independent_reference
      is now a real NameExact G2 match instead of a pinned gap.
+  ☐ BUG / OPEN x2 — **PLAN OF RECORD: design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md**
+     (read that first; it has the variant map, the hardware adjudication, the corpus
+     status table, both rejected approaches, the guardrail acceptance criteria R1-R7,
+     and the phased plan with gates G0-G3. The summary below is a pointer, not the
+     authority.)
+     (found 2026-08-21 while starting the two_domain_counter test;
+     DEFERRED pending a semantics decision — user chose "anchor first, then decide"):
+     two silent sim ≠ transpiled-SV divergences, both from pre/post-edge segment
+     alignment. PINNED (flip loudly when fixed) in
+     tests/sequential_forwarding_divergence.rs.
+     D1 — PRE-TICK REGISTER UPDATE FORWARDED TO A SAME-SEGMENT READ.
+       `loop { r = r+1; o.write(r); tick; }` → sim [2,3,4,..] vs SV [1,2,3,..].
+       Sim's sequential forwarding makes the pre-tick assignment visible to the
+       write after it; codegen emits `r <= r+1` (non-blocking) + `assign o = r`, so
+       the SV drives the pre-update value. A flip-flop's Q cannot reflect its own D.
+       DISCRIMINATOR (measured): a leading `In` read. It classifies Deferred (item 3)
+       and injects pre_edge_barrier(), pinning the pre-tick segment to the pre-edge.
+       With NO input read there is no barrier, the loop top also runs in the previous
+       tick's post-edge settle, and the update lands an extra time. The identical
+       design plus one input read agrees with its SV exactly.
+       BLAST RADIUS (swept 49 clocked modules): 8 have the update-then-read shape; the
+       6 that are equivalence-tested (lfsr, det_110101, shift_register) all gate on
+       input reads and are safe. Only fast_counter (3 copies) has the shape without
+       one — which is why the suite is green.
+       ADJUDICATED AGAINST INDEPENDENT HARDWARE, not by argument:
+       examples/cdc/sv/two_domain_hierarchy.sv::ref_fast_counter (committed 0d67f9e,
+       2026-07-30, long before this was known) MATCHES the transpiled SV and
+       DISAGREES with the sim. **The simulator is the one that is wrong.**
+     D2 — COMBINATIONAL PASSTHROUGH OF A POST-EDGE-PRODUCED SIGNAL.
+       `loop { out.write(inp.read()); tick; }` transpiles to `assign out = inp;`
+       (zero cycles), but in sim the leading read is Deferred → samples at the
+       pre-edge while its producer updates at the post-edge → lags one cycle.
+       Standalone the two agree (a testbench drives the input before the edge);
+       the divergence needs a clocked producer.
+     ⚠️ CONSEQUENCE: tests/two_domain_hierarchy_cdc.rs — the independent-hardware
+       anchor for the dual-clock design — is green because D1 and D2 CANCEL (flag one
+       early, consumer one late; boundary lands on the same cycle). Correcting either
+       alone moves the boundary 5→6 and that test must be re-blessed. Verified by
+       experiment; caveat added to its header. Do NOT treat that pass as evidence the
+       chain is correct.
+     HYPOTHESIS TESTED AND REJECTED (2026-08-21) — "always-barrier".
+       Idea: the pre-tick segment's phase alignment is currently decided by an
+       INCIDENTAL property (whether the module happens to contain a leading In read;
+       a module with no In params gets no barrier at all — inject_synced_reads
+       returns early on in_params.is_empty()). So: pin it unconditionally by always
+       injecting pre_edge_barrier at the top of the loop, and see if both symptoms go.
+       Implemented behind COPPER_ALWAYS_BARRIER in copper-macros, measured, REVERTED.
+       RESULT: fixes D1's forwarding (minimal case sim [2,3,4..] → [1,2,3..], matching
+       SV) and leaves the already-correct leading-read form alone — but OVER-CORRECTS
+       plain Moore outputs. With the barrier the loop top runs only at the pre-edge,
+       so a Moore output shows the PRE-edge register value, where SV's
+       `assign count_out = count` shows the post-edge one. fast_counter's count_out
+       went [(1,0),(2,0)..] → [(0,0),(1,0)..], i.e. still ≠ the independent reference,
+       just wrong in a different place.
+       CORPUS DAMAGE: 22 failures / 654 tests, and they are the modules that are
+       currently CORRECT — counter, up_down_counter, accumulator_en, slow_counter,
+       traffic_light, seq6 equivalence; the sync_2ff anchor itself; poll-order
+       independence; frozen golden traces.
+       DIAGNOSIS (the useful part): the pre-tick segment does TWO jobs — compute next
+       state (wants pre-edge values; D1 gets this wrong) and drive Moore outputs
+       (wants the post-edge register value; the barrier breaks this). No single global
+       phase choice satisfies both, so a unified "pin the phase" fix cannot work and
+       "just fix the sim's phase machinery" is not a small change. Any real fix must
+       separate the two jobs, or reject the shape.
+     SECOND HYPOTHESIS TESTED AND REJECTED (2026-08-21) — naive static rule.
+       "A register assigned in the pre-tick segment with no In read comb-reaching it
+       on that path." Derived from a 7-variant measured map (V4-vs-V5 pins that the
+       read must PRECEDE; V7 pins that the register need NOT be read back), matched
+       ALL 7 variants — then OVER-FLAGGED the corpus: 12/77, including mac_fsm (x3)
+       and if_tick_explicit, both of which PASS their Verilator equivalence tests.
+       mac_fsm is the G2 name-exact register reference, so a rule that rejects it is
+       not shippable. Reverted. Open question it left: what separates V7 (diverges,
+       no output escape) from mac_fsm's Mul arm (agrees, no output escape)? See the
+       design doc Q1.
+     DIRECTION CHOSEN (user, 2026-08-21): static guardrail. Blocked on the Q1/Q2
+     measurement — plan + acceptance criteria in PRETICK_ALIGNMENT_GUARDRAIL.md. Needs sign-off — copper-sim/copper-codegen.
   ☐ two_domain_counter example → behavioral/equiv test
+     [BLOCKED on the D1/D2 decision — fast_counter is the divergent module, so any
+     test written now would pin behavior that is about to change.]
   ☐ flag_crossing example → behavioral test (metastability-free handoff semantics)
-     (the synchronizer half is now anchored above; what remains is the end-to-end
-     producer→sync→consumer handoff as its own cargo test)
+     (the synchronizer half is anchored above; what remains is the end-to-end
+     producer→sync→consumer handoff. event_source/event_sink may hit D2.)
   ☐ Multi-driver ACROSS domains — define behavior
 
 --------------------------------------------------------------------------------

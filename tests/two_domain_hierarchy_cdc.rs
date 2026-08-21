@@ -11,6 +11,25 @@
 //!      (`examples/cdc/sv/two_domain_hierarchy.sv`, `two_domain_ref`) — the
 //!      non-circular anchor: Copper's CDC timing vs an outside implementation.
 //!
+//! **CAVEAT (2026-08-21) — this anchor currently agrees by COINCIDENCE.** All three
+//! views really do match at the observable boundary, but not because the chain is
+//! right: two silent sim ≠ SV divergences cancel inside it.
+//!
+//!   * `fast_counter` asserts its flag one cycle EARLY in the simulator — its
+//!     sticky `latched` is updated in the pre-tick segment and read back in that
+//!     same segment, which the simulator forwards and a flip-flop cannot.
+//!     Independent hardware sides with codegen here; the simulator is wrong.
+//!   * `slow_consumer` lags one cycle LATE in the simulator — its leading read is
+//!     `Deferred` (samples at the pre-edge) while its producer updates at the
+//!     post-edge, where the transpiled `assign out = flag_in` is immediate.
+//!
+//! Net: the flag lands on slow cycle 5 either way. Correct EITHER divergence alone
+//! and this test must be re-blessed. Both are pinned, with the evidence and the
+//! hardware adjudication, in `tests/sequential_forwarding_divergence.rs`; the full
+//! analysis and the plan are `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` (re-blessing
+//! this test is step 3c there). Read one of them before treating a pass here as
+//! evidence the dual-clock chain is correct.
+//!
 //! If Verilator is not installed the Verilator arms are skipped (the sim arm and
 //! its invariant checks still run), mirroring the rest of the suite.
 
