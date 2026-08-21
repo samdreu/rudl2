@@ -75,13 +75,24 @@ exactly one driver, with no separate analysis pass.
    tests/timing_probe_investigation.rs, tests/mem_latency_probe.rs; sim≡transpiler in
    tests/*_equivalence.rs. TODO: expand the BaseJump set and the transpiler-verified set.]`
 
-5. **A minimal, provably-necessary output-timing annotation.** Control-flow inference resolves
-   register-vs-combinational timing for *internal* state (contribution 1), but we show — by a
-   dual-convention executor experiment against hand-written Verilog — that no single global
-   scheduling choice can make *output-port* timing correct for both registered and combinational
-   outputs simultaneously: the two conventions are exact duals. Copper therefore infers output
-   timing where it is derivable and requires exactly one explicit annotation (`RegOut`) at the
-   provably-ambiguous boundary. `[Evidence: design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.]`
+5. **A minimal, provably-necessary output-timing annotation — with a compile-time boundary on the
+   residual.** Control-flow inference resolves register-vs-combinational timing for *internal* state
+   (contribution 1), but we show — by a dual-convention executor experiment against hand-written
+   Verilog — that no single global scheduling choice can make *output-port* timing correct for both
+   registered and combinational outputs simultaneously: the two conventions are exact duals. This is
+   the blocking/non-blocking (`=`/`<=`) distinction that event-driven HDL simulators require the
+   author to write explicitly (see §Simulation semantics); Copper's `Out`/`RegOut` pair is its
+   rediscovery — `Out` ≈ `=`, `RegOut` ≈ `<=`, each Verilator-verified against the corresponding
+   `assign` / `always_ff`. Copper therefore infers output timing where derivable and requires
+   exactly one explicit annotation (`RegOut`) at the provably-ambiguous boundary. The one shape that
+   *neither* inference nor a single annotation makes sim-observable — a combinational `Out` written
+   on both sides of one tick in a single region, which the coroutine executor collapses because it
+   advances no observable time between the writes — is **rejected at compile time** rather than
+   silently mis-simulated, exactly as MyHDL restricts its synthesizable subset to single-edge
+   processes. Every accepted program thus preserves same-source sim ≡ synth. `[Evidence:
+   design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md; EXECUTION_MODEL_RECONCILIATION.md
+   (multi-write-around-a-tick). Guardrail: SIMULATOR/MACRO TODO — detection over the transpiler's
+   existing phase structure.]`
 
 3. **Ownership-enforced single-driver and phantom-typed clock domains** as lightweight,
    pass-free structural guarantees discharged entirely by the Rust compiler. We position clock-

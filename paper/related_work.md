@@ -116,6 +116,45 @@ language, not embedded Rust reusing rustc's async lowering. Prost is now cited a
 above; contribution 1 must be re-scoped so its novelty is the embedded-reuse + verified-same-
 source + hardware-anchored realization, not the coroutine-as-FSM idea in the abstract.]`
 
+## Simulation semantics: how the register/combinational split is resolved
+
+The output-timing question behind contribution 5 — when does a write to an output become visible —
+is one every hardware simulator must answer, and the established answers explain why it surfaces
+for Copper specifically. **Event-driven Verilog/VHDL simulators** (Verilator, VCS, Questa, Icarus,
+GHDL) resolve it *explicitly and structurally*: the author writes blocking `=` vs non-blocking `<=`
+(VHDL: variable `:=` vs signal `<=`) inside an explicit `always_comb`/`always @*` or
+`always @(posedge)` block, and a stratified event queue samples every non-blocking right-hand side
+before applying any left-hand update, so a register update cannot race a combinational read.
+Crucially, *simulation time advances between two writes that straddle a clock edge*
+(`out = 0; @(posedge clk); out = 1;`), so the intermediate value occupies a full clock period and
+is observable to testbench and waveform. **Cycle-based and dataflow tools** (Clash,
+Chisel→FIRRTL/treadle, cycle simulators) make the split *unrepresentable*: the design *is* a pair
+(combinational function, register set) evaluated once per cycle, so an output cannot be assigned
+twice in one cycle. Clash's Mealy machines are pure `state → input → (state, output)` functions.
+
+Copper's `Out`/`RegOut` distinction is a rediscovery of exactly the blocking/non-blocking pair:
+plain `Out` writes its cell immediately (≈ blocking `=`), `RegOut` buffers and commits at the clock
+edge (≈ non-blocking `<=`), and the two agree with the transpiled `assign` / `always_ff`
+respectively under Verilator. What is *not* inherited is the event kernel's advancing time: the
+Copper executor runs a coroutine's post-tick continuation immediately within one `tick_clock`, with
+no observable step between a pre-tick and a post-tick write to the *same* combinational `Out`. A
+single-write-per-cycle output (the common case — a Mealy decode, a counter's registered value) is
+unaffected and matches hand-written Verilog; the residual is a combinational `Out` written on both
+sides of one tick in a single control-flow region (`out.write(0); tick; out.write(1)`), where the
+second write clobbers the first before observation.
+
+The precedent for the residual is decisive. **MyHDL** — the closest coroutine analogue — resolves
+it by *restricting the synthesizable subset*: a synthesizable MyHDL generator is a single
+edge-sensitive process (≈ one `always` block); multi-`yield`, cycle-sliced behavioral generators
+are convertible-only, never RTL-synthesizable (verified against the 0.11 manual, above). No prior
+simulator both treats a *multi-tick* coroutine as the synthesizable form and simulates it by
+running the coroutine, so none inherits this problem; Copper's control extraction is what
+reintroduces it, and Copper follows the same discipline — the multi-write-across-a-tick pattern is
+rejected at compile time (directing the author to `RegOut` for a registered output, or to explicit
+per-state writes for a combinational one), so every accepted program preserves same-source
+sim ≡ synth. `[Detection is over the same phase structure the transpiler already computes;
+guardrail to be added — see contribution 5 and the SIMULATOR/MACRO TODO.]`
+
 ## Type systems for compile-time hardware safety
 
 **Clash** [Baaij et al.] compiles a subset of Haskell to Verilog/VHDL and encodes **clock
