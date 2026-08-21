@@ -262,3 +262,43 @@ probes); scale both before framing as a general guarantee.]`
   generator testbenches; `fsm-gen-migen` experimental generator→FSM.
 - Handel-C; Silice; Vivado HLS / Catapult / LegUp — sequential-program→FSM+datapath compilers
   (bespoke compilers, not host-language coroutine reuse); cite for contribution 1's lineage.
+
+## Register update semantics — how other HDLs prevent the D1 hazard (2026-08-21)
+
+> Researched while working `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`. Relevant to
+> contribution 5 (the blocking/non-blocking rediscovery) and to §Threats T1.
+
+The field has converged on **making the hazard unexpressible**, not on detecting it.
+Every mainstream typed/generator HDL separates a register's *current* value from its
+*next* value syntactically, so a mid-cycle assignment cannot be forwarded to a
+same-cycle read:
+
+- **MyHDL** — read `sig`, write `sig.next`; the docs describe `.next` as "the MyHDL
+  equivalent of the VHDL signal assignment and the Verilog non-blocking assignment".
+- **Chisel/FIRRTL** — a `Reg`'s output *is* the current value; `:=` connects the next
+  value, with last-connect semantics for multiple writes.
+- **Amaranth** — `m.d.sync` vs `m.d.comb`; a signal is driven by exactly one domain,
+  and driving from two is an error.
+- **Spade** — `reg(clk) name = expr`, where the expression *is* the next value.
+- **Bluespec** — guarded atomic rules; register reads within a rule see the value at
+  rule start, and same-cycle forwarding is an explicit opt-in.
+- **Clash** — pure functions over streams; no mutable state to mis-order.
+
+Only Verilog/SystemVerilog leaves it expressible, and there the ecosystem lints it:
+Cummings' SNUG guidelines (non-blocking for sequential, blocking for combinational,
+never mixed), Verilator's `BLKSEQ` / `COMBDLY` / `BLKANDNBLK`, Verible's
+`always-ff-non-blocking`.
+
+**The positioning consequence for the paper.** Those lints work by comparing an
+author-written *marker* (`=` vs `<=`) against an author-written *block kind*
+(`always_comb` vs `always_ff`) — two declarations checked against each other, no
+inference. Copper has neither declaration: every register assignment is a plain Rust
+`=` and the block kind is implicit in position relative to `.await`. So the
+async-coroutine surface, which is contribution 1, is precisely what *reintroduces* a
+hazard the rest of the field designed out — and it does so in a form that cannot be
+checked the way Verilog checks it.
+
+This should be reported honestly rather than elided: it is the sharpest known cost of
+the coroutine surface, and it is the strongest argument for giving register *locals*
+the same current/next distinction Copper already gives *ports* via `Out`/`RegOut`.
+

@@ -176,7 +176,10 @@ diverges without escaping**. The two facts are not yet reconciled; see Q1.
   complete. *Leading hypothesis:* V7's module contains **no** `In` read anywhere (its
   `en` port is unused), so every iteration is post-edge-aligned, whereas `mac_fsm`'s
   arms are *mixed* — the `Load` arm parks at a barrier and the others do not.
-  Testable directly.
+  Testable directly. **See also §10.4** — Verible's rule permits blocking
+  assignments that target *locals* in sequential logic, which is the same
+  distinction; the refinement is likely "does the value become observable at all"
+  rather than "is it written to a port in this segment".
 - **Q2 — Is `probe_fsm`/`accum_2` the same defect or a second one?** Both are
   pre-existing `#[ignore]`d divergences described as read-timing (a read whose result
   crosses a *second* tick). If distinct, the guardrail must not claim them, and they
@@ -337,7 +340,103 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
 - **D2's disposition** — its own guardrail, a codegen change, or accepted-and-
   documented? Unlike D1 there is no independent-hardware adjudication yet; getting
   one is the prerequisite.
+- **A fourth option, from §10: make it unexpressible.** Give register locals the
+  current/next distinction that `Out`/`RegOut` already gives ports — a `Reg<T>`
+  with explicit read/write. This is what MyHDL, Chisel, Amaranth, Spade and
+  Bluespec all do, and it dissolves the problem rather than detecting it. Cost: it
+  changes the surface syntax for sequential state, which is a headline ergonomic
+  claim.
 - **Is the deeper fix worth scoping separately?** §5.1's finding — that the pre-tick
   segment conflates next-state and Moore-output evaluation — describes an executor
   restructuring that would make the guardrail unnecessary. Out of scope here, but it
   is the principled fix and should be recorded as such rather than forgotten.
+
+---
+
+## 10. Prior art — how other HDLs handle this
+
+Researched 2026-08-21. The field has converged on **two** answers, and Copper
+currently has neither.
+
+### 10.1 Structural prevention — separate "current value" from "next value"
+
+Most modern HDLs make this class **unexpressible** rather than checking for it. In
+each case reading a register yields its *current* value and writing goes to a
+syntactically distinct *next*-value slot, so a mid-cycle assignment cannot be
+forwarded to a same-cycle read:
+
+| HDL | mechanism |
+|---|---|
+| **MyHDL** | read `sig` (current, read-only attr); write `sig.next` — documented as "the MyHDL equivalent of the VHDL signal assignment and the Verilog non-blocking assignment" |
+| **Chisel / FIRRTL** | a `Reg`'s output *is* the current value; `:=` connects the next value, with last-connect semantics resolving multiple writes |
+| **Amaranth** | `m.d.sync` vs `m.d.comb` domains; a signal is driven by exactly one domain and driving from two is an error; all `sync` assignments take effect at the edge |
+| **Spade** | `reg(clk) name = expr` — the expression *is* the next value; registers are the only sequential element and are always explicit |
+| **Bluespec** | rules are guarded atomic actions; register reads within a rule observe the value at rule start (cross-rule same-cycle forwarding is an explicit opt-in, not the default) |
+| **Clash** | pure functions over streams; no mutable state to mis-order |
+
+**Copper already has this axis — for ports.** `Out` vs `RegOut` is exactly the
+current/next distinction, and it is what resolved the multi-write-around-a-tick
+collapse. It just does not exist for *locals*: a register-classified local is an
+ordinary Rust binding, so `r` means both "the flop's Q" and "the flop's D"
+depending on where you read it.
+
+### 10.2 Static lint — for languages where it *is* expressible
+
+Verilog/SystemVerilog can express the hazard, so the ecosystem lints it:
+
+- **Cummings, SNUG 2000, *Nonblocking Assignments in Verilog Synthesis, Coding
+  Styles That Kill!*** — the canonical reference. Guideline #1: model sequential
+  logic with non-blocking assignments; use blocking for combinational; do not mix
+  the two in one `always` block.
+- **Verilator**: `BLKSEQ` — "a blocking assignment (`=`) is used in a sequential
+  block"; `COMBDLY` — "a delayed assignment inside of a combinatorial block";
+  `BLKANDNBLK` — "a variable is driven by a mix of blocking and non-blocking
+  assignments"; plus `MULTIDRIVEN`.
+- **Verible**: `always-ff-non-blocking` — "use only non-blocking assignments inside
+  `always_ff` sequential blocks"; no non-blocking in combinational logic.
+
+### 10.3 Why Copper can't just copy the lint — and what that implies
+
+Every one of those lints works by comparing an **author-written marker** (`=` vs
+`<=`) against an **author-written block kind** (`always_comb` vs `always_ff`). The
+tool never has to infer intent; it checks two declarations against each other.
+
+Copper has **neither declaration**. Every register assignment is a plain Rust `=`,
+and the "block kind" is implicit in position relative to `.await`. So Copper is
+currently in the worst of the three positions:
+
+- it has Verilog's *expressiveness* (the hazard is writable), but
+- not Verilog's *marker* (so no syntactic check is possible — the rule must infer
+  both sides, which is exactly why §5.2's rule over-flagged), and
+- not the modern HDLs' *structural separation* (so the hazard exists at all).
+
+**This adds a fourth option to §9** — and it is the one the field converged on:
+give locals the same current/next distinction ports already have. A `Reg<T>` with
+explicit read/write (`.get()` / `.set()`, or a `next` slot) would make D1
+**unexpressible** instead of merely detected, in the same way `RegOut` did for the
+multi-write collapse. Cost: it changes the surface syntax for sequential state,
+which is a headline ergonomic claim ("a register is just a local live across an
+await"). That trade is a real design decision, not an implementation detail.
+
+### 10.4 A direct hint for Q1
+
+Verible's rule is not "no blocking assignments in sequential logic" — it is that
+**blocking assignments may target locals** in sequential logic. That is precisely
+the distinction §3.4 was groping for: an assignment whose value never becomes
+observable is harmless, which is why `mac_fsm`'s `Mul` arm is safe.
+
+The catch is V7, where the register is never read again in its segment yet still
+diverges — because it escapes *across the tick* (`s = r` post-tick, then `o.write(s)`).
+So the right predicate is likely **"does this value become observable at all"**,
+not "is it written to a port in this segment". That is a reachability question over
+the CFG, and it is the concrete thing to test first in phase 1.
+
+**Sources**
+- [Cummings, *Nonblocking Assignments in Verilog Synthesis, Coding Styles That Kill!* (SNUG)](https://csg.csail.mit.edu/6.375/6_375_2009_www/papers/cummings-nonblocking-snug99.pdf)
+- [Verilator — Errors and Warnings](https://verilator.org/guide/latest/warnings.html)
+- [verible-verilog-lint rule list](https://umarcor.github.io/verible/verilog_lint.html)
+- [MyHDL manual — Signals and `.next`](http://docs.myhdl.org/en/stable/manual/reference.html)
+- [Chisel — Sequential Circuits](https://www.chisel-lang.org/docs/explanations/sequential-circuits)
+- [Amaranth — Language guide (domains)](https://amaranth-lang.org/docs/amaranth/v0.4.3/lang.html)
+- [Spade: An Expression-Based HDL With Pipelines](https://spade-lang.org/osda2023.pdf)
+- [Bluespec — Rule Scheduling (UCSB course notes)](https://web.ece.ucsb.edu/its/bluespec/training/BSV/slides/Lec06_Scheduling.pdf)
