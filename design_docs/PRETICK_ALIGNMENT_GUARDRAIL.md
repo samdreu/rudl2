@@ -250,9 +250,14 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
   guardrail must point at a *legal* alternative. For `fast_counter` that is the
   post-tick update (`tick; if count[3] { latched = 1 }`), verified to match the
   independent reference — but the general rewriting rule is unstated.
-- **Q5 — Should the rule cover every inter-tick segment, not just the pre-tick one?**
-  The candidate examines only head → first tick, which is a known false negative for
-  multi-tick loops (`accum_2` class).
+- **Q5 — ANSWERED 2026-08-21, and the premise was wrong.** The rule examines only
+  head → first tick, and this was recorded as a known false negative citing the
+  multi-tick `accum_2`. **`accum_2` does not diverge.** Its test was `#[ignore]`d as
+  "sim and transpiler disagree by one cycle … adjudication pending", but it passes —
+  and passes *without* the D2 fix, so earlier read-timing work had repaired it and the
+  ignore went stale. Un-ignored. So the rule has **no known false negative**; the
+  middle-segment gap is theoretical, with no instance in the corpus. If one turns up
+  it should be measured before the rule is widened.
 
 ---
 

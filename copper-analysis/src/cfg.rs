@@ -432,10 +432,12 @@ impl Cfg {
     ///
     /// # Known false negative
     ///
-    /// Only the pre-tick segment is examined, so the multi-tick `accum_2` class (a
-    /// read whose result crosses a *second* tick) is not caught. Tracked in
-    /// `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` (Q5); widening this to every
-    /// inter-tick segment needs its own empirical pass.
+    /// Only the pre-tick segment is examined, so a hazard in a *middle* segment of a
+    /// multi-tick loop would not be caught. This is **theoretical** — the case
+    /// originally cited for it, `accum_2`, was measured and does not diverge (its
+    /// `#[ignore]` was stale; it is un-ignored now). There is no known instance;
+    /// measure one before widening the rule. Tracked as Q5 in
+    /// `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`.
     pub fn unprotected_pretick_out_write(&self) -> Vec<String> {
         let region = self.pre_tick_region();
 

@@ -58,8 +58,12 @@ fn sample_hold_2_sim_matches_verilog() {
 /// That is the deferred output register-vs-combinational axis, the SAME bucket as
 /// the other transpiler-alignment ignores — NOT a read-timing bug. See
 /// SYNCHRONOUS_SEMANTICS.md / ATOMIC_INSTANT_EXECUTOR.md.
+/// UN-IGNORED 2026-08-21. This was `#[ignore]`d as "sim and transpiler disagree by
+/// one cycle … adjudication pending" — a mid-phase read whose result crosses a
+/// *second* tick. It passes, and it passes independently of the D2 fix (checked by
+/// reverting `cfg.rs` alone), so it was repaired by earlier read-timing work and the
+/// ignore simply went stale. Nobody noticed because an ignored test prints nothing.
 #[test]
-#[ignore = "mid-phase (between-ticks) read: sim and transpiler disagree by one cycle. Under post-edge the loop-top read cases (sample_hold_2, sum_hold_2) now match, but this read whose result crosses a *second* tick does not — adjudication pending. See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md"]
 fn accum_2_sim_matches_verilog() {
     let step: Vec<u8> = (0..12).map(|i| (i as u8) + 1).collect();
     let mut eq = EquivalenceTest::for_module("accum_2", DUT_SRC, Some("accum_2"));

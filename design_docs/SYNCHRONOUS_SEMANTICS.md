@@ -99,8 +99,9 @@ the read must *precede* the assignment (a trailing read does not protect); mixed
 **not** protect (a read on one branch leaves another branch exposed); `RegOut` is immune (changing
 *only* the port type flips a diverging module to agreeing); and the write must read a **register** —
 a constant write is idempotent across the phase shift, which is why `branch_merge_explicit`, driving
-three plain `Out`s from an unprotected path, agrees. Known false negative: only the pre-tick segment
-is examined, so the multi-tick `accum_2` class is not caught.
+three plain `Out`s from an unprotected path, agrees. Scope: only the pre-tick segment is examined, so a hazard in a *middle* segment of a multi-tick loop
+would not be caught — theoretical, with no known instance (the case originally cited, `accum_2`, was
+measured and does not diverge).
 
 **This is the third member of the blocking/non-blocking family**, after `Out`-hold semantics and the
 multi-write collapse — and the three share a root cause worth stating plainly: **Copper infers the

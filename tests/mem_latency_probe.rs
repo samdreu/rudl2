@@ -63,7 +63,7 @@ async fn ram_prewrite(
 }
 
 #[test]
-#[ignore = "temp mem-latency probe"]
+#[ignore = "DIAGNOSTIC PRINTOUT, not a check — it has no assertions, so passing means nothing. Run with --ignored --nocapture to read the traces."]
 fn probe_mem_latency() {
     for (name, straddle) in [("straddle", true), ("prewrite", false)] {
         let addrs: Vec<u8> = vec![5, 6, 7, 8, 9, 10];

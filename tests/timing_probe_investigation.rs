@@ -213,7 +213,7 @@ fn run_counter(sv: &str, name: &str) -> bool {
 }
 
 #[test]
-#[ignore = "temp timing investigation — run with --ignored --nocapture"]
+#[ignore = "DIAGNOSTIC PRINTOUT, not a check — it has no assertions, so passing means nothing. Run with --ignored --nocapture to read the traces."]
 fn probe_registered_timing() {
     eprintln!("\n=== DFF read-before-tick (q <= d) ===");
     let dff_ok = run_dff("tests/fixtures/timing_probe_sv/dff.sv");
