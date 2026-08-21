@@ -63,6 +63,22 @@ Two output-port kinds capture the Mealy/Moore distinction explicitly:
   clock edge, so it appears one cycle later. Use it for write-before-tick Moore outputs (verified on
   `sipo_block`). The two axes — input read timing and output register timing — are orthogonal.
 
+**Multi-write-around-a-tick guardrail.** A combinational `Out` written on *both sides of one bare
+`clk.tick().await`* within an iteration, after a *leading (deferred) input read*
+(`… inp.read() …; out.write(x); clk.tick().await; out.write(y)`), is **rejected at compile time**.
+The read shifts the pre-tick write into the pre-edge settle; the coroutine then runs the post-tick
+write in the *same* `tick_clock`'s post-edge and clobbers the pre-tick value before it is observed —
+a silent sim ≠ synth divergence (the synthesized combinational Mealy output is correct; the
+simulator loses a cycle). The fix is to declare the port `RegOut` (registered/non-blocking, which
+buffers and commits at the edge and reconciles) or to split the writes into distinct FSM states so
+each state drives the output once. This is Copper's analogue of Verilog's blocking/non-blocking
+(`=`/`<=`) choice, and follows MyHDL's discipline of restricting the synthesizable subset — so every
+*accepted* program preserves sim ≡ synth. Detection is `copper_analysis::multi_write_collapse` (over
+the shared CFG, top-level loop **and** nested ticking loops); it is precise (three necessary
+conditions — bare tick, both-sides write, leading read comb-reaching the pre-tick write) and
+corpus-clean. A single-write-per-cycle output, a `RegOut`, and a write-straddle *without* a leading
+read (`counter`; `uart_rx`'s `rx_dv`) are all unaffected.
+
 ## Input read timing — static edge-phase classification
 
 An `In` read is classified **statically** by its position relative to ticks, replacing the retired
