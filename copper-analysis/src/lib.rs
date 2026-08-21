@@ -50,6 +50,20 @@ pub fn infer_registers(f: &ItemFn) -> Vec<String> {
     Cfg::build(f).map(|c| c.registers()).unwrap_or_default()
 }
 
+/// Combinational output ports (`Out<…>`, not `RegOut`) that hit the
+/// multi-write-around-a-tick **collapse**: written on both sides of a bare
+/// `clk.tick().await` within one iteration, with a leading (deferred) input read
+/// shifting the pre-tick write into the pre-edge — where the coroutine simulator
+/// clobbers it with the post-tick write before observation (silent sim ≠ synth; see
+/// the paper's contribution 5). Returns the offending ports, sorted; empty for a
+/// combinational module or one with no top-level loop. Intended for a macro
+/// guardrail that rejects the pattern (directing the author to `RegOut`, or to
+/// explicit per-state writes). See [`Cfg::multi_write_collapse`] for the precise
+/// three-part condition and why it does not flag `uart`/`counter`/serializers.
+pub fn multi_write_collapse(f: &ItemFn) -> Vec<String> {
+    Cfg::build(f).map(|c| c.multi_write_collapse()).unwrap_or_default()
+}
+
 /// Enforce the reachability well-formedness invariant: **every path through the
 /// module's top-level loop must reach a `clk.tick().await`**. Deleting all tick
 /// edges from the CFG must leave the reachable subgraph acyclic; a remaining cycle

@@ -10,7 +10,7 @@
 
 use copper_analysis::{
     check_definite_assignment, check_reachability, classify_reads, infer_registers,
-    reference_sv_registers, Cfg, ReadTiming, RegMatch,
+    multi_write_collapse, reference_sv_registers, Cfg, ReadTiming, RegMatch,
 };
 use syn::ItemFn;
 
@@ -397,4 +397,75 @@ fn fsm_report_counts_tick_boundaries() {
     let report = cfg.fsm_report("three_stage");
     assert!(report.contains("three_stage"), "names the module: {report}");
     assert!(report.contains('3'), "reports 3 tick boundaries: {report}");
+}
+
+// ── multi-write-around-a-tick collapse detection (macro-guardrail candidate) ──
+//
+// Flags a combinational `Out` written on both sides of a BARE tick with a leading
+// (deferred) input read shifting the pre-tick write into the pre-edge — the pattern
+// the coroutine sim collapses to the last write. The three conditions are all
+// necessary; validated to flag exactly the genuine cases and NOTHING in the real
+// corpus (uart/rv32i/sipo_block/counter/serializers stay clean).
+
+/// The canonical collapse: `out.write(0); tick; out.write(1)` gated by a deferred read.
+#[test]
+fn multi_write_flags_if_tick() {
+    let src = "async fn if_tick(clk: Clock<C>, sel: In<Logic, C>, out_o: Out<Logic, C>) {
+        loop {
+            if sel.read() == Logic::One { out_o.write(Logic::One); clk.tick().await; }
+            else { out_o.write(Logic::Zero); clk.tick().await; out_o.write(Logic::One); clk.tick().await; }
+        }
+    }";
+    assert_eq!(multi_write_collapse(&f(src)), vec!["out_o".to_string()]);
+}
+
+/// Even an *unused* leading read triggers the collapse — it is the phase shift, not
+/// the read's value, that matters.
+#[test]
+fn multi_write_flags_unused_leading_read() {
+    let src = "async fn m(clk: Clock<C>, sel: In<Logic, C>, out: Out<Logic, C>) {
+        loop { let _s = sel.read(); out.write(Logic::Zero); clk.tick().await; out.write(Logic::One); clk.tick().await; }
+    }";
+    assert_eq!(multi_write_collapse(&f(src)), vec!["out".to_string()]);
+}
+
+/// The SAME straddle with NO leading read does not collapse (write lands post-edge).
+#[test]
+fn multi_write_clean_without_leading_read() {
+    let src = "async fn m(clk: Clock<C>, _sel: In<Logic, C>, out: Out<Logic, C>) {
+        loop { out.write(Logic::Zero); clk.tick().await; out.write(Logic::One); clk.tick().await; }
+    }";
+    assert!(multi_write_collapse(&f(src)).is_empty());
+}
+
+/// `RegOut` buffers and commits at the edge, so it is never the collapsing case —
+/// excluded by construction (not a combinational output).
+#[test]
+fn multi_write_clean_for_regout() {
+    let src = "async fn m(clk: Clock<C>, sel: In<Logic, C>, out_o: RegOut<Logic, C>) {
+        loop {
+            if sel.read() == Logic::One { out_o.write(Logic::One); clk.tick().await; }
+            else { out_o.write(Logic::Zero); clk.tick().await; out_o.write(Logic::One); clk.tick().await; }
+        }
+    }";
+    assert!(multi_write_collapse(&f(src)).is_empty());
+}
+
+/// A single write per cycle (`counter`) is fine even with a read — one write, no straddle.
+#[test]
+fn multi_write_clean_for_counter() {
+    let src = "async fn m(clk: Clock<C>, step: In<Bits<8>, C>, out: Out<Bits<8>, C>) {
+        let mut count: Bits<8> = Bits::zero();
+        loop { out.write(count); clk.tick().await; count = count + step.read(); }
+    }";
+    assert!(multi_write_collapse(&f(src)).is_empty());
+}
+
+/// A per-cycle serializer (`out.write(x); tick`) writes the output once per iteration.
+#[test]
+fn multi_write_clean_for_serializer() {
+    let src = "async fn m(clk: Clock<C>, d: In<Logic, C>, out: Out<Logic, C>) {
+        loop { out.write(d.read()); clk.tick().await; }
+    }";
+    assert!(multi_write_collapse(&f(src)).is_empty());
 }

@@ -68,6 +68,10 @@ struct Node {
     /// Combinational output ports (`Out<…>`, not `RegOut`) driven here via
     /// `port.write(…)` — the def/use of *ports* the definite-assignment check keys on.
     writes: BTreeSet<String>,
+    /// True iff this is a *folded* nested loop node whose `writes` is the
+    /// conservative all-outputs over-approximation (not a real single `port.write`).
+    /// The multi-write-collapse detector must not read it as an explicit write.
+    folded: bool,
     /// Source span, for spanned diagnostics.
     span: Span,
 }
@@ -82,6 +86,7 @@ impl Node {
             tick_clock: None,
             succs: Vec::new(),
             writes: BTreeSet::new(),
+            folded: false,
             span,
         }
     }
@@ -102,6 +107,10 @@ pub struct Cfg {
     /// from the signature — the ports the definite-assignment check requires to be
     /// driven on all paths (or none) per cycle.
     comb_outputs: BTreeSet<String>,
+    /// The module's `In<…>` input ports, from the signature. Used by
+    /// [`multi_write_collapse`](Self::multi_write_collapse) to spot a leading
+    /// (deferred) port read before a straddling output write.
+    inputs: BTreeSet<String>,
     /// The exit sink for a **combinational** body (loop-free): the single point all
     /// paths reach, where definite-assignment is checked. `None` for a sequential
     /// loop (definite-assignment does not apply — a sequential `Out` legitimately
@@ -141,6 +150,7 @@ impl Cfg {
             head,
             defined_in_loop,
             comb_outputs,
+            inputs: in_param_names(f),
             exit: None,
             nested_ticking_loops: b.nested,
         })
@@ -163,6 +173,7 @@ impl Cfg {
             head,
             defined_in_loop: BTreeSet::new(),
             comb_outputs,
+            inputs: in_param_names(f),
             exit: Some(exit),
             nested_ticking_loops: b.nested,
         }
@@ -186,6 +197,110 @@ impl Cfg {
             .intersection(&across_tick)
             .cloned()
             .collect()
+    }
+
+    /// Combinational output ports (`Out<…>`, not `RegOut`) that hit the
+    /// **multi-write-around-a-tick collapse**: written on both sides of a *bare*
+    /// `clk.tick().await` within one iteration, where the pre-tick write is
+    /// phase-shifted into the pre-edge by a *leading (deferred) input read*. The
+    /// coroutine simulator then runs the post-tick write in the same `tick_clock`
+    /// and clobbers the pre-tick value before it is observed (silent sim ≠ synth).
+    /// Returns the offending ports, sorted, for a macro guardrail to reject.
+    ///
+    /// Precise by construction (validated empirically against the corpus): the three
+    /// necessary conditions are all required, so designs that merely straddle a tick
+    /// without the collapsing alignment are not flagged —
+    ///   * a *bare* tick (`is_tick` with no writes), not a folded multi-tick loop
+    ///     (whose ticks separate the writes into distinct `tick_clock`s — `uart_tx`);
+    ///   * the same `Out` written on both sides of that bare tick in one iteration;
+    ///   * a leading `In` read that comb-reaches the pre-tick write (what pushes it to
+    ///     the pre-edge). Its absence is why `counter` and `uart_rx`'s `rx_dv`
+    ///     (`write(1); tick; write(0)` with no leading read) do **not** collapse.
+    /// `RegOut` outputs are excluded by construction (they are not in `comb_outputs`).
+    pub fn multi_write_collapse(&self) -> Vec<String> {
+        let mut flagged = BTreeSet::new();
+        for (t, node) in self.nodes.iter().enumerate() {
+            if !(node.is_tick && node.writes.is_empty()) {
+                continue; // only a bare `clk.tick().await`
+            }
+            let after = self.post_tick_writes(t);
+            for p in &self.comb_outputs {
+                if flagged.contains(p) || !after.contains(p) {
+                    continue;
+                }
+                // A pre-tick write of `p` that this bare tick ends, with a leading
+                // input read reaching it. (Skip folded loops: their `writes` is a
+                // conservative all-outputs over-approximation, not a real write.)
+                for w1 in 0..self.nodes.len() {
+                    if self.nodes[w1].is_tick
+                        || self.nodes[w1].folded
+                        || !self.nodes[w1].writes.contains(p)
+                    {
+                        continue;
+                    }
+                    if self.comb_reaches(w1, t) && self.leading_read_reaches(w1) {
+                        flagged.insert(p.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        flagged.into_iter().collect()
+    }
+
+    /// Ports explicitly written in the cycle-region *after* bare tick `t` (comb-
+    /// reachable from its tick-successor, within the same iteration).
+    fn post_tick_writes(&self, t: usize) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(&(start, _)) = self.nodes[t].succs.iter().find(|(_, k)| *k == EdgeKind::Tick)
+        else {
+            return out;
+        };
+        let mut stack = vec![start];
+        let mut seen = vec![false; self.nodes.len()];
+        while let Some(n) = stack.pop() {
+            if n == self.head || std::mem::replace(&mut seen[n], true) {
+                continue;
+            }
+            if !self.nodes[n].is_tick && !self.nodes[n].folded {
+                out.extend(self.nodes[n].writes.iter().cloned());
+            }
+            for &(s, k) in &self.nodes[n].succs {
+                if k == EdgeKind::Comb {
+                    stack.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// True iff `b` is reachable from `a` via comb-only edges (same cycle-region),
+    /// not crossing a tick or the loop head.
+    fn comb_reaches(&self, a: usize, b: usize) -> bool {
+        let mut stack = vec![a];
+        let mut seen = vec![false; self.nodes.len()];
+        while let Some(n) = stack.pop() {
+            if n == b {
+                return true;
+            }
+            if n == self.head || std::mem::replace(&mut seen[n], true) {
+                continue;
+            }
+            for &(s, k) in &self.nodes[n].succs {
+                if k == EdgeKind::Comb {
+                    stack.push(s);
+                }
+            }
+        }
+        false
+    }
+
+    /// True iff some node reading an `In` port comb-reaches `w1` (i.e. a leading
+    /// input read sits before the write in its region — including `w1`'s own reads).
+    fn leading_read_reaches(&self, w1: usize) -> bool {
+        (0..self.nodes.len()).any(|r| {
+            !self.nodes[r].uses.is_disjoint(&self.inputs) && self.comb_reaches(r, w1)
+        })
     }
 
     /// Enforce the reachability invariant: with every tick edge deleted, the graph
@@ -468,6 +583,7 @@ impl Builder {
             head,
             defined_in_loop: BTreeSet::new(),
             comb_outputs: BTreeSet::new(),
+            inputs: BTreeSet::new(),
             exit: None,
             nested_ticking_loops: b.nested,
         }
@@ -617,6 +733,7 @@ impl Builder {
                     // (so the definite-assignment check never *false*-flags a partial
                     // write around a folded loop — it under-reports here, by design).
                     writes: self.outputs.clone(),
+                    folded: true,
                     ..Node::empty(expr.span())
                 })
             }
