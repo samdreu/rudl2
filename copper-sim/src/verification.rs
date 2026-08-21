@@ -335,7 +335,11 @@ pub(crate) fn verify_with_verilator_traced(
 
     // Generate and write testbench
     let testbench = generate_testbench(module_name, trace, has_clock, vcd_output_path);
-    let tb_file   = format!("tb_{}.cpp", module_name);
+    let param_suffix: String = params
+        .iter()
+        .map(|(name, value)| format!("_{name}{value}"))
+        .collect();
+    let tb_file   = format!("tb_{module_name}{param_suffix}.cpp");
     fs::write(&tb_file, &testbench)
         .map_err(|e| format!("Failed to write testbench: {}", e))?;
 
@@ -354,10 +358,32 @@ pub(crate) fn verify_with_verilator_traced(
         .map(|(name, value)| format!("-G{name}={value}"))
         .collect();
 
+    // Verilated output directory, keyed on module name AND parameters.
+    //
+    // Two things shared a single `obj_dir` before this, and both let a test run
+    // against the WRONG Verilated model:
+    //
+    //  * Verilator defaults to `obj_dir` in the CWD, which *every* equivalence test
+    //    shared. Tests inside one binary run in parallel threads, so two Verilating at
+    //    once clobbered each other.
+    //  * Worse, the same module built at *different parameters* also collided —
+    //    `wide_alu` is checked at `N=32` and then `N=64`. Same name, same directory,
+    //    and `--build`'s make step decides by mtime, so the second build could be
+    //    skipped as "up to date" and the N=64 stimulus then ran against the N=32
+    //    model. That is the observed symptom: a Bits<64> DUT reading back 32-bit
+    //    values, intermittently (mtime has 1-second granularity), and always clean
+    //    under `--test-threads=1`.
+    //
+    // Nondeterministic *failure* is how this surfaced, but the same collision can
+    // equally produce a false PASS — which is why the directory is now unique per
+    // (module, parameters) rather than per module.
+    let obj_dir = format!("obj_dir_{module_name}{param_suffix}");
+
     // Build compile arguments
     let mut verilator_args: Vec<&str> = vec![
         "--cc", "--exe", "--build",
         "--top-module", module_name,
+        "--Mdir", &obj_dir,
         "-Wall", "-Wno-DECLFILENAME",
         "-CFLAGS", "-std=c++14",
     ];
@@ -387,7 +413,7 @@ pub(crate) fn verify_with_verilator_traced(
     println!("Verilator compilation successful");
 
     // Run simulation
-    let sim_exe = format!("./obj_dir/V{}", module_name);
+    let sim_exe = format!("./{obj_dir}/V{module_name}");
     if !Path::new(&sim_exe).exists() {
         return Err(format!("Simulation executable not found: {}", sim_exe));
     }

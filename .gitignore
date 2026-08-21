@@ -1,5 +1,6 @@
 # Verilator build artifacts
 obj_dir/
+obj_dir_*/
 *.v
 tb_*.cpp
 
