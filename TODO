@@ -185,11 +185,17 @@ P1 — macro compile-time guardrails (trybuild; pattern in copper-macros/tests/u
        read comb-reaching the pre-tick write) — empirically pinned + corpus-clean (flags
        ONLY the two control-extraction probes, now converted to RegOut).
      - Wired into copper-macros (sequential arm); trybuild ui/fail/multi_write_collapse.rs
-       + ui/pass/multi_write_regout_ok.rs; 6 analysis unit tests. Fixtures if_tick/
+       + ui/pass/multi_write_regout_ok.rs; 8 analysis unit tests. Fixtures if_tick/
        match_tick → RegOut (nested_tick upgraded sim_only → full Verilator equivalence).
-     - FOLLOW-UP (in progress): a DYNAMIC executor backstop (detect at runtime an Out
-       written in pre_edge overwritten in post_edge before observation) to catch cases
-       the static rule might miss on exercised paths. NEEDS sign-off (sim change).
+     - Now recurses into nested ticking loops (a straddle inside a `for`/`while` that
+       ticks is caught in its sub-CFG). Whole corpus clean (0 flags). Nested serializer
+       stays clean (writes once per iteration).
+     - DYNAMIC backstop CONSIDERED then DROPPED: a runtime "Out written in both settle
+       passes" check FALSE-FIRED on legitimate combinational modules (a comb output
+       re-settles in both phases — confirmed on copper-sim's own wired_passthrough test).
+       A precise dynamic version would need per-task tick-resolution tracking; instead we
+       extended the STATIC rule to nested loops (above), keeping everything compile-time,
+       all-paths, and false-positive-free. Decision: static checks over dynamic ones.
 
 --------------------------------------------------------------------------------
 P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)

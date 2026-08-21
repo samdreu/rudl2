@@ -469,3 +469,30 @@ fn multi_write_clean_for_serializer() {
     }";
     assert!(multi_write_collapse(&f(src)).is_empty());
 }
+
+/// A collapse INSIDE a nested ticking loop is caught by recursion into the sub-CFG.
+#[test]
+fn multi_write_flags_nested_loop_collapse() {
+    let src = "async fn m(clk: Clock<C>, inp: In<Logic, C>, out: Out<Logic, C>) {
+        loop {
+            for _i in 0..4 {
+                let _x = inp.read();
+                out.write(Logic::Zero);
+                clk.tick().await;
+                out.write(Logic::One);
+                clk.tick().await;
+            }
+        }
+    }";
+    assert_eq!(multi_write_collapse(&f(src)), vec!["out".to_string()]);
+}
+
+/// A serializer nested in a ticking for-loop writes its output once per iteration —
+/// no straddle, stays clean (guards against the recursion over-flagging).
+#[test]
+fn multi_write_clean_for_nested_serializer() {
+    let src = "async fn m(clk: Clock<C>, d: In<Logic, C>, out: Out<Logic, C>) {
+        loop { for _i in 0..8 { out.write(d.read()); clk.tick().await; } }
+    }";
+    assert!(multi_write_collapse(&f(src)).is_empty());
+}

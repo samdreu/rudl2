@@ -138,7 +138,7 @@ impl Cfg {
 
         let comb_outputs = combinational_outputs(f);
 
-        let mut b = Builder::new(comb_outputs.clone());
+        let mut b = Builder::new(comb_outputs.clone(), in_param_names(f));
         // The head is node 0: an empty node whose successor is the first body node.
         // Every back-edge (trailing tick, fall-through) targets it.
         let head = b.new_node(Node::empty(loop_span));
@@ -164,7 +164,7 @@ impl Cfg {
     /// rejects. Structure: `head → body → exit` sink, no back-edge.
     pub fn build_combinational(f: &ItemFn) -> Cfg {
         let comb_outputs = combinational_outputs(f);
-        let mut b = Builder::new(comb_outputs.clone());
+        let mut b = Builder::new(comb_outputs.clone(), in_param_names(f));
         let span = f.sig.ident.span();
         let exit = b.new_node(Node::empty(span));
         let head = b.build_block(&f.block.stmts, exit);
@@ -217,7 +217,21 @@ impl Cfg {
     ///     the pre-edge). Its absence is why `counter` and `uart_rx`'s `rx_dv`
     ///     (`write(1); tick; write(0)` with no leading read) do **not** collapse.
     /// `RegOut` outputs are excluded by construction (they are not in `comb_outputs`).
+    ///
+    /// Recurses into nested ticking loops (`for`/`while` that await a tick): a
+    /// straddle *inside* such a loop is caught in its sub-CFG, which carries the same
+    /// port sets. So both a top-level and a nested-loop collapse are reported.
     pub fn multi_write_collapse(&self) -> Vec<String> {
+        let mut flagged: BTreeSet<String> = self.multi_write_collapse_local().into_iter().collect();
+        for sub in &self.nested_ticking_loops {
+            flagged.extend(sub.multi_write_collapse());
+        }
+        flagged.into_iter().collect()
+    }
+
+    /// Collapse detection over this CFG's own nodes only (top-level of one loop);
+    /// [`multi_write_collapse`](Self::multi_write_collapse) adds the nested recursion.
+    fn multi_write_collapse_local(&self) -> Vec<String> {
         let mut flagged = BTreeSet::new();
         for (t, node) in self.nodes.iter().enumerate() {
             if !(node.is_tick && node.writes.is_empty()) {
@@ -535,6 +549,9 @@ struct Builder {
     /// The module's combinational output ports, so terminal `port.write(…)` nodes
     /// can be tagged with the port they drive (definite-assignment).
     outputs: BTreeSet<String>,
+    /// The module's `In` ports — propagated into nested-loop sub-CFGs so the
+    /// multi-write-collapse detector can spot a leading read inside a nested loop.
+    inputs: BTreeSet<String>,
     /// Sub-CFGs of **tick-containing nested loops** — built alongside the (still
     /// folded) parent node so [`Cfg::check_reachability`] can recurse into each one
     /// and enforce the tickless-cycle invariant *inside* the nested loop. Only
@@ -549,10 +566,11 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(outputs: BTreeSet<String>) -> Builder {
+    fn new(outputs: BTreeSet<String>, inputs: BTreeSet<String>) -> Builder {
         Builder {
             nodes: Vec::new(),
             outputs,
+            inputs,
             nested: Vec::new(),
             loop_ctx: Vec::new(),
         }
@@ -571,7 +589,7 @@ impl Builder {
     /// loop (no register/output analysis), so `defined_in_loop`/`comb_outputs`/
     /// `exit` are empty/`None`.
     fn nested_loop_cfg(&self, body: &[Stmt], span: Span) -> Cfg {
-        let mut b = Builder::new(self.outputs.clone());
+        let mut b = Builder::new(self.outputs.clone(), self.inputs.clone());
         let head = b.new_node(Node::empty(span));
         let brk = b.new_node(Node::empty(span)); // exit sink for `break`
         b.loop_ctx.push((head, brk));
@@ -582,8 +600,10 @@ impl Builder {
             nodes: b.nodes,
             head,
             defined_in_loop: BTreeSet::new(),
-            comb_outputs: BTreeSet::new(),
-            inputs: BTreeSet::new(),
+            // Port sets propagated from the parent so multi_write_collapse can recurse
+            // into this nested loop (reachability, its original purpose, ignores them).
+            comb_outputs: self.outputs.clone(),
+            inputs: self.inputs.clone(),
             exit: None,
             nested_ticking_loops: b.nested,
         }
