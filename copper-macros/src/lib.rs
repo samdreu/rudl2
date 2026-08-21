@@ -275,6 +275,17 @@ fn collect_pat_idents(pat: &Pat, out: &mut Vec<syn::Ident>) {
     }
 }
 
+/// The span of the port parameter named `name`, for a spanned diagnostic.
+fn port_param_span(sig: &syn::Signature, name: &str) -> Option<proc_macro2::Span> {
+    sig.inputs.iter().find_map(|a| match a {
+        FnArg::Typed(pt) => match &*pt.pat {
+            Pat::Ident(pi) if pi.ident == name => Some(syn::spanned::Spanned::span(a)),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
 /// The identifiers of every value parameter (the hardware ports).
 fn param_idents(sig: &syn::Signature) -> std::collections::HashSet<String> {
     sig.inputs
@@ -866,6 +877,30 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             // pristine ItemFn, before any rewrite.
             if let Err(err) = copper_analysis::check_reachability(&input_fn) {
                 return err.to_compile_error().into();
+            }
+            // A combinational `Out` written on both sides of one bare `clk.tick().await`
+            // within an iteration, after a leading (deferred) input read, collapses in
+            // the simulator: the post-tick write clobbers the pre-tick value before it
+            // is observed, so the sim silently disagrees with the synthesized hardware
+            // (the multi-write-around-a-tick pattern; see the shared analysis and the
+            // paper's contribution 5). Reject it, pointing at `RegOut`.
+            let collapsing = copper_analysis::multi_write_collapse(&input_fn);
+            if let Some(port) = collapsing.first() {
+                let span = port_param_span(&input_fn.sig, port)
+                    .unwrap_or_else(|| input_fn.sig.ident.span());
+                return Error::new(
+                    span,
+                    format!(
+                        "output port `{port}` is written on both sides of a `clk.tick().await` \
+                         within one iteration, after a leading input read — the simulator collapses \
+                         this multi-write-around-a-tick to the last write, silently disagreeing with \
+                         the synthesized hardware. Declare `{port}` as `RegOut<…>` (a registered \
+                         output), or split the writes into distinct FSM states so each state drives \
+                         the output once."
+                    ),
+                )
+                .to_compile_error()
+                .into();
             }
             // c2 (gate G6): the sim macro consumes the SHARED analysis crate — the
             // same one the transpiler consumes — proving a proc-macro can depend on

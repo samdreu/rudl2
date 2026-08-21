@@ -152,8 +152,10 @@ running the coroutine, so none inherits this problem; Copper's control extractio
 reintroduces it, and Copper follows the same discipline — the multi-write-across-a-tick pattern is
 rejected at compile time (directing the author to `RegOut` for a registered output, or to explicit
 per-state writes for a combinational one), so every accepted program preserves same-source
-sim ≡ synth. `[Detection is over the same phase structure the transpiler already computes;
-guardrail to be added — see contribution 5 and the SIMULATOR/MACRO TODO.]`
+sim ≡ synth. `[Landed: `copper_analysis::multi_write_collapse` detects the pattern over the
+shared CFG — a bare-tick output straddle with a leading (deferred) input read — and the macro
+rejects it, pointing at `RegOut`. Corpus-validated to flag only the two control-extraction
+probes, none of the shipping designs.]`
 
 ## Type systems for compile-time hardware safety
 

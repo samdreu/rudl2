@@ -1,0 +1,19 @@
+error: output port `out` is written on both sides of a `clk.tick().await` within one iteration, after a leading input read — the simulator collapses this multi-write-around-a-tick to the last write, silently disagreeing with the synthesized hardware. Declare `out` as `RegOut<…>` (a registered output), or split the writes into distinct FSM states so each state drives the output once.
+  --> tests/ui/fail/multi_write_collapse.rs:13:66
+   |
+13 | async fn collapser(clk: Clock<MainClk>, sel: In<Logic, MainClk>, out: Out<Logic, MainClk>) {
+   |                                                                  ^^^
+
+warning: unused imports: `Clock` and `Logic`
+ --> tests/ui/fail/multi_write_collapse.rs:1:19
+  |
+1 | use copper_core::{Clock, ClockDomain, Logic};
+  |                   ^^^^^               ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `In` and `Out`
+ --> tests/ui/fail/multi_write_collapse.rs:2:25
+  |
+2 | use copper_core::port::{In, Out};
+  |                         ^^  ^^^

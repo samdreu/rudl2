@@ -91,8 +91,9 @@ exactly one driver, with no separate analysis pass.
    silently mis-simulated, exactly as MyHDL restricts its synthesizable subset to single-edge
    processes. Every accepted program thus preserves same-source sim ≡ synth. `[Evidence:
    design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md; EXECUTION_MODEL_RECONCILIATION.md
-   (multi-write-around-a-tick). Guardrail: SIMULATOR/MACRO TODO — detection over the transpiler's
-   existing phase structure.]`
+   (multi-write-around-a-tick). Guardrail landed: `copper_analysis::multi_write_collapse` +
+   the `#[hardware(sequential)]` macro reject it (pointing at `RegOut`), corpus-validated to
+   flag no shipping design.]`
 
 3. **Ownership-enforced single-driver and phantom-typed clock domains** as lightweight,
    pass-free structural guarantees discharged entirely by the Rust compiler. We position clock-

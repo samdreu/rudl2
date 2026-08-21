@@ -1,27 +1,22 @@
-//! P2 nested-tick awaits. `if_tick` has a branch-nested tick (then: 1 tick, else:
-//! 2 ticks); `if_tick_explicit` is the hand-written pc-FSM twin. This asserts the
-//! branch-nested form behaves identically to the explicit FSM **in the simulator**
-//! (a control-extraction behavioral differential — the structural test only checks
-//! SV shape).
+//! P2 nested-tick awaits — a FULL sim ≡ transpiled-SV equivalence test.
 //!
-//! P2 nested-tick awaits. `if_tick` has a branch-nested tick (then: 1 tick, else:
-//! 2 ticks); `if_tick_explicit` is the hand-written pc-FSM twin. This asserts the
-//! branch-nested form behaves identically to the explicit FSM **in the simulator**
-//! (a control-extraction behavioral differential — the structural test only checks
-//! SV shape).
+//! `if_tick` has a branch-nested tick (then: 1 tick, else: 2); `if_tick_explicit` is
+//! the hand-written pc-FSM twin. This asserts BOTH that control extraction is correct
+//! (the branch-nested form behaves identically to the explicit FSM in the simulator)
+//! AND that the transpiler agrees (`if_tick`'s SV matches the sim under Verilator).
 //!
-//! Runs `sim_only`. The registered-Moore-output codegen bug (which blocked `seq6`)
-//! is now FIXED, and this FSM's output does lower to `always_comb`. But `if_tick`'s
-//! output is *Mealy* — in state `pc=0` it is `sel ? 1 : 0`, depending on the live
-//! input — and the combinational SV then disagrees with the simulator at some
-//! cycles: a SEPARATE, still-open output-timing (Mealy) reconciliation, distinct
-//! from the Moore-decode fix. So the Verilator half stays parked; the sim
-//! self-consistency (branch-nested ≡ explicit FSM) is what this asserts.
+//! The output is `RegOut`, not `Out`: `if_tick` writes `out_o` on both sides of a bare
+//! tick after a leading `sel` read, which the multi-write-around-a-tick guardrail
+//! rejects for a plain (combinational) `Out` — a plain `Out` there collapses in the
+//! sim (see `copper_analysis::multi_write_collapse` and the paper's contribution 5).
+//! `RegOut` (registered / non-blocking) both satisfies the guardrail and reconciles
+//! sim with the transpiled `always_ff`, so this runs as a full equivalence check
+//! rather than the earlier `sim_only`.
 
 mod common;
 
 use common::EquivalenceTest;
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, Out, RegOut};
 use copper_core::types::Bits;
 use copper_core::{Clock, ClockDomain, Logic};
 use copper_macros::hardware;
@@ -31,19 +26,21 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 include!("fixtures/control_extraction_dut.rs");
+const SRC: &str = include_str!("fixtures/control_extraction_dut.rs");
 
 #[test]
-fn if_tick_branch_nested_matches_explicit_fsm() {
-    let mut eq = EquivalenceTest::sim_only("if_tick");
+fn if_tick_sim_matches_transpiled_verilog() {
+    let mut eq = EquivalenceTest::for_module("if_tick", SRC, Some("if_tick"));
 
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
     let (sel_drv, sel_in) = wire::<Logic, MainClk>(Logic::Zero);
-    let (dut_out, dut_obs) = wire::<Logic, MainClk>(Logic::Zero);
-    let (ref_out, ref_obs) = wire::<Logic, MainClk>(Logic::Zero);
+    let (dut_out, dut_obs) = registered_wire(&clk, Logic::Zero);
+    let (ref_out, ref_obs) = registered_wire(&clk, Logic::Zero);
     let dut_dh = dut_out.dirty_handle();
     let ref_dh = ref_out.dirty_handle();
+    // DUT = the branch-nested async form; reference = the explicit pc-FSM twin.
     exec.spawn_wired(if_tick(clk.clone(), sel_in.clone(), dut_out), vec![dut_dh], vec![sel_in.wire_id()]);
     exec.spawn_wired(
         if_tick_explicit(clk.clone(), sel_in.clone(), ref_out),

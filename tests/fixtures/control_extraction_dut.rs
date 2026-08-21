@@ -7,6 +7,14 @@
 // simulator (and so immune to the still-open output-timing reconciliation — see
 // EXECUTION_MODEL_RECONCILIATION.md). This is the det_010_awaits→det_010 method,
 // applied to the simplest straight-line + if/else cases.
+//
+// `if_tick`/`match_tick` write their output on both sides of a bare tick after a
+// leading input read — the multi-write-around-a-tick pattern the macro guardrail
+// (`copper_analysis::multi_write_collapse`) rejects for a plain (combinational)
+// `Out`, because the simulator would collapse it. Their outputs are therefore
+// `RegOut` (registered / non-blocking), which both satisfies the guardrail and
+// makes sim ≡ transpiled SV (see tests/nested_tick_equivalence.rs). Their explicit
+// twins mirror the `RegOut` so the structural SV comparison stays apples-to-apples.
 
 // FSM state enum for the match-nested-tick case (Case 3).
 #[derive(Clone, Copy, PartialEq)]
@@ -21,7 +29,7 @@ enum Mode {
 async fn if_tick(
     clk: Clock<MainClk>,
     sel: In<Logic, MainClk>,
-    out_o: Out<Logic, MainClk>,
+    out_o: RegOut<Logic, MainClk>,
 ) {
     loop {
         if sel.read() == Logic::One {
@@ -40,7 +48,7 @@ async fn if_tick(
 async fn if_tick_explicit(
     clk: Clock<MainClk>,
     sel: In<Logic, MainClk>,
-    out_o: Out<Logic, MainClk>,
+    out_o: RegOut<Logic, MainClk>,
 ) {
     let mut pc: u8 = 0;
     loop {
@@ -126,7 +134,7 @@ async fn match_tick(
     clk: Clock<MainClk>,
     a: In<Bits<8>, MainClk>,
     b: In<Bits<8>, MainClk>,
-    out: Out<Bits<8>, MainClk>,
+    out: RegOut<Bits<8>, MainClk>,
 ) {
     let mut mode = Mode::Single;
     loop {
@@ -152,7 +160,7 @@ async fn match_tick_explicit(
     clk: Clock<MainClk>,
     a: In<Bits<8>, MainClk>,
     b: In<Bits<8>, MainClk>,
-    out: Out<Bits<8>, MainClk>,
+    out: RegOut<Bits<8>, MainClk>,
 ) {
     let mut mode = Mode::Single;
     let mut pc: u8 = 0;

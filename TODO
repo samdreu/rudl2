@@ -173,20 +173,23 @@ P1 — macro compile-time guardrails (trybuild; pattern in copper-macros/tests/u
      [DEFERRED — it's a WARNING; trybuild asserts on errors, so needs a different
      test path (or promotion to an error). Design call pending.]
   ☐ Require direct tick await (reject aliased/wrapped `clk` tick)  [DEFERRED]
-  ☐ PROPOSED (2026-08-03): reject a combinational `Out` written on both sides of ONE
-     tick in a single control-flow region (`out.write(x); tick; out.write(y)`). The
-     coroutine executor collapses such multi-write-around-a-tick outputs to the last
-     write (silent sim ≠ SV; see TRANSPILATION Mealy item + EXECUTION_MODEL_RECONCILIATION.md
-     §OUTPUT). Rejecting it (directing to `RegOut` for a registered output, or explicit
-     per-state writes for a combinational one) keeps every accepted program sim ≡ SV —
-     the MyHDL "restrict the synthesizable subset" discipline. Referenced by paper
-     contribution 5 + the new related_work §Simulation semantics.
-     - Detection: an `Out` (non-RegOut) port in the pre_edge write-set of >1 phase of
-       one iteration — reuse the transpiler's phase structure (copper-analysis). CARE:
-       must NOT over-flag a per-cycle serializer (`for x { out.write(x); tick }` writes
-       out once per phase-as-cycle, not twice around one tick) — validate the exact rule
-       against the corpus before landing. Macro-guardrail category (compile error), not a
-       sim/codegen semantics change. NEEDS user sign-off on the rule + a green corpus.
+  ✔ LANDED (2026-08-03): reject a combinational `Out` written on both sides of ONE
+     bare tick after a leading input read (`… inp.read() …; out.write(x); tick;
+     out.write(y)`). The coroutine executor collapses such multi-write-around-a-tick
+     outputs to the last write (silent sim ≠ SV). Rejected at the macro, pointing at
+     `RegOut` (registered) or explicit per-state writes — the MyHDL "restrict the
+     synthesizable subset" discipline; keeps every accepted program sim ≡ SV.
+     - Detection = `copper_analysis::multi_write_collapse` (copper-analysis/src/cfg.rs).
+       The naive "written in >1 phase" rule OVER-FLAGGED uart/rv32i/sipo_block; the
+       landed rule needs all THREE conditions (bare tick, both-sides write, leading In
+       read comb-reaching the pre-tick write) — empirically pinned + corpus-clean (flags
+       ONLY the two control-extraction probes, now converted to RegOut).
+     - Wired into copper-macros (sequential arm); trybuild ui/fail/multi_write_collapse.rs
+       + ui/pass/multi_write_regout_ok.rs; 6 analysis unit tests. Fixtures if_tick/
+       match_tick → RegOut (nested_tick upgraded sim_only → full Verilator equivalence).
+     - FOLLOW-UP (in progress): a DYNAMIC executor backstop (detect at runtime an Out
+       written in pre_edge overwritten in post_edge before observation) to catch cases
+       the static rule might miss on exercised paths. NEEDS sign-off (sim change).
 
 --------------------------------------------------------------------------------
 P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)
