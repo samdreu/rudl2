@@ -43,6 +43,28 @@ holds corpus-wide across 17+ sequential modules with codegen adding only its syn
 FSM counter — i.e. the inferred set is exactly the design's registers, with no rustc-style
 over-capture.
 
+**Scope correction (2026-08-21) — the evidence above covers `#[hardware(sequential)]` modules
+only, and the inference is *not* exactly right outside them.** Both evidence paths are
+sequential-scoped: the G2 references are all sequential DUTs, and `register_reconciliation.rs`
+filters on `#[hardware(sequential)]`, so `#[hardware(synchronizer)]` modules were never
+reconciled. Lifting that filter (`tests/cdc_synchronizer_anchor.rs`) found the library CDC
+primitive `copper::sync_2ff` is **under**-approximated: inference reports one flip-flop where the
+simulator's behaviour, an independent hand-written reference, and codegen all have two. The
+second stage `ff2` is assigned post-tick and read pre-tick, so no def→use path crosses a tick
+edge and the "live across a tick" rule calls it a wire. A corpus sweep bounds the blast radius at
+exactly this shape — 41 modules checked, the only divergences are the three copies of that same
+2-FF synchronizer; every sequential module agrees.
+
+The honest framing for the paper: the claim is that the inferred set is minimal *and* correct,
+and correctness is currently established for the sequential subset. The synchronizer case is a
+counter-example to the unqualified claim, and it cuts the *opposite* way from T1's main worry —
+not rustc-style over-capture, but an under-approximation of our own. Either the rule needs a
+second clause for post-edge-defined, pre-edge-read locals, or the claim must be stated over the
+sequential subset. It affects no landed behaviour today (codegen computes its own register set
+via `find_promoted_wires` rather than consuming the shared one), which is also why the
+"behavior-neutral follow-up" of having codegen consume the shared set directly is **not**
+behaviour-neutral until this is resolved.
+
 **T2 — We use the coroutine *transform*, not the async *runtime*.** Copper's executor polls
 every task each delta cycle with a no-op waker (`copper-sim/src/executor.rs`); it uses none of
 async's readiness/waker scheduling. This is deliberate and should be stated: we repurpose

@@ -20,6 +20,9 @@ log = "0.4.29"
 # structurally reg-match inferred registers against independent hand-written SV
 # (G2 of design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md).
 copper-analysis = { path = "copper-analysis" }
+# `tests/cdc_synchronizer_anchor.rs` parses a fixture to call `infer_registers`
+# directly (pinning the synchronizer register-inference gap).
+syn = { version = "2", features = ["full", "parsing"] }
 
 [[example]]
 name = "one_bit_comparator"

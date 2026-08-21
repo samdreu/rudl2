@@ -18,6 +18,17 @@
 //!   * codegen adds only the **synthetic phase/pc counter** it introduces for
 //!     multi-tick / control-extracted FSMs (`codegen − inferred ⊆ {phase, pc}`),
 //!     which the source-level inference has no name for.
+//!
+//! **Scope: `#[hardware(sequential)]` only** — `is_sequential` below skips
+//! `combinational` and `synchronizer` modules. That is not merely a convenience:
+//! synchronizers **do not currently reconcile**. `copper_analysis::infer_registers`
+//! reports one flip-flop for the 2-FF synchronizer where codegen emits two (`ff2`
+//! is assigned post-tick and read pre-tick, so it never crosses a tick edge under
+//! the liveness rule). A sweep with this filter lifted found that is the *only*
+//! divergence in the corpus — 41 modules, three copies of the same synchronizer.
+//! The gap is pinned by
+//! `tests/cdc_synchronizer_anchor.rs::register_inference_under_reports_the_second_flop_known_gap`;
+//! widen this test to `synchronizer` once the inference rule is extended.
 
 use std::collections::BTreeSet;
 use std::fs;
