@@ -19,16 +19,15 @@
 //!     multi-tick / control-extracted FSMs (`codegen − inferred ⊆ {phase, pc}`),
 //!     which the source-level inference has no name for.
 //!
-//! **Scope: `#[hardware(sequential)]` only** — `is_sequential` below skips
-//! `combinational` and `synchronizer` modules. That is not merely a convenience:
-//! synchronizers **do not currently reconcile**. `copper_analysis::infer_registers`
-//! reports one flip-flop for the 2-FF synchronizer where codegen emits two (`ff2`
-//! is assigned post-tick and read pre-tick, so it never crosses a tick edge under
-//! the liveness rule). A sweep with this filter lifted found that is the *only*
-//! divergence in the corpus — 41 modules, three copies of the same synchronizer.
-//! The gap is pinned by
-//! `tests/cdc_synchronizer_anchor.rs::register_inference_under_reports_the_second_flop_known_gap`;
-//! widen this test to `synchronizer` once the inference rule is extended.
+//! **Scope: clocked modules — `sequential` *and* `synchronizer`.** Synchronizers
+//! were excluded until 2026-08-21, and that exclusion hid a real bug: inference
+//! reported one flip-flop for the 2-FF synchronizer where codegen emits two (`ff2`
+//! is defined post-tick and read pre-tick, so its live range crosses the loop back
+//! edge but no tick edge). A sweep with the filter lifted showed that was the only
+//! divergence in the corpus — 41 modules, three copies of the same synchronizer —
+//! and it is fixed by the back-edge clause in `Cfg::registers`. With that fix all
+//! 41 clocked modules that transpile agree. The filter is now lifted permanently so
+//! the shape stays covered.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -48,10 +47,14 @@ fn is_hardware(f: &ItemFn) -> bool {
     f.attrs.iter().any(|a| a.path().segments.last().is_some_and(|s| s.ident == "hardware"))
 }
 
-fn is_sequential(f: &ItemFn) -> bool {
+/// Clocked modes — the ones with a top-level ticking loop and therefore registers.
+/// Excludes only `combinational`. See the scope note in the header for why
+/// `synchronizer` is included.
+fn is_clocked(f: &ItemFn) -> bool {
     f.attrs.iter().any(|a| {
         a.path().segments.last().is_some_and(|s| s.ident == "hardware")
-            && a.parse_args::<syn::Ident>().is_ok_and(|id| id == "sequential")
+            && a.parse_args::<syn::Ident>()
+                .is_ok_and(|id| id == "sequential" || id == "synchronizer")
     })
 }
 
@@ -82,7 +85,7 @@ fn codegen_registers_match_shared_inference() {
         let multi = hw_fns.len() > 1;
 
         for f in hw_fns {
-            if !is_sequential(f) {
+            if !is_clocked(f) {
                 continue;
             }
             let name = f.sig.ident.to_string();
@@ -124,12 +127,12 @@ fn codegen_registers_match_shared_inference() {
         }
     }
 
-    assert!(checked >= 8, "expected to reconcile the sequential fixtures, only did {checked}");
+    assert!(checked >= 8, "expected to reconcile the clocked fixtures, only did {checked}");
     assert!(
         violations.is_empty(),
         "register-set reconciliation failed for {} module(s):\n{}",
         violations.len(),
         violations.join("\n")
     );
-    eprintln!("register reconciliation: {checked} sequential modules — codegen ≡ shared inference (+ synthetic phase/pc)");
+    eprintln!("register reconciliation: {checked} clocked modules — codegen ≡ shared inference (+ synthetic phase/pc)");
 }

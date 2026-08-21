@@ -255,26 +255,36 @@ P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettle
      (20 source ticks with d toggling every one; q must not move).
   ✔ G1 TIMING_COVERAGE_MATRIX pattern 5 (CDC/synchronizer latency) — CLOSED.
      All 6 timing patterns are now anchored to independent hardware.
-  ☐ BUG / OPEN (found 2026-08-21 while writing the anchor above; needs sign-off):
-     copper_analysis::infer_registers reports ONE flip-flop for the 2-FF
-     synchronizer where the sim's behavior, the independent Verilog, and codegen
-     all have TWO. Cause: `ff2` is assigned post-tick and read pre-tick, so no
-     def→use path crosses a tick edge and the "defined-in-loop ∧ live-across-a-tick"
-     rule classifies it as a combinational wire; `ff1` survives only because it is
-     also read post-tick. Nothing caught it because
-     copper-codegen/tests/register_reconciliation.rs filters on
-     #[hardware(sequential)], so #[hardware(synchronizer)] modules were NEVER
-     reconciled. Blast radius MEASURED by a corpus sweep with that filter lifted:
-     41 modules checked, the ONLY divergences are the three copies of this same
-     2-FF synchronizer (src/sync.rs::sync_2ff,
-     examples/cdc/two_domain_hierarchy.rs::flag_sync, tests/fixtures/sync_2ff_dut.rs).
-     Every sequential module agrees. Affects no landed behavior today (codegen
-     computes its own set via find_promoted_wires), but it is an UNDER-approximation
-     of the set the design docs call authoritative — a consumer that trusted it
-     would drop a flop, and it is a hole in the paper's contribution-2 claim that
-     the inferred register set is correct. PINNED (flips loudly when fixed) by
-     cdc_synchronizer_anchor.rs::register_inference_under_reports_the_second_flop_known_gap.
-     Fixing it is a copper-analysis change that feeds codegen → needs sign-off.
+  ✔ BUG FIXED (found + fixed 2026-08-21, with user sign-off): infer_registers
+     under-reported the 2-FF synchronizer — ONE flip-flop where the sim's behavior,
+     the independent Verilog, and codegen all have TWO.
+     ROOT CAUSE: Cfg::registers keyed only on "live across a TICK edge". `ff2` is
+     defined post-tick (`ff2 = ff1`) and read pre-tick (`q.write(ff2)`), so walking
+     backwards from the use, its own definition kills it before the tick is reached —
+     its live range crosses the loop BACK EDGE, not a tick. It is nonetheless a real
+     flop: `ff2 = ff1` reads ff1's PRE-edge value (the next line overwrites it), which
+     a wire cannot reproduce — `assign ff2 = ff1` tracks the post-edge value and
+     collapses the two stages into one flop (the exact failure src/sync.rs's own
+     comment warns about).
+     FIX: one line — Cfg::registers now unions live_out[head] (the loop head is an
+     empty node, so its live-out IS the set carried across the back edge) with the
+     across-tick set. General principle documented on the fn: a local defined in a
+     post-tick segment had its defining expression evaluated against pre-edge values,
+     so if it survives to the next iteration it needs storage. A post-tick temp that
+     dies in its own segment is still excluded (D-input logic).
+     VALIDATED against a differential oracle, not by argument: inference vs codegen's
+     emitted flip-flops over every clocked module that transpiles in tests/fixtures +
+     examples + src — 41/41 AGREE (was 38/41), synchronizers included, nothing newly
+     over-reported. (register_reconciliation.rs itself scans only tests/fixtures: 24
+     clocked modules, all green.)
+     Both production call sites of infer_registers only log::debug! it, so no emitted
+     hardware changed.
+     REGRESSION COVER: register_reconciliation.rs no longer filters out
+     #[hardware(synchronizer)] (is_sequential → is_clocked), so the shape is pinned
+     corpus-wide; two new copper-analysis unit tests (post_tick_def_read_pre_tick_is_
+     a_register + post_tick_temp_dying_in_its_own_segment_is_not_a_register); and
+     cdc_synchronizer_anchor.rs::register_inference_matches_the_independent_reference
+     is now a real NameExact G2 match instead of a pinned gap.
   ☐ two_domain_counter example → behavioral/equiv test
   ☐ flag_crossing example → behavioral test (metastability-free handoff semantics)
      (the synchronizer half is now anchored above; what remains is the end-to-end

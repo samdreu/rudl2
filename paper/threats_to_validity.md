@@ -39,31 +39,35 @@ independent hand-written SystemVerilog** (`copper_analysis::assert_source_regist
 wired into `tests/common::EquivalenceTest::with_reference_registers` for `mac_fsm` name-exact and
 `det_010`/`det_110101`/`lfsr` storage-equivalent); and (ii) a **reconciliation against the
 transpiler's own emitted flip-flops** (`copper-codegen/tests/register_reconciliation.rs`), which
-holds corpus-wide across 17+ sequential modules with codegen adding only its synthesized phase/pc
+holds across the fixture corpus (24 clocked modules) with codegen adding only its synthesized phase/pc
 FSM counter — i.e. the inferred set is exactly the design's registers, with no rustc-style
 over-capture.
 
-**Scope correction (2026-08-21) — the evidence above covers `#[hardware(sequential)]` modules
-only, and the inference is *not* exactly right outside them.** Both evidence paths are
-sequential-scoped: the G2 references are all sequential DUTs, and `register_reconciliation.rs`
-filters on `#[hardware(sequential)]`, so `#[hardware(synchronizer)]` modules were never
-reconciled. Lifting that filter (`tests/cdc_synchronizer_anchor.rs`) found the library CDC
-primitive `copper::sync_2ff` is **under**-approximated: inference reports one flip-flop where the
-simulator's behaviour, an independent hand-written reference, and codegen all have two. The
-second stage `ff2` is assigned post-tick and read pre-tick, so no def→use path crosses a tick
-edge and the "live across a tick" rule calls it a wire. A corpus sweep bounds the blast radius at
-exactly this shape — 41 modules checked, the only divergences are the three copies of that same
-2-FF synchronizer; every sequential module agrees.
+**A counter-example found and fixed (2026-08-21) — worth reporting, because it is evidence the
+check has teeth.** Both evidence paths above were *sequential-scoped*: the G2 references are all
+sequential DUTs, and `register_reconciliation.rs` filtered on `#[hardware(sequential)]`, so
+`#[hardware(synchronizer)]` modules had never been reconciled. Lifting that filter found the
+library CDC primitive `copper::sync_2ff` was **under**-approximated — inference reported one
+flip-flop where the simulator's behaviour, an independent hand-written reference, and codegen all
+have two.
 
-The honest framing for the paper: the claim is that the inferred set is minimal *and* correct,
-and correctness is currently established for the sequential subset. The synchronizer case is a
-counter-example to the unqualified claim, and it cuts the *opposite* way from T1's main worry —
-not rustc-style over-capture, but an under-approximation of our own. Either the rule needs a
-second clause for post-edge-defined, pre-edge-read locals, or the claim must be stated over the
-sequential subset. It affects no landed behaviour today (codegen computes its own register set
-via `find_promoted_wires` rather than consuming the shared one), which is also why the
-"behavior-neutral follow-up" of having codegen consume the shared set directly is **not**
-behaviour-neutral until this is resolved.
+The cause is instructive for the liveness rule itself. `ff2` is defined *post*-tick and read
+*pre*-tick, so its live range crosses the loop back edge but no tick edge, and a rule keyed only
+on ticks classified it a combinational wire. It is not one: `ff2 = ff1` reads `ff1`'s *pre-edge*
+value (the next statement overwrites it), which a wire cannot reproduce — `assign ff2 = ff1` would
+track the post-edge value and collapse the two synchronizer stages into a single flop. The rule now
+has two clauses, tick edge **and** loop back edge, on the principle that a local defined in a
+post-tick segment had its defining expression evaluated against pre-edge values, so if it survives
+to the next iteration it needs storage.
+
+The fix is validated against a differential oracle rather than by argument: inference is now
+compared to codegen's emitted flip-flops across every clocked module that transpiles in
+`tests/fixtures`, `examples`, and `src` — **41 of 41 agree**, synchronizers included, with nothing newly over-reported. `register_reconciliation.rs`
+covers `synchronizer` permanently so the shape cannot regress, and
+`tests/cdc_synchronizer_anchor.rs` adds a structural reg-for-reg match against the independent
+reference. Both production call sites of `infer_registers` only log it, so the correction changed
+no emitted hardware — but it does restore the unqualified claim, and it removes the caveat that
+routing codegen through the shared set would have dropped a flop on every synchronizer.
 
 **T2 — We use the coroutine *transform*, not the async *runtime*.** Copper's executor polls
 every task each delta cycle with a no-op waker (`copper-sim/src/executor.rs`); it uses none of

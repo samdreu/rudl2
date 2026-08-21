@@ -28,11 +28,11 @@
 //! for why those are consistent, and the note on `LATENCY_DST_CYCLES` for why the
 //! "two-cycle" figure in the CDC examples' prose counts a different path.
 //!
-//! **Finding (open):** writing these tests surfaced a real gap in the shared
-//! register inference — it reports one flip-flop for the 2-FF synchronizer where
-//! the sim, independent hardware, and codegen all have two. It is pinned by
-//! `register_inference_under_reports_the_second_flop_known_gap`, which carries the
-//! cause, the measured blast radius, and the fix criterion.
+//! **Finding, since fixed:** writing these tests surfaced a real under-approximation
+//! in the shared register inference — it reported one flip-flop for the 2-FF
+//! synchronizer where the sim, independent hardware, and codegen all have two.
+//! Fixed 2026-08-21 by the back-edge clause in `Cfg::registers`; the structural
+//! check is now `register_inference_matches_the_independent_reference`.
 //!
 //! If Verilator is not installed the Verilator arms are skipped (the sim arms
 //! still run), mirroring the rest of the suite.
@@ -292,77 +292,28 @@ fn synchronizer_behaves_as_two_flops_not_one() {
 }
 
 #[test]
-fn register_inference_under_reports_the_second_flop_known_gap() {
-    // KNOWN GAP, pinned so it flips loudly the day it is fixed — do not "fix" this
-    // test by relaxing it.
+fn register_inference_matches_the_independent_reference() {
+    // G2 structural reg-for-reg match against the independent hand-written SV.
+    // `NameExact` is warranted here because the reference uses the same stage names
+    // as the design (`ff1`, `ff2`) — it is the same textbook idiom, not a
+    // differently-encoded reimplementation.
     //
-    // `copper_analysis::infer_registers` is the authoritative register set both
-    // front-ends consume. On the 2-FF synchronizer it reports ONE register (`ff1`)
-    // where the design has two: `synchronizer_behaves_as_two_flops_not_one` shows
-    // the *simulator* behaves as two flops, `independent_verilog_matches_sim` shows
-    // independent hardware agrees, and codegen emits both (`ff1`, `ff2`).
-    //
-    // Cause: the inference rule is "defined in loop ∧ live across a tick". `ff2` is
-    // assigned *after* the tick and read *before* the next one, so no def→use path
-    // crosses a tick edge and it is classified a combinational wire. `ff1` survives
-    // the rule because it is also read post-tick.
-    //
-    // Why nothing else caught it: `copper-codegen/tests/register_reconciliation.rs`
-    // filters on `#[hardware(sequential)]`, so `#[hardware(synchronizer)]` modules
-    // were never reconciled. A corpus sweep with that filter lifted found the gap is
-    // exactly this shape — 41 modules checked, the only divergences are the three
-    // copies of this same 2-FF synchronizer (`src/sync.rs::sync_2ff`,
-    // `examples/cdc/two_domain_hierarchy.rs::flag_sync`, and this fixture). Every
-    // sequential module agrees.
-    //
-    // Consequence: it is an *under*-approximation of the register set, so a
-    // consumer that trusted it (rather than codegen's own `find_promoted_wires`)
-    // would drop a flop. It does not affect any landed behaviour today — codegen
-    // computes its own set and both Verilator arms above pass.
+    // HISTORY: until 2026-08-21 this was pinned as a KNOWN GAP. Inference reported
+    // one flip-flop here where the simulator's behaviour, this reference, and
+    // codegen all have two: `ff2` is defined post-tick and read pre-tick, so its
+    // live range crosses the loop back edge but no tick, and the rule keyed only on
+    // ticks. Fixed by adding the back-edge clause to `Cfg::registers` (which see for
+    // why such a local is a genuine flip-flop and not a wire). Synchronizers had
+    // never been reconciled because `register_reconciliation.rs` filtered on
+    // `#[hardware(sequential)]`; that filter is now lifted, so this shape is covered
+    // corpus-wide too.
     let sv = std::fs::read_to_string(REFERENCE_SV).expect("read independent reference");
-    let reference = copper_analysis::reference_sv_registers(&sv);
-    assert_eq!(
-        reference.iter().cloned().collect::<Vec<_>>(),
-        vec!["ff1".to_string(), "ff2".to_string()],
-        "the independent reference is a genuine two-flop synchronizer"
+    copper_analysis::assert_source_registers_match_reference_sv(
+        FIXTURE_SRC,
+        Some("sync_2ff_concrete"),
+        &sv,
+        copper_analysis::RegMatch::NameExact,
     );
-
-    let inferred = copper_analysis::infer_registers(
-        &syn::parse_str::<syn::File>(FIXTURE_SRC)
-            .expect("fixture parses")
-            .items
-            .into_iter()
-            .find_map(|i| match i {
-                syn::Item::Fn(f) => Some(f),
-                _ => None,
-            })
-            .expect("fixture defines a hardware fn"),
-    );
-    assert_eq!(
-        inferred,
-        vec!["ff1".to_string()],
-        "register inference changed — if `ff2` is now inferred the gap is FIXED: \
-         delete this test, and replace it with a NameExact \
-         assert_source_registers_match_reference_sv against {REFERENCE_SV}"
-    );
-}
-
-#[test]
-fn concrete_specialization_matches_the_library_generic() {
-    // The transpiled/anchored arms below run the concrete fixture. This is what
-    // licenses treating those results as results about `copper::sync_2ff`.
-    let schedules: Vec<Vec<Vec<u8>>> = vec![
-        (0..10).map(|i| vec![if i >= 2 { 1 } else { 0 }; 2]).collect(),
-        vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![0, 0], vec![1, 1], vec![0, 0]],
-        vec![vec![1, 1, 1], vec![0, 0, 0], vec![1, 0, 1], vec![0, 1, 0]],
-    ];
-    for (i, schedule) in schedules.iter().enumerate() {
-        assert_eq!(
-            trace_with(Dut::ConcreteFixture, schedule),
-            trace_with(Dut::LibraryGeneric, schedule),
-            "concrete specialization diverged from the library generic on schedule {i}"
-        );
-    }
 }
 
 // ── Verilator arms ────────────────────────────────────────────────────────────

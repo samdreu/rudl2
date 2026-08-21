@@ -86,18 +86,18 @@ independent Verilog agrees on all of it. Note this does **not** contradict the
 that counts the full path from a fast-domain *register's* output, which includes the
 producer's own registered delay.
 
-**Gap surfaced while closing this one (open, separate).** The shared
-`copper_analysis::infer_registers` reports **one** flip-flop for the 2-FF
+**Gap surfaced while closing this one — found and FIXED (2026-08-21).** The shared
+`copper_analysis::infer_registers` reported **one** flip-flop for the 2-FF
 synchronizer, where the simulator's behaviour, the independent Verilog, and codegen
-all have two — `ff2` is assigned post-tick and read pre-tick, so no def→use path
-crosses a tick edge and the "live across a tick" rule classifies it as a wire.
-`register_reconciliation.rs` filters on `#[hardware(sequential)]`, so synchronizers
-were never reconciled and nothing caught it. A corpus sweep with that filter lifted
-measured the blast radius as *exactly* this shape: 41 modules checked, the only
-divergences are the three copies of the same 2-FF synchronizer. It is pinned by
-`tests/cdc_synchronizer_anchor.rs::register_inference_under_reports_the_second_flop_known_gap`
-and affects no landed behaviour today (codegen computes its own set), but it is an
-under-approximation of a set the design docs call authoritative.
+all have two: `ff2` is defined post-tick and read pre-tick, so its live range crosses
+the loop back edge but no tick edge, and the rule keyed only on ticks.
+`register_reconciliation.rs` filtered on `#[hardware(sequential)]`, so synchronizers
+were never reconciled and nothing caught it. `Cfg::registers` now has a **back-edge
+clause** alongside the tick clause; the reconciliation test covers `synchronizer`
+permanently; and the fix was validated against a differential oracle — inference vs
+codegen's emitted flip-flops over every clocked module that transpiles in
+`tests/fixtures` + `examples` + `src`, **41/41 now agree** (was 38/41), with nothing
+newly over-reported.
 
 **6 · Variable-iteration loop (`det_010`) — the glaring gap, now filled.**
 `examples/sequential/pattern_detector_2.rs` has two codings of an "010" detector:
@@ -145,5 +145,5 @@ read-timing retirement) was already satisfied before that work, since item 3 doe
 touch pattern 5; what pattern 5's closure buys is that the **multi-clock** timing
 claims now rest on an outside referee rather than on self-assertion.
 
-One *analysis* gap remains open, surfaced by that work and tracked under pattern 5
-above: register inference under-reports the synchronizer's second flop.
+That work also surfaced — and fixed — a real under-approximation in register
+inference on synchronizers; see under pattern 5 above.

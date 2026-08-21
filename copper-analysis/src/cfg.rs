@@ -185,16 +185,57 @@ impl Cfg {
     /// some tick edge, i.e. it is in the live-out set of a tick node. Same-cycle
     /// combinational temps (redefined at the loop head before any post-tick use)
     /// are killed by that redefinition and correctly excluded.
+    ///
+    /// **Two clock boundaries, not one.** A local is a register iff it is defined in
+    /// the loop **and** live across *either*
+    ///
+    ///   * a **tick edge** — its pre-tick value is read post-tick (the original
+    ///     rule, which catches a register by its *use* on the far side of an edge); or
+    ///   * the **loop back edge** — it is live entering the loop head, i.e. handed
+    ///     from one iteration to the next.
+    ///
+    /// The back-edge clause was added 2026-08-21 to fix a real under-approximation
+    /// (see the `sync_2ff` case below). It is not redundant with the tick clause:
+    /// anything passed from one *pre*-tick segment to the next must pass through the
+    /// intervening tick and is already caught, so the only values it newly admits are
+    /// those **defined in a post-tick segment and read before the next tick**.
+    ///
+    /// Those are genuine flip-flops, and the reason is the *ordering* inside the
+    /// post-tick segment. In the 2-FF synchronizer (`src/sync.rs`):
+    ///
+    /// ```text
+    /// loop { q.write(ff2); clk.tick().await; ff2 = ff1; ff1 = d.read(); }
+    /// ```
+    ///
+    /// `ff2` is used pre-tick and defined post-tick, so walking backwards from the
+    /// use, its own definition kills it before the tick is reached — under the tick
+    /// clause alone it looks like a same-cycle wire, and inference reported **one**
+    /// register where the simulator's behaviour, an independent hand-written
+    /// reference, and codegen all have **two**. But `ff2 = ff1` reads `ff1`'s
+    /// *pre-edge* value (the next line overwrites it), which no wire can reproduce:
+    /// `assign ff2 = ff1` would track `ff1`'s post-edge value and collapse the two
+    /// stages into one flop — the exact failure `src/sync.rs`'s own comment warns
+    /// about. Only an edge-triggered, non-blocking update behaves as observed.
+    ///
+    /// Generally: a local defined in a post-tick segment had its defining expression
+    /// evaluated against *pre-edge* values, while its consumer runs after the other
+    /// post-edge updates — so if it survives to the next iteration it needs storage.
+    /// A post-tick temp that dies within its own segment is not live at the head and
+    /// is still correctly excluded (it is combinational logic in a D-input path).
     pub fn registers(&self) -> Vec<String> {
         let live_out = self.liveness();
-        let mut across_tick = BTreeSet::new();
+        let mut across_boundary = BTreeSet::new();
         for (i, node) in self.nodes.iter().enumerate() {
             if node.is_tick {
-                across_tick.extend(live_out[i].iter().cloned());
+                across_boundary.extend(live_out[i].iter().cloned());
             }
         }
+        // The head is an empty node (no defs/uses), so its live-out is exactly the
+        // set live entering it — i.e. carried across the back edge.
+        across_boundary.extend(live_out[self.head].iter().cloned());
+
         self.defined_in_loop
-            .intersection(&across_tick)
+            .intersection(&across_boundary)
             .cloned()
             .collect()
     }
@@ -1420,6 +1461,52 @@ mod tests {
             }
         "#;
         // `acc` crosses the tick (register); `t` is same-cycle (wire).
+        assert_eq!(regs(src), ["acc"]);
+    }
+
+    /// The **back-edge clause** (added 2026-08-21). A local defined *post*-tick and
+    /// read *pre*-tick is a flip-flop even though its live range crosses no tick: it
+    /// crosses the loop back edge. The 2-FF synchronizer is the canonical case —
+    /// under the tick-only rule this returned just `["ff1"]`, a silent
+    /// under-approximation contradicted by the simulator's own behaviour, by
+    /// independent hand-written Verilog, and by codegen (all three have two flops).
+    /// See `Cfg::registers` for why `ff2` cannot be a wire.
+    #[test]
+    fn post_tick_def_read_pre_tick_is_a_register() {
+        let src = r#"
+            #[hardware(synchronizer)]
+            async fn sync_2ff(clk: Clock<D>, d: In<Logic, S>, q: Out<Logic, D>) {
+                let mut ff1 = Logic::Zero;
+                let mut ff2 = Logic::Zero;
+                loop {
+                    q.write(ff2);
+                    clk.tick().await;
+                    ff2 = ff1;
+                    ff1 = d.read();
+                }
+            }
+        "#;
+        assert_eq!(regs(src), ["ff1", "ff2"]);
+    }
+
+    /// The back-edge clause must not swallow the combinational case it neighbours:
+    /// a temp defined *and* consumed within one post-tick segment dies there, so it
+    /// is not live at the head and stays a wire (it is D-input logic in hardware).
+    #[test]
+    fn post_tick_temp_dying_in_its_own_segment_is_not_a_register() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut acc = Bits::from_u32(0);
+                loop {
+                    o.write(acc);
+                    clk.tick().await;
+                    let t = a.read() + Bits::from_lit::<1>();
+                    acc = t + acc;
+                }
+            }
+        "#;
+        // `acc` is carried across the boundary; `t` is consumed where it is born.
         assert_eq!(regs(src), ["acc"]);
     }
 
