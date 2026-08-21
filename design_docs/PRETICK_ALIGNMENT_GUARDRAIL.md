@@ -156,11 +156,11 @@ comb-reaching it on that path.* Path-sensitive, over `Cfg`, reusing
 |---|---|---|---|
 | `fast_counter` | 3 | **TRUE POSITIVE** | measured divergence + hardware adjudication |
 | `add_then_write` | 1 | **TRUE POSITIVE** | the V1 fixture itself |
-| `mac_fsm` | 3 | **FALSE POSITIVE** | `mac_fsm_sim_matches_transpiled_verilog` passes |
-| `if_tick_explicit` | 1 | **FALSE POSITIVE** | `if_tick_sim_matches_transpiled_verilog` passes |
-| `probe_fsm` | 1 | diverges, **cause unconfirmed** | pre-existing `#[ignore]`d divergence; its own note calls it a "phase-gated cross-tick read", the `accum_2` family — may be a *different* defect this rule flags coincidentally |
-| `branch_merge_explicit` | 1 | **UNKNOWN** | only a *structural* test (`branch_merge_extracts_to_explicit_fsm`); no behavioral equivalence |
-| `ram_prewrite` | 1 | **UNKNOWN** | `probe_mem_latency` is `#[ignore]`d |
+| `mac_fsm` | 3 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `mac_fsm_sim_matches_transpiled_verilog` passes |
+| `if_tick_explicit` | 1 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `if_tick_sim_matches_transpiled_verilog` passes |
+| `probe_fsm` | 1 | **TRUE POSITIVE** — same defect as D1, confirmed (Q2) | a leading read on every path fixes it, exactly as it fixes V1; plain `Out` |
+| `branch_merge_explicit` | 1 | **FALSE POSITIVE** — output is `RegOut` (Q1) | (still has no behavioral equivalence test — phase 0a stands) |
+| `ram_prewrite` | 1 | **UNKNOWN** (plain `Out`, so the refined rule retains it) | `probe_mem_latency` is `#[ignore]`d — phase 0b stands |
 
 Two observations that shape the plan:
 
@@ -170,31 +170,63 @@ Two observations that shape the plan:
    cannot be adjudicated until that coverage exists — which makes coverage a
    *prerequisite* of the guardrail, not a follow-up.
 
-### 3.4 Why `mac_fsm` survives
+### 3.4 Why `mac_fsm` survives — ANSWERED
 
-Its `Mul` arm assigns `result` and `stage` with no read on that path, so the rule
-flags it — but nothing in that arm escapes to an output port, so the misalignment is
-unobservable. That suggests adding an "escapes to an output" condition, **except V7
-diverges without escaping**. The two facts are not yet reconciled; see Q1.
+**Because its output is `RegOut`.** Not because of anything about its control flow.
+`RegOut` buffers and commits at the clock edge, so the phase at which the write
+executes cannot be observed. Changing *only* the port type on an otherwise-identical
+divergent module flips it to agreeing (Q1, W8/W9). The same is true of
+`if_tick_explicit` and `branch_merge_explicit` — all three false positives are
+`RegOut` modules, and every divergent case uses a plain `Out`.
+
+An earlier revision of this section guessed at an "escapes to an output" condition and
+noted it could not explain V7. That line of reasoning was looking at the wrong axis.
 
 ---
 
 ## 4. Open questions (what must be answered before a rule exists)
 
-- **Q1 — What separates V7 from `mac_fsm`'s `Mul` arm?** Both assign a register in an
-  unprotected pre-tick segment without escaping to an output in that segment. V7
-  diverges; `mac_fsm` does not. Until this is answered no rule can be both sound and
-  complete. *Leading hypothesis:* V7's module contains **no** `In` read anywhere (its
-  `en` port is unused), so every iteration is post-edge-aligned, whereas `mac_fsm`'s
-  arms are *mixed* — the `Load` arm parks at a barrier and the others do not.
-  Testable directly. **See also §10.4** — Verible's rule permits blocking
-  assignments that target *locals* in sequential logic, which is the same
-  distinction; the refinement is likely "does the value become observable at all"
-  rather than "is it written to a port in this segment".
-- **Q2 — Is `probe_fsm`/`accum_2` the same defect or a second one?** Both are
-  pre-existing `#[ignore]`d divergences described as read-timing (a read whose result
-  crosses a *second* tick). If distinct, the guardrail must not claim them, and they
-  need their own analysis.
+- **Q1 — ANSWERED 2026-08-21. The discriminator is the OUTPUT PORT TYPE, not control
+  flow.** The leading hypothesis ("the module contains no `In` read anywhere") is
+  **refuted**: W4 — a mixed-alignment module shaped like `mac_fsm`, with a read on one
+  arm and an unprotected assignment on the other — **diverges**. Mixed alignment does
+  not protect.
+
+  What actually separates them is that `mac_fsm`, `if_tick_explicit` and
+  `branch_merge_explicit` all declare their outputs **`RegOut`**, while every
+  divergent case uses a plain `Out`. Proven by changing *only* the port type on two
+  otherwise-identical modules:
+
+  | | plain `Out` | `RegOut` |
+  |---|---|---|
+  | W1/W9 (D1 minimal) | **DIVERGE** | **agree** |
+  | W4/W8 (mixed alignment) | **DIVERGE** | **agree** |
+
+  `RegOut` buffers and commits at the edge, so the phase at which the write executes
+  cannot be observed — it is immune to the alignment by construction. That is exactly
+  what the `RegOut` axis was introduced for.
+
+  **Consequence for the rule: key on plain combinational `Out` writes, not on
+  registers.** The §5.2 rule failed because it keyed on registers. This is the same
+  structure `multi_write_collapse` already has (it excludes `RegOut` by construction),
+  and it is corpus-clean by inspection: the refined predicate exempts both confirmed
+  false positives (`mac_fsm` ×3, `if_tick_explicit`, `branch_merge_explicit` — all
+  `RegOut`) while retaining every true positive (`fast_counter` ×3, `add_then_write`,
+  `probe_fsm`, `ram_prewrite` — all plain `Out`).
+
+- **Q2 — ANSWERED 2026-08-21. `probe_fsm` is the SAME defect as D1, not a second one.**
+  W6 — `probe_fsm` with an unconditional leading `In` read, so *every* path carries a
+  barrier — **agrees** with its transpiled SV, where `probe_fsm` as written diverges.
+  The prescribed test ("does adding a preceding input read fix it, as it fixes V1?")
+  returns yes. So the pre-existing `#[ignore]`d divergence in
+  `tests/probe_timing_investigation.rs` is in scope for this plan, and its sibling
+  `accum_2` (same family per its own note) very likely is too — a separately-tracked
+  bug consolidates into this one. `accum_2` itself is not yet measured.
+
+- **Q4 — ANSWERED by Q1: the legal alternative is `RegOut`.** The guardrail can point
+  at exactly the remedy `multi_write_collapse` points at, rather than needing a
+  bespoke rewriting rule per case.
+
 - **Q3 — Does D2 need its own rule, or does fixing D1 subsume it?** They are pinned
   together only because they cancel; nothing shows they share a mechanism.
 - **Q4 — What is the correct form for a designer who wants a sticky flag?** The
@@ -237,7 +269,12 @@ reverted.
 
 *A register assigned in the pre-tick segment with no `In` read comb-reaching it.*
 Matched 7/7 variants, false-positived on `mac_fsm` and `if_tick_explicit` (§3.3).
-Reverted. Kept here because the *next* rule must explain why these survive.
+Reverted.
+
+**Why it failed, now known (Q1):** it keyed on **registers**. The observable
+divergence requires a plain combinational **`Out`** — `RegOut` is immune by
+construction. Every false positive was a `RegOut` module. The corrected rule keys on
+the output write, which is the same structure `multi_write_collapse` already uses.
 
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
 
@@ -319,7 +356,7 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
 - **Gate G0:** every module the candidate rule flags has a behavioral verdict:
   diverges, or agrees.
 
-### Phase 1 — Discrimination measurement (answers Q1, Q2)
+### Phase 1 — Discrimination measurement (answers Q1, Q2) — **DONE 2026-08-21**
 
 - **1a** Test the Q1 hypothesis directly: does a module containing *no* `In` read
   anywhere behave differently from one with mixed per-arm alignment? Construct the
@@ -329,8 +366,14 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
   fixes V1? If not, they are a separate defect and leave this plan.
 - **1c** Extend the variant map until every condition in the proposed rule has a
   flipping witness (R3).
-- **Gate G1:** a written rule whose every clause cites a measured variant, and which
-  is hand-checked against all 12 flagged modules plus `mac_fsm`.
+- **Gate G1: MET.** Q1 and Q2 are answered above from a measured 8-variant battery
+  (W1–W9), including the two controlled port-type pairs that isolate `RegOut` as the
+  discriminator. The rule shape that follows — *a plain combinational `Out` written on
+  a path where a register was assigned in the pre-tick segment with no preceding `In`
+  read* — exempts both confirmed false positives and retains every true positive by
+  inspection. **Phase 2 can proceed**; the remaining work there is implementing it
+  over the CFG and re-running the corpus sweep to confirm cleanliness empirically
+  rather than by inspection.
 
 ### Phase 2 — Rule synthesis and offline validation
 
