@@ -64,6 +64,24 @@ pub fn multi_write_collapse(f: &ItemFn) -> Vec<String> {
     Cfg::build(f).map(|c| c.multi_write_collapse()).unwrap_or_default()
 }
 
+/// Combinational `Out` ports exposed to the **pre-tick alignment hazard** — the
+/// module assigns a register in its pre-tick segment on a path no `In` read precedes,
+/// and drives a plain `Out` in that same segment. Returns the offending ports, sorted;
+/// empty for a combinational module, one with no top-level loop, or one whose outputs
+/// are all `RegOut`.
+///
+/// The fix to point an author at is `RegOut`, which is immune by construction — the
+/// same remedy [`multi_write_collapse`] points at. See
+/// [`Cfg::unprotected_pretick_out_write`] for the mechanism, why the rule keys on the
+/// output write rather than the register, and the known multi-tick false negative;
+/// and `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` for the measurements behind each
+/// clause.
+pub fn unprotected_pretick_out_write(f: &ItemFn) -> Vec<String> {
+    Cfg::build(f)
+        .map(|c| c.unprotected_pretick_out_write())
+        .unwrap_or_default()
+}
+
 /// Enforce the reachability well-formedness invariant: **every path through the
 /// module's top-level loop must reach a `clk.tick().await`**. Deleting all tick
 /// edges from the CFG must leave the reachable subgraph acyclic; a remaining cycle

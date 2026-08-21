@@ -159,7 +159,7 @@ comb-reaching it on that path.* Path-sensitive, over `Cfg`, reusing
 | `mac_fsm` | 3 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `mac_fsm_sim_matches_transpiled_verilog` passes |
 | `if_tick_explicit` | 1 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `if_tick_sim_matches_transpiled_verilog` passes |
 | `probe_fsm` | 1 | **TRUE POSITIVE** — same defect as D1, confirmed (Q2) | a leading read on every path fixes it, exactly as it fixes V1; plain `Out` |
-| `branch_merge_explicit` | 1 | **FALSE POSITIVE** — output is `RegOut` (Q1) | (still has no behavioral equivalence test — phase 0a stands) |
+| `branch_merge_explicit` | 1 | **AGREES** — measured (phase 0a) | plain `Out`, but every write is a CONSTANT; produced the constant-write clause. An earlier revision wrongly recorded this as `RegOut` |
 | `ram_prewrite` | 1 | **UNKNOWN** (plain `Out`, so the refined rule retains it) | `probe_mem_latency` is `#[ignore]`d — phase 0b stands |
 
 Two observations that shape the plan:
@@ -349,8 +349,10 @@ need no sign-off; phase 3 changes `copper-macros` behaviour and does.
 Two flagged modules cannot currently be adjudicated because nothing checks their
 behaviour. Fix that first, or the corpus verdict stays partly unknown.
 
-- **0a** Behavioral equivalence test for `branch_merge_explicit` (today: structural
-  only).
+- **0a** ~~Behavioral equivalence test for `branch_merge_explicit`~~ **DISCHARGED
+  2026-08-21** — measured sim-vs-Verilator: it **AGREES**. Note the trace is weak
+  (its outputs are write-once `Logic::One` and saturate), but it was enough to
+  establish it is not divergent, and it produced the constant-write clause.
 - **0b** Resolve `ram_prewrite` / `probe_mem_latency` — un-ignore it, or record why
   it cannot be.
 - **Gate G0:** every module the candidate rule flags has a behavioral verdict:
@@ -375,7 +377,46 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
   over the CFG and re-running the corpus sweep to confirm cleanliness empirically
   rather than by inspection.
 
-### Phase 2 — Rule synthesis and offline validation
+### Phase 2 — Rule synthesis and offline validation — **DONE 2026-08-21**
+
+**The rule, as landed** (`Cfg::unprotected_pretick_out_write`). Flag a plain
+combinational `Out` port `P` when **both** hold in the pre-tick segment:
+
+1. some node writes `P` **and reads a register** — a constant write is idempotent
+   across the phase shift, so it is unobservable; and
+2. some node assigns a register with **no `In` read comb-reaching it**
+   (`leading_read_reaches`) — the barrier is what pins the segment's phase.
+
+`RegOut` is excluded for free: `Node::writes` holds only combinational outputs, the
+same way `multi_write_collapse` gets its exclusion.
+
+**Every clause has a measured witness** (R3), each a unit test in `cfg.rs`:
+
+| clause | witness | verdict |
+|---|---|---|
+| register assigned pre-tick, plain `Out` | V1 | DIVERGE → flag |
+| no in-segment read-back needed | V7 | DIVERGE → flag |
+| read must *precede* the assignment | V4 vs V5 | agree / DIVERGE |
+| post-tick assignment is safe | V6 | agree → no flag |
+| mixed alignment does **not** protect | W4 | DIVERGE → flag |
+| `RegOut` is immune | W8, W9 | agree → no flag |
+| **write must read a register** | `branch_merge_explicit` | agree → no flag |
+| same defect as `probe_fsm` | W5/W6 | DIVERGE → flag |
+| barrier-pinned corpus shape | `lfsr` | agree → no flag |
+
+The constant-write clause was added *during* phase 2: `branch_merge_explicit` drives
+three plain `Out`s from an unprotected path and was flagged by the first cut, so it
+was measured (phase 0a, discharged) — it **agrees**, because every write is
+`Logic::One`. Flagging it would have rejected a correct design.
+
+- **Gate G2: MET.** `copper-analysis/tests/pretick_alignment_corpus.rs` scans 76
+  clocked modules across `examples/`, `src/` and `tests/`, and flags **exactly 7** —
+  the measured-divergent set, nothing else. The expectation is an *exact set*, so the
+  test fails in both directions: a newly flagged module is a regression or a real bug,
+  and a no-longer-flagged one means the divergence was fixed and several pinned tests
+  need re-blessing.
+
+### Phase 2 (original scope, for reference)
 
 - **2a** Implement as `Cfg::…` in `copper-analysis`, path-sensitive, reusing
   `comb_reaches` / `leading_read_reaches`.

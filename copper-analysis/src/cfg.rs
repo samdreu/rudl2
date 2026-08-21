@@ -358,6 +358,115 @@ impl Cfg {
         })
     }
 
+    /// Nodes in the **pre-tick region**: reachable from the loop head over `Comb`
+    /// edges only, so traversal stops at every tick. This is the segment whose phase
+    /// alignment is decided incidentally — see
+    /// [`unprotected_pretick_out_write`](Self::unprotected_pretick_out_write).
+    fn pre_tick_region(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut seen = vec![false; self.nodes.len()];
+        let mut stack: Vec<usize> = self.nodes[self.head]
+            .succs
+            .iter()
+            .filter(|(_, k)| *k == EdgeKind::Comb)
+            .map(|(s, _)| *s)
+            .collect();
+        while let Some(n) = stack.pop() {
+            if n == self.head || std::mem::replace(&mut seen[n], true) {
+                continue;
+            }
+            out.push(n);
+            for &(s, k) in &self.nodes[n].succs {
+                if k == EdgeKind::Comb {
+                    stack.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// Combinational `Out` ports whose value is exposed to the **pre-tick alignment
+    /// hazard**: the pre-tick segment assigns a register on a path with **no `In`
+    /// read preceding it**, and drives a plain `Out` in that same segment. Returns
+    /// the offending ports, sorted; empty for a combinational module, a module with
+    /// no top-level loop, or one whose outputs are all `RegOut`.
+    ///
+    /// # The hazard
+    ///
+    /// A leading `In` read classifies `Deferred` (impl-plan item 3) and injects
+    /// `pre_edge_barrier()`, which parks the task at the barrier so the pre-tick
+    /// segment runs in the **pre-edge** phase. With no such read the task parks at the
+    /// tick instead, and the segment for cycle *N+1* runs during cycle *N*'s
+    /// **post-edge settle** — so the post-edge observation of cycle *N* sees *N+1*'s
+    /// value. Codegen emits a non-blocking `r <= …`, which cannot reproduce that.
+    /// Measured: `loop { r = r+1; o.write(r); tick; }` simulates `[2,3,4,…]` against
+    /// the SV's `[1,2,3,…]`.
+    ///
+    /// # Why it keys on the `Out` write, not on the register
+    ///
+    /// **`RegOut` is immune by construction** — it buffers and commits at the edge, so
+    /// the phase at which the write executes cannot be observed. This was established
+    /// by changing *only* the port type on otherwise-identical modules: both the
+    /// minimal case and a mixed-alignment case flip from diverging to agreeing. An
+    /// earlier rule keyed on registers and therefore rejected `mac_fsm`,
+    /// `if_tick_explicit` and `branch_merge_explicit` — all correct `RegOut` designs.
+    /// `Node::writes` already holds only combinational outputs, so `RegOut` is
+    /// excluded here for free, exactly as it is in
+    /// [`multi_write_collapse`](Self::multi_write_collapse).
+    ///
+    /// # Why the write must read a register
+    ///
+    /// The misalignment changes *when* the write happens, so it is observable only if
+    /// the value written differs between the two phases. A write of a **constant** is
+    /// idempotent across the shift — measured on `branch_merge_explicit`, which drives
+    /// three plain `Out`s from an unprotected path and **agrees** with its transpiled
+    /// SV because every write is `Logic::One`.
+    ///
+    /// # Why the read must *precede* the assignment
+    ///
+    /// The barrier suspends at the point the read appears, so a read placed *after*
+    /// the assignment does not protect it — measured, and the reason this uses
+    /// `leading_read_reaches` (a comb-path query) rather than "the module reads an
+    /// input somewhere". Mixed alignment does **not** protect either: a module with a
+    /// read on one branch and an unprotected assignment on another still diverges.
+    ///
+    /// # Known false negative
+    ///
+    /// Only the pre-tick segment is examined, so the multi-tick `accum_2` class (a
+    /// read whose result crosses a *second* tick) is not caught. Tracked in
+    /// `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` (Q5); widening this to every
+    /// inter-tick segment needs its own empirical pass.
+    pub fn unprotected_pretick_out_write(&self) -> Vec<String> {
+        let region = self.pre_tick_region();
+
+        let regs: BTreeSet<String> = self.registers().into_iter().collect();
+
+        // (ii) plain combinational `Out` ports driven in this segment **from a
+        // register**. A write of a constant is idempotent across the phase shift —
+        // the misalignment changes *when* the write happens, so it is only
+        // observable if the value written differs between phases. A `folded` node
+        // carries the conservative all-outputs over-approximation for a nested loop,
+        // not a real `port.write`, so it must not count as evidence.
+        let mut driven: BTreeSet<String> = BTreeSet::new();
+        for &n in &region {
+            let node = &self.nodes[n];
+            if node.folded || node.writes.is_empty() || node.uses.is_disjoint(&regs) {
+                continue;
+            }
+            driven.extend(node.writes.iter().cloned());
+        }
+        if driven.is_empty() {
+            return Vec::new();
+        }
+
+        // (i) a register assigned on a path no leading `In` read reaches.
+        let unprotected = region.iter().any(|&n| {
+            !self.nodes[n].defs.is_disjoint(&regs) && !self.leading_read_reaches(n)
+        });
+
+        if unprotected { driven.into_iter().collect() } else { Vec::new() }
+    }
+
     /// Enforce the reachability invariant: with every tick edge deleted, the graph
     /// reachable from the loop head must be acyclic. A remaining cycle is a path
     /// that returns to the top of the loop without ever awaiting a clock tick — a
@@ -1462,6 +1571,227 @@ mod tests {
         "#;
         // `acc` crosses the tick (register); `t` is same-cycle (wire).
         assert_eq!(regs(src), ["acc"]);
+    }
+
+    // ── pre-tick alignment hazard (PRETICK_ALIGNMENT_GUARDRAIL.md) ──────────
+
+    /// Every case below cites a variant that was **measured** — run in the simulator
+    /// and independently under Verilator on its own transpiled SV. `flag` mirrors the
+    /// measured verdict, so this table is the rule's evidence, not its restatement.
+    fn hazard(src: &str) -> Vec<String> {
+        Cfg::build(&parse(src)).map(|c| c.unprotected_pretick_out_write()).unwrap_or_default()
+    }
+
+    /// V1 — no `In` read anywhere; register assigned pre-tick; plain `Out`. DIVERGES.
+    #[test]
+    fn hazard_v1_assign_then_write_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { r = r + Bits::from_lit::<1>(); o.write(r); clk.tick().await; }
+            }
+        "#;
+        assert_eq!(hazard(src), ["o"]);
+    }
+
+    /// V7 — the assigned register is never read back in the segment, and it still
+    /// diverges. The rule must not require an in-segment read-back.
+    #[test]
+    fn hazard_v7_no_readback_still_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                let mut s: Bits<8> = Bits::zero();
+                loop { r = r + Bits::from_lit::<1>(); o.write(s); clk.tick().await; s = r; }
+            }
+        "#;
+        assert_eq!(hazard(src), ["o"]);
+    }
+
+    /// V4 — an `In` read PRECEDES the assignment, installing the barrier. AGREES.
+    #[test]
+    fn hazard_v4_leading_read_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { r = r + i.read(); o.write(r); clk.tick().await; }
+            }
+        "#;
+        assert!(hazard(src).is_empty());
+    }
+
+    /// V5 — the read comes AFTER the assignment, so it does not protect it. DIVERGES.
+    /// This is what makes `leading_read_reaches` (a comb-path query) the right test
+    /// rather than "the module reads an input somewhere".
+    #[test]
+    fn hazard_v5_trailing_read_still_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop {
+                    r = r + Bits::from_lit::<1>();
+                    o.write(r);
+                    let _late = i.read();
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(hazard(src), ["o"]);
+    }
+
+    /// V6 — the safe order: the register is assigned POST-tick. AGREES.
+    #[test]
+    fn hazard_v6_post_tick_assign_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { o.write(r); clk.tick().await; r = r + Bits::from_lit::<1>(); }
+            }
+        "#;
+        assert!(hazard(src).is_empty());
+    }
+
+    /// W4 — MIXED alignment: a read on one arm, an unprotected assignment on the
+    /// other. Measured to DIVERGE, which refuted the "any read in the module
+    /// protects it" hypothesis.
+    #[test]
+    fn hazard_w4_mixed_alignment_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut phase: u8 = 0;
+                let mut r: Bits<8> = Bits::zero();
+                loop {
+                    if phase == 0 { r = i.read(); phase = 1; }
+                    else { r = r + Bits::from_lit::<1>(); phase = 0; }
+                    o.write(r);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(hazard(src), ["o"]);
+    }
+
+    /// W8 — EXACTLY W4 with the output declared `RegOut`. Measured to AGREE. This
+    /// pair is the whole reason the rule keys on the output write: `RegOut` commits
+    /// at the edge, so the write's phase is unobservable.
+    #[test]
+    fn hazard_w8_regout_immunises_mixed_alignment() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: RegOut<Bits<8>, C>) {
+                let mut phase: u8 = 0;
+                let mut r: Bits<8> = Bits::zero();
+                loop {
+                    if phase == 0 { r = i.read(); phase = 1; }
+                    else { r = r + Bits::from_lit::<1>(); phase = 0; }
+                    o.write(r);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(hazard(src).is_empty(), "RegOut must be exempt — it commits at the edge");
+    }
+
+    /// W9 — EXACTLY V1 with the output declared `RegOut`. Measured to AGREE.
+    #[test]
+    fn hazard_w9_regout_immunises_the_minimal_case() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: RegOut<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { r = r + Bits::from_lit::<1>(); o.write(r); clk.tick().await; }
+            }
+        "#;
+        assert!(hazard(src).is_empty());
+    }
+
+    /// `probe_fsm` — measured to diverge, and measured to be the SAME defect as V1
+    /// (adding a leading read on every path fixes it). Plain `Out`, so flagged.
+    #[test]
+    fn hazard_probe_fsm_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, inp: In<Bits<8>, C>, out: Out<Bits<8>, C>) {
+                let mut phase: u8 = 0;
+                let mut x: Bits<8> = Bits::from_lit::<0>();
+                loop {
+                    if phase == 0 { x = inp.read(); phase = 1; }
+                    else { out.write(x.clone()); phase = 0; }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(hazard(src), ["out"]);
+    }
+
+    /// `lfsr`-shaped: the guard reads inputs before every assignment, so the whole
+    /// segment is barrier-pinned. AGREES — and it must, it is an equivalence-tested
+    /// corpus module.
+    #[test]
+    fn hazard_lfsr_shape_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, reset_i: In<Logic, C>, yumi_i: In<Logic, C>, o: Out<Bits<32>, C>) {
+                let mut state = Bits::from_u32(1);
+                loop {
+                    if reset_i.read().as_bool() { state = Bits::from_u32(1); }
+                    else if yumi_i.read().as_bool() { state = state >> 1; }
+                    o.write(state);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(hazard(src).is_empty());
+    }
+
+    /// `branch_merge_explicit` — drives three plain `Out`s from an unprotected path,
+    /// but every write is the CONSTANT `Logic::One`. Measured to AGREE: the shift
+    /// changes *when* the write happens, which is unobservable when the value does
+    /// not depend on a register. Witness for the "write must read a register" clause.
+    #[test]
+    fn hazard_constant_writes_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, sel: In<Logic, C>, head_o: Out<Logic, C>, mid_o: Out<Logic, C>, tail_o: Out<Logic, C>) {
+                let mut pc: u8 = 0;
+                loop {
+                    match pc {
+                        0u8 => {
+                            head_o.write(Logic::One);
+                            if sel.read() == Logic::One { pc = 1; }
+                            else { mid_o.write(Logic::One); tail_o.write(Logic::One); pc = 0; }
+                        }
+                        1u8 => { tail_o.write(Logic::One); pc = 0; }
+                        _ => {}
+                    }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(
+            hazard(src).is_empty(),
+            "a constant write is idempotent across the phase shift — flagging it \
+             rejects a correct design"
+        );
+    }
+
+    /// A module with no `Out` at all cannot expose the hazard.
+    #[test]
+    fn hazard_regout_only_module_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, o: RegOut<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { r = r + Bits::from_lit::<1>(); o.write(r); clk.tick().await; }
+            }
+        "#;
+        assert!(hazard(src).is_empty());
     }
 
     /// The **back-edge clause** (added 2026-08-21). A local defined *post*-tick and
