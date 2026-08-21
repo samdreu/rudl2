@@ -180,8 +180,12 @@ declarations, which Copper does not have. Inference buys the ergonomics that are
 and this is its bill. See `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` §10 for the prior-art survey
 and `SYNCHRONOUS_SEMANTICS.md` for the normative statement.
 
-**Still open (T-align-2).** A combinational passthrough of a post-edge-produced signal lags a cycle
-in the simulator and is *not* guarded — it has no independent-hardware adjudication yet. Its root
-cause is narrower than it appears: `classify_reads` defers a read because *a tick follows it*, not
-because *its result crosses the tick*.
+**T-align-2 — resolved 2026-08-21.** The companion divergence (a combinational passthrough of a
+post-edge-produced signal lagging a cycle) was adjudicated against independent hand-written Verilog
+and **fixed** rather than restricted: a read feeding a combinational `Out` in a segment that assigns
+no register is now `Immediate`. The barrier was doing two jobs — deferring the read *and* pinning the
+segment's phase — and only the second is ever needed. Note this one went the other way from
+T-align: the fix was in the *simulator*, and it cost nothing (666/667 corpus, the single failure
+being the test that pinned the old behaviour). Worth reporting as the counterweight: not every
+member of this family has to be paid for with a restriction on the language.
 

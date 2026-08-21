@@ -307,14 +307,23 @@ P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettle
      MIGRATED: fast_counter x3 → post-tick sticky update; slow_consumer x3 →
      trailing read. two_domain_hierarchy_cdc.rs now passes FOR THE RIGHT REASON
      (it previously passed because D1 and D2 cancelled).
-  ☐ D2 STILL OPEN / UNGUARDED — a combinational passthrough of a post-edge-produced
-     signal lags one cycle in the sim (`loop { out.write(inp.read()); tick; }` →
-     `assign out = inp`, zero cycles). Reading AFTER the tick classifies `Immediate`
-     and matches the netlist; that is the workaround now used in the CDC designs.
-     ROOT CAUSE is narrower than it looks: classify_reads defers a read because A TICK
-     FOLLOWS IT, not because ITS RESULT CROSSES THE TICK — in a passthrough the value
-     is consumed before the edge and never needed deferring. No independent-hardware
-     adjudication yet; that is the prerequisite before guarding or fixing it.
+  ✔ D2 FIXED 2026-08-21 (in the simulator, not by restriction). A read feeding a
+     combinational `Out` in a segment that assigns NO register is now `Immediate`,
+     not `Deferred` — `copper_analysis::classify_reads`. The barrier does two jobs,
+     deferring the read AND pinning the segment's phase; only the second is ever
+     needed, and pinning a register-free segment makes a wire behave like a flop.
+     ADJUDICATED against independent hand-written Verilog first (a clocked producer
+     feeding a passthrough gives mid == out; sim gave mid/out = 1/0 2/1 3/2 before,
+     1/1 2/2 3/3 after).
+     FIRST ATTEMPT REJECTED: keying on the MODULE ("no registers anywhere") broke 3
+     currently-passing tests including det_010_awaits_matches_independent_verilog — a
+     HARDWARE-ANCHORED test. Cause: det_010_awaits and if_tick have no data registers
+     but read inside control flow whose TICK COUNT depends on the sampled value, so
+     their phase genuinely matters. The narrowed per-read rule excludes condition
+     positions and fixes that.
+     CORPUS: 666/667, the single failure being the test that pinned the old behavior.
+     The CDC designs' trailing-read workaround was REVERTED — the natural
+     `loop { out.write(in.read()); tick; }` idiom is correct again.
   ☐ Q5 known false negative: only the pre-tick segment is examined, so the multi-tick
      accum_2 class is not caught. Widening needs its own empirical pass.
   ☐ two_domain_counter example → behavioral/equiv test

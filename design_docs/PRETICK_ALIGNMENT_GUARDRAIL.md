@@ -1,7 +1,8 @@
 # Pre-Tick Segment Alignment — Divergence Analysis and Guardrail Plan
 
-> **Status (2026-08-21): D1 GUARDED — phases 0–3 complete, gates G0–G3 met.
-> D2 remains OPEN and unguarded.** Three candidate fixes were tried and rejected with
+> **Status (2026-08-21): D1 GUARDED, D2 FIXED.** Phases 0–3 complete, gates G0–G3
+> met. D1 is a compile error (the language is restricted); D2 was adjudicated against
+> independent hardware and fixed in the simulator at no corpus cost.** Three candidate fixes were tried and rejected with
 > measured evidence (§5) before the shippable rule was found. This doc is both the
 > plan and the record of what was ruled out and why.
 >
@@ -48,7 +49,17 @@ at all gets none — `inject_synced_reads` returns early on `in_params.is_empty(
 > an **incidental** property — whether it happens to read an input before its tick —
 > rather than by anything the designer expressed.
 
-### D2 — a combinational passthrough of a post-edge-produced signal
+### D2 — a combinational passthrough of a post-edge-produced signal — **FIXED 2026-08-21**
+
+> Adjudicated against independent hand-written Verilog (a clocked producer feeding a
+> passthrough gives `mid == out`; the simulator gave `1/0 2/1 3/2 …`), then fixed in
+> `classify_reads`: a read feeding a combinational `Out` in a segment that assigns no
+> register is `Immediate`. Corpus cost: **666/667**, the one failure being the test
+> that pinned the old behaviour. A first attempt keyed on the *module* ("no registers
+> anywhere") broke three passing tests including a hardware-anchored one, because
+> `det_010_awaits` and `if_tick` have no data registers yet read inside control flow
+> whose *tick count* depends on the sampled value; the narrowed per-read rule excludes
+> condition positions.
 
 ```rust
 loop { out.write(inp.read()); clk.tick().await; }   // → `assign out = inp;`

@@ -1,4 +1,4 @@
-//! **KNOWN GAP, pinned.** Two silent sim ≠ synthesized-SV divergences, both from
+//! **D1: guarded. D2: fixed.** Two silent sim ≠ synthesized-SV divergences, both from
 //! the pre-edge/post-edge alignment of the coroutine's loop segments. Every
 //! assertion here records *today's* behaviour so it flips loudly when either is
 //! fixed — do not "fix" this file by relaxing it.
@@ -41,25 +41,28 @@
 //! transpiled SV and disagrees with the simulator: **the simulator is the one that
 //! is wrong.**
 //!
-//! # Divergence 2 — a combinational passthrough of a post-edge-produced signal
+//! # Divergence 2 — FIXED 2026-08-21
 //!
 //! `loop { out.write(inp.read()); clk.tick().await; }` transpiles to
-//! `assign out = inp;` — zero cycles. In the simulator its leading read is
-//! `Deferred`, so it samples at the *pre*-edge while its producer (a synchronizer)
-//! updates at the *post*-edge, and the passthrough lags one cycle. Standalone the
-//! two agree (a testbench drives the input before the edge, which coincides with
-//! the pre-edge sample); the divergence only appears when the producer is another
-//! clocked task.
+//! `assign out = inp;` — zero cycles. Its leading read used to classify `Deferred`,
+//! so it sampled at the *pre*-edge while a clocked producer updates at the
+//! *post*-edge, and the passthrough lagged one cycle. Adjudicated against
+//! independent hand-written Verilog (a clocked producer feeding a passthrough gives
+//! `mid == out`), then fixed in `classify_reads`: a read feeding a combinational
+//! `Out` in a segment that assigns no register is `Immediate`, because there is no
+//! register for a `pre_edge_barrier` to pin. `d2_is_fixed_and_d1_still_demonstrates_the_hazard`
+//! guards the fix.
 //!
-//! # Why nothing caught either one
+//! # Why nothing caught either one (historical)
 //!
 //! `tests/two_domain_hierarchy_cdc.rs` — the independent-hardware anchor for the
-//! whole dual-clock design — is green because these two divergences **cancel**:
-//! divergence 1 makes the flag assert a cycle early, divergence 2 makes the
-//! consumer a cycle late, and the observable boundary lands on the same cycle as
-//! the reference. `compensation_is_what_makes_the_hierarchy_anchor_pass` pins that
-//! explicitly, so the anchor cannot be mistaken for evidence that the chain is
-//! right. Correct either divergence alone and that test must be re-blessed.
+//! whole dual-clock design — used to be green because these two divergences
+//! **cancelled**: D1 made the flag assert a cycle early, D2 made the consumer a cycle
+//! late, and the observable boundary landed on the reference's cycle. It took a
+//! deliberate experiment (correct one side, watch the boundary move 5 → 6) to see it.
+//! Both are resolved now and that anchor passes for the right reason; D1's fixture
+//! here keeps the shape expressible via `allow_pretick_alignment` so the hazard stays
+//! demonstrable.
 
 mod common;
 use common::{verilator_available, verilator_command};
@@ -444,25 +447,29 @@ fn chain_assert_cycles(corrected: bool) -> (usize, usize, usize) {
 }
 
 #[test]
-fn compensation_is_what_makes_the_hierarchy_anchor_pass_known_gap() {
-    // `tests/two_domain_hierarchy_cdc.rs` asserts the flag arrives at slow cycle 5,
-    // matching its independent SV reference — and it does. But not because the chain
-    // is right: the counter asserts a cycle EARLY (divergence 1) and the passthrough
-    // consumer a cycle LATE (divergence 2), and the two cancel at the boundary.
-    let (f, q, o) = chain_assert_cycles(false);
-    assert_eq!((f, q, o), (3, 4, 5), "as-is chain timing changed");
+fn d2_is_fixed_and_d1_still_demonstrates_the_hazard() {
+    // HISTORY. `tests/two_domain_hierarchy_cdc.rs` used to pass for the WRONG reason:
+    // the counter asserted a cycle early (D1) and the passthrough consumer a cycle
+    // late (D2), and the two cancelled at the boundary. This test pinned that
+    // cancellation. Both are now resolved — D1 is a compile error (this file's
+    // `fast_counter` opts out precisely so it can still demonstrate it), and D2 is
+    // fixed in `classify_reads`. What is asserted here is the post-fix state.
 
-    // Divergence 2 in isolation: the synchronizer's output reaches the consumer a
-    // cycle later in the sim, where `assign out = flag_in` in the SV is immediate.
-    assert_eq!(o, q + 1, "the combinational passthrough should lag by one in the sim");
-
-    // Correct ONLY the counter and the cancellation is gone — the boundary moves to
-    // 6, which no longer matches the reference's 5.
-    let (fc, qc, oc) = chain_assert_cycles(true);
-    assert_eq!((fc, qc, oc), (4, 5, 6), "corrected-counter chain timing changed");
-    assert_ne!(
-        oc, o,
-        "correcting the counter no longer changes the boundary — the compensation \
-         story has changed and two_domain_hierarchy_cdc.rs needs re-examining"
+    // D2 IS FIXED: a combinational passthrough now TRACKS its producer instead of
+    // lagging it. Adjudicated against independent hand-written Verilog — a clocked
+    // producer feeding a passthrough gives `mid == out` in hardware.
+    let (_f, q, o) = chain_assert_cycles(false);
+    assert_eq!(
+        o, q,
+        "the combinational passthrough must track the synchronizer output, not lag it \
+         — if this regresses, D2 is back"
     );
+
+    // D1 IS STILL DEMONSTRABLE: `fast_counter` here carries
+    // `allow_pretick_alignment`, so the divergent shape is still expressible and its
+    // effect is still visible — the flag asserts a cycle before the corrected form.
+    let (fc, qc, oc) = chain_assert_cycles(true);
+    let (f, _, _) = chain_assert_cycles(false);
+    assert_eq!(f + 1, fc, "the opted-out fast_counter should still assert a cycle early");
+    assert_eq!(oc, qc, "the corrected chain must also have a tracking passthrough");
 }

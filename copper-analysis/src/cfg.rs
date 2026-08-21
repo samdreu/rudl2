@@ -1249,13 +1249,25 @@ pub fn classify_reads(f: &ItemFn) -> Vec<ReadTiming> {
         return Vec::new();
     }
     let mut out = Vec::new();
+
+    // A segment that assigns no register has nothing for a `pre_edge_barrier` to
+    // pin, which is what licenses the passthrough case in `classify_expr`.
+    // Registers are computed on the same `ItemFn`, so the two agree by construction.
+    let comb_outputs = combinational_outputs(f);
+    let combinational_segment = Cfg::build(f).is_some_and(|c| c.registers().is_empty());
+    let ctx = ReadCtx {
+        in_params: &in_params,
+        comb_outputs: &comb_outputs,
+        combinational_segment,
+    };
+
     // The whole body is walked (reads before the top-level loop are sampled once
     // at spawn, where Deferred and Immediate coincide — both land at the initial
     // pre-edge). `tail_has_tick = false`: after the last statement of a loop
     // iteration control returns to the head, and the next iteration's tick is not
     // "after" this read within *this* iteration — which is exactly why a trailing
     // next-state read (`counter`, `traffic_light`) is Immediate, not Deferred.
-    classify_block(&f.block.stmts, false, &in_params, &mut out);
+    classify_block(&f.block.stmts, false, &ctx, &mut out);
     out
 }
 
@@ -1276,6 +1288,46 @@ fn in_param_names(f: &ItemFn) -> BTreeSet<String> {
     names
 }
 
+/// Shared inputs for read classification.
+struct ReadCtx<'a> {
+    in_params: &'a BTreeSet<String>,
+    /// Plain combinational `Out` ports (not `RegOut`).
+    comb_outputs: &'a BTreeSet<String>,
+    /// True when the module's pre-tick segment assigns **no register**.
+    ///
+    /// The `pre_edge_barrier` a `Deferred` read injects does two jobs: it defers the
+    /// read *and* it pins the whole segment to the pre-edge phase. Pinning is
+    /// essential when the segment updates a register — that is the pre-tick alignment
+    /// hazard. When the segment assigns nothing, there is nothing to pin, and
+    /// deferring a read that only feeds a wire makes that wire behave like a flop.
+    /// See [`passthrough_read`].
+    combinational_segment: bool,
+}
+
+/// Whether `expr` is `<comb_out>.write(…)` — the shape whose arguments feed a wire
+/// rather than a flop.
+///
+/// A read in this position, in a segment that assigns no register, is `Immediate`:
+/// the value is consumed within the cycle by a continuous assignment
+/// (`assign out = inp`), so deferring it makes the simulator trail its own netlist by
+/// a cycle. Adjudicated against independent hand-written Verilog — a clocked producer
+/// feeding a passthrough gives `mid == out` in hardware, and only the `Immediate`
+/// form reproduces that.
+///
+/// Deliberately narrow. It does **not** apply to a read in a *condition* (those are
+/// handled by the `If`/`Match`/`While` arms, which already defer a read gating a tick:
+/// `det_010_awaits` and `if_tick` read inside control flow whose tick *count* depends
+/// on the sampled value, so their phase genuinely matters), nor to any segment that
+/// assigns a register.
+fn passthrough_read(expr: &Expr, ctx: &ReadCtx<'_>) -> bool {
+    if !ctx.combinational_segment {
+        return false;
+    }
+    let Expr::MethodCall(mc) = expr else { return false };
+    mc.method == "write"
+        && simple_ident(&mc.receiver).is_some_and(|n| ctx.comb_outputs.contains(&n))
+}
+
 /// Classify the reads of a straight-line block. `tail_has_tick` is whether a tick
 /// occurs *after* this block completes, in the enclosing continuation. Statements
 /// are processed in source order (so emitted read indices match the macro), and
@@ -1284,31 +1336,31 @@ fn in_param_names(f: &ItemFn) -> BTreeSet<String> {
 fn classify_block(
     stmts: &[Stmt],
     tail_has_tick: bool,
-    in_params: &BTreeSet<String>,
+    ctx: &ReadCtx<'_>,
     out: &mut Vec<ReadTiming>,
 ) {
     for (i, stmt) in stmts.iter().enumerate() {
         let after = tail_has_tick || stmts[i + 1..].iter().any(stmt_has_tick);
-        classify_stmt(stmt, after, in_params, out);
+        classify_stmt(stmt, after, ctx, out);
     }
 }
 
 fn classify_stmt(
     stmt: &Stmt,
     after: bool,
-    in_params: &BTreeSet<String>,
+    ctx: &ReadCtx<'_>,
     out: &mut Vec<ReadTiming>,
 ) {
     match stmt {
         Stmt::Local(l) => {
             if let Some(init) = &l.init {
-                classify_expr(&init.expr, after, in_params, out);
+                classify_expr(&init.expr, after, ctx, out);
                 if let Some((_, diverge)) = &init.diverge {
-                    classify_expr(diverge, after, in_params, out);
+                    classify_expr(diverge, after, ctx, out);
                 }
             }
         }
-        Stmt::Expr(e, _) => classify_expr(e, after, in_params, out),
+        Stmt::Expr(e, _) => classify_expr(e, after, ctx, out),
         // Reads inside a macro token stream are *not* rewritten by the macro
         // (`syn` does not descend into macro tokens), so they are not classified
         // either — keeping the two sides' read sets identical.
@@ -1325,18 +1377,29 @@ fn classify_stmt(
 fn classify_expr(
     expr: &Expr,
     after: bool,
-    in_params: &BTreeSet<String>,
+    ctx: &ReadCtx<'_>,
     out: &mut Vec<ReadTiming>,
 ) {
     // A `clk.tick().await` contributes no `In`-param read.
     if tick_clock(expr).is_some() {
         return;
     }
+    // `<comb_out>.write(<expr>)` in a register-free segment: the arguments feed a
+    // continuous assignment, so their reads are Immediate regardless of a following
+    // tick. See `passthrough_read`.
+    if passthrough_read(expr, ctx) {
+        if let Expr::MethodCall(mc) = expr {
+            for arg in &mc.args {
+                classify_expr(arg, false, ctx, out);
+            }
+            return;
+        }
+    }
     match expr {
         // `<in_param>.read()` — the classified site.
         Expr::MethodCall(mc) if mc.method == "read" && mc.args.is_empty() => {
             if let Some(name) = simple_ident(&mc.receiver) {
-                if in_params.contains(&name) {
+                if ctx.in_params.contains(&name) {
                     out.push(if after {
                         ReadTiming::Deferred
                     } else {
@@ -1347,7 +1410,7 @@ fn classify_expr(
             }
             // A `.read()` on something that is not a bare `In` param (e.g. a method
             // chain): still descend so any nested `In` reads are covered.
-            classify_expr(&mc.receiver, after, in_params, out);
+            classify_expr(&mc.receiver, after, ctx, out);
         }
         Expr::If(ei) => {
             let then_tick = block_has_tick(&ei.then_branch.stmts);
@@ -1357,10 +1420,10 @@ fn classify_expr(
                 .is_some_and(|(_, e)| expr_has_tick(e));
             // A condition read is Deferred if a tick follows the whole `if` OR a
             // tick lives in either branch (the read gates that tick's edge).
-            classify_expr(&ei.cond, after || then_tick || else_tick, in_params, out);
-            classify_block(&ei.then_branch.stmts, after, in_params, out);
+            classify_expr(&ei.cond, after || then_tick || else_tick, ctx, out);
+            classify_block(&ei.then_branch.stmts, after, ctx, out);
             if let Some((_, e)) = &ei.else_branch {
-                classify_expr(e, after, in_params, out);
+                classify_expr(e, after, ctx, out);
             }
         }
         Expr::Match(em) => {
@@ -1368,12 +1431,12 @@ fn classify_expr(
                 expr_has_tick(&a.body)
                     || a.guard.as_ref().is_some_and(|(_, g)| expr_has_tick(g))
             });
-            classify_expr(&em.expr, after || arm_tick, in_params, out);
+            classify_expr(&em.expr, after || arm_tick, ctx, out);
             for arm in &em.arms {
                 if let Some((_, g)) = &arm.guard {
-                    classify_expr(g, after, in_params, out);
+                    classify_expr(g, after, ctx, out);
                 }
-                classify_expr(&arm.body, after, in_params, out);
+                classify_expr(&arm.body, after, ctx, out);
             }
         }
         // A `while cond { body }`: a condition read is Deferred if the body ticks
@@ -1383,17 +1446,17 @@ fn classify_expr(
             classify_expr(
                 &w.cond,
                 after || block_has_tick(&w.body.stmts),
-                in_params,
+                ctx,
                 out,
             );
-            classify_block(&w.body.stmts, false, in_params, out);
+            classify_block(&w.body.stmts, false, ctx, out);
         }
         Expr::ForLoop(fl) => {
-            classify_expr(&fl.expr, after, in_params, out);
-            classify_block(&fl.body.stmts, false, in_params, out);
+            classify_expr(&fl.expr, after, ctx, out);
+            classify_block(&fl.body.stmts, false, ctx, out);
         }
-        Expr::Loop(l) => classify_block(&l.body.stmts, false, in_params, out),
-        Expr::Block(b) => classify_block(&b.block.stmts, after, in_params, out),
+        Expr::Loop(l) => classify_block(&l.body.stmts, false, ctx, out),
+        Expr::Block(b) => classify_block(&b.block.stmts, after, ctx, out),
         // Any other expression is a value expression: no interior tick, so all its
         // `In` reads share `after`. Flat-collect them in source order (the same
         // order the macro's `visit_expr_mut` reaches the read leaves).
@@ -1403,7 +1466,7 @@ fn classify_expr(
             } else {
                 ReadTiming::Immediate
             };
-            collect_reads_flat(expr, timing, in_params, out)
+            collect_reads_flat(expr, timing, ctx.in_params, out)
         }
     }
 }

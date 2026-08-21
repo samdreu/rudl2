@@ -88,15 +88,8 @@ async fn slow_consumer(
     out: Out<Logic, ClkSlow>,
 ) {
     loop {
-        clk.tick().await;
-        // Read AFTER the tick. A pure combinational passthrough transpiles to
-        // `assign out = flag_in` (zero cycles), but a *leading* read is classified
-        // `Deferred` and samples at the pre-edge, while a clocked producer updates at
-        // the post-edge — so the leading-read form lags a cycle in the simulator and
-        // silently disagrees with its own SV. A trailing read is `Immediate` and
-        // tracks the producer, matching the netlist. See D2 in
-        // design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md.
         out.write(flag_in.read());
+        clk.tick().await;
     }
 }
 

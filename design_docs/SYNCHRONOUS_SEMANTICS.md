@@ -113,14 +113,21 @@ author-written **block kind** (`always_comb` vs `always_ff`), two declarations c
 other. Copper has neither, which is why its rules must *infer* both sides. See
 `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`.
 
-**A second, unguarded divergence (D2).** A combinational passthrough
-(`loop { out.write(inp.read()); tick; }` → `assign out = inp;`) lags one cycle in the simulator when
-its producer is another clocked task: the *leading* read classifies `Deferred` and samples at the
-pre-edge, while the producer updates at the post-edge. Reading **after** the tick classifies
-`Immediate` and matches the netlist. This is not currently guarded — it has no independent-hardware
-adjudication yet — but note the root cause is narrower than it looks: `classify_reads` marks a read
-`Deferred` because *a tick follows it*, not because *its result crosses the tick*. In a passthrough
-the value is consumed before the edge, so it never needed deferring.
+**Passthrough reads are `Immediate` (the D2 fix, 2026-08-21).** A read that feeds a *combinational*
+`Out` in a segment that assigns **no register** is classified `Immediate`, not `Deferred`, even when
+a tick follows it. The barrier a `Deferred` read injects does two jobs — it defers the read *and*
+pins the whole segment to the pre-edge phase. Pinning is essential when the segment updates a
+register (that is the hazard above); when the segment assigns nothing there is nothing to pin, and
+deferring a read that only feeds a wire makes that wire behave like a flop. A passthrough
+(`loop { out.write(inp.read()); tick; }` → `assign out = inp;`) used to lag its clocked producer by
+a cycle for exactly this reason.
+
+Adjudicated against independent hand-written Verilog: a clocked producer feeding a passthrough gives
+`mid == out` in hardware, and only the `Immediate` form reproduces that. The rule is deliberately
+narrow — it does **not** apply to a read in a *condition*, because there the sampled value can decide
+how many cycles elapse (`det_010_awaits` reads inside `while … { tick }`; `if_tick` picks a branch
+with a different tick count), so its phase genuinely matters. A first attempt that keyed on the
+module rather than the read broke exactly those two, one of them a hardware-anchored test.
 
 ## Input read timing — static edge-phase classification
 

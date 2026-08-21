@@ -177,8 +177,9 @@ receive/clone one.
   to *demonstrate* the hazard opts out with
   `#[hardware(sequential, allow_pretick_alignment)]` — this silences the error, not
   the detection, and must never be reached for in a real design.
-  **D2 is still open and unguarded** (a combinational passthrough of a
-  post-edge-produced signal lags a cycle; read *after* the tick to avoid it). The doc
+  **D2 is FIXED** (2026-08-21) — a read feeding a combinational `Out` in a
+  register-free segment is now `Immediate`, so a passthrough tracks its producer
+  instead of lagging it. The doc
   also records **three** rejected fixes with measured evidence so they are not
   re-tried, and the prior-art survey in §10.
 - **When adding a `#[hardware]` mode or flag, fix every attribute parser.**
