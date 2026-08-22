@@ -20,3 +20,5 @@ waveforms/
 
 # Local agent/editor config
 .claude/
+smoke-failure.log
+regression-failure.log

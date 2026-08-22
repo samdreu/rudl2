@@ -18,11 +18,17 @@ the example equivalence check passes, and there is nothing to screenshot.
 
 The driver script is the regression command. **Bare, it runs everything** —
 build, CLI, `cargo test --workspace`, and *every* registered example — and exits
-non-zero on the first failure (clean run ends with `SMOKE OK`):
+non-zero on the first failure (a clean full run ends with `REGRESSION OK`; any
+subset ends with `PARTIAL OK`, so it cannot be mistaken for one):
 
 ```bash
-.claude/skills/run-copper/smoke.sh
+tools/regression.sh
 ```
+
+It lives in `tools/` **because it must be in version control**: `.gitignore` excludes
+`.claude/`, so a runner under the skill directory is invisible to everyone else and
+lost on a fresh clone. `.claude/skills/run-copper/smoke.sh` is now a thin wrapper
+that `exec`s this script, so the skill keeps working.
 
 It also enforces three wiring guards, because "the check silently didn't run" has
 been a recurring bug class here: **G-A** every `examples/**.rs` is registered as a
@@ -30,14 +36,14 @@ been a recurring bug class here: **G-A** every `examples/**.rs` is registered as
 `tests/*.rs` (root and per-crate) produced a test binary that ran. It prints the
 `#[ignore]`d tests on every run so a deliberately-skipped check stays visible.
 
-Subsets — all of these print `SMOKE OK (PARTIAL …)` or skip guards, so they are
-**not** a regression run:
+Subsets — all of these print `PARTIAL OK` and skip some guards, so they are **not**
+a regression run:
 
 ```bash
-.claude/skills/run-copper/smoke.sh --quick          # fast loop: build + CLI + 5 examples
-.claude/skills/run-copper/smoke.sh --no-examples    # build + CLI + tests, no Verilator
-.claude/skills/run-copper/smoke.sh --no-test        # skip cargo test
-.claude/skills/run-copper/smoke.sh --example lfsr   # one named example
+tools/regression.sh --quick          # fast loop: build + CLI + a few examples
+tools/regression.sh --no-examples    # build + CLI + tests, no Verilator
+tools/regression.sh --no-test        # skip cargo test
+tools/regression.sh --example lfsr   # one named example
 ```
 
 Note an example's `main()` is a real self-check — several assert against
@@ -182,6 +188,12 @@ receive/clone one.
   instead of lagging it. The doc
   also records **three** rejected fixes with measured evidence so they are not
   re-tried, and the prior-art survey in §10.
+- **Verilator work dirs are unique PER INVOCATION** (`obj_dir_<module><params>_<pid>_<n>`),
+  not per module. Two tests in one binary can Verilate the *same* top module in
+  parallel — `det_010_independent_golden.rs` checks two codings against the same
+  golden `det_010` — and a shared directory made them clobber each other's build.
+  That is a false-PASS mechanism as well as a false-failure one: a test can end up
+  run against another test's model. Never key that directory on anything less unique.
 - **When adding a `#[hardware]` mode or flag, fix every attribute parser.**
   `parse_args::<syn::Ident>()` fails outright once a flag is present, which silently
   drops those modules from corpus scans (`pretick_alignment_corpus`,
