@@ -338,3 +338,106 @@ P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettle
      instead of "temp investigation", which read like a deferred check.
      REMAINING IGNORED: probe_fsm_sim_matches_verilog only — correctly, it is the D1
      demonstration and still diverges by design.
+  ✔ Q5 ANSWERED 2026-08-21 — AND THE PREMISE WAS WRONG. The guardrail examines only
+     the pre-tick segment, recorded as a known false negative citing multi-tick
+     `accum_2`. **accum_2 does not diverge.** Its test was #[ignore]d as "sim and
+     transpiler disagree by one cycle ... adjudication pending" but it PASSES — and
+     passes WITHOUT the D2 fix (checked by reverting cfg.rs alone), so earlier
+     read-timing work had repaired it and the ignore went stale. Nobody noticed
+     because an ignored test prints nothing. UN-IGNORED; stable over 3 runs.
+     So the rule has NO known false negative — the middle-segment gap is theoretical.
+     Measure an instance before widening it.
+     ALSO: probe_registered_timing and probe_mem_latency are eprintln! DIAGNOSTICS
+     with no assertions — passing means nothing. Their ignore reasons now say so
+     instead of "temp investigation", which read like a deferred check.
+     REMAINING IGNORED: probe_fsm_sim_matches_verilog only — correctly, it is the D1
+     demonstration and still diverges by design.
+  ✔ two_domain_counter → behavioral test  [DONE 2026-08-21]
+     → tests/two_domain_counter_behavioral.rs (5 tests). The example self-checked only
+     the BOUNDARY (flag high from slow cycle 5, one ratio, last signal in the chain) —
+     which passes equally well when stages are individually wrong and cancel, exactly
+     what happened to two_domain_hierarchy_cdc.rs. This asserts the PER-STAGE
+     decomposition at 1:1/2:1/3:1: synchronizer costs exactly one slow cycle
+     (rate-independent), the passthrough consumer adds zero, the crossing is monotone,
+     the flag never leads the threshold it latches, counter advances at the source rate.
+     ALSO FIXED THE EXAMPLE: its "flag_raw" column displayed a PROXY (fast_count >= 8),
+     not the wire — showing the flag at slow 3 when the real wire asserts at 4. Now
+     reads the real intermediate wires (In is Clone), adds a sync_q column, drops the
+     dead raw_display/flag_raw vars (unused-variable warning), and the prose no longer
+     claims "2-slow-cycle synchronizer latency" — measured, it is 1 + 0.
+  ✔ flag_crossing → behavioral test (handoff semantics)  [DONE 2026-08-21]
+     → tests/flag_crossing_behavioral.rs (5 tests). The example asserted only
+     SELF-CONSISTENCY (recorded the sim's own output, compared it to itself, with a
+     comment saying outright there is no Verilog reference). Now asserted at three
+     ratios: a held flag crosses with exactly the synchronizer's latency (source and
+     sink are passthroughs, adding none), a crossed flag stays high, a pulse standing
+     at the edge crosses keeping its width, nothing crosses without a trigger.
+     PINNED AS A FEATURE: a pulse that falls before the destination edge is DROPPED.
+     That is the defining limitation of a bare 2-FF synchronizer and why a LEVEL
+     crossing is safe while an EVENT crossing needs a toggle or handshake. Recorded so
+     a later change cannot quietly "fix" it into something hardware cannot do.
+  ✔ Multi-driver ACROSS domains — DEFINED: it is UNREPRESENTABLE  [DONE 2026-08-21]
+     No behavior to define — the program cannot be written, and it fails on TWO
+     independent counts, either fatal alone:
+       1. a wire has exactly one write handle (`Out` and `RegOut` are !Clone), so a
+          second driver is E0382 use-of-moved-value;
+       2. domains are nominal, so a driver from another domain is E0308.
+     Made EXECUTABLE rather than asserted: three new compile_fail doctests in
+     copper-core/src/cdc.rs (the file whose doctests ARE the spec) — the moved-wire
+     count, the wrong-domain count, and RegOut's single-driver guarantee, which had no
+     doctest where `Out` already did. copper-core compile_fail doctests: 5 -> 8.
+
+
+--------------------------------------------------------------------------------
+P4 — Memory (first-class construct; MEMORY_DESIGN.md)
+--------------------------------------------------------------------------------
+  ◐ Existing: memory_new.rs, mem_latency_probe.rs, verilog_fifo_memory_new.rs
+  ☐ WRITE_LAT > 0 (write latency) — commit timing
+  ☐ Read-during-write hazard at same address: write-first vs read-first modes both
+  ☐ Multi-read-port + multi-write-port arbitration (port-index priority) at scale
+  ☐ from_fn / from_contents preload equivalence through the transpiled path
+  ☐ Out-of-range address behavior (define: panic / X / wrap)
+
+--------------------------------------------------------------------------------
+P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
+--------------------------------------------------------------------------------
+  ✔ rv32i_cpu: 10 known programs (addi..bubblesort) run to halt, assert final a0.
+     → tests/rv32i_integration.rs::scalar_cpu_matches_known_results.
+  ✔ rv32i_cpu_pipelined: same 10 + the pipeline-specific ones (RAW forwarding=3,
+     load-use stall=43, jal=7) → pipelined_cpu_matches_known_results; PLUS a direct
+     scalar-vs-pipelined differential on the common programs → scalar_and_pipelined_agree.
+     Structure: cfg(not(test)) on each example `fn main` + `include!` (scalar at crate
+     root, pipelined in `mod pl` with its harness `pub`). CPUs don't transpile (Vec
+     port + Memory + submodules), so this is a sim self-check, not a Verilator equiv.
+     NOTE (found probing): the standalone transpiler PANICS on rv32i_cpu
+     ("gate guarantees at least one tick", control_extract.rs:95) instead of a clean
+     error — a codegen robustness bug, logged for later (needs sign-off to fix).
+  ✔ uart/system: tx→rx loopback self-check → tests/uart_integration.rs.
+     - uart_single_channel_loopback: 6 bytes (framing edges) round-trip tx→rx.
+     - uart_dual_channel_no_crosstalk: two channels transmit different bytes on the
+       same cycle; each arrives on its own channel (no cross-contamination).
+     Same cfg(not(test))-main + top-level `include!` structure (self-contained file,
+     so no `mod`/`pub` needed). Sim self-check, not a Verilator equiv.
+  ☐ uart/rx standalone example — its own testbench not yet lifted (system.rs, which
+     embeds tx+rx, is the integration path and IS covered above).
+
+--------------------------------------------------------------------------------
+P6 — reset / X-propagation / robustness
+--------------------------------------------------------------------------------
+  ☐ Uninitialized register reads X; assert X flows through a full design
+  ☐ Reset drives registers to a known state; post-reset behavior matches SV
+  ☐ X-pessimism end-to-end (X on a control input → X on affected outputs, sim ≡ SV)
+  ☐ as_uint on X panics (documented) — assert the panic path is reachable in-context
+
+--------------------------------------------------------------------------------
+Already landed in this pass (2026-08-03) — for reference
+--------------------------------------------------------------------------------
+  ✔ copper-analysis/tests/analysis_semantics.rs   (19: registers, reachability,
+      definite-assignment, read-timing, reference-SV extraction, RegMatch, fsm_report)
+  ✔ copper-core/tests/port_and_type_edge_cases.rs (14: wire dirty/identity, type
+      width boundaries, concat/part_select, asr sign-fill, X-pessimistic eq)
+  ✔ tests/{one_bit_comparator,ripple_carry_adder,gray_to_binary,up_down_counter,
+      accumulator_en,slow_counter}_equivalence.rs  (6 new sim ≡ SV equiv tests)
+  ✔ tests/simulator_corner_cases.rs               (chain convergence, oscillation)
+  ✔ copper-macros/tests/ui/{fail/combinational_latch,fail/tickless_loop,
+      fail/partial_tick_path,pass/combinational_mux_valid}.rs

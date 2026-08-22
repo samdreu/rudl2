@@ -82,6 +82,55 @@
 //! slow_module(Clock::<Slow>::new(), fast_out);
 //! ```
 //!
+//! **Multi-driver across domains — unrepresentable, on two independent counts.**
+//!
+//! There is no behaviour to define here, because the program cannot be written. A
+//! wire has exactly one write handle (`Out`/`RegOut` are **not** `Clone`), so a
+//! second driver is a move error; and domains are nominal, so a driver from another
+//! domain is a type error. Either one alone is fatal.
+//!
+//! Count 1 — the wire is already moved into its single driver:
+//!
+//! ```compile_fail
+//! use copper_core::port::{wire, Out};
+//! use copper_core::{Clock, ClockDomain, Logic};
+//! struct Fast; impl ClockDomain for Fast {}
+//! fn driver_a(_c: Clock<Fast>, _q: Out<Logic, Fast>) {}
+//! fn driver_b(_c: Clock<Fast>, _q: Out<Logic, Fast>) {}
+//!
+//! let (out, _obs) = wire::<Logic, Fast>(Logic::Zero);
+//! driver_a(Clock::<Fast>::new(), out);
+//! // E0382: use of moved value `out` — a wire has one driver, by move semantics
+//! driver_b(Clock::<Fast>::new(), out);
+//! ```
+//!
+//! Count 2 — and even the *attempt* to reach across a domain is a type error, so
+//! cloning `Out` (if it were possible) would not help:
+//!
+//! ```compile_fail
+//! use copper_core::port::{wire, Out};
+//! use copper_core::{Clock, ClockDomain, Logic};
+//! struct Fast; impl ClockDomain for Fast {}
+//! struct Slow; impl ClockDomain for Slow {}
+//! fn slow_driver(_c: Clock<Slow>, _q: Out<Logic, Slow>) {}
+//!
+//! let (fast_out, _obs) = wire::<Logic, Fast>(Logic::Zero);
+//! // E0308: expected `Out<Logic, Slow>`, found `Out<Logic, Fast>`
+//! slow_driver(Clock::<Slow>::new(), fast_out);
+//! ```
+//!
+//! `RegOut` carries the same single-driver guarantee as `Out`:
+//!
+//! ```compile_fail
+//! use copper_core::port::registered_wire;
+//! use copper_core::{Clock, ClockDomain, Logic};
+//! struct Fast; impl ClockDomain for Fast {}
+//!
+//! let clk = Clock::<Fast>::new();
+//! let (regout, _obs) = registered_wire::<Logic, Fast>(&clk, Logic::Zero);
+//! let _second = regout.clone(); // error: `RegOut<Logic, Fast>` is not `Clone`
+//! ```
+//!
 //! Passing a `Fast` clock where a `Slow` clock is required:
 //!
 //! ```compile_fail

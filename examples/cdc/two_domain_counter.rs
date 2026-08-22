@@ -90,6 +90,11 @@ fn main() {
     let dh_sync_q   = sync_q_port.dirty_handle();
     let dh_consumer = consumer_port.dirty_handle();
 
+    // Observers on the intermediate wires, taken before the `In`s are moved into
+    // the downstream modules (`In` is `Clone`; `Out` deliberately is not).
+    let flag_obs = flag_to_sync.clone();
+    let sync_obs = sync_to_consumer.clone();
+
     let sync_reads = vec![flag_to_sync.wire_id()];
     let consumer_reads = vec![sync_to_consumer.wire_id()];
     exec.spawn_wired(
@@ -134,44 +139,63 @@ fn main() {
     // eliminating the metastability guard entirely.
 
     println!("=== CDC Two-Domain Counter (2:1 fast:slow) ===");
-    println!("{:>5}  {:>10}  {:>8}  {:>9}  {}", "slow", "fast_count", "flag_raw", "flag_sync", "");
+    println!(
+        "{:>5}  {:>10}  {:>8}  {:>7}  {:>9}  {}",
+        "slow", "fast_count", "flag_raw", "sync_q", "flag_sync", ""
+    );
 
     let mut all_pass = true;
+    let bit = |l: Logic| if l == Logic::One { "1" } else { "0" };
 
     for slow_cycle in 0..10usize {
-        // Tick fast domain twice (producer runs at 2× rate)
+        // Tick fast domain twice (producer runs at 2x rate)
         exec.tick_clock(&mut clk_fast);
         exec.tick_clock(&mut clk_fast);
         // Tick slow domain once (synchronizer and consumer update)
         exec.tick_clock(&mut clk_slow);
 
         let fast_count = count_obs.read().as_u128() as u8;
-        // flag_raw: testbench reads the latched flag from the fast domain.
-        // In real hardware this wire is ClkFast-tagged and must not be read
-        // directly by ClkSlow logic — that is the CDC violation the synchronizer prevents.
-        let flag_raw  = consumer_obs.read(); // we observe sync output, not raw fast signal
-
-        // flag_raw (latched) first asserts at slow_cycle 3 (fast count first reaches 8).
-        // The 2-FF synchronizer resolves over two destination-clock edges, so flag_sync
-        // appears at slow_cycle 5 (2-slow-cycle latency).
+        // The REAL fast-domain flag wire, not a proxy. In hardware this wire is
+        // ClkFast-tagged and must not be read by ClkSlow logic — that is the CDC
+        // violation the synchronizer exists to prevent; the testbench may look at it
+        // because it is outside both domains.
+        let flag_raw = flag_obs.read();
+        let sync_q = sync_obs.read();
         let flag_sync = consumer_obs.read();
-        let expected  = if slow_cycle >= 5 { Logic::One } else { Logic::Zero };
+
+        // Timeline at 2:1 — `latched` is sticky on count[3], so it asserts once the
+        // counter has reached 8; the synchronizer costs ONE slow cycle; and the
+        // consumer is a combinational passthrough, so it costs none:
+        //
+        //   slow 3  count=8   flag_raw=0  (latch set at this edge, visible next)
+        //   slow 4  count=10  flag_raw=1  sync_q=0
+        //   slow 5  count=12  flag_raw=1  sync_q=1  flag_sync=1
+        //
+        // Per-stage latencies are asserted at 1:1 / 2:1 / 3:1 in
+        // tests/two_domain_counter_behavioral.rs — that is the real check; this
+        // example only illustrates one ratio.
+        let expected = if slow_cycle >= 5 { Logic::One } else { Logic::Zero };
         let pass = flag_sync == expected;
-        if !pass { all_pass = false; }
+        if !pass {
+            all_pass = false;
+        }
 
-        // Read the raw fast-domain flag separately for display only.
-        // (In a full Copper CDC check this read would be flagged as a domain violation.)
-        let raw_display = count_obs.read()[3]; // bit 3 of count, not the latched flag
-
-        println!("{:>5}  {:>10}  {:>8}  {:>9}  {}",
-            slow_cycle, fast_count,
-            if fast_count >= 8 { "1" } else { "0" },  // show latched fast-domain flag
-            if flag_sync == Logic::One { "1" } else { "0" },
-            if pass { "✓" } else { "✗" });
-        let _ = raw_display;
+        println!(
+            "{:>5}  {:>10}  {:>8}  {:>7}  {:>9}  {}",
+            slow_cycle,
+            fast_count,
+            bit(flag_raw),
+            bit(sync_q),
+            bit(flag_sync),
+            if pass { "\u{2713}" } else { "\u{2717}" }
+        );
     }
 
-    println!("\n2-slow-cycle synchronizer latency verified: {}",
-        if all_pass { "✓" } else { "✗" });
-    if !all_pass { std::process::exit(1); }
+    println!(
+        "\nsynchronizer latency = 1 slow cycle, passthrough = 0: {}",
+        if all_pass { "\u{2713}" } else { "\u{2717}" }
+    );
+    if !all_pass {
+        std::process::exit(1);
+    }
 }
