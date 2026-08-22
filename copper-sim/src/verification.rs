@@ -339,7 +339,26 @@ pub(crate) fn verify_with_verilator_traced(
         .iter()
         .map(|(name, value)| format!("_{name}{value}"))
         .collect();
-    let tb_file   = format!("tb_{module_name}{param_suffix}.cpp");
+
+    // ...and on a per-INVOCATION counter. Neither the module name nor the process is
+    // enough:
+    //
+    //  * `det_010_independent_golden.rs` runs TWO tests against the same golden top
+    //    module (`det_010`) in parallel threads of ONE binary. Same module, same
+    //    params, same pid — they shared a directory and clobbered each other's build,
+    //    failing intermittently with "no such file or directory: Vdet_010__ALL.a".
+    //  * Two `cargo test` runs in one checkout collide the same way.
+    //
+    // A counter plus the pid is unique per call, which is the only thing that
+    // actually holds. Reproduced and verified both ways before landing.
+    static WORK_DIR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let unique = format!(
+        "{}_{}",
+        std::process::id(),
+        WORK_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let obj_dir = format!("obj_dir_{module_name}{param_suffix}_{unique}");
+    let tb_file = format!("tb_{module_name}{param_suffix}_{unique}.cpp");
     fs::write(&tb_file, &testbench)
         .map_err(|e| format!("Failed to write testbench: {}", e))?;
 
@@ -377,7 +396,6 @@ pub(crate) fn verify_with_verilator_traced(
     // Nondeterministic *failure* is how this surfaced, but the same collision can
     // equally produce a false PASS — which is why the directory is now unique per
     // (module, parameters) rather than per module.
-    let obj_dir = format!("obj_dir_{module_name}{param_suffix}");
 
     // Build compile arguments
     let mut verilator_args: Vec<&str> = vec![
@@ -422,6 +440,11 @@ pub(crate) fn verify_with_verilator_traced(
     let sim_output = Command::new(&sim_exe)
         .output()
         .map_err(|e| format!("Failed to run simulation: {}", e))?;
+
+    // The per-process work dir is scratch; drop it so runs do not accumulate
+    // hundreds of directories in the repo root.
+    let _ = fs::remove_dir_all(&obj_dir);
+    let _ = fs::remove_file(&tb_file);
 
     let stdout = String::from_utf8_lossy(&sim_output.stdout);
     println!("Verilator output:\n{}", stdout);
