@@ -97,3 +97,46 @@ fn arithmetic_shift_right_is_unsupported() {
         "reproduced a *different* transpile error than the tracked asr gap: {err}"
     );
 }
+
+// ── Memory is not transpilable at all (P4) ───────────────────────────────────
+
+/// `Memory` — the first-class memory construct — has **no transpiled path**.
+///
+/// This is a larger gap than the operator/port limitations above: it is not one
+/// construct being rejected, it is an entire feature that exists only in the
+/// simulator. `examples/memory/dual_port_ram.rs` is a shipped example with an
+/// independent hand-written SV reference (`examples/memory/sv/dual_port_ram.sv`),
+/// and its Copper source cannot be lowered.
+///
+/// **What this costs:** every memory guarantee is sim-only. `tests/memory_new.rs`,
+/// the 16 in-crate tests, and `tests/memory_multiport_arbitration.rs` all check the
+/// simulator against a Rust reference; `tests/verilog_fifo_memory_new.rs` anchors to
+/// *hand-written* Verilog rather than to transpiled output. So the project's central
+/// claim — the same source simulates and synthesises, provably in agreement — simply
+/// does not extend to designs using `Memory`. That is worth stating plainly rather
+/// than leaving as an absence.
+///
+/// It also removes the usual way of settling semantics questions here: out-of-range
+/// addressing was decided on diagnostic grounds (a deliberate panic naming the port,
+/// address and size) precisely because there is no synthesised counterpart to be
+/// faithful to. See `copper-core/src/memory.rs::out_of_range`.
+#[test]
+fn memory_is_not_transpilable() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/memory/dual_port_ram.rs"
+    ))
+    .expect("read the dual_port_ram example");
+
+    let err = transpile(&src).expect_err(
+        "Memory now transpiles! Promote this to a real equivalence test against \
+         examples/memory/sv/dual_port_ram.sv, extend P4's from_fn/from_contents \
+         preload check through the transpiled path, and revisit the out-of-range \
+         decision now that a synthesised counterpart exists to adjudicate against.",
+    );
+    assert!(
+        err.contains("cannot infer bit width"),
+        "the Memory transpile gap changed shape; it used to fail bit-width inference. \
+         New error: {err}"
+    );
+}

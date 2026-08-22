@@ -113,6 +113,30 @@ fn advance_write_pipelines<
     }
 }
 
+/// Panic message for an out-of-range memory address.
+///
+/// **Out-of-range addressing panics, deliberately.** The alternatives were returning
+/// `X` (what SystemVerilog does on an out-of-range read) or wrapping (what real
+/// address decoding does when the index simply has fewer bits than you supplied).
+/// A simulator that silently substitutes a value turns an addressing bug into a
+/// wrong-answer bug somewhere downstream, and Copper has no transpiled Memory path
+/// to be faithful *to* — so the diagnostic is worth more here than the fidelity.
+///
+/// It is raised at the `read()`/`write()` call, not when the pipeline commits, so the
+/// backtrace points at the line that supplied the address rather than at the clock
+/// edge inside the executor.
+#[cold]
+#[inline(never)]
+fn out_of_range(kind: &str, port: usize, addr: usize, size: usize) -> ! {
+    panic!(
+        "memory {kind} port {port}: address {addr} is out of range — this memory has \
+         {size} entr{} (valid addresses 0..={}). The address is checked where it is \
+         supplied, so the frame below this one is the offending `{kind}()` call.",
+        if size == 1 { "y" } else { "ies" },
+        size.saturating_sub(1),
+    )
+}
+
 fn advance_read_pipelines<
     T: Clone,
     const R: usize,
@@ -264,7 +288,13 @@ impl<
     /// After `READ_LAT` posedges, `data()` will return the value at `addr`.
     /// Call this every cycle to keep the pipeline continuously fed.
     pub fn read(&self, addr: usize) {
-        self.mem.shared.inner.lock().unwrap().pending_read_addr[I] = Some(addr);
+        let mut inner = self.mem.shared.inner.lock().unwrap();
+        if addr >= inner.data.len() {
+            let size = inner.data.len();
+            drop(inner);
+            out_of_range("read", I, addr, size);
+        }
+        inner.pending_read_addr[I] = Some(addr);
     }
 
     /// Returns `true` once the output stage of the read pipeline holds valid
@@ -321,7 +351,13 @@ impl<
     /// Stage a write into the write pipeline. The value will be committed to
     /// memory after `WRITE_LAT` posedges.
     pub fn write(&self, addr: usize, value: T) {
-        self.mem.shared.inner.lock().unwrap().write_pipeline[I][0] = Some((addr, value));
+        let mut inner = self.mem.shared.inner.lock().unwrap();
+        if addr >= inner.data.len() {
+            let size = inner.data.len();
+            drop(inner);
+            out_of_range("write", I, addr, size);
+        }
+        inner.write_pipeline[I][0] = Some((addr, value));
     }
 
     /// Always returns `true`: pipelined write ports accept a new write every

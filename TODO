@@ -392,11 +392,46 @@ P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettle
 P4 — Memory (first-class construct; MEMORY_DESIGN.md)
 --------------------------------------------------------------------------------
   ◐ Existing: memory_new.rs, mem_latency_probe.rs, verilog_fifo_memory_new.rs
-  ☐ WRITE_LAT > 0 (write latency) — commit timing
-  ☐ Read-during-write hazard at same address: write-first vs read-first modes both
-  ☐ Multi-read-port + multi-write-port arbitration (port-index priority) at scale
+  ✔ WRITE_LAT > 0 — ALREADY COVERED (this list was stale). copper-core/src/memory.rs
+     has write_lat1_commits_after_one_tick + write_lat2_commits_after_two_ticks.
+     Verified by reading the bodies, not the names: the LAT=2 test checks the write is
+     INVISIBLE at posedge 1 and visible at posedge 2.
+  ✔ Read-during-write, both modes — ALREADY COVERED (stale too):
+     read_first_sees_old_value_on_same_addr_write,
+     write_first_sees_new_value_on_same_addr_write, plus a different-address control.
+  ✔ Multi-port arbitration at scale  [DONE 2026-08-22]
+     → tests/memory_multiport_arbitration.rs (7 tests, 4R/4W). The existing two-port
+     test CANNOT pin the rule: "highest index wins", "second one wins" and "last
+     issued wins" all agree at two ports and disagree at four. One test therefore
+     issues the contest in DESCENDING source order — source-order would give 0xB0, and
+     the answer is 0xB3, so the rule is port INDEX priority. Also: partial contests,
+     uncontested parallel writes, 4 independent reads, all read ports agreeing on the
+     winner, and arbitration holding under WRITE_LAT=2.
+  ✔ Out-of-range address — DEFINED: DELIBERATE PANIC  [DONE 2026-08-22, user's call]
+     Was already a panic, but an INCIDENTAL one: raw "index out of bounds: the len is
+     4 but the index is 104" from inside advance_write_pipelines, at the CLOCK EDGE,
+     naming neither the memory nor the port. Now `copper-core::memory::out_of_range`
+     panics at the read()/write() CALL — so the backtrace points at the line supplying
+     the address — with a message naming the port kind+index, the address, the size
+     and the valid range.
+     Rejected alternatives: X (what SV does on an out-of-range read) and wrap (what
+     real address decoding does). Both silently substitute a value, turning an
+     addressing bug into a wrong-answer bug downstream. There is no transpiled Memory
+     path to be faithful to (below), so no sim≡synth pressure — the diagnostic is
+     worth more than the fidelity here. REVISIT if Memory ever transpiles.
+     Pinned by tests/memory_multiport_arbitration.rs::out_of_range (4 tests, incl. the
+     boundary address and "panics at the call, not at the edge").
   ☐ from_fn / from_contents preload equivalence through the transpiled path
-  ☐ Out-of-range address behavior (define: panic / X / wrap)
+     BLOCKED — **Memory does not transpile AT ALL.** examples/memory/dual_port_ram.rs
+     fails with "cannot infer bit width; add an explicit type annotation". This is
+     bigger than one construct: an entire first-class feature exists only in the
+     simulator, so EVERY memory guarantee is sim-only and the project's central claim
+     (same source simulates and synthesises, provably in agreement) does not extend to
+     designs using Memory. tests/verilog_fifo_memory_new.rs anchors to HAND-WRITTEN
+     Verilog, not to transpiled output.
+     PINNED: copper-codegen/tests/unsupported_constructs.rs::memory_is_not_transpilable
+     — flips loudly if support lands, and says what to do then (promote to a real
+     equivalence test, extend the preload check, revisit out-of-range).
 
 --------------------------------------------------------------------------------
 P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
