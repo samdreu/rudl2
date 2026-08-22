@@ -459,10 +459,44 @@ P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
 --------------------------------------------------------------------------------
 P6 — reset / X-propagation / robustness
 --------------------------------------------------------------------------------
-  ☐ Uninitialized register reads X; assert X flows through a full design
-  ☐ Reset drives registers to a known state; post-reset behavior matches SV
-  ☐ X-pessimism end-to-end (X on a control input → X on affected outputs, sim ≡ SV)
-  ☐ as_uint on X panics (documented) — assert the panic path is reachable in-context
+  ✔ Uninitialized register reads X; X flows through a design  [DONE 2026-08-22]
+     → tests/x_propagation_and_reset.rs (8 tests). An X-initialised register DOES read
+     X and drive it to the output — but ONLY if it is not reloaded. In a design that
+     reloads every cycle (`r = d.read()` unconditionally) the initial value is gone
+     before any observation point, because the loop top re-runs during the post-edge
+     settle AFTER the load. So the test holds the register behind an enable; that is
+     what makes the initial X reachable at all. (I first wrote this test against a
+     reload-every-cycle design, misread a probe where the X actually came from the
+     INPUT I was driving, and had to re-measure.)
+  ✔ Reset drives registers to a known state  [DONE 2026-08-22]
+     Contaminate via the datapath, assert reset across an edge clears the unknown and
+     the register reads 0, then release reset and confirm normal loading resumes with
+     no unknowns. Plus reset_is_what_makes_a_design_verilator_checkable, which asserts
+     the PRECONDITION every equivalence-tested design in the corpus relies on: after
+     reset there are no unknowns in the observable output, so a comparison downstream
+     is meaningful. ("post-reset behavior matches SV" is what the existing equivalence
+     tests already do — shift_register, lfsr, det_010 all reset first.)
+  ✔ as_uint on X panics — reachable IN-CONTEXT  [DONE 2026-08-22]
+     x_on_a_control_input_panics drives X into a design's control input and gets the
+     documented "Cannot convert X to bool" from inside the executor, not from a bare
+     Logic. Plus as_uint_on_x_panics for the Bits counterpart.
+     ⚠️ SEMANTIC NOTE worth knowing: X splits into TWO REGIMES. Data is X-PESSIMISTIC
+     (X flows and contaminates; eq on an X operand is X). Control ABORTS (as_bool /
+     as_uint panic rather than propagating). So Copper does NOT explore both arms on
+     an unknown condition — it stops. That is a real difference from 4-state Verilog,
+     where `if (x)` simply takes the else branch.
+  ☐ X-pessimism end-to-end sim ≡ SV — NOT POSSIBLE; pinned with evidence
+     Two INDEPENDENT reasons, either fatal alone:
+       1. THE X INITIALISER IS DROPPED IN TRANSPILATION. `let mut r: Bits<8> =
+          Bits::x()` emits a bare `logic [7:0] r;` with no initial value — the unknown
+          is simply not represented in the generated SystemVerilog.
+       2. VERILATOR IS 2-STATE. `--x-assign` / `--x-initial` ASSIGN X AWAY to 0, 1 or
+          random; they do not model X propagation. There is no X in the reference to
+          compare against even in principle.
+     MEASURED: sim reports X at cycle 0 where Verilator reports 0.
+     PINNED by x_cannot_be_checked_against_verilator, which asserts the DIVERGENCE (and
+     that the SV carries no X initialiser), so it fails loudly if either half is fixed.
+     A 4-state reference simulator would be needed to close this.
 
 --------------------------------------------------------------------------------
 Already landed in this pass (2026-08-03) — for reference
