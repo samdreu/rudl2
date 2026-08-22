@@ -69,11 +69,20 @@ exactly one driver, with no separate analysis pass.
    — as well as hand-written references for the primitive constructs (flip-flop `q <= d`,
    enabled register, synchronous-read block RAM). Because the reference DUTs and the test
    vectors both come from a third party, the equivalence is anchored to hardware neither we nor
-   our transpiler authored. `[Evidence: sim≡BaseJump-Verilog in examples/basejump/ —
-   bsg_dff_en, bsg_mux_one_hot, bsg_counter_up_down, bsg_encode_one_hot, bsg_gray_to_binary,
-   bsg_adder_one_hot; sim≡hand-written-SV in examples/memory/dual_port_ram.rs,
-   tests/timing_probe_investigation.rs, tests/mem_latency_probe.rs; sim≡transpiler in
-   tests/*_equivalence.rs. TODO: expand the BaseJump set and the transpiler-verified set.]`
+   our transpiler authored. `[Evidence — CORRECTED 2026-08-22, two citations withdrawn:
+   sim≡BaseJump-Verilog in examples/basejump/ — bsg_dff_en, bsg_mux_one_hot,
+   bsg_counter_up_down, bsg_encode_one_hot, bsg_gray_to_binary, bsg_adder_one_hot, sipo_block;
+   sim≡hand-written-SV in examples/memory/dual_port_ram.rs (with_verilog + assert_passed),
+   examples/cdc/sv/sync_2ff_ref.sv and two_domain_hierarchy.sv via tests/cdc_synchronizer_anchor.rs
+   and tests/two_domain_hierarchy_cdc.rs, and tests/det_010_independent_golden.rs;
+   sim≡transpiler in tests/*_equivalence.rs.
+   WITHDRAWN: tests/timing_probe_investigation.rs and tests/mem_latency_probe.rs were cited here
+   as hand-written-SV evidence. They contain NO assertions — they are `eprintln!` diagnostics —
+   and both are `#[ignore]`d, so they neither check anything nor run. Citing them overstated the
+   evidence base. Do not re-add them without giving them assertions.
+   SCOPE: this claim covers the transpilable subset only; `Memory`, array ports, `/` and `asr`
+   have no transpiled artifact to agree with (00_claims_audit.md §Scope, Threats T7).
+   TODO: expand the BaseJump set and the transpiler-verified set.]`
 
 5. **A minimal, provably-necessary output-timing annotation — with a compile-time boundary on the
    residual.** Control-flow inference resolves register-vs-combinational timing for *internal* state

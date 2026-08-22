@@ -4,7 +4,7 @@
 crates, not the design docs, which are out of sync in several places) and how each claim
 should be framed against prior work. Read this before writing any paper prose.
 
-Last verified against source: 2026-07-16.
+Last verified against source: 2026-08-22 (see §Scope of the equivalence claim).
 
 ---
 
@@ -16,7 +16,7 @@ Last verified against source: 2026-07-16.
 | Clock-domain-crossing safety | **Phantom-type**, not ownership: `In<T,D>`/`Out<T,D>` carry `PhantomData<D>`; cross-domain pass = `E0308` type mismatch | `copper-core/src/port.rs:13-37`; `examples/cdc/two_domain_counter.rs:40-48` |
 | Single-driver guarantee | `Out<T,D>` is **non-`Clone`** (move-only); `In<T,D>` is `Clone`. One writer per wire, by Rust move semantics | `copper-core/src/port.rs:12-49` |
 | Async/await FSMs | `#[hardware]` macro only validates + injects a sim barrier; **rustc's own async→state-machine lowering is the FSM the *simulator* runs**. Vars live across `.await` are the design's registers — but the *synthesizable* set is Copper's own liveness result, **not** rustc's over-captured `Future` fields; the emitted netlist is an independent transpiler lowering. See §Claim-scope correction (2026-07-30) | `copper-macros/src/lib.rs:118-138`; `examples/sequential/traffic_light_fsm.rs:26-28` |
-| Same-source sim = synth | DUT source included once as Rust (rustc sim) and once via `include_str!` → `copper_codegen::transpile_source` → SV; traces compared under Verilator | `tests/lfsr_equivalence.rs`, `tests/m1_counter_equivalence.rs` |
+| Same-source sim = synth | DUT source included once as Rust (rustc sim) and once via `include_str!` → `copper_codegen::transpile_source` → SV; traces compared under Verilator. **Holds only for the transpilable subset — see §Scope below** | `tests/lfsr_equivalence.rs`, `tests/m1_counter_equivalence.rs` |
 | Transpiler pipeline | FIR → CHIR → SHIR → VLIR → SV; entry `copper_codegen::transpile_source`; CLI `copper-transpile` | `copper-codegen/src/{parser,chir_lower,shir_lower,vlir_lower,emit}.rs`, `main.rs` |
 
 ## Doc/code mismatches to fix before publication
@@ -151,3 +151,37 @@ inference across 19 modules), and the G2 structural reg-match vs 4 independent h
 - **No formal semantics / soundness argument yet.** Filament (PLDI'23), Anvil (ASPLOS'26),
   Spade all carry one. Leading with a "correctness guarantee" invites demand for a proof
   sketch of the async-lowering ↔ transpiler correspondence, or a much larger verified set.
+
+---
+
+## Scope of the equivalence claim (added 2026-08-22) — read before writing "the same source"
+
+The same-source claim is real but **bounded**, and the bound is not a rough edge. State it as
+*"the same source simulates and synthesises, provably in agreement, for the subset the transpiler
+supports."* Outside that subset there is no transpiled artifact at all, so there is nothing to
+agree with.
+
+Outside the subset today, each pinned by a test that flips loudly if support lands
+(`copper-codegen/tests/unsupported_constructs.rs`, `transpile_inference_gaps.rs`):
+
+| construct | status |
+|---|---|
+| **`Memory`** | does not transpile at all — see Threats T7 |
+| array-typed ports (`mux`) | unsupported |
+| `/` (note `%` transpiles) | unsupported |
+| `arithmetic_shift_right` | unsupported |
+| `[Logic; N]` array locals, tuple-returning helpers | bit-width inference gap |
+| generic modules | monomorphised by the macro at example-run time, not by the standalone CLI |
+
+**The trap to avoid in prose:** the RISC-V CPU is the most impressive example in the repo and is
+*not* covered by the equivalence claim — it uses `Memory` and a `Vec` port, and does not transpile.
+`tests/rv32i_integration.rs` is a simulator self-check against known program results, not a
+sim≡synth check. Any figure or sentence that puts the CPU next to the equivalence claim needs to
+say which one it is demonstrating.
+
+**Two further limits on the evidence itself**, both in Threats: X-propagation cannot be checked
+against Verilator at all (T8 — Verilator is 2-state and the X initialiser is dropped in
+transpilation), and the harness producing all of this evidence had five defects that could make a
+check pass or vanish silently (T9). Neither invalidates the claim; both bound how much weight it
+carries, and both are worth pre-empting rather than having a reviewer find.
+

@@ -15,11 +15,13 @@
 //!
 //!   * `det_010` (canonical single-tick Moore coding) — LIVE. Anchors the working
 //!     coding to independent hardware.
-//!   * `det_010_awaits` (variable-iteration-loop coding) — `#[ignore]`. It
-//!     currently diverges from the golden because of the runtime read-timing
-//!     heuristic (see the module comment in `pattern_detector_2.rs`). Retiring
-//!     that heuristic with CFG-derived static timing (impl-plan item 3) must make
-//!     this pass against *this* golden — that is item 3's provable claim.
+//!   * `det_010_awaits` (variable-iteration-loop coding) — LIVE, and passing.
+//!     **This was item 3's provable claim, and it is discharged.** The header used
+//!     to say this test was `#[ignore]`d and diverging from the golden because of
+//!     the runtime read-timing heuristic; retiring that heuristic for CFG-derived
+//!     static timing fixed it, but the comment was never updated — so a resolved
+//!     divergence went on being cited as an open limitation (corrected 2026-08-22,
+//!     alongside the same problem in `accum_2`). Both tests run; neither is ignored.
 
 mod common;
 

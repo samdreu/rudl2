@@ -119,21 +119,24 @@ because they diverge.
   - `det_010_matches_independent_verilog` — **LIVE, passes.** The canonical Moore
     coding matches the independent hardware cycle-by-cycle. The "010" detector now
     has a real hardware referee.
-  - `det_010_awaits_matches_independent_verilog` — **`#[ignore]`d.** Empirically it
-    diverges from the golden at the **repeat detections** (cycles 9 and 13 of the
-    coverage stream): the golden asserts `out=1`, the variable-iteration coding
-    records `0` — it **misses the 2nd and 3rd detections**. The golden sides with
-    the canonical Moore semantics.
+  - `det_010_awaits_matches_independent_verilog` — **LIVE and passing (2026-08-22).**
+    It used to be `#[ignore]`d: the variable-iteration coding diverged from the golden
+    at the repeat detections (cycles 9 and 13 of the coverage stream), recording `0`
+    where the golden asserts `out=1` — it *missed* the 2nd and 3rd detections. Item 3's
+    CFG-derived static read-timing fixed that, and this was item 3's stated provable
+    claim, so the claim is **discharged**.
 
-**Consequence for item 3.** The variable-iteration divergence is no longer a
-Copper-vs-Copper curiosity — it is now measured against independent hardware, and
-the hardware says the canonical semantics are correct. Retiring the runtime
-`synced_read` heuristic in favour of CFG-derived static timing (item 3) must make
-`det_010_awaits` match `pattern_detector_010.sv`. Un-ignoring
-`det_010_awaits_matches_independent_verilog` is that item's provable,
-hardware-anchored claim (gate G5's per-item claim for item 3). Whether the fix is
-purely read-timing or the sliced coding also needs its overlap logic corrected is
-now an empirically decidable question rather than an argued one.
+**Consequence for item 3 — DISCHARGED.** The variable-iteration divergence was measured
+against independent hardware, the hardware sided with the canonical Moore semantics, and
+retiring the runtime `synced_read` heuristic in favour of CFG-derived static timing made
+`det_010_awaits` match `pattern_detector_010.sv`. Both codings are now anchored.
+
+> **Note on how long this took to notice.** The test passed for some time while its own
+> header, and this document, went on describing it as ignored and diverging — the same
+> stale-`#[ignore]` pattern as `accum_2` (see `TODO` P3/Q5). A disabled test says nothing
+> when it starts passing, so both were cited as open limitations long after they were
+> closed. The regression driver now prints the `#[ignore]`d list on every run for exactly
+> this reason.
 
 ## Summary
 

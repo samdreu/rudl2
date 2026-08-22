@@ -189,3 +189,88 @@ T-align: the fix was in the *simulator*, and it cost nothing (666/667 corpus, th
 being the test that pinned the old behaviour). Worth reporting as the counterweight: not every
 member of this family has to be paid for with a restriction on the language.
 
+## T7 — the same-source claim does not extend to `Memory` (added 2026-08-22)
+
+**`Memory`, Copper's first-class memory construct, has no transpiled path at all.**
+`examples/memory/dual_port_ram.rs` — a shipped example with an independent hand-written SV
+reference — fails to transpile with `cannot infer bit width; add an explicit type annotation`.
+
+This is a *scope* limit on contribution 2, not a rough edge. Every memory guarantee Copper
+offers is simulator-only: the read/write-latency pipelines, the read-during-write modes, the
+multi-port arbitration priority. The one memory anchor that exists
+(`tests/verilog_fifo_memory_new.rs`) compares the simulator against **hand-written** Verilog, not
+against transpiled output — so it is evidence about the simulator's fidelity, not about
+same-source agreement.
+
+The honest statement for the paper is therefore: *the same source simulates and synthesises,
+provably in agreement, for the subset of designs the transpiler supports* — and `Memory` is
+outside that subset, along with array-typed ports, `/`, and `arithmetic_shift_right` (all pinned
+in `copper-codegen/tests/unsupported_constructs.rs`). A reader who assumes the RISC-V CPU example
+is covered by the equivalence claim would be wrong; it uses `Memory` and does not transpile.
+
+It also removes the usual way of settling semantics questions in this project. Out-of-range
+addressing was decided on *diagnostic* grounds — a deliberate panic naming the port, address and
+size — precisely because there is no synthesised counterpart to adjudicate against. Where the rest
+of the system settles "which behaviour is correct" against independent hardware, memory cannot.
+
+## T8 — X-propagation cannot be checked against the reference simulator (added 2026-08-22)
+
+Copper's `Logic` is 3-state and `Bits<N>` carries X per bit, so the simulator models unknowns. That
+modelling is **unverifiable against Verilator**, for two independent reasons either of which is
+fatal alone:
+
+1. **The X initialiser is dropped in transpilation.** `let mut r: Bits<8> = Bits::x()` emits a bare
+   `logic [7:0] r;` with no initial value — the unknown is simply not represented in the generated
+   SystemVerilog.
+2. **Verilator is 2-state.** Its `--x-assign` / `--x-initial` flags *assign X away* to 0, 1, or a
+   random value; they do not model X propagation. There is no X in the reference to compare
+   against even in principle.
+
+Measured: the simulator reports X where Verilator reports 0
+(`tests/x_propagation_and_reset.rs::x_cannot_be_checked_against_verilator`, which pins the
+divergence so it fails if either half is fixed). Closing this needs a 4-state reference simulator.
+
+**A semantic difference worth declaring, not just an evidence gap.** X splits into two regimes in
+Copper, and they behave differently:
+
+- **Data is X-pessimistic** — X flows through the datapath and contaminates what it touches.
+- **Control aborts** — `as_bool` / `as_uint` *panic* on X rather than propagating, so branching on
+  an unknown stops the simulation instead of exploring both arms.
+
+Four-state Verilog does neither: `if (x)` takes the else branch. Copper's choice is defensible for a
+simulator (an unknown condition usually means the testbench is wrong, and failing loudly beats
+silently taking a branch), but it is a deliberate divergence from the reference semantics and should
+be stated rather than left for a reader to discover.
+
+## T9 — the verification harness is itself part of the trusted base (added 2026-08-22)
+
+Every equivalence claim in this paper rests on a harness that runs Verilator and compares traces.
+That harness is code, and an audit of it found **five** defects, each of which could make a check
+pass or vanish without anyone noticing. They are fixed, but the episode bounds how much weight the
+evidence can bear and motivates the guards now in `tools/regression.sh`.
+
+- **Verilator failures were swallowed.** The "should we skip?" test matched `err.contains("not
+  found")`, and Verilator's C++ stage emits `fatal error: 'Vfoo.h' file not found` for a broken
+  testbench — so a genuine build failure was reported as "Verilator not available" and the test
+  **passed**.
+- **Tests could verify against the wrong model.** Verilated output directories were keyed by module
+  name, but `det_010_independent_golden.rs` runs two tests against the *same* top module in parallel
+  threads; they shared a directory and clobbered each other's build. A false-*pass* mechanism, not
+  merely a flake.
+- **An anchor was green for the wrong reason.** `two_domain_hierarchy_cdc.rs` — the independent
+  hardware check for the dual-clock design — passed because two silent sim≠SV divergences cancelled
+  inside the chain. Only a deliberate experiment (correct one side, watch the boundary move) exposed
+  it.
+- **Most examples never ran.** Examples carry self-checks, several against third-party BaseJump
+  Verilog, and `cargo test` only *builds* them. The default regression ran 5 of 26.
+- **A disabled test's stated reason had gone stale.** `accum_2` was `#[ignore]`d as "sim and
+  transpiler disagree by one cycle"; the divergence had since been fixed, but the claim was still
+  being cited in design documents as a known limitation.
+
+The pattern is one thing in five costumes: **a check that does not run looks exactly like a check
+that passes.** The mitigation is structural — the regression driver now asserts that it ran what it
+claims (every example registered and executed, every test file producing a binary), prints the
+`#[ignore]`d list on every run, and preserves the log when it fails. The residual threat is the one
+that cannot be designed away: our evidence is only as good as the machinery producing it, and that
+machinery had bugs we found by looking rather than by being told.
+
