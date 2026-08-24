@@ -295,7 +295,16 @@ Reverted.
 
 **Why it failed, now known (Q1):** it keyed on **registers**. The observable
 divergence requires a plain combinational **`Out`** — `RegOut` is immune by
-construction. Every false positive was a `RegOut` module. The corrected rule keys on
+construction.
+
+> **Correction (2026-08-24): `RegOut`'s immunity is narrower than stated here.** It is
+> immune to the *phase* question this document is about — when the segment runs is
+> unobservable through a port that commits at the edge. It is **not** immune to
+> sequential forwarding *within* the segment: measured, a `RegOut` written **after** a
+> register update in the same segment emits `out <= n`, the register's **old** value,
+> while the simulator forwards the update and writes the new one. D1's compile error
+> exempts `RegOut`, so that shape passes the guardrail and diverges silently. Whether
+> to narrow the exemption or repair the forwarding is open — see the `TODO`. Every false positive was a `RegOut` module. The corrected rule keys on
 the output write, which is the same structure `multi_write_collapse` already uses.
 
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
