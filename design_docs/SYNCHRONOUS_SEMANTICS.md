@@ -147,6 +147,29 @@ defer; the trailing next-state reads in `counter`/`traffic_light` fire immediate
 class it got wrong (the variable-iteration `while in_i.read() == 0 { tick }` in `det_010_awaits`) —
 anchored to the independent `pattern_detector_010.sv`.
 
+**A repeating wait must test *before* its tick (2026-08-24).** In a nested wait loop, the ordering
+
+```rust
+loop { clk.tick().await; if ready.read() == Logic::One { break; } }   // REJECTED
+loop { if ready.read() == Logic::One { break; } clk.tick().await; }   // the form to write
+```
+
+differs by more than style. The rejected ordering puts the read in the window *after* the entering
+edge, where an `Immediate` read consumes the value the just-past edge produced while the flip-flop
+the FSM lowers to samples the value present before *its own* edge. Under the harness convention
+"drive, then clock" those are different values a cycle apart — measured, the transpiled module
+reacted a full cycle earlier than the simulator, and holding each stimulus value for two cycles did
+**not** reconcile them (the two models read in different *windows*, not at different points of one).
+
+**Copper does not choose between the two samplings; it declines to let a design depend on which.**
+Same disposition as the pre-tick alignment hazard: the divergent program is made unwritable rather
+than the divergence adjudicated. The cost is low because the supported ordering expresses the same
+designs, and because the divergence needs an input that changes *mid-cycle* — an `In` driven by a
+clocked module in the same domain is stable across the window and both models agree. It is a
+testbench-observable difference, which is exactly why it could not be left in: sim ≡ SV *under a
+testbench* is this project's bar. Enforced in `control_extract` (which declines to flatten the
+shape) and reported by `chir_lower`; see `TODO` for the rejected alternatives.
+
 ## Poll-order and cross-domain interleave independence
 
 **Single domain — poll-order independence.** `poll_tasks` order is an implementation detail: a

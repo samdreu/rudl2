@@ -130,10 +130,16 @@ async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainC
     );
 }
 
-/// The tick must be the LAST statement of the wait's body. The other ordering puts
-/// the test in the window where the simulator and a testbench disagree about which
-/// input value is current — measured, the transpiled module reacted a full cycle
-/// early — so it is refused rather than lowered to a guess.
+/// The tick must be the LAST statement of the wait's body. The other ordering is
+/// **outside the language by decision** (2026-08-24), not merely unimplemented: it
+/// puts the test in the window where an `Immediate` read consumes the value the
+/// just-past edge produced while the flip-flop it lowers to samples the value
+/// before its own edge. Measured, the transpiled module reacted a full cycle
+/// early, and holding the stimulus two cycles did not reconcile them.
+///
+/// Same disposition as the pre-tick alignment hazard: the divergent program is
+/// made unwritable rather than the divergence adjudicated. See
+/// `design_docs/SYNCHRONOUS_SEMANTICS.md`.
 #[test]
 fn ticking_before_the_test_in_a_wait_is_unsupported() {
     let src = r#"
@@ -152,9 +158,10 @@ async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainC
 }
 "#;
     let err = transpile(src).expect_err(
-        "NOW SUPPORTED: testing after the tick transpiles. That means the mid-phase-read \
-         window was decided — verify the transpiled module no longer reacts a cycle earlier \
-         than the simulator.",
+        "This ordering is refused BY DESIGN, not pending support — see \
+         SYNCHRONOUS_SEMANTICS.md. If it now transpiles, a language decision was reversed; \
+         that needs sign-off and a hardware-anchored check that the module no longer reacts a \
+         cycle earlier than the simulator, not just a green test.",
     );
     assert!(
         err.contains("LAST statement"),

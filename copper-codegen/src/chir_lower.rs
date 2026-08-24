@@ -2140,10 +2140,13 @@ fn lower_expr_stmt(
             return Err(CHIRLowerError::UnsupportedConstruct {
                 description: if stmts_contain_tick(&l.body) {
                     "a repeating wait must be written as `loop { <test>; clk.tick().await; }` \
-                     — the tick has to be the LAST statement of the loop body. Testing after \
-                     the tick instead puts the read in the window where the simulator and the \
-                     emitted hardware disagree about which input value is current, so it is \
-                     refused rather than lowered to something that reacts a cycle early"
+                     — the tick has to be the LAST statement of the loop body. Testing AFTER \
+                     the tick reads an input in the window where a simulator samples the value \
+                     the just-past edge produced and a flip-flop samples the value present \
+                     before its own edge; the two are a cycle apart under any testbench that \
+                     changes inputs between edges. Copper does not choose between them — the \
+                     ordering is outside the language, the same way a pre-tick alignment hazard \
+                     is"
                         .to_string()
                 } else {
                     "a nested `loop` with no `clk.tick().await` would never terminate in \

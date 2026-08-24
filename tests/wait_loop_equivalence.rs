@@ -21,18 +21,27 @@
 //! has to be inlined per-branch just the same. That is why "diverges" replaced
 //! "contains a tick" as the splitting rule.
 //!
-//! ## Scope: the tick must be the body's LAST statement
+//! ## Scope: the tick must be the body's LAST statement — decided, not deferred
 //!
-//! `tick_first_waiter` in the fixture is the refused ordering, and it is refused
-//! on evidence. Testing *after* the tick puts the read in the window where the
-//! simulator and a testbench disagree about which input value is current — the
-//! simulator's post-edge settle still holds the value driven for the cycle whose
-//! edge just passed. Measured, the transpiled module reacted a full cycle earlier
-//! than the simulator on every detection. That is the mid-phase-read seam, not a
-//! flattening question, so the pass declines instead of picking a side.
+//! `tick_first_waiter` in the fixture is the refused ordering. Testing *after* the
+//! tick puts the read in the window where an `Immediate` read consumes the value
+//! the just-past edge produced while the flip-flop it lowers to samples the value
+//! present before its own edge. Measured, the transpiled module reacted a full
+//! cycle earlier than the simulator on every detection — and holding each stimulus
+//! value for two cycles did **not** reconcile them, so it is not a
+//! which-of-two-samples question but two different windows.
 //!
-//! Worth knowing: this is the ordering `examples/cpu/rv32i_cpu.rs` is written in.
-//! The `TODO` carries the open question.
+//! **Copper does not choose between the two samplings; it declines to let a design
+//! depend on which** (2026-08-24). Same disposition as the pre-tick alignment
+//! hazard: the divergent program is made unwritable. The cost is low because the
+//! supported ordering expresses the same designs, and because the divergence needs
+//! an input that changes mid-cycle — a clocked producer in the same domain is
+//! stable across the window and both models agree.
+//!
+//! Worth knowing: this is the ordering `examples/cpu/rv32i_cpu.rs` is written in,
+//! but the CPU is blocked ahead of it on three other things (a `Vec` port,
+//! host-side Rust at construction, a run-time memory preload), so the restriction
+//! is not what keeps it out. `TODO` has the measurement.
 
 mod common;
 
@@ -193,9 +202,9 @@ fn ticking_before_the_test_is_refused() {
         &copper_codegen::EmitConfig::default(),
     )
     .expect_err(
-        "NOW SUPPORTED: `loop { tick; if c { break; } }` transpiles. That means the \
-         mid-phase-read window was decided — check the transpiled module does not react a \
-         cycle earlier than the simulator, which is what it did before.",
+        "This ordering is refused BY DESIGN, not pending support. If it now transpiles, a \
+         language decision was reversed — that needs sign-off, and a hardware-anchored check \
+         that the module no longer reacts a cycle earlier than the simulator.",
     );
     let msg = err.to_string();
     assert!(

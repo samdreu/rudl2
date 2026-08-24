@@ -562,15 +562,25 @@ fn contains_unflattenable_control(stmts: &[RawStmt]) -> bool {
 /// A nested loop body must be exactly one "code between two ticks" segment: its
 /// tick has to be the LAST statement, so the body is `<test> ; tick`.
 ///
-/// The other ordering — `loop { tick; <test> }` — puts the test in the window
-/// AFTER the entering edge, and that window is where the simulator and a
-/// testbench disagree about which input value is current: the simulator's
-/// post-edge settle still holds the value driven for the cycle whose edge just
-/// passed, while the emitted FSM's state reads the value driven for the cycle
-/// about to end. Measured on `loop { clk.tick().await; if go { break; } }`: the
-/// transpiled module reacted a full cycle earlier than the simulator. That is the
-/// mid-phase-read seam, not a flattening question, so this pass declines rather
-/// than picking a side. See the `TODO`.
+/// The other ordering — `loop { tick; <test> }` — is **outside the language, by
+/// decision** (2026-08-24), not merely unimplemented. It puts the test in the
+/// window after the entering edge, where a simulator samples the value the
+/// just-past edge produced and a flip-flop samples the value present before its
+/// own edge. Measured on `loop { clk.tick().await; if go { break; } }`: the
+/// transpiled module reacted a full cycle earlier than the simulator, and holding
+/// the stimulus for two cycles did NOT reconcile them — the two models read in
+/// different windows, not at different points of one.
+///
+/// The restriction is cheap because the supported ordering expresses the same
+/// designs: `loop { <test>; clk.tick().await; }` is what one would write anyway.
+/// It is the same disposition as the pre-tick alignment hazard (D1) — the
+/// divergent program is made unwritable rather than adjudicated. See the `TODO`
+/// and `design_docs/SYNCHRONOUS_SEMANTICS.md`.
+///
+/// Note the divergence needs an input that changes mid-cycle. An `In` driven by a
+/// clocked module in the same domain is stable across the window, so both models
+/// read the same value — it is a testbench-observable difference, which is
+/// precisely why it cannot be left in: sim ≡ SV under a testbench is the bar.
 fn tick_is_last_statement(body: &[RawStmt]) -> bool {
     match body.iter().position(is_tick_stmt) {
         // Ticks only inside branches: no single "between two ticks" segment, and

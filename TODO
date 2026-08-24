@@ -337,35 +337,43 @@ TRANSPILATION:
      the one the tick ENTERS) was right all along.
      What still diverges is exactly one thing: an `In` read in the post-tick window.
 
-  ☐ THE REMAINING SEAM — needs a decision, stated precisely:
+  ✔ THE REMAINING SEAM — CLOSED AS REFUSED BY DESIGN  [2026-08-24, user's call]
      A post-tick `In` read is sampled by the SIMULATOR at the START of the window
      (`Immediate`, per SYNCHRONOUS_SEMANTICS.md: "consumes the value the just-past
      edge produced") and by the EMITTED HARDWARE at the END of it (a flip-flop
      samples just before its own edge). Under the harness convention "drive, then
      clock", those are different input values, one cycle apart.
      NOT a "which of two adjacent samples" question: holding each stimulus value
-     for TWO cycles does not make them agree, because the two models read in
+     for TWO cycles does not reconcile them, because the two models read in
      different WINDOWS, not at different points of the same one.
-     Note what this means in real hardware: an `In` driven by a clocked module in
-     the same domain changes just after an edge and is stable thereafter, so start
-     and end of the window carry the same value and the two models AGREE. The
-     divergence needs an input that changes mid-cycle — which a testbench does and
-     synchronous hardware does not.
-     THE FORK (each has a real cost, so it is not mine to pick):
-       (a) Make the hardware faithful to the simulator: register a post-tick `In`
-           read at the entering edge and use the register. Exact, but adds a flop
-           and changes the circuit the user wrote.
-       (b) Declare the simulator's reading normative only for edge-aligned inputs,
-           and require equivalence harnesses to hold inputs across the boundary.
-           Restricts the TEST METHOD rather than the language — but the project's
-           correctness bar IS sim ≡ SV under exactly that method.
-       (c) Keep refusing a post-tick `In` read that drives control flow (today's
-           behaviour). Safe, and excludes the idiom rv32i_cpu is written in.
-     Pinned by unsupported_constructs.rs::ticking_before_the_test_in_a_wait_is_unsupported.
-
+     DISPOSITION: the ordering `loop { clk.tick().await; <test> }` is OUTSIDE THE
+     LANGUAGE. Not "unimplemented" — decided. The supported ordering
+     (`loop { <test>; clk.tick().await; }`) expresses the same designs and is what
+     one would write anyway, so the restriction costs nothing that works.
+     THIS IS THE SAME DISPOSITION AS D1 (pre-tick alignment): the divergent program
+     is made unwritable rather than the divergence adjudicated. Copper does not
+     choose between the two samplings; it declines to let a design depend on which.
+     PAPER NOTE: cite as a SCOPE RESTRICTION, not a repair — alongside D1 and the
+     Mealy-output item, which are the same move. The honest framing of all three is
+     "Copper infers the register/combinational boundary that other HDLs make
+     explicit, and where inference cannot decide, the language narrows."
+     WHY THE COST IS LOW, measured: the divergence needs an input that CHANGES
+     MID-CYCLE. An `In` driven by a clocked module in the same domain is stable
+     across the window, so both models read the same value. It is a
+     testbench-observable difference — which is exactly why it could not be left
+     in, since sim ≡ SV under a testbench is this project's bar.
+     REJECTED ALTERNATIVES, recorded so they are not re-tried:
+       - register the input at the entering edge so the hardware reproduces the
+         simulator. Exact under any stimulus, and it would have allowed the
+         ordering — but it silently inserts a flip-flop the user did not write and
+         delays the input a cycle relative to the plain reading of the source.
+       - declare the simulator normative only for edge-aligned inputs and require
+         harnesses to hold inputs across the boundary. Changes no hardware and no
+         language surface, but weakens the central check: sim ≡ SV would no longer
+         hold under the testbench convention every existing test uses.
      WHAT IT DOES *NOT* UNBLOCK — measured 2026-08-24, correcting an earlier
      overstatement in this file ("settling it is what would put the CPU's control
-     flow within reach"). The seam is the FOURTH thing standing between
+     flow within reach"). The seam was the FOURTH thing standing between
      examples/cpu/rv32i_cpu.rs and transpilation, not the first:
        1. `program: In<Vec<Bits<32>>, MainClk>` — a `Vec` input port. A
           variable-length vector is not a wire bundle; this is not a missing
@@ -379,15 +387,15 @@ TRANSPILATION:
      which is how the example is WRITTEN (to be simulated with a program handed in
      by the testbench), not a transpiler gap. A synthesizable CPU takes its program
      from a fixed image (`from_fn`, or `from_contents` with literals — both work
-     now) or fetches it over a bus port. So settling the seam in the most permissive
-     direction still leaves the CPU needing that rewrite.
-     ALSO WORTH KNOWING before assuming the waits can just be flipped: of the 17,
-     EIGHT wait on a *write* port's `is_ready()`, which the simulator always
-     returns true for — they are "tick exactly once" written in a general form, and
+     now) or fetches it over a bus port.
+     ALSO WORTH KNOWING before assuming the CPU's waits could just be flipped to
+     the supported ordering: of the 17, EIGHT wait on a *write* port's
+     `is_ready()`, which the simulator always returns true for — they are "tick
+     exactly once" written in a general form, and
      `loop { if wp.is_ready() { break; } tick; }` would never tick at all, which
      the reachability guarantee rejects. Only the nine read-port waits (READ_LAT=2)
-     are genuine variable waits, and flipping those still changes when the first
-     test happens.
+     are genuine variable waits. So a transpilable CPU is a REWRITE, not a flip.
+     Pinned by unsupported_constructs.rs::ticking_before_the_test_in_a_wait_is_unsupported.
 
   ☐ `RegOut` IS NOT IMMUNE TO SEQUENTIAL FORWARDING, contrary to
      PRETICK_ALIGNMENT_GUARDRAIL.md, which lists it as the first remedy and calls
