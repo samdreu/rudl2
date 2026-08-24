@@ -966,7 +966,14 @@ fn infer_type_from_suffix(compact: &str) -> Option<CHIRType> {
         ("i32",  CHIRType::SInt { width: Width::Concrete(32) }),
         ("i16",  CHIRType::SInt { width: Width::Concrete(16) }),
         ("i8",   CHIRType::SInt { width: Width::Concrete(8) }),
-        ("usize", CHIRType::UInt { width: Width::Concrete(64) }),
+        // 32, not 64: `resolve_type` decided `usize` is 32-bit (matching the SV
+        // `int` loop variable, keeping index arithmetic width-consistent) and
+        // `from_usize` mirrors it. This table is the LITERAL-SUFFIX path for the
+        // same type, so `let x = 0usize` and `let x: usize = 0` must agree —
+        // they used to emit a 64-bit and a 32-bit signal, and could then be
+        // added together in one expression.
+        ("usize", CHIRType::UInt { width: Width::Concrete(32) }),
+        ("isize", CHIRType::SInt { width: Width::Concrete(32) }),
     ];
     for (suffix, ty) in suffixes {
         if let Some(base) = compact.strip_suffix(suffix) {
@@ -3672,7 +3679,8 @@ fn strip_int_suffix(s: &str) -> (&str, Option<usize>) {
     let suffixes: &[(&str, usize)] = &[
         ("u128", 128), ("u64", 64), ("u32", 32), ("u16", 16), ("u8", 8),
         ("i128", 128), ("i64", 64), ("i32", 32), ("i16", 16), ("i8", 8),
-        ("usize", 64),
+        // See `infer_type_from_suffix`: `usize`/`isize` are 32-bit throughout.
+        ("usize", 32), ("isize", 32),
     ];
     for (suffix, width) in suffixes {
         if let Some(stripped) = s.strip_suffix(suffix) {

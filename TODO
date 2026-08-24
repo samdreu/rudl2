@@ -57,13 +57,29 @@ TRANSPILATION:
     bsg_counter_up_down (I): `let mut count: usize = 0;` emits `logic [31:0]`;
       `assign count_o = count` is WIDTHTRUNC, and `up = (up_i == 1'b1)` is
       WIDTHEXPAND (a 1-bit RHS into a 32-bit target).
-  NOTE the two widths disagree — 64 bits for `0usize`, 32 for `: usize = 0` —
-  which is worth understanding before fixing either; they are reaching different
-  inference paths for what the source says is the same type.
+  ✔ THE WIDTH DISAGREEMENT BETWEEN THEM IS FIXED (2026-08-24). It read 64 bits
+  for `0usize` and 32 for `: usize = 0` — two spellings of one Rust type reaching
+  different inference paths. `usize` gets a width in THREE places in chir_lower:
+  `resolve_type` (:127, the annotation path), `infer_type_from_suffix` (:969) and
+  `strip_int_suffix` (:3675, both the literal-suffix path). History settles which
+  was intended: both 64s are first-draft code (d48dcb7, 5a55011), while the 32
+  was a deliberate later decision (78d91f7, 2026-07-24 — "matches SV `int` loop
+  var, keeps index arithmetic width-consistent"), and that commit also added
+  `from_usize` → 32 to mirror it. It updated the TYPE table and missed the two
+  LITERAL tables for the same type. Now aligned at 32, with `isize` added to both
+  (it was in resolve_type at 32 and absent from the suffix tables entirely).
+  Worse than cosmetic while it lasted: nothing stopped the two meeting in one
+  expression, where the mismatch is a silent width conversion, not an error.
+  Pinned by transpile_inference_gaps.rs::both_spellings_of_usize_give_the_same_width.
+
+  ☐ BUT THAT DID NOT UNBLOCK EITHER MODULE — measured after the fix, correcting an
+  expectation recorded earlier in this session. Both still fail `-Wall`, now at 32
+  bits instead of 64/32: a wide integer local driving a NARROW port is the actual
+  blocker, and it is independent of which width `usize` resolves to.
   So neither has an equivalence test yet. Two ways out, undecided: narrow the
   examples' locals to `Bits<N>` (an example edit; also better hardware style,
-  since `usize` is not a hardware type), or infer a narrower width for an integer
-  local from its uses (codegen work, cause J's neighbourhood).
+  since `usize` is not a hardware type), or give a bare integer local its width
+  from context rather than from its type (codegen work, cause J's neighbourhood).
   The count above is "the CLI emits SystemVerilog", not "the SystemVerilog lints".
 
   ✔ FIXED (2026-08-24, with user sign-off) — I: a branch-local `let` with a

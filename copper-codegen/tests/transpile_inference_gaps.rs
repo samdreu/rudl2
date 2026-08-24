@@ -82,3 +82,50 @@ fn tuple_returning_helper_is_a_known_transpile_gap() {
         "reproduced a *different* transpile error than the tracked bit-width gap: {err}"
     );
 }
+
+/// `usize` must mean ONE width, whichever way the source spells it.
+///
+/// It did not. `resolve_type` resolved `usize` to 32 bits — a deliberate choice
+/// (commit 78d91f7, 2026-07-24: "matches SV `int` loop var, keeps index
+/// arithmetic width-consistent"), which `Bits::from_usize` was written to mirror
+/// — but the two LITERAL-SUFFIX tables still carried the first draft's 64, so
+/// `let x = 0usize` and `let x: usize = 0` produced a 64-bit and a 32-bit signal
+/// from the same Rust type.
+///
+/// That is worse than a cosmetic inconsistency: nothing stopped the two from
+/// meeting in one expression, where the mismatch becomes a silent width
+/// conversion rather than an error. Both spellings appear in the corpus —
+/// `bsg_encode_one_hot` uses the suffix form, `bsg_counter_up_down` the
+/// annotation.
+#[test]
+fn both_spellings_of_usize_give_the_same_width() {
+    let src = r#"
+#[hardware(combinational)]
+fn m(i: In<Bits<8>, ()>, o: Out<Bits<8>, ()>) {
+    let mut suffixed = 0usize;
+    let mut annotated: usize = 0;
+    if i.read()[0] == Logic::One {
+        suffixed = 3;
+        annotated = 4;
+    }
+    o.write(Bits::from_usize(suffixed) + Bits::from_usize(annotated));
+}
+"#;
+    let sv = transpile(src).expect("transpiles");
+    let widths: Vec<&str> = sv
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            let name = t.strip_prefix("logic [")?;
+            let (range, rest) = name.split_once("] ")?;
+            (rest.starts_with("suffixed") || rest.starts_with("annotated")).then_some(range)
+        })
+        .collect();
+    assert_eq!(widths.len(), 2, "both locals must be declared, got:\n{sv}");
+    assert_eq!(
+        widths[0], widths[1],
+        "`0usize` and `: usize = 0` are the same Rust type and must emit the \
+         same width, got:\n{sv}"
+    );
+    assert_eq!(widths[0], "31:0", "usize is 32-bit throughout, got:\n{sv}");
+}
