@@ -232,7 +232,9 @@ fn capture_clock_metadata(design_fn: &ItemFn) -> Vec<ClockParamMeta> {
             };
 
             let clock_ty = pat_type.ty.to_token_stream().to_string();
-            let ty_compact: String = clock_ty.chars().filter(|c| !c.is_whitespace()).collect();
+            // Qualified paths (`copper_core::Clock<D>`) compact to the bare form
+            // so they match the same textual rules as `Clock<D>`.
+            let ty_compact = crate::chir_lower::compact_type(&clock_ty);
             if !ty_compact.starts_with("Clock<") {
                 continue;
             }

@@ -67,9 +67,37 @@ fn build_module_params(fir: &FrontendModuleIR) -> Vec<copper_core::chir::ModuleP
 
 // ── Type resolution ───────────────────────────────────────────────────────────
 
+/// Compact a **type** text: drop whitespace, then strip a leading module-path
+/// qualifier so `copper_core::Clock<MainClk>` matches the same rules as a bare
+/// `Clock<MainClk>`.
+///
+/// Every prefix test in this file (`starts_with("Clock<")`, `"In<"`, `"Out<"`,
+/// …) is a *textual* match, so a fully-qualified path silently failed all of
+/// them — `sipo_block` was the one example written that way and was reported
+/// unresolvable. Type texts go through here; literal, path and pattern texts do
+/// **not** (a qualifier is meaningful there — `Logic::One`, `Opcode::LUI`).
+pub(crate) fn compact_type(ty_text: &str) -> String {
+    let compact: String = ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+    strip_path_qualifier(&compact).to_string()
+}
+
+/// `copper_core::Clock<D>` → `Clock<D>`; `::a::b::In<T,D>` → `In<T,D>`;
+/// `Bits<8>` unchanged.
+///
+/// Only the **head** path is stripped: the search stops at the first `<`, so a
+/// qualifier inside a generic argument (`In<Bits<8>, some_mod::Dom>`) is left
+/// alone for the domain logic to deal with.
+fn strip_path_qualifier(compact: &str) -> &str {
+    let head_end = compact.find('<').unwrap_or(compact.len());
+    match compact[..head_end].rfind("::") {
+        Some(i) => &compact[i + 2..],
+        None => compact,
+    }
+}
+
 /// Resolve a raw Copper type text to a `CHIRType`.
 pub fn resolve_type(ty_text: &str, span: SourceSpan) -> Result<CHIRType, CHIRLowerError> {
-    let compact: String = ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact = compact_type(ty_text);
 
     if let Some(inner) = strip_arc_mutex(&compact) {
         return resolve_type(inner, span);
@@ -693,7 +721,7 @@ fn build_write_inferred_types(fir: &FrontendModuleIR, port_symbols: &SymbolTable
         .params
         .iter()
         .filter(|p| {
-            let c: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            let c = compact_type(&p.ty.ty_text);
             c.starts_with("Out<")
         })
         .map(|p| p.name.clone())
@@ -837,7 +865,7 @@ fn ident_of_expr(e: &ExprType) -> Option<String> {
 fn build_port_symbols(fir: &FrontendModuleIR) -> SymbolTable {
     let mut symbols = SymbolTable::new();
     for p in &fir.signature.params {
-        let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+        let compact = compact_type(&p.ty.ty_text);
         let inner = strip_port_wrapper("In<", &compact)
             .or_else(|| strip_port_wrapper("Out<", &compact));
         if let Some(inner) = inner {
@@ -952,7 +980,7 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
     let mut ports = Vec::new();
 
     for param in &fir.signature.params {
-        let compact: String = param.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+        let compact = compact_type(&param.ty.ty_text);
 
         if compact.starts_with("Clock<") {
             let domain = compact
@@ -1037,7 +1065,7 @@ fn lower_comb_body(
     let mut ctx = LowerCtx::new(hardware_fns, registry);
     ctx.output_ports = fir.signature.params.iter()
         .filter_map(|p| {
-            let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            let compact = compact_type(&p.ty.ty_text);
             if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
         })
         .collect();
@@ -1171,7 +1199,7 @@ fn lower_seq_body(
     ctx.clock_name = clock.clone();
     ctx.output_ports = fir.signature.params.iter()
         .filter_map(|p| {
-            let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+            let compact = compact_type(&p.ty.ty_text);
             if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
         })
         .collect();
@@ -1323,7 +1351,7 @@ fn parse_wire_net(init: &ExprType, span: SourceSpan) -> Result<(CHIRType, Option
 /// unit domain `()` for the one-arg shorthand `In<T>`). `Clock<D>` → `D`.
 /// Any other type → `None`.
 fn domain_of_type_text(ty_text: &str) -> Option<String> {
-    let compact: String = ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact = compact_type(ty_text);
     let lt = compact.find('<')?;
     let gt = compact.rfind('>')?;
     if gt <= lt + 1 {
@@ -1411,7 +1439,7 @@ fn lower_structural_inst(
             }
         }
 
-        let compact: String = param.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+        let compact = compact_type(&param.ty.ty_text);
         if compact.starts_with("Clock<") {
             clocks.push((param.name.clone(), signal));
         } else {
@@ -2814,7 +2842,7 @@ fn lower_hardware_call(
         // Skip clock params when mapping positional args → port names
         let data_params: Vec<_> = callee.signature.params.iter()
             .filter(|p| {
-                let compact: String = p.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();
+                let compact = compact_type(&p.ty.ty_text);
                 !compact.starts_with("Clock<")
             })
             .collect();
