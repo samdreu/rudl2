@@ -11,20 +11,76 @@ DOCUMENTATION:
 
 TRANSPILATION:
   ☐ Figure out TODOs
-  ☐ BUG/GAP (found 2026-08-03 while writing equivalence tests): the standalone
-    `transpile_source` path rejects two constructs the macro-sim accepts, with
-    "cannot infer bit width; add an explicit type annotation":
-      - `[Logic::Zero; N]` array locals (raw Logic arrays; `Bits::zero()` +
-        indexed writes works instead)
+
+  ── TRANSPILER COVERAGE, MEASURED 2026-08-24 ────────────────────────────────
+  Every #[hardware] module in examples/ probed through the copper-transpile CLI.
+  BEFORE this pass: 19/34 modules transpiled. AFTER fixes A+B below: 20/34.
+  The 14 still failing, by ROOT CAUSE (several share one cause — fix the cause,
+  not the module):
+    A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
+    B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
+    C ☐ `while` loops unsupported ................ uart/rx, det_010_awaits
+    D ☐ generic const params in loop bounds /
+        array-typed ports .................. bsg_counter_up_down (MOD),
+                                             bsg_encode_one_hot (WIDTH),
+                                             bsg_mux_one_hot, mux
+    E ☐ `Memory` does not transpile at all ....... dual_port_ram (+ both CPUs)
+    F ☐ `Vec` ports .............................. rv32i_cpu_pipelined
+    G ☐ transpiler PANICS (not a clean error) .... rv32i_cpu
+        control_extract.rs:95 `.expect("gate guarantees at least one tick")`
+    H ☐ no structural parent module .............. uart/system
+        spawn_uart is a plain sim-wiring fn, so the UART has no hierarchy module
+        to transpile. two_domain_top shows the pattern already works.
+  ALSO STILL BLOCKED, behind causes above rather than their own:
+    ripple_carry_adder → tuple-returning helper gap (below), not A
+    bsg_gray_to_binary → symbolic const expr (`let mut k = WIDTH - 1`) + C
+    bsg_adder_one_hot  → D (`for ia in 0..WIDTH`)
+
+  ✔ FIXED (2026-08-24) — A: `[Logic::Zero; N]` array locals.
+    An array local now lowers to the packed vector its repeat length describes —
+    element k at bit k, the SAME layout Bits<N> already has in copper-core
+    (`Bits { bits: [Logic; N] }`). Because the layouts coincide,
+    `Bits::from_slice`/`from_array` move no bits and lower to IDENTITY.
+      copper-codegen/src/chir_lower.rs: `ExprType::Repeat` arm in
+      infer_type_from_expr (+ `repeat_len`, `chir_type_width`), `lower_repeat`,
+      and `identity_pack_call`.
+      Symbolic lengths work (`[Logic::Zero; N]` → `logic [N-1:0]`): repeating a
+      ZERO is zero at any width, so it emits as a context-width literal the way
+      Bits::zero() does. `[Bits<8>; N]` stays a clean error — Width has no product
+      form, so it is refused rather than silently mis-sized.
+      VERIFIED BEHAVIORALLY, not by shape: tests/logic_array_pack_equivalence.rs
+      (+ fixtures/logic_array_pack_dut.rs) — sim ≡ transpiled SV ≡ an INDEPENDENT
+      Rust golden under Verilator, sweeping all 16 values of each nibble field.
+      copper-codegen/tests/transpile_inference_gaps.rs: the array half is now a
+      POSITIVE assertion (per that file's own instruction — promote, do not relax).
+
+  ✔ FIXED (2026-08-24) — B: fully-qualified type paths.
+    Every port/clock test in chir_lower.rs is TEXTUAL (`starts_with("Clock<")`,
+    `"In<"`, `"Out<"`), so `copper_core::Clock<MainClk>` failed all of them and
+    was reported unresolvable. sipo_block was the one example written that way.
+      New `compact_type()` / `strip_path_qualifier()` choke point; the 9 type-text
+      compaction sites in chir_lower.rs + the one in parser.rs route through it.
+      Only the HEAD path is stripped, so a qualifier inside a generic argument
+      (`In<Bits<8>, some_mod::Dom>`) is untouched. Literal, path and pattern texts
+      deliberately do NOT go through it — a qualifier is meaningful there
+      (`Logic::One`, `Opcode::LUI`).
+
+  ✔ A+B UNBLOCKED sipo_block THROUGH THE FRONT END, WHICH IMMEDIATELY EXPOSED THE
+     multi-phase RegOut codegen bug — and, verifying that, a second one in the
+     same family for plain `Out`. BOTH now FIXED (see above). sipo_block is now
+     sim ≡ transpiled SV ≡ BaseJump on all five outputs.
+
+  ☐ BUG/GAP (found 2026-08-03 while writing equivalence tests), HALF FIXED:
+    the standalone `transpile_source` path rejected two constructs the macro-sim
+    accepts, both with "cannot infer bit width":
+      - `[Logic::Zero; N]` array locals — ✔ FIXED 2026-08-24, see A above
       - tuple-returning plain-Rust helper fns called from hardware bodies
         (e.g. `let (s, c) = full_adder(...)`; inlining the expression works)
-    Concretely, examples/combinational/ripple_carry_adder.rs and
-    examples/basejump/bsg_gray_to_binary.rs (as written) do NOT round-trip through
-    `transpile_source` / the copper-transpile CLI — they are only ever checked via
-    the macro-sim + hand-written SV in their own main(). The new equivalence tests
-    (tests/ripple_carry_adder_equivalence.rs, tests/gray_to_binary_equivalence.rs)
-    use Bits-indexing rewrites of the same designs to get real sim≡SV coverage;
-    the underlying transpiler inference gap is NOT fixed, just worked around.
+        → STILL OPEN, still pinned in transpile_inference_gaps.rs
+    examples/combinational/ripple_carry_adder.rs still does NOT round-trip — it
+    is blocked on the TUPLE half, not the array half (measured: with A fixed it
+    now fails at the `let (s, c) = full_adder(...)` line). Its equivalence test
+    keeps the Bits-indexing rewrite until the tuple gap closes.
   ✔ FIXED (2026-08-03): Moore output decoded from a state `case` was lowered into
     `always_ff` (REGISTERED, `out <= …`) instead of `always_comb`, lagging the
     simulator one cycle (verilator FAIL / trace PASS).
@@ -43,21 +99,94 @@ TRANSPILATION:
       hold driven in only some arms (bsg_dff_en) is untouched and stays `always_ff`
       (both verified). seq6 → full equivalence (tests/fsm_six_state_equivalence.rs).
       RESIDUAL (separate, still open): see the Mealy-output item directly below.
-  ☐ BUG / OPEN (flagged 2026-08-03, surfaced while fixing the Moore-output bug
-    above): a MEALY FSM output — one that depends on a live input inside a state,
-    not only on the state register — does not reconcile between the simulator and
-    the transpiled SV. After the Moore fix, if_tick lowers to a correct-looking
-    combinational `always_comb` (`pc=0: out_o = sel ? 1 : 0`), yet Verilator still
-    disagrees with the sim at specific cycles (trace PASS / verilator FAIL).
-      Repro: tests/fixtures/control_extraction_dut.rs (`if_tick`) — branch-nested
-      tick where the `then` path writes out under a live `sel` read. The two SIM
-      forms agree (if_tick ≡ if_tick_explicit), so this is a sim-vs-SV *timing*
-      reconciliation for Mealy outputs, NOT the (now-fixed) registered-Moore bug.
-      This is the same family as the long-standing output-timing reconciliation the
-      control_extraction structural test deliberately sidesteps (it compares SV
-      shape, not behavior). Needs a decision on the canonical Mealy-output edge
-      timing before it can be fixed — a CODEGEN and/or SIM change (get sign-off).
-      Meanwhile tests/nested_tick_equivalence.rs runs sim_only.
+  ✔ RESOLVED-BY-RESTRICTION (entry was STALE, corrected 2026-08-24): the MEALY
+    output sim-vs-SV divergence flagged 2026-08-03 is no longer open, but note it
+    was NOT fixed — it was ruled out of the language. The multi-write-around-a-tick
+    guardrail rejects a plain (combinational) `Out` in that shape and points at
+    `RegOut`, which reconciles with the transpiled `always_ff`. So the divergent
+    program can no longer be written, rather than the divergence being repaired.
+      EVIDENCE the entry was stale: tests/nested_tick_equivalence.rs and
+      tests/fsm_six_state_equivalence.rs both run FULL sim ≡ transpiled-SV
+      equivalence now; the only `sim_only` occurrences left in either file are
+      historical comments. This entry still said "Meanwhile ... runs sim_only".
+      PAPER NOTE: cite this as a scope restriction, not a repair — it belongs with
+      contribution 5 (the `Out`/`RegOut` pair), not with the Moore-output fix.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — RegOut written UNCONDITIONALLY in a
+    multi-phase loop was emitted as a continuous `assign`, not a flip-flop.
+      ROOT CAUSE: vlir_lower::lower_flat_stmts turned EVERY top-level
+      SHIRStmt::PortDrive into a module-level VLIRContinuousAssign. Those assigns
+      are collected separately from the phase's statements and never passed
+      through split_output_regs — so the port's `registered` flag was silently
+      ignored for unconditional writes, and the phase guard was lost with it. The
+      output then followed a phase-gated combinational value and collapsed to 0
+      on the cycles where that phase was inactive.
+      WHY mac_fsm WAS ALWAYS FINE: it writes its RegOut INSIDE a conditional,
+      which lowers to a PortAssign in the phase statements — which
+      split_output_regs does see. Only the unconditional shape was broken.
+      FIX: one arm in lower_flat_stmts — a PortDrive targeting a registered
+      output becomes a PortAssign instead of a continuous assign, so the existing
+      split moves it into always_ff under the phase guard. lower_flat_stmts now
+      takes `registered_outs`; the combinational caller passes an empty set (a
+      comb module has no clock, so no registered outputs).
+      THE SIM WAS THE CORRECT SIDE: it matches BaseJump's own sipo_block.sv,
+      which registers data_o in an always_ff.
+      REGRESSION COVER: tests/regout_multiphase_equivalence.rs — a behavioural
+      sim ≡ SV check PLUS a shape assertion (`word_o <=` present, `assign word_o`
+      absent), because the behavioural check alone could pass by luck on the
+      sampled cycles.
+      NEW COVERAGE UNLOCKED: tests/sipo_block_equivalence.rs — sipo_block now has
+      sim ≡ transpiled SV on top of the example's existing sim ≡ BaseJump check,
+      so the generated SV is transitively anchored to third-party hardware. It
+      `include!`s the example (with #[cfg(not(test))] on its main) rather than
+      copying it, so there is one source of truth. All five outputs compared once
+      the plain-Out fix below landed.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — a PLAIN `Out` written in only SOME
+    PHASES of a multi-phase loop was emitted as an unguarded continuous assign, so
+    it dropped to 0 outside its phase instead of holding.
+      SAME MECHANISM as the RegOut bug above (top-level PortDrive → unguarded
+      continuous assign over a phase-gated wire defaulting to '0), different port
+      kind. Sim gave 1,1,3,3; the SV gave 0,2,0,4.
+      THE SIM WAS THE CORRECT SIDE: a sequential plain `Out` HOLDS when unwritten
+      (the enabled-register idiom, verified against BaseJump's bsg_dff_en), so a
+      write in one phase is EFFECTIVELY conditional and must become an
+      implicit-hold register — the same treatment a write on some-but-not-all
+      PATHS already got.
+      WHY THE RegOut PATCH ALONE WAS NOT ENOUGH: conditional_output_ports decides
+      conditionality by finding writes nested in a conditional. A phase-top-level
+      write is unconditional WITHIN its phase, so routing it to a PortAssign left
+      it unrecognised. lower_seq therefore also computes
+      `phase_scoped_output_ports` from the SHIR. It has to be done at SHIR level:
+      the VLIR-level ports_driven_any_path cannot see an unconditional drive,
+      because that has already been moved out of the statement list. The two sets
+      are unioned into one `hold_outs`, so RegOut and phase-scoped plain Out share
+      one mechanism.
+      ⚠️ THE RULE KEYS ON THE DRIVEN VALUE, NOT ON PHASE COVERAGE — AND THE FIRST
+      ATTEMPT GOT THIS WRONG. "Written in some phases but not all" LAGGED
+      mac_pipeline's output by one cycle (expected 10 got 0, expected 37 got 10);
+      caught by the full regression, tests/mac_pipeline_equivalence.rs is the
+      measured witness. A top-level drive lowers to an UNGUARDED continuous
+      assign, so it reads its RHS every cycle; correctness depends on what the RHS
+      is OUTSIDE the writing phase:
+        - mac_pipeline: `out.write(sum)` reads the inferred REGISTER sum_r, which
+          RETAINS its value → `assign out = sum_r` is already correct, and
+          registering it again just adds a cycle.
+        - sipo_block / the fixture: the drive reads a PHASE-LOCAL COMBINATIONAL
+          WIRE that always_comb defaults to '0 → the assign propagates zeros.
+      Only the second needs the hold. Helpers: shir_expr_vars,
+      shir_phase_local_wires, shir_port_drives.
+      DELIBERATELY NARROW ON TWO COUNTS: a port written in EVERY phase is excluded
+      (driven every cycle), and so is a port whose value is register-backed.
+      Widening either lags an output by a cycle — do not widen without a measured
+      witness.
+      REGRESSION COVER: tests/plain_out_multiphase_equivalence.rs — behavioural
+      sim ≡ SV plus a shape assertion (`seen_o <=` present, `assign seen_o`
+      absent).
+      COVERAGE UNLOCKED: tests/sipo_block_equivalence.rs now compares ALL FIVE
+      outputs (data_o + the four wN_dbg), not just data_o. The wN_dbg ports expose
+      the module's per-cycle internal capture, which is exactly what the
+      mid-phase-read question sipo_block was built to answer.
 
 SIMULATOR:
   ☐ Add tests for semantic corner cases
