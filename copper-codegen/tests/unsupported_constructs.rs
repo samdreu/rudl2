@@ -109,8 +109,10 @@ fn arithmetic_shift_right_is_unsupported() {
 // As of 2026-08-24 the single-cycle ReadFirst form lowers, and
 // `tests/dual_port_ram_equivalence.rs` carries sim ≡ transpiled SV for the
 // shipped example — which in turn is checked against an independent hand-written
-// `examples/memory/sv/dual_port_ram.sv`. What remains is pinned below, one test
-// per construct, each measured against the baseline that does transpile.
+// `examples/memory/sv/dual_port_ram.sv`. Preloaded contents followed on the same
+// day (`initial` block; `tests/preloaded_memory_equivalence.rs`). What remains is
+// pinned below, one test per construct, each measured against the baseline that
+// does transpile.
 //
 // One decision still rests on the absence of a synthesised counterpart:
 // out-of-range addressing is a deliberate panic naming the port, address and size
@@ -197,22 +199,87 @@ fn write_first_memory_is_unsupported() {
     );
 }
 
-/// Preloaded contents (`from_fn` / `from_contents`). Named in the `TODO` P4 item:
-/// preload equivalence through the transpiled path is still open, now for want of
-/// an emitted form rather than for want of memory support at all.
+/// A read-only preloaded memory: the shape the pins below vary one thing from.
+fn rom_dut(decl: &str) -> String {
+    format!(
+        r#"
+#[hardware(sequential)]
+async fn r(clk: Clock<MainClk>, a: In<Bits<4>, MainClk>, o: Out<Bits<16>, MainClk>) {{
+    let rom = {decl};
+    let mut q: Bits<16> = Bits::zero();
+    loop {{
+        rom.read_port::<0>().read(a.read().as_usize());
+        clk.tick().await;
+        if rom.read_port::<0>().is_ready() {{ q = rom.read_port::<0>().data(); }}
+        o.write(q);
+    }}
+}}
+"#
+    )
+}
+
+/// Preloaded contents DO transpile, as an `initial` block.
+/// `tests/preloaded_memory_equivalence.rs` at the repo root carries the
+/// behavioural sim ≡ transpiled-SV check for both constructors.
 #[test]
-fn preloaded_memory_is_unsupported() {
-    let src = mem_dut(
-        "let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::from_fn(clk.clone(), 256, |i| Bits::from_usize(i));",
-        MEM_BODY,
+fn preloaded_memory_is_supported() {
+    let sv = transpile(&rom_dut(
+        "Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::from_fn(clk.clone(), 16, |i| Bits::from_usize(i * 3))",
+    ))
+    .expect("a `from_fn` preload must transpile");
+    assert!(
+        sv.contains("initial begin") && sv.contains("for (int i = 0; i < 16; i++)"),
+        "expected a fill loop in an initial block, got:\n{sv}"
     );
-    let err = transpile(&src).expect_err(
-        "NOW SUPPORTED: preloaded memory transpiles. Close P4's from_fn/from_contents preload \
-         check through the transpiled path.",
+}
+
+/// Contents that only exist at run time. `examples/cpu/rv32i_cpu.rs` is the real
+/// instance: `from_contents(clk, flat.clone())`, where `flat` is a program image
+/// assembled by the harness. The transpiler does not execute Rust, so there is
+/// nothing to emit — and emitting a zero-filled array instead would be a silently
+/// wrong design.
+#[test]
+fn runtime_computed_preload_is_unsupported() {
+    let err = transpile(&rom_dut(
+        "Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::from_contents(clk.clone(), flat.clone())",
+    ))
+    .expect_err(
+        "NOW SUPPORTED: a run-time `Vec` preload transpiles — which would mean the transpiler \
+         gained a way to evaluate Rust. Check very carefully what it actually emits.",
     );
     assert!(
-        err.contains("from_fn") && err.contains("not supported"),
-        "reproduced a *different* error than the tracked preload gap: {err}"
+        err.contains("computed at run time") && err.contains("does not execute Rust"),
+        "reproduced a *different* error than the tracked run-time-contents gap: {err}"
+    );
+}
+
+/// A fill that is not written at the call site — a named function, or a closure
+/// bound to a variable. Same root cause as above: there is no body to emit.
+#[test]
+fn non_inline_fill_function_is_unsupported() {
+    let err = transpile(&rom_dut(
+        "Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::from_fn(clk.clone(), 16, make_word)",
+    ))
+    .expect_err("a `from_fn` fill that is not an inline closure must be rejected");
+    assert!(
+        err.contains("must be a closure written at the call site"),
+        "reproduced a *different* error than the inline-fill rule: {err}"
+    );
+}
+
+/// A preload that reads one of the module's own signals. The simulator would
+/// evaluate the captured port ONCE at construction; an `initial` block samples it
+/// at time 0. Those are different things that look alike in source, so the shape
+/// is rejected rather than emitted.
+#[test]
+fn preload_reading_a_signal_is_rejected() {
+    let err = transpile(&rom_dut(
+        "Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::from_fn(clk.clone(), 16, |i| Bits::from_usize(i) + a.read())",
+    ))
+    .expect_err("a preload that reads a signal must be rejected");
+    assert!(
+        err.contains("Initial contents must be constant"),
+        "reproduced a *different* error than the constant-preload rule: {err}"
     );
 }
 

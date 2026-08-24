@@ -11,12 +11,12 @@ use std::collections::{HashMap, HashSet};
 
 use copper_core::chir::{CHIRBinOp, CHIRType, CHIRUnOp, Width};
 use copper_core::shir::{
-    SHIRBody, SHIRCombBody, SHIRExpr, SHIRLit, SHIRMemory, SHIRModule, SHIRPhase, SHIRPortDir, SHIRPortKind,
+    SHIRBody, SHIRCombBody, SHIRExpr, SHIRLit, SHIRMemInit, SHIRMemory, SHIRModule, SHIRPhase, SHIRPortDir, SHIRPortKind,
     SHIRRegUpdate, SHIRSeqBody, SHIRStmt, SHIRStructuralBody, SHIRSubmoduleInst,
 };
 use copper_core::vlir::{
     VLIRAlwaysFF, VLIRBinOp, VLIRCaseArm, VLIRBody, VLIRCombBody, VLIRCombPhase, VLIRContinuousAssign, VLIRExpr,
-    VLIRFFCaseArm, VLIRFFStmt, VLIRMemDecl, VLIRMemReadNet, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind, VLIRRegDecl, VLIRSeqBody, VLIRStmt,
+    VLIRFFCaseArm, VLIRFFStmt, VLIRMemDecl, VLIRMemInit, VLIRMemReadNet, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind, VLIRRegDecl, VLIRSeqBody, VLIRStmt,
     VLIRStructuralBody, VLIRSubmoduleInst, VLIRUnOp,
 };
 
@@ -206,7 +206,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
             collect_mem_use_expr(&u.next_value, &mut mem_use);
         }
     }
-    let memories = lower_mem_decls(&s.memories, &mem_use, leg);
+    let memories = lower_mem_decls(&s.memories, &mem_use, leg)?;
 
     let mut comb_phases = Vec::new();
     let mut output_assigns = Vec::new();
@@ -1602,11 +1602,15 @@ fn mem_net_defaults(
     out
 }
 
-/// The array declarations plus the continuous read-data nets.
-fn lower_mem_decls(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer) -> Vec<VLIRMemDecl> {
+/// The array declarations, their preloads, and the continuous read-data nets.
+fn lower_mem_decls(
+    memories: &[SHIRMemory],
+    use_: &MemPortUse,
+    leg: &Legalizer,
+) -> LowerResult<Vec<VLIRMemDecl>> {
     memories
         .iter()
-        .map(|m| VLIRMemDecl {
+        .map(|m| Ok(VLIRMemDecl {
             name: leg.get(&m.name),
             width: width_of(&m.elem_ty),
             depth: m.depth,
@@ -1618,7 +1622,23 @@ fn lower_mem_decls(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer) 
                     width: width_of(&m.elem_ty),
                 })
                 .collect(),
-        })
+            init: match &m.init {
+                None => None,
+                // The fill index is a plain `int` loop variable in the emitted
+                // `initial` block, so it is not routed through the legalizer's
+                // signal namespace — but it must not collide with a signal name
+                // the body references, which `leg.get` on the body's vars ensures
+                // stays distinct only if the source name was distinct. It was: the
+                // closure parameter is a Rust binding in the same scope.
+                Some(SHIRMemInit::Fill { var, value }) => Some(VLIRMemInit::Fill {
+                    var: var.clone(),
+                    value: lower_expr(value, leg)?,
+                }),
+                Some(SHIRMemInit::Words(words)) => Some(VLIRMemInit::Words(
+                    words.iter().map(|w| lower_expr(w, leg)).collect::<LowerResult<_>>()?,
+                )),
+            },
+        }))
         .collect()
 }
 

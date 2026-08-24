@@ -325,6 +325,7 @@ pub enum ExprType {
     Block(ExprBlock),
     Call(ExprCall),
     Cast(ExprCast),
+    Closure(ExprClosure),
     Field(ExprField),
     Index(ExprIndex),
     If(ExprIf),
@@ -499,6 +500,18 @@ pub struct ExprRange {
 pub struct ExprReference {
     pub is_mut: bool,
     pub expr: Box<ExprType>,
+    pub span: SourceSpan,
+}
+
+/// A closure expression — `|i| i * 3`. Captured structurally because a memory
+/// preload (`Memory::<..>::from_fn(clk, N, |i| …)`) is an initializer the
+/// transpiler has to look *inside*: the body becomes the emitted fill loop's
+/// value, with `params[0]` as the loop variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprClosure {
+    /// Parameter patterns as source text, in order (`|i|` → `["i"]`).
+    pub params: Vec<String>,
+    pub body: Box<ExprType>,
     pub span: SourceSpan,
 }
 

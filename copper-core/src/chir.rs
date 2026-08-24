@@ -175,7 +175,25 @@ pub struct CHIRMemoryDecl {
     pub depth: usize,
     pub read_ports: usize,
     pub write_ports: usize,
+    /// Preloaded contents from `from_fn` / `from_contents`; `None` for `new`
+    /// (which zero-fills, matching an unwritten array).
+    pub init: Option<CHIRMemInit>,
     pub span: SourceSpan,
+}
+
+/// How a memory's initial contents are described.
+///
+/// Both forms stay *expressions*, never evaluated constants: the transpiler does
+/// not run Rust, so a preload is emitted as the fill it describes rather than as
+/// the values it would produce. That is what makes `from_fn(clk, N, |i| f(i))`
+/// representable at all — the body lowers with the closure parameter in scope as
+/// the fill loop's index.
+#[derive(Debug, Clone)]
+pub enum CHIRMemInit {
+    /// `from_fn(clk, N, |var| value)` — every word from one expression in `var`.
+    Fill { var: String, value: CHIRExpr },
+    /// `from_contents(clk, vec![a, b, c])` — one expression per word, in order.
+    Words(Vec<CHIRExpr>),
 }
 
 // ── Submodule instantiation ───────────────────────────────────────────────────

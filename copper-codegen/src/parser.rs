@@ -1,7 +1,7 @@
 use copper_core::frontend_ir::{
     ClockParamMeta, EnumVariant, ExprArray, ExprAssign, ExprAsync, ExprAwait, ExprBinary, ExprCall, ExprCast,
     ExprBlock, ExprBreak, ExprConst, ExprContinue, ExprField, ExprIf, ExprIndex, ExprLet, ExprLit, ExprLoop,
-    ExprMacro, ExprMatch, ExprTry,
+    ExprClosure, ExprMacro, ExprMatch, ExprTry,
     ExprMatchArm, ExprMethodCall, ExprPath, ExprRange, ExprReference, ExprRepeat, ExprReturn, ExprStmt,
     ExprForLoop, ExprStruct, ExprStructField, ExprTuple, ExprType, ExprUnary, ExprWhile, ExprYield, FrontendClassification,
     FrontendFnIR, FrontendImplIR, FrontendModuleIR, FrontendSignature, FrontendTraitIR, GenericParamKind,
@@ -823,6 +823,18 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             span: capture_source_span(e),
         }),
 
+        // `|i| <body>` — captured structurally so a memory preload's fill
+        // function can be lowered as an expression in its parameter.
+        Expr::Closure(e) => ExprType::Closure(ExprClosure {
+            params: e
+                .inputs
+                .iter()
+                .map(|p| p.to_token_stream().to_string().replace(' ', ""))
+                .collect(),
+            body: Box::new(parse_expr_type(&e.body, hardware_fns)),
+            span: capture_source_span(e),
+        }),
+
         // `expr?` — the try operator.
         Expr::Try(e) => ExprType::Try(ExprTry {
             expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
@@ -833,6 +845,7 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
         // reusing match-as-value lowering. Other macros (`panic!`, `println!`, …)
         // are captured structurally as `ExprMacro`.
         Expr::Macro(e) => desugar_matches(&e.mac, hardware_fns, capture_source_span(e))
+            .or_else(|| desugar_vec(&e.mac, hardware_fns, capture_source_span(e)))
             .unwrap_or_else(|| ExprType::Macro(macro_to_expr(&e.mac, capture_source_span(e)))),
 
         // Fallback for unsupported/unhandled expressions
@@ -874,6 +887,43 @@ fn desugar_matches(
             bool_arm(true, pat.to_token_stream().to_string()),
             bool_arm(false, "_".to_string()),
         ],
+        span,
+    }))
+}
+
+/// Desugar `vec![a, b, c]` into an array literal and `vec![x; n]` into a repeat,
+/// which is what they are for hardware purposes — a fixed list of values. Keeping
+/// them as an opaque `ExprMacro` would hide a memory preload's contents from every
+/// later phase. Returns `None` for any other macro.
+fn desugar_vec(
+    mac: &syn::Macro,
+    hardware_fns: &std::collections::HashSet<String>,
+    span: SourceSpan,
+) -> Option<ExprType> {
+    if mac.path.segments.last().map(|s| s.ident != "vec").unwrap_or(true) {
+        return None;
+    }
+    use syn::parse::Parser;
+
+    // `vec![x; n]` first — it would otherwise parse as a one-element list.
+    let repeat = |input: syn::parse::ParseStream| -> syn::Result<(syn::Expr, syn::Expr)> {
+        let value: syn::Expr = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        let len: syn::Expr = input.parse()?;
+        Ok((value, len))
+    };
+    if let Ok((value, len)) = repeat.parse2(mac.tokens.clone()) {
+        return Some(ExprType::Repeat(ExprRepeat {
+            expr: Box::new(parse_expr_type(&value, hardware_fns)),
+            len: Box::new(parse_expr_type(&len, hardware_fns)),
+            span,
+        }));
+    }
+
+    let list = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+    let elems = list.parse2(mac.tokens.clone()).ok()?;
+    Some(ExprType::Array(ExprArray {
+        elements: elems.iter().map(|e| parse_expr_type(e, hardware_fns)).collect(),
         span,
     }))
 }

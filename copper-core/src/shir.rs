@@ -96,6 +96,15 @@ pub struct SHIRMemory {
     pub depth: usize,
     pub read_ports: usize,
     pub write_ports: usize,
+    /// Preloaded contents — see `CHIRMemInit`.
+    pub init: Option<SHIRMemInit>,
+}
+
+/// 1:1 with `CHIRMemInit`, over `SHIRExpr`.
+#[derive(Debug)]
+pub enum SHIRMemInit {
+    Fill { var: String, value: SHIRExpr },
+    Words(Vec<SHIRExpr>),
 }
 
 /// A `#[hardware]` submodule instance. The output_wire is a combinational

@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use copper_core::chir::{
-    CHIRBody, CHIRExpr, CHIRLit, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir,
+    CHIRBody, CHIRExpr, CHIRLit, CHIRMemInit, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir,
     CHIRPortKind, CHIRRegDecl, CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst,
     CHIRType, Width,
 };
 use copper_core::frontend_ir::SourceSpan;
 use copper_core::shir::{
     SHIRBody, SHIRCaseArm, SHIRCombBody, SHIRExpr, SHIRLit, SHIRLowerError, SHIRMatchArm,
+    SHIRMemInit,
     SHIRMemory, SHIRModule, SHIRPattern, SHIRPhase, SHIRPort,
     SHIRPortDir, SHIRPortKind, SHIRReg, SHIRRegUpdate, SHIRSeqBody, SHIRStmt,
     SHIRStructuralBody, SHIRSubmoduleInst,
@@ -420,13 +421,14 @@ fn lower_seq_body(
     Ok(SHIRSeqBody {
         clock: seq.clock.clone(),
         registers,
-        memories: seq.memories.iter().map(|m| SHIRMemory {
+        memories: seq.memories.iter().map(|m| Ok(SHIRMemory {
             name: m.name.clone(),
             elem_ty: m.elem_ty.clone(),
             depth: m.depth,
             read_ports: m.read_ports,
             write_ports: m.write_ports,
-        }).collect(),
+            init: m.init.as_ref().map(lower_mem_init).transpose()?,
+        })).collect::<Result<Vec<_>, SHIRLowerError>>()?,
         submodules,
         phases,
     })
@@ -974,6 +976,19 @@ fn lower_pattern(pattern: &CHIRPattern) -> Result<SHIRPattern, SHIRLowerError> {
                 .transpose()?,
         }),
     }
+}
+
+/// A memory preload, expression by expression.
+fn lower_mem_init(init: &CHIRMemInit) -> Result<SHIRMemInit, SHIRLowerError> {
+    Ok(match init {
+        CHIRMemInit::Fill { var, value } => SHIRMemInit::Fill {
+            var: var.clone(),
+            value: lower_expr(value)?,
+        },
+        CHIRMemInit::Words(words) => {
+            SHIRMemInit::Words(words.iter().map(lower_expr).collect::<Result<_, _>>()?)
+        }
+    })
 }
 
 fn lower_reg_decl(r: &CHIRRegDecl) -> Result<SHIRReg, SHIRLowerError> {

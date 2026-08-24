@@ -606,21 +606,47 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      top of its existing sim ≡ hand-written-SV check — so the generated SV is
      transitively anchored to third-party hardware. Full write-up in the
      TRANSPILATION section above (fix E).
-  ☐ from_fn / from_contents preload equivalence through the transpiled path
-     STILL OPEN, but no longer blocked on memory support existing — only on an
-     emitted form for the initial contents. Deferred deliberately (the user's
-     call): the two candidates are an `initial` block (Verilator-fine, not
-     universally synthesizable, makes sim ≡ SV depend on initial-block ordering)
-     and `$readmemh` + a second artifact file (portable, but nothing in the
-     pipeline emits a second file today).
-     PINNED: copper-codegen/tests/unsupported_constructs.rs::preloaded_memory_is_unsupported
+  ✔ from_fn / from_contents preload equivalence through the transpiled path
+     [DONE 2026-08-24, user chose the `initial` block over `$readmemh`]
+     → tests/preloaded_memory_equivalence.rs — sim ≡ transpiled SV for BOTH
+     constructors, on ROMs (1 read port, 0 write ports) so nothing but the preload
+     can make the output right: a missing `initial` block reads as zeros instead of
+     hiding behind a write. Addresses are driven out of fill order, so a reversed
+     or off-by-one fill cannot pass either. Plus shape pins.
+     THE KEY DESIGN POINT: the transpiler does NOT evaluate the preload — it emits
+     the description. `from_fn(clk, N, |i| f(i))` becomes the fill LOOP:
+         initial begin
+             for (int i = 0; i < 16; i++) rom[i] = 16'(((i * 32'd3) + 32'd7));
+         end
+     That is what makes `from_fn` representable at all without running Rust, and it
+     is why the closure had to become a real FIR node (`ExprType::Closure`) rather
+     than falling into the parser's raw-text catch-all. `vec![…]` likewise now
+     desugars structurally to an Array/Repeat (`desugar_vec`, alongside the
+     existing `desugar_matches`) instead of staying an opaque ExprMacro — the
+     contents of a preload have to be visible to later phases.
+     COST OF THE FORM, stated plainly: `initial` is what Verilator runs at time 0
+     and what FPGA tools read to infer an initialized block RAM, but most ASIC
+     flows ignore it. A preloaded memory is a simulation-and-FPGA construct by
+     nature. That is a property of the construct, not of this lowering.
+     WIDTH GOTCHA worth remembering: a fill body like `i * 3 + 7` has no inferable
+     width, and an unresized assignment into the array is a Verilator width warning
+     — fatal under `-Wall`. Preload words therefore get an explicit `width'(…)`
+     cast whenever they are not already known to be element-width (stricter than
+     `resize_to_target`, which leaves unknown widths alone).
+     STILL REFUSED, each pinned in unsupported_constructs.rs:
+       - contents computed at run time — `from_contents(clk, flat.clone())`, which
+         is exactly what examples/cpu/rv32i_cpu.rs does. No source-level form to
+         emit; a zero-filled array would be a silently wrong design.
+       - a fill that is not an inline closure (a named fn / a bound closure)
+       - a preload that reads one of the module's own signals. The simulator
+         evaluates a captured port ONCE at construction; an `initial` block samples
+         it at time 0. Two different things that look alike in source.
   ☐ Memory constructs still outside the transpiled path, each pinned with its own
      diagnostic in copper-codegen/tests/unsupported_constructs.rs. Every pin is
      measured against `single_cycle_readfirst_memory_is_supported`, the baseline
      DUT that DOES transpile, so a pin can only fail for the construct it names:
        - READ_LAT / WRITE_LAT > 1 (the emitted array has no stage registers)
        - WriteFirst (needs explicit same-address bypass; ReadFirst is free)
-       - preloaded contents (above)
        - memory inside a multi-phase loop (needs phase-guarded address buses and
          a read result that survives into a later phase)
      And two rules that are rejections rather than gaps — hardware cannot express

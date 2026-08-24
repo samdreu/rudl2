@@ -125,6 +125,21 @@ pub struct VLIRMemDecl {
     pub width: Width,
     pub depth: usize,
     pub read_data_nets: Vec<VLIRMemReadNet>,
+    /// Preloaded contents, emitted as an `initial` block. `initial` is how a
+    /// design states power-on contents in SystemVerilog; it is what Verilator
+    /// executes at time 0 and what FPGA tools read to infer an initialized block
+    /// RAM. It is NOT universally synthesizable (most ASIC flows ignore it), so a
+    /// preloaded memory is a simulation-and-FPGA construct by nature.
+    pub init: Option<VLIRMemInit>,
+}
+
+/// The body of a memory's `initial` block.
+#[derive(Debug)]
+pub enum VLIRMemInit {
+    /// `for (int <var> = 0; <var> < depth; <var>++) <mem>[<var>] = <value>;`
+    Fill { var: String, value: VLIRExpr },
+    /// `<mem>[0] = <v0>; <mem>[1] = <v1>; …`
+    Words(Vec<VLIRExpr>),
 }
 
 /// `logic [width-1:0] <data>;` + `assign <data> = <mem>[<addr>];`

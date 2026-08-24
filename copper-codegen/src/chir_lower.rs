@@ -1,6 +1,6 @@
 use copper_core::chir::{
     CHIRBinOp, CHIRBody, CHIRCaseArm, CHIRCombBody, CHIRExpr, CHIRLit, CHIRLowerError,
-    CHIRMatchArm, CHIRMemoryDecl, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
+    CHIRMatchArm, CHIRMemInit, CHIRMemoryDecl, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
     CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
@@ -1193,6 +1193,8 @@ fn lower_seq_body(
     let mut memories: Vec<CHIRMemoryDecl> = Vec::new();
     let mut mem_infos: std::collections::HashMap<String, MemInfo> =
         std::collections::HashMap::new();
+    // (index into `memories`, its source-level preload) — see `RawMemInit`.
+    let mut pending_mem_inits: Vec<(usize, RawMemInit)> = Vec::new();
     let mut loop_body_stmts: Option<&[RawStmt]> = None;
     // Pre-loop non-`mut` `let`s: combinational constants/wires available in the
     // loop body. Collected here, lowered once the context exists, and prepended
@@ -1229,7 +1231,7 @@ fn lower_seq_body(
             RawStmtKind::Local(local) => {
                 // A `Memory<..>` binding is a hardware submodule (an array plus
                 // per-port buses), not a wire — it has no bit width to infer.
-                if let Some(decl) =
+                if let Some((decl, raw_init)) =
                     parse_memory_decl(&local.name, local.init.as_ref(), local.span)?
                 {
                     mem_infos.insert(
@@ -1240,6 +1242,10 @@ fn lower_seq_body(
                             write_ports: decl.write_ports,
                         },
                     );
+                    if let Some(raw) = raw_init {
+                        // Lowered once the context exists, like the pre-loop wires.
+                        pending_mem_inits.push((memories.len(), raw));
+                    }
                     memories.push(decl);
                     continue;
                 }
@@ -1297,6 +1303,87 @@ fn lower_seq_body(
     ctx.structs = build_struct_registry(fir);
     ctx.write_inferred = build_write_inferred_types(fir, &ctx.symbols);
     ctx.memories = mem_infos;
+
+    // Preloads, now that expressions can be lowered. Each word is retyped and
+    // width-cast to the element type, the same treatment a `let` binding's
+    // initializer gets — a bare `0` in a 16-bit memory must be `16'd0`.
+    for (idx, raw) in pending_mem_inits {
+        let elem_ty = memories[idx].elem_ty.clone();
+        let ew = type_width(&elem_ty);
+        let lower_word = |e: &ExprType, ctx: &mut LowerCtx| -> Result<CHIRExpr, CHIRLowerError> {
+            let v = retype_default_literals_in_values(lower_expr(e, ctx)?, ew.clone());
+            // Stricter than `resize_to_target`: an index expression like `i * 3 + 7`
+            // has no inferable width, and an UNRESIZED assignment into the array is
+            // a Verilator width warning — fatal under `-Wall`. So anything not
+            // already known to be element-width gets an explicit cast.
+            Ok(if expr_width(&v, ctx) == Some(ew.clone()) {
+                v
+            } else {
+                CHIRExpr::Resize { expr: Box::new(v), width: ew.clone() }
+            })
+        };
+        // A preload is power-on contents: it must be a constant expression, not a
+        // reading of the design's own state. The simulator would evaluate a
+        // captured port once at construction and an `initial` block would sample
+        // it at time 0 — two different things that happen to look alike, so the
+        // shape is refused rather than emitted.
+        let span = memories[idx].span;
+        let mem_name = memories[idx].name.clone();
+        let check_const = |e: &CHIRExpr, fill_var: Option<&str>, ctx: &LowerCtx| {
+            let mut bad: Option<String> = None;
+            walk_chir_expr(e, &mut |x| {
+                if let CHIRExpr::Var(n) = x {
+                    if Some(n.as_str()) != fill_var && ctx.symbols.contains_key(n.as_str()) {
+                        bad.get_or_insert_with(|| n.clone());
+                    }
+                }
+            });
+            match bad {
+                None => Ok(()),
+                Some(n) => Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "memory `{mem_name}`: the preload reads `{n}`, which is a signal of this \
+                         module. Initial contents must be constant — a signal has no value before \
+                         the design starts running"
+                    ),
+                    span,
+                    suggested_rewrite: None,
+                }),
+            }
+        };
+
+        memories[idx].init = Some(match raw {
+            RawMemInit::Fill { var, body } => {
+                // The fill index is an integer in scope only for the fill body.
+                let shadowed = ctx.symbols.insert(
+                    var.clone(),
+                    CHIRType::UInt { width: Width::Concrete(32) },
+                );
+                let value = lower_word(body, &mut ctx);
+                match shadowed {
+                    Some(prev) => {
+                        ctx.symbols.insert(var.clone(), prev);
+                    }
+                    None => {
+                        ctx.symbols.remove(&var);
+                    }
+                }
+                let value = value?;
+                check_const(&value, Some(&var), &ctx)?;
+                CHIRMemInit::Fill { var, value }
+            }
+            RawMemInit::Words(words) => {
+                let lowered: Vec<CHIRExpr> = words
+                    .iter()
+                    .map(|w| lower_word(w, &mut ctx))
+                    .collect::<Result<_, _>>()?;
+                for w in &lowered {
+                    check_const(w, None, &ctx)?;
+                }
+                CHIRMemInit::Words(lowered)
+            }
+        });
+    }
 
     // Emit pre-loop wires first so they are declared before any use, then the
     // loop body itself.
@@ -3588,11 +3675,23 @@ fn matching_angle(s: &str, open: usize) -> Option<usize> {
 ///
 /// `Ok(None)` means "not a memory at all" — the caller falls through to normal
 /// wire lowering. `Err` means "a memory, but not one this pipeline can emit".
-fn parse_memory_decl(
+/// A memory's initial contents as *source expressions*, held until the lowering
+/// context exists (they can reference module parameters and constants, exactly
+/// like the pre-loop wires that are lowered the same way).
+enum RawMemInit<'a> {
+    /// `from_fn(clk, N, |var| body)`.
+    Fill { var: String, body: &'a ExprType },
+    /// `from_contents(clk, vec![a, b, c])`.
+    Words(Vec<&'a ExprType>),
+}
+
+type ParsedMemory<'a> = (CHIRMemoryDecl, Option<RawMemInit<'a>>);
+
+fn parse_memory_decl<'a>(
     name: &str,
-    init: Option<&ExprType>,
+    init: Option<&'a ExprType>,
     span: SourceSpan,
-) -> Result<Option<CHIRMemoryDecl>, CHIRLowerError> {
+) -> Result<Option<ParsedMemory<'a>>, CHIRLowerError> {
     let Some(init) = init else { return Ok(None) };
 
     // `Memory::<..>::new(..).read_first()` — the mode this lowering emits.
@@ -3651,11 +3750,11 @@ fn parse_memory_decl(
         suggested_rewrite: None,
     })?;
     let ctor = path[close + 1..].trim_start_matches(':').to_string();
-    if ctor != "new" {
+    if !matches!(ctor.as_str(), "new" | "from_fn" | "from_contents") {
         return Err(CHIRLowerError::UnsupportedConstruct {
             description: format!(
-                "memory constructor `{ctor}` is not supported by the transpiler yet; only \
-                 `Memory::<..>::new(clk, size)` lowers (preloaded contents have no emitted form)"
+                "memory constructor `{ctor}` is not supported by the transpiler yet; \
+                 `new`, `from_fn` and `from_contents` lower"
             ),
             span,
             suggested_rewrite: None,
@@ -3700,14 +3799,120 @@ fn parse_memory_decl(
         });
     }
 
-    // `new(clk, size)` — the depth must be a literal to size the array.
-    let depth_arg = call.args.get(1).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
-        description: format!("memory `{name}`: `new` takes a clock and a size"),
-        span,
-        suggested_rewrite: None,
-    })?;
-    let depth = match depth_arg {
-        ExprType::Lit(l) => l
+    // The depth, and the preload if there is one. `new`/`from_fn` state the size
+    // directly; `from_contents` states it by how many words it supplies.
+    let (depth, raw_init) = match ctor.as_str() {
+        "new" => (literal_depth(call.args.get(1), name, "new", span)?, None),
+        "from_fn" => {
+            let depth = literal_depth(call.args.get(1), name, "from_fn", span)?;
+            let f = call.args.get(2).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+                description: format!("memory `{name}`: `from_fn` takes a clock, a size and a fill function"),
+                span,
+                suggested_rewrite: None,
+            })?;
+            let ExprType::Closure(c) = f else {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "memory `{name}`: the `from_fn` fill must be a closure written at the \
+                         call site. The transpiler emits the fill it describes rather than \
+                         running it, so a named function or a captured value has nothing to emit"
+                    ),
+                    span,
+                    suggested_rewrite: Some("inline the fill: `from_fn(clk, N, |i| …)`".to_string()),
+                });
+            };
+            let [var] = c.params.as_slice() else {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "memory `{name}`: the `from_fn` fill takes exactly one parameter (the index)"
+                    ),
+                    span,
+                    suggested_rewrite: None,
+                });
+            };
+            if !is_ident(var) {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "memory `{name}`: unsupported `from_fn` parameter pattern `{var}`; use a \
+                         plain index name"
+                    ),
+                    span,
+                    suggested_rewrite: None,
+                });
+            }
+            (depth, Some(RawMemInit::Fill { var: var.clone(), body: &c.body }))
+        }
+        _ => {
+            // `from_contents(clk, <words>)`. The words must be visible in the
+            // source — `vec![…]` (desugared to an array) or `vec![x; n]`. A Vec
+            // built at run time (the CPU's program image) is not something the
+            // transpiler can see, and is refused rather than half-emitted.
+            let words = call.args.get(1).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+                description: format!("memory `{name}`: `from_contents` takes a clock and the contents"),
+                span,
+                suggested_rewrite: None,
+            })?;
+            match words {
+                ExprType::Array(a) => {
+                    if a.elements.is_empty() {
+                        return Err(CHIRLowerError::UnsupportedConstruct {
+                            description: format!("memory `{name}` is created with no contents"),
+                            span,
+                            suggested_rewrite: None,
+                        });
+                    }
+                    (
+                        a.elements.len(),
+                        Some(RawMemInit::Words(a.elements.iter().collect())),
+                    )
+                }
+                // `vec![x; n]` — every word the same expression, which is a fill
+                // whose value happens not to mention the index.
+                ExprType::Repeat(r) => {
+                    let depth = literal_depth(Some(&r.len), name, "from_contents", span)?;
+                    (depth, Some(RawMemInit::Fill { var: "i".to_string(), body: &r.expr }))
+                }
+                _ => {
+                    return Err(CHIRLowerError::UnsupportedConstruct {
+                        description: format!(
+                            "memory `{name}`: `from_contents` needs its contents written at the \
+                             call site (`vec![…]`). A `Vec` computed at run time has no emitted \
+                             form — the transpiler does not execute Rust"
+                        ),
+                        span,
+                        suggested_rewrite: Some(
+                            "write the words inline, or describe them with `from_fn(clk, N, |i| …)`"
+                                .to_string(),
+                        ),
+                    })
+                }
+            }
+        }
+    };
+
+    Ok(Some((
+        CHIRMemoryDecl {
+            name: name.to_string(),
+            elem_ty,
+            depth,
+            read_ports,
+            write_ports,
+            init: None, // filled in by the caller, once expressions can be lowered
+            span,
+        },
+        raw_init,
+    )))
+}
+
+/// A memory size argument, which must be an integer literal to size the array.
+fn literal_depth(
+    arg: Option<&ExprType>,
+    mem: &str,
+    ctor: &str,
+    span: SourceSpan,
+) -> Result<usize, CHIRLowerError> {
+    let depth = match arg {
+        Some(ExprType::Lit(l)) => l
             .text
             .trim()
             .trim_end_matches("usize")
@@ -3718,26 +3923,20 @@ fn parse_memory_decl(
         _ => None,
     }
     .ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
-        description: format!("memory `{name}`: the size argument must be an integer literal"),
+        description: format!(
+            "memory `{mem}`: the size argument to `{ctor}` must be an integer literal"
+        ),
         span,
         suggested_rewrite: None,
     })?;
     if depth == 0 {
         return Err(CHIRLowerError::UnsupportedConstruct {
-            description: format!("memory `{name}` has size 0"),
+            description: format!("memory `{mem}` has size 0"),
             span,
             suggested_rewrite: None,
         });
     }
-
-    Ok(Some(CHIRMemoryDecl {
-        name: name.to_string(),
-        elem_ty,
-        depth,
-        read_ports,
-        write_ports,
-        span,
-    }))
+    Ok(depth)
 }
 
 fn parse_const_usize(

@@ -9,7 +9,7 @@ use copper_core::chir::Width;
 use copper_core::vlir::{
     ToolchainProfile, VLIRAlwaysFF, VLIRBinOp, VLIRBody, VLIRCombBody, VLIRCombPhase,
     VLIRContinuousAssign, VLIRExpr, VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind,
-    VLIRMemDecl, VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRStructuralBody, VLIRSubmoduleInst,
+    VLIRMemDecl, VLIRMemInit, VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRStructuralBody, VLIRSubmoduleInst,
     VLIRUnOp,
 };
 
@@ -236,6 +236,51 @@ impl Emitter<'_> {
         }
         if !mems.is_empty() {
             self.out.push('\n');
+        }
+        self.mem_inits(mems);
+    }
+
+    /// Power-on contents, as an `initial` block per preloaded memory.
+    ///
+    /// `initial` is how SystemVerilog states what a memory holds before the first
+    /// clock edge: Verilator executes it at time 0, and FPGA tools read it to
+    /// infer an initialized block RAM. It is deliberately NOT guarded by the
+    /// clock, and deliberately blocking (`=`) — this is elaboration-time state,
+    /// not a clocked update.
+    fn mem_inits(&mut self, mems: &[VLIRMemDecl]) {
+        for m in mems {
+            let Some(init) = &m.init else { continue };
+            self.out.push_str(&format!("{}initial begin\n", self.indent(1)));
+            match init {
+                VLIRMemInit::Fill { var, value } => {
+                    self.out.push_str(&format!(
+                        "{}for (int {v} = 0; {v} < {}; {v}++) begin\n",
+                        self.indent(2),
+                        m.depth,
+                        v = var,
+                    ));
+                    self.out.push_str(&format!(
+                        "{}{}[{}] = {};\n",
+                        self.indent(3),
+                        m.name,
+                        var,
+                        expr_str(value)
+                    ));
+                    self.out.push_str(&format!("{}end\n", self.indent(2)));
+                }
+                VLIRMemInit::Words(words) => {
+                    for (i, w) in words.iter().enumerate() {
+                        self.out.push_str(&format!(
+                            "{}{}[{}] = {};\n",
+                            self.indent(2),
+                            m.name,
+                            i,
+                            expr_str(w)
+                        ));
+                    }
+                }
+            }
+            self.out.push_str(&format!("{}end\n\n", self.indent(1)));
         }
     }
 
