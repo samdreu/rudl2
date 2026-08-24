@@ -4,7 +4,7 @@ use copper_core::chir::{
     CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
-    ExprCall, ExprIndex, ExprStruct, ExprType, FrontendClassification, FrontendFnIR,
+    ExprCall, ExprIndex, ExprRepeat, ExprStruct, ExprType, FrontendClassification, FrontendFnIR,
     FrontendModuleIR, ItemStruct, LocalStmt, RawStmt, RawStmtKind, SourceSpan,
 };
 
@@ -203,9 +203,32 @@ fn infer_type_from_expr(
             "as_bool" => Ok(CHIRType::Bool),
             _ => infer_type_from_expr(&mc.receiver, span, symbols, enums),
         },
-        ExprType::Call(call) => infer_type_from_call(call, span),
+        ExprType::Call(call) => match identity_pack_call(call) {
+            Some(inner) => infer_type_from_expr(inner, span, symbols, enums),
+            None => infer_type_from_call(call, span),
+        },
         // A single-bit index `x[i]` is 1-bit.
         ExprType::Index(_) => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
+        // `[Logic::Zero; N]` — a repeated array of hardware elements is a packed
+        // vector: N elements of width W is an (N*W)-bit value. This is the same
+        // representation `Bits<N>` already has, and `a[k]` already lowers as a
+        // 1-bit select, so indexed reads and writes into the local need nothing
+        // extra.
+        ExprType::Repeat(rep) => {
+            let elem_w = infer_type_from_expr(&rep.expr, span, symbols, enums)
+                .ok()
+                .and_then(|t| chir_type_width(&t).as_concrete());
+            match (elem_w, repeat_len(&rep.len)) {
+                (Some(w), Some(Width::Concrete(n))) =>
+                    Ok(CHIRType::UInt { width: Width::Concrete(w * n) }),
+                // A symbolic length only yields a symbolic width when each
+                // element is one bit: `Width` has no product form, so
+                // `[Bits<8>; N]` stays ambiguous rather than silently mis-sized.
+                (Some(1), Some(Width::Param(name))) =>
+                    Ok(CHIRType::UInt { width: Width::Param(name) }),
+                _ => Err(CHIRLowerError::AmbiguousWidth { span }),
+            }
+        }
         // A tuple is the concatenation of its elements.
         ExprType::Tuple(t) => {
             let mut total = 0usize;
@@ -688,6 +711,52 @@ fn width_of_type(ty: &CHIRType) -> usize {
     match ty {
         CHIRType::UInt { width } | CHIRType::SInt { width } => width.concrete(),
         CHIRType::Bool => 1,
+    }
+}
+
+/// The `Width` of a hardware type, symbolic widths included (unlike
+/// `width_of_type`, which panics on a `Param`).
+fn chir_type_width(ty: &CHIRType) -> Width {
+    match ty {
+        CHIRType::UInt { width } | CHIRType::SInt { width } => width.clone(),
+        CHIRType::Bool => Width::Concrete(1),
+    }
+}
+
+/// The length of an array-repeat expression `[elem; len]`.
+///
+/// A literal gives a concrete length; a bare identifier is taken as a module
+/// parameter, the same rule `Bits<N>` uses in `parse_bits_type`. A computed
+/// length (`WIDTH + 1`) is not representable and yields `None`.
+fn repeat_len(len: &ExprType) -> Option<Width> {
+    match len {
+        ExprType::Lit(lit) => {
+            let compact: String = lit.text.chars().filter(|c| !c.is_whitespace()).collect();
+            parse_int_literal(&compact).map(|(v, _)| Width::Concrete(v as usize))
+        }
+        ExprType::Path(path) => {
+            let compact: String = path.path_text.chars().filter(|c| !c.is_whitespace()).collect();
+            is_ident(&compact).then_some(Width::Param(compact))
+        }
+        _ => None,
+    }
+}
+
+/// `Bits::from_array(a)` / `Bits::from_slice(&a)` — a no-op on Copper's packed
+/// representation, returning the argument to lower in its place.
+///
+/// `Bits<N>` *is* `[Logic; N]` in `copper-core` (element k at bit k), and an
+/// array local lowers to that same packing, so packing one into the other moves
+/// no bits. Recognising the identity is what makes an array local usable: build
+/// it up with indexed writes, then hand it to a port.
+fn identity_pack_call(call: &ExprCall) -> Option<&ExprType> {
+    let path = call_path(call)?;
+    if !(path.ends_with("from_array") || path.ends_with("from_slice")) {
+        return None;
+    }
+    match call.args.first()? {
+        ExprType::Reference(r) => Some(&r.expr),
+        other => Some(other),
     }
 }
 
@@ -2045,6 +2114,11 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
             } else if call_path(call).as_deref().is_some_and(|n| ctx.fns.contains_key(n)) {
                 // Call to a file-scope free function (#7b): inline it.
                 lower_inlined_fn_call(call, ctx)
+            } else if let Some(inner) = identity_pack_call(call) {
+                // `Bits::from_array` / `from_slice` move no bits — lower the
+                // argument in place of the call.
+                let inner = inner.clone();
+                lower_expr(&inner, ctx)
             } else if let Some(ctor) = call_path(call).as_deref().and_then(classify_value_ctor) {
                 match ctor {
                     // `Bits::from_u32(x)` — the value is the argument,
@@ -2101,6 +2175,10 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(CHIRExpr::Concat(parts))
         }
+
+        // `[Logic::Zero; N]` — the packed vector its declared type describes
+        // (see the matching arm in `infer_type_from_expr`).
+        ExprType::Repeat(rep) => lower_repeat(rep, ctx),
 
         // A block used as an expression (e.g. an `if`/`else` branch) evaluates to
         // its tail expression.
@@ -2419,6 +2497,38 @@ fn lower_match_as_chain(
 }
 
 /// The width an untyped integer literal falls back to when nothing constrains it.
+/// `[elem; len]` as a packed vector.
+///
+/// Repeating a **zero** gives a zero whatever the length is, so it is emitted the
+/// way `Bits::zero()` is — a context-width literal the surrounding declaration
+/// sizes. That is what lets `[Logic::Zero; N]` work for a symbolic `N`, which the
+/// concatenation form below cannot express.
+///
+/// Any other repeated element needs the length spelled out and becomes an
+/// explicit concatenation.
+fn lower_repeat(rep: &ExprRepeat, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
+    let elem = lower_expr(&rep.expr, ctx)?;
+
+    if matches!(&elem, CHIRExpr::Lit(l) if l.value == 0) {
+        return Ok(CHIRExpr::Lit(CHIRLit {
+            ty: CHIRType::UInt { width: Width::Concrete(DEFAULT_LIT_WIDTH) },
+            value: 0,
+        }));
+    }
+
+    match repeat_len(&rep.len) {
+        Some(Width::Concrete(n)) => Ok(CHIRExpr::Concat(vec![elem; n])),
+        _ => Err(CHIRLowerError::UnsupportedConstruct {
+            description: "a repeated array with a symbolic length must repeat a zero \
+                          element (`[Logic::Zero; N]`); give the length a concrete value \
+                          to repeat anything else"
+                .to_string(),
+            span: rep.span,
+            suggested_rewrite: None,
+        }),
+    }
+}
+
 const DEFAULT_LIT_WIDTH: usize = 64;
 
 /// Give a bare (default-width) integer literal operand the width of the other

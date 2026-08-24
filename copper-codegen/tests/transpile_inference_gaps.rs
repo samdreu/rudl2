@@ -1,17 +1,21 @@
-//! Tracked regressions for a KNOWN transpiler bit-width-inference GAP
-//! (P0, `TODO` TESTING plan; see `TODO` TRANSPILATION section).
+//! Bit-width inference: one gap CLOSED, one still open.
+//! (P0, `TODO` TESTING plan; see `TODO` TRANSPILATION section.)
 //!
-//! `transpile_source` currently rejects two constructs that the macro-simulator
-//! accepts, with "cannot infer bit width; add an explicit type annotation":
-//!   1. `[Logic::Zero; N]` array locals (raw `Logic` arrays), and
-//!   2. tuple-returning plain-Rust helper fns called from a hardware body.
+//! `transpile_source` used to reject two constructs the macro-simulator accepts,
+//! both with "cannot infer bit width; add an explicit type annotation":
+//!   1. `[Logic::Zero; N]` array locals (raw `Logic` arrays) — **CLOSED**, now
+//!      asserted positively below, and behaviourally verified end-to-end by
+//!      `tests/logic_array_pack_equivalence.rs` (sim ≡ transpiled SV ≡ an
+//!      independent Rust golden, under Verilator).
+//!   2. tuple-returning plain-Rust helper fns called from a hardware body —
+//!      **still open**, still pinned.
 //!
-//! These tests PIN that current behavior so the gap stays visible and honest — the
-//! equivalence tests for the affected designs (ripple_carry_adder, gray_to_binary)
-//! use `Bits`-indexing rewrites to sidestep it, which could otherwise let the
+//! The open one PINS current behavior so the gap stays visible and honest — the
+//! equivalence test for the affected design (ripple_carry_adder) uses a
+//! `Bits`-indexing rewrite to sidestep it, which could otherwise let the
 //! limitation be silently forgotten.
 //!
-//! **When the gap is fixed** these `expect_err`s will fail loudly. That is the
+//! **When that gap is fixed** its `expect_err` will fail loudly. That is the
 //! signal to delete the workaround and promote the natural form to a positive
 //! equivalence test — do NOT just relax the assertion.
 
@@ -45,15 +49,25 @@ fn use_pair(i0: In<Logic, ()>, i1: In<Logic, ()>, o: Out<Logic, ()>) {
 "#;
 
 #[test]
-fn logic_array_local_is_a_known_transpile_gap() {
-    let err = transpile(LOGIC_ARRAY_DUT).expect_err(
-        "KNOWN GAP now closed: `[Logic; N]` array locals transpile. Remove the \
-         Bits-indexing workaround in the ripple/gray fixtures and make this a \
-         positive equivalence test.",
-    );
+fn logic_array_local_transpiles_as_a_packed_vector() {
+    let sv = transpile(LOGIC_ARRAY_DUT)
+        .expect("`[Logic::Zero; N]` array locals must transpile (gap closed)");
+
+    // The array local is a packed vector of the repeat length — symbolic here,
+    // so it must carry the module parameter rather than a guessed width.
     assert!(
-        err.contains("cannot infer bit width"),
-        "reproduced a *different* transpile error than the tracked bit-width gap: {err}"
+        sv.contains("logic [N-1:0] a;"),
+        "array local should be an N-bit packed vector, got:\n{sv}"
+    );
+    // Element k is bit k, so an indexed write stays an indexed write...
+    assert!(
+        sv.contains("a[k] = x[k];"),
+        "indexed writes into the array should lower as bit-selects, got:\n{sv}"
+    );
+    // ...and `Bits::from_slice` moves no bits, so it lowers to identity.
+    assert!(
+        sv.contains("assign o = a;"),
+        "from_slice should lower to identity, got:\n{sv}"
     );
 }
 
