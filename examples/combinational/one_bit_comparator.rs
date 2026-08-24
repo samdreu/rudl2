@@ -28,7 +28,7 @@ fn main() {
     );
 
     let mut test = HardwareTest::new("one_bit_comparator")
-        .with_verilog("/Users/sdreussi/project/final_copper/examples/combinational/sv/one_bit_comparator.sv")
+        .with_verilog("examples/combinational/sv/one_bit_comparator.sv")
         .with_waveform("waveforms/one_bit_comparator.vcd");
 
     // test cases
