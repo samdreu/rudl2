@@ -443,6 +443,8 @@ fn lower_seq_body(
             depth: m.depth,
             read_ports: m.read_ports,
             write_ports: m.write_ports,
+            read_lat: m.read_lat,
+            write_lat: m.write_lat,
             init: m.init.as_ref().map(lower_mem_init).transpose()?,
             write_mode: m.write_mode,
         })).collect::<Result<Vec<_>, SHIRLowerError>>()?,

@@ -217,7 +217,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
     collect_phase_mem_use(&s.phases, &mut mem_use);
     let mem_widths = MemWidths::build(&s.memories, &mem_use);
     let memories = lower_mem_decls(&s.memories, &mem_use, leg)?;
-    reg_decls.extend(mem_read_pipeline_regs(&s.memories, &mem_use, leg));
+    reg_decls.extend(mem_pipeline_regs(&s.memories, &mem_use, leg));
 
     let mut comb_phases = Vec::new();
     let mut output_assigns = Vec::new();
@@ -314,7 +314,11 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
     // nonblocking assignment makes their position relative to the register
     // updates immaterial.
     ff_stmts.extend(mem_read_pipeline(&s.memories, &mem_use, leg));
+    // The commit reads the last write stage, so it must be emitted before the
+    // shift that overwrites it — non-blocking assignment makes the order
+    // immaterial for correctness, but keeping it reads the way the pipeline runs.
     ff_stmts.extend(mem_write_commits(&s.memories, &mem_use, leg));
+    ff_stmts.extend(mem_write_pipeline(&s.memories, &mem_use, leg));
 
     Ok(VLIRSeqBody {
         clock: clock.clone(),
@@ -1569,6 +1573,39 @@ fn mem_net(mem: &str, is_read: bool, port: usize, suffix: &str) -> String {
     format!("{mem}_{}{port}_{suffix}", if is_read { "rd" } else { "wr" })
 }
 
+/// Read-pipeline stage `k` of a read port: `<m>_rd<i>_q<k>` (data) and
+/// `<m>_rd<i>_v<k>` (valid). Stage `READ_LAT - 1` is the port's output; stage 0
+/// holds what the most recent edge captured.
+fn read_stage(mem: &str, port: usize, stage: usize, data: bool) -> String {
+    mem_net(mem, true, port, &format!("{}{stage}", if data { "q" } else { "v" }))
+}
+
+/// Write-pipeline stage `k` of a write port (`k` in `1..WRITE_LAT`). Stage 0 is
+/// the combinational `en`/`addr`/`data` nets — it is filled and consumed within
+/// one cycle, so it needs no register. Stage `WRITE_LAT - 1` is what commits.
+fn write_stage(mem: &str, port: usize, stage: usize, suffix: &str) -> String {
+    mem_net(mem, false, port, &format!("s{stage}_{suffix}"))
+}
+
+/// The nets a write port's committing stage is held in: the combinational ones at
+/// `WRITE_LAT == 1`, otherwise the last stage registers. `(en, addr, data)`.
+fn write_commit_nets(mem: &str, port: usize, write_lat: usize) -> (String, String, String) {
+    if write_lat == 1 {
+        (
+            mem_net(mem, false, port, "en"),
+            mem_net(mem, false, port, "addr"),
+            mem_net(mem, false, port, "data"),
+        )
+    } else {
+        let k = write_lat - 1;
+        (
+            write_stage(mem, port, k, "v"),
+            write_stage(mem, port, k, "addr"),
+            write_stage(mem, port, k, "data"),
+        )
+    }
+}
+
 /// Bits needed to index `depth` entries (at least one).
 fn addr_width(depth: usize) -> Width {
     let bits = if depth <= 1 { 1 } else { (usize::BITS - (depth - 1).leading_zeros()) as usize };
@@ -1654,14 +1691,26 @@ fn mem_binding(
             let key = (m.name.clone(), port);
             let same_edge = post_edge && staged_here.contains(&key);
             let nets = if same_edge {
-                (
-                    leg.get(&mem_net(&m.name, true, port, "data")),
-                    leg.get(&mem_net(&m.name, true, port, "en")),
-                )
+                // The value the port's OUTPUT will hold once this edge passes.
+                // At one cycle of latency that is the live array read; deeper, it
+                // is the stage about to shift into the output, read at its
+                // pre-edge value inside `always_ff`.
+                if m.read_lat == 1 {
+                    (
+                        leg.get(&mem_net(&m.name, true, port, "data")),
+                        leg.get(&mem_net(&m.name, true, port, "en")),
+                    )
+                } else {
+                    (
+                        leg.get(&read_stage(&m.name, port, m.read_lat - 2, true)),
+                        leg.get(&read_stage(&m.name, port, m.read_lat - 2, false)),
+                    )
+                }
             } else {
+                // The port's output as it stands now.
                 (
-                    leg.get(&mem_net(&m.name, true, port, "q")),
-                    leg.get(&mem_net(&m.name, true, port, "v")),
+                    leg.get(&read_stage(&m.name, port, m.read_lat - 1, true)),
+                    leg.get(&read_stage(&m.name, port, m.read_lat - 1, false)),
                 )
             };
             b.insert(key, nets);
@@ -1910,15 +1959,42 @@ fn unstaged_read_defaults(
     out
 }
 
-/// `<m>_rd<i>_q <= <m>_rd<i>_data;` / `<m>_rd<i>_v <= <m>_rd<i>_en;` — the read
-/// pipeline stage, for ports whose result is observed after its capture edge.
+/// How deep a read port's data / valid register chains have to be.
+///
+/// Stage `READ_LAT - 1` is the port's output, and a consumer that latches at the
+/// capture edge reads stage `READ_LAT - 2` instead (see `mem_binding`), so the
+/// deepest stage actually referenced depends on which forms are used. Returns
+/// `None` when no register is needed at all — the one-cycle port whose only
+/// consumer latches at the capture edge, which reads the array directly.
+fn read_chain_depth(m: &SHIRMemory, port: usize, use_: &MemPortUse, data: bool) -> Option<usize> {
+    let key = (m.name.clone(), port);
+    let (delayed, same_edge) = if data {
+        (use_.data_reg.contains(&key), use_.data_comb.contains(&key))
+    } else {
+        (use_.valid_reg.contains(&key), use_.valid_comb.contains(&key))
+    };
+    let mut deepest = None;
+    if delayed {
+        deepest = Some(m.read_lat - 1);
+    }
+    if same_edge && m.read_lat >= 2 {
+        deepest = Some(deepest.map_or(m.read_lat - 2, |d: usize| d.max(m.read_lat - 2)));
+    }
+    deepest
+}
+
+/// The read pipeline: `q0 <= <array read>` and `qk <= q(k-1)`, plus the matching
+/// valid chain.
 ///
 /// Deliberately UNGUARDED by phase, because the simulator's pipeline advances on
 /// every posedge regardless of what the design is doing (`advance_read_pipelines`
 /// is a clock listener; the memory knows nothing about phases). Outside its
-/// staging phase the enable net is 0, so `_v` goes false there — which is exactly
-/// the simulator's `is_ready()` after a cycle with no staged address. The captured
-/// data survives for one cycle and no longer, in both.
+/// staging phase the enable net is 0, so the valid chain drains — which is exactly
+/// the simulator's `is_ready()` after a cycle with no staged address.
+///
+/// The shift is written `qk <= q(k-1)` *and* `q0 <= data` in one block: with
+/// non-blocking assignment every right-hand side reads the pre-edge value, which
+/// is the same "shift, then capture into stage 0" the simulator performs.
 fn mem_read_pipeline(
     memories: &[SHIRMemory],
     use_: &MemPortUse,
@@ -1927,26 +2003,63 @@ fn mem_read_pipeline(
     let mut out = Vec::new();
     for m in memories {
         for port in 0..m.read_ports {
-            let key = (m.name.clone(), port);
-            if use_.data_reg.contains(&key) {
-                out.push(VLIRFFStmt::NonBlockingAssign {
-                    target: leg.get(&mem_net(&m.name, true, port, "q")),
-                    value: VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "data"))),
-                });
-            }
-            if use_.valid_reg.contains(&key) {
-                out.push(VLIRFFStmt::NonBlockingAssign {
-                    target: leg.get(&mem_net(&m.name, true, port, "v")),
-                    value: VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "en"))),
-                });
+            for (is_data, source) in [
+                (true, mem_net(&m.name, true, port, "data")),
+                (false, mem_net(&m.name, true, port, "en")),
+            ] {
+                let Some(deepest) = read_chain_depth(m, port, use_, is_data) else { continue };
+                for stage in 0..=deepest {
+                    let value = if stage == 0 {
+                        VLIRExpr::Var(leg.get(&source))
+                    } else {
+                        VLIRExpr::Var(leg.get(&read_stage(&m.name, port, stage - 1, is_data)))
+                    };
+                    out.push(VLIRFFStmt::NonBlockingAssign {
+                        target: leg.get(&read_stage(&m.name, port, stage, is_data)),
+                        value,
+                    });
+                }
             }
         }
     }
     out
 }
 
-/// Register declarations for the read pipeline stages emitted above.
-fn mem_read_pipeline_regs(
+/// The write pipeline: `s1 <= <comb nets>` and `sk <= s(k-1)`, for a write port
+/// whose commit is more than one cycle out. Stage 0 needs no register — it is
+/// filled by the `write()` call and consumed in the same cycle.
+fn mem_write_pipeline(
+    memories: &[SHIRMemory],
+    use_: &MemPortUse,
+    leg: &Legalizer,
+) -> Vec<VLIRFFStmt> {
+    let mut out = Vec::new();
+    for m in memories {
+        for port in 0..m.write_ports {
+            if !use_.writes.contains(&(m.name.clone(), port)) {
+                continue;
+            }
+            for stage in 1..m.write_lat {
+                for suffix in ["v", "addr", "data"] {
+                    let value = if stage == 1 {
+                        let comb = if suffix == "v" { "en" } else { suffix };
+                        VLIRExpr::Var(leg.get(&mem_net(&m.name, false, port, comb)))
+                    } else {
+                        VLIRExpr::Var(leg.get(&write_stage(&m.name, port, stage - 1, suffix)))
+                    };
+                    out.push(VLIRFFStmt::NonBlockingAssign {
+                        target: leg.get(&write_stage(&m.name, port, stage, suffix)),
+                        value,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Register declarations for both pipelines.
+fn mem_pipeline_regs(
     memories: &[SHIRMemory],
     use_: &MemPortUse,
     leg: &Legalizer,
@@ -1954,18 +2067,31 @@ fn mem_read_pipeline_regs(
     let mut out = Vec::new();
     for m in memories {
         for port in 0..m.read_ports {
-            let key = (m.name.clone(), port);
-            if use_.data_reg.contains(&key) {
-                out.push(VLIRRegDecl {
-                    name: leg.get(&mem_net(&m.name, true, port, "q")),
-                    width: width_of(&m.elem_ty),
-                });
+            for (is_data, width) in [(true, width_of(&m.elem_ty)), (false, Width::Concrete(1))] {
+                let Some(deepest) = read_chain_depth(m, port, use_, is_data) else { continue };
+                for stage in 0..=deepest {
+                    out.push(VLIRRegDecl {
+                        name: leg.get(&read_stage(&m.name, port, stage, is_data)),
+                        width: width.clone(),
+                    });
+                }
             }
-            if use_.valid_reg.contains(&key) {
-                out.push(VLIRRegDecl {
-                    name: leg.get(&mem_net(&m.name, true, port, "v")),
-                    width: Width::Concrete(1),
-                });
+        }
+        for port in 0..m.write_ports {
+            if !use_.writes.contains(&(m.name.clone(), port)) {
+                continue;
+            }
+            for stage in 1..m.write_lat {
+                for (suffix, width) in [
+                    ("v", Width::Concrete(1)),
+                    ("addr", addr_width(m.depth)),
+                    ("data", width_of(&m.elem_ty)),
+                ] {
+                    out.push(VLIRRegDecl {
+                        name: leg.get(&write_stage(&m.name, port, stage, suffix)),
+                        width,
+                    });
+                }
             }
         }
     }
@@ -2038,27 +2164,34 @@ fn read_net_value(m: &SHIRMemory, port: usize, use_: &MemPortUse, leg: &Legalize
         if !use_.writes.contains(&(m.name.clone(), wp)) {
             continue;
         }
+        // Forward from the stage that COMMITS this edge, which at a deeper write
+        // latency is a pipeline register rather than the freshly staged nets.
+        let (wen, waddr, wdata) = write_commit_nets(&m.name, wp, m.write_lat);
         let same_addr = VLIRExpr::BinOp {
-            left: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, false, wp, "addr")))),
+            left: Box::new(VLIRExpr::Var(leg.get(&waddr))),
             op: VLIRBinOp::Eq,
             right: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "addr")))),
         };
         value = VLIRExpr::Ternary {
             cond: Box::new(VLIRExpr::BinOp {
-                left: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, false, wp, "en")))),
+                left: Box::new(VLIRExpr::Var(leg.get(&wen))),
                 op: VLIRBinOp::LogicalAnd,
                 right: Box::new(same_addr),
             }),
-            then_val: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, false, wp, "data")))),
+            then_val: Box::new(VLIRExpr::Var(leg.get(&wdata))),
             else_val: Box::new(value),
         };
     }
     value
 }
 
-/// `if (<mem>_wr<J>_en) <mem>[<mem>_wr<J>_addr] <= <mem>_wr<J>_data;` — one per
-/// staged write port. The commit is unguarded by phase because a module using
-/// memory has exactly one phase (enforced in `chir_lower`).
+/// `if (<commit en>) <mem>[<commit addr>] <= <commit data>;` — one per staged
+/// write port, from whichever stage commits this edge (the combinational nets at
+/// `WRITE_LAT == 1`, the last pipeline stage otherwise).
+///
+/// Unguarded by phase: the enable is 0 outside the staging phase, so the guard is
+/// implicit, and the pipeline must keep shifting on every edge regardless — the
+/// simulator's does.
 fn mem_write_commits(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer) -> Vec<VLIRFFStmt> {
     let mut out = Vec::new();
     for m in memories {
@@ -2066,12 +2199,13 @@ fn mem_write_commits(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer
             if !use_.writes.contains(&(m.name.clone(), port)) {
                 continue;
             }
+            let (en, addr, data) = write_commit_nets(&m.name, port, m.write_lat);
             out.push(VLIRFFStmt::If {
-                condition: VLIRExpr::Var(leg.get(&mem_net(&m.name, false, port, "en"))),
+                condition: VLIRExpr::Var(leg.get(&en)),
                 then_stmts: vec![VLIRFFStmt::MemAssign {
                     mem: leg.get(&m.name),
-                    addr: VLIRExpr::Var(leg.get(&mem_net(&m.name, false, port, "addr"))),
-                    value: VLIRExpr::Var(leg.get(&mem_net(&m.name, false, port, "data"))),
+                    addr: VLIRExpr::Var(leg.get(&addr)),
+                    value: VLIRExpr::Var(leg.get(&data)),
                 }],
                 else_stmts: None,
             });
@@ -2169,8 +2303,20 @@ fn collect_and_legalize_body_names(body: &SHIRBody, leg: &mut Legalizer) {
                 leg.legalize(&m.name);
                 for (is_read, count) in [(true, m.read_ports), (false, m.write_ports)] {
                     for port in 0..count {
-                        for suffix in ["en", "addr", "data", "q", "v"] {
+                        for suffix in ["en", "addr", "data"] {
                             leg.legalize(&mem_net(&m.name, is_read, port, suffix));
+                        }
+                        if is_read {
+                            for stage in 0..m.read_lat {
+                                leg.legalize(&read_stage(&m.name, port, stage, true));
+                                leg.legalize(&read_stage(&m.name, port, stage, false));
+                            }
+                        } else {
+                            for stage in 1..m.write_lat {
+                                for sfx in ["v", "addr", "data"] {
+                                    leg.legalize(&write_stage(&m.name, port, stage, sfx));
+                                }
+                            }
                         }
                     }
                 }

@@ -96,6 +96,9 @@ pub struct SHIRMemory {
     pub depth: usize,
     pub read_ports: usize,
     pub write_ports: usize,
+    /// Port latencies — see `CHIRMemoryDecl`.
+    pub read_lat: usize,
+    pub write_lat: usize,
     /// Preloaded contents — see `CHIRMemInit`.
     pub init: Option<SHIRMemInit>,
     /// Read-during-write ordering — see `CHIRMemoryDecl::write_mode`.

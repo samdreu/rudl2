@@ -111,9 +111,11 @@ fn arithmetic_shift_right_is_unsupported() {
 // shipped example — which in turn is checked against an independent hand-written
 // `examples/memory/sv/dual_port_ram.sv`. Preloaded contents followed on the same
 // day (`initial` block; `tests/preloaded_memory_equivalence.rs`), then WriteFirst
-// (`tests/write_first_memory_equivalence.rs`) and multi-phase access
-// (`tests/multiphase_memory_equivalence.rs`). What remains is pinned below, one
-// test per construct, each measured against the baseline that does transpile.
+// (`tests/write_first_memory_equivalence.rs`), multi-phase access
+// (`tests/multiphase_memory_equivalence.rs`) and pipelined latency
+// (`tests/pipelined_memory_equivalence.rs`). Every remaining memory test below is
+// a RULE — a shape hardware cannot express, or contents the transpiler cannot
+// see — rather than an unimplemented construct.
 //
 // One decision still rests on the absence of a synthesised counterpart:
 // out-of-range addressing is a deliberate panic naming the port, address and size
@@ -163,22 +165,36 @@ fn single_cycle_readfirst_memory_is_supported() {
     );
 }
 
-/// Read/write latency greater than one cycle. The simulator's pipelines are real
-/// behaviour (`copper-core/src/memory.rs` has the LAT=2 tests); the emitted array
-/// has no stage registers, so a deeper pipeline is refused rather than flattened.
+/// Read/write latency greater than one cycle DOES transpile: a read port becomes
+/// a register chain and a write port's commit comes from its last stage.
+/// `tests/pipelined_memory_equivalence.rs` carries the behavioural checks at
+/// READ_LAT 2 and 3 and WRITE_LAT 2, including a WriteFirst forward from the
+/// committing stage.
 #[test]
-fn memory_latency_above_one_is_unsupported() {
+fn pipelined_memory_latency_is_supported() {
     let src = mem_dut(
         "let mem = Memory::<Bits<16>, 1, 1, MainClk, 2, 1>::new(clk.clone(), 256);",
         MEM_BODY,
     );
-    let err = transpile(&src).expect_err(
-        "NOW SUPPORTED: pipelined memory latency transpiles. Give it an equivalence test that \
-         drives a read every cycle and checks the result appears READ_LAT edges later.",
-    );
+    let sv = transpile(&src).expect("a pipelined memory must transpile");
     assert!(
-        err.contains("READ_LAT = 2") && err.contains("single-cycle"),
-        "reproduced a *different* error than the tracked latency gap: {err}"
+        sv.contains("mem_rd0_q0 <= mem_rd0_data;"),
+        "READ_LAT=2 must emit a capture stage, got:\n{sv}"
+    );
+}
+
+/// Zero latency is not a thing a synchronous port can do, and the simulator's
+/// pipelines index `[LAT - 1]`, so it is refused rather than underflowing.
+#[test]
+fn zero_latency_memory_is_rejected() {
+    let src = mem_dut(
+        "let mem = Memory::<Bits<16>, 1, 1, MainClk, 0, 1>::new(clk.clone(), 256);",
+        MEM_BODY,
+    );
+    let err = transpile(&src).expect_err("READ_LAT = 0 must be rejected");
+    assert!(
+        err.contains("must be at least 1"),
+        "reproduced a *different* error than the zero-latency rule: {err}"
     );
 }
 
@@ -320,7 +336,7 @@ async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainCl
 "#;
     let sv = transpile(src).expect("a two-phase memory read must transpile");
     assert!(
-        sv.contains("mem_rd0_q <= mem_rd0_data;"),
+        sv.contains("mem_rd0_q0 <= mem_rd0_data;"),
         "a cross-phase read result must be captured into a pipeline register, got:\n{sv}"
     );
 }

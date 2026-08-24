@@ -49,8 +49,8 @@ const SYNTHETIC: &[&str] = &["phase", "pc"];
 /// A register synthesized by the lowering rather than named in the source.
 ///
 /// Two kinds: the phase/pc counter above, and a memory read port's pipeline stage
-/// (`<mem>_rd<N>_q` / `<mem>_rd<N>_v`), which holds what a capture edge produced
-/// so a later phase can observe it. Neither has a source-level name —
+/// (`<mem>_rd<N>_q<K>` / `_v<K>`) or write pipeline stage (`<mem>_wr<N>_s<K>_…`),
+/// which carry a port's latency. Neither has a source-level name —
 /// `infer_registers` names locals that live across a tick, and a memory's internal
 /// pipeline is not one; it belongs to the memory the way a submodule's registers
 /// belong to the submodule.
@@ -63,15 +63,35 @@ fn is_synthetic(name: &str) -> bool {
     if SYNTHETIC.contains(&name) {
         return true;
     }
-    let Some(rest) = name.strip_suffix("_q").or_else(|| name.strip_suffix("_v")) else {
-        return false;
-    };
-    match rest.rfind("_rd") {
-        Some(i) => {
-            let digits = &rest[i + 3..];
-            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && i > 0
+    // Read pipeline stage: `<mem>_rd<N>_q<K>` / `_v<K>`.
+    let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if let Some(rest) = trimmed.strip_suffix("_q").or_else(|| trimmed.strip_suffix("_v")) {
+        if trimmed.len() < name.len() && has_port_index(rest, "_rd") {
+            return true;
         }
-        None => false,
+    }
+    // Write pipeline stage: `<mem>_wr<N>_s<K>_v` / `_addr` / `_data`.
+    for suffix in ["_v", "_addr", "_data"] {
+        let Some(rest) = name.strip_suffix(suffix) else { continue };
+        let rest = rest.trim_end_matches(|c: char| c.is_ascii_digit());
+        if let Some(head) = rest.strip_suffix("_s") {
+            if has_port_index(head, "_wr") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `name` ends in `<marker><digits>` with something before it — i.e. it carries a
+/// memory port index, which is what makes a synthesized net name recognizable.
+fn has_port_index(name: &str, marker: &str) -> bool {
+    match name.rfind(marker) {
+        Some(i) if i > 0 => {
+            let digits = &name[i + marker.len()..];
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
     }
 }
 

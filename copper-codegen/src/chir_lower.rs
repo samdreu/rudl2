@@ -3790,13 +3790,11 @@ fn parse_memory_decl<'a>(
         Some(a) => parse_const_usize(a, "WRITE_LAT", name, span)?,
         None => 1,
     };
-    if read_lat != 1 || write_lat != 1 {
+    if read_lat == 0 || write_lat == 0 {
         return Err(CHIRLowerError::UnsupportedConstruct {
             description: format!(
-                "memory `{name}` has READ_LAT = {read_lat}, WRITE_LAT = {write_lat}; the \
-                 transpiler only lowers single-cycle memories (READ_LAT = WRITE_LAT = 1). A \
-                 deeper pipeline is real behaviour in the simulator that the emitted array \
-                 would not reproduce"
+                "memory `{name}` has READ_LAT = {read_lat}, WRITE_LAT = {write_lat}; both must \
+                 be at least 1 (a synchronous port cannot answer in zero cycles)"
             ),
             span,
             suggested_rewrite: None,
@@ -3901,6 +3899,8 @@ fn parse_memory_decl<'a>(
             depth,
             read_ports,
             write_ports,
+            read_lat,
+            write_lat,
             init: None, // filled in by the caller, once expressions can be lowered
             // The default; a `.read_first()` / `.write_first()` wrapper overrides
             // it on the way back out of the recursion above.

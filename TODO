@@ -659,6 +659,44 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      top of its existing sim ≡ hand-written-SV check — so the generated SV is
      transitively anchored to third-party hardware. Full write-up in the
      TRANSPILATION section above (fix E).
+  ✔ Pipelined latency: READ_LAT / WRITE_LAT > 1  [DONE 2026-08-24]
+     The last Memory construct to reach the transpiled path. A read port becomes a
+     register chain — stage READ_LAT-1 is the output, stage 0 holds what the most
+     recent edge captured:
+         mem_rd0_q0 <= mem_rd0_data;   // capture
+         mem_rd0_q1 <= mem_rd0_q0;     // shift
+     Written as ONE always_ff block, non-blocking assignment gives every RHS its
+     pre-edge value — which IS the simulator's "shift toward the output, then
+     capture into stage 0". A write port's stage 0 needs no register (filled by the
+     write() call, consumed the same cycle), so WRITE_LAT yields WRITE_LAT-1 stage
+     registers and the commit reads the last one.
+     TWO EARLIER DECISIONS THAT LATENCY CHANGES, both silent-one-cycle-shift risks:
+       1. WHICH NET A SAME-EDGE CONSUMER READS. A register update latched at the
+          capture edge needs the value the output will hold AFTER that edge. At
+          LAT=1 that is the live array read; deeper it is stage READ_LAT-2, read at
+          its pre-edge value inside always_ff. ram_r3w1 (READ_LAT=3) exists so a
+          chain deeper than two cannot be right by accident.
+       2. WHICH WRITE THE WriteFirst MUX FORWARDS. It must be the write that
+          COMMITS at this edge — at WRITE_LAT=2 the pipeline stage, NOT the freshly
+          staged nets, which will not reach the array for another cycle.
+     → tests/pipelined_memory_equivalence.rs (5 tests): READ_LAT=2/WRITE_LAT=2,
+       READ_LAT=3/WRITE_LAT=1, READ_LAT=1/WRITE_LAT=2 WriteFirst, shape pins, and a
+       check that the configurations are DISTINGUISHABLE — otherwise all three
+       would pass against a transpiler that flattened every memory to one cycle.
+       The reference model is written from the CONTRACT (latency as delay,
+       read-during-write as which side of the commit a capture sees), not
+       transcribed from copper-core/src/memory.rs, and matched on the first run.
+     BOTH NEGATIVE CONTROLS MEASURED: making the same-edge form read stage LAT-1
+     failed r2w2 and r3w1 while leaving r1w2_wf green; forwarding the freshly
+     staged write instead of the committing stage failed only r1w2_wf. Each
+     sabotage broke exactly the test built for it.
+     NOTE the net names gained a stage index (`_q0`, `_v0`, `_wr0_s1_addr`), so the
+     earlier shape pins were updated — and register_reconciliation's synthetic-name
+     matcher now covers both pipeline shapes.
+     THE CPUs STILL DO NOT TRANSPILE (re-measured): rv32i_cpu uses READ_LAT=2
+     memories, but is blocked on the control_extract panic (cause G) and
+     rv32i_cpu_pipelined on `Vec<Bits<32>>` ports (cause F). Memory is no longer
+     what stops either.
   ✔ Multi-phase memory access  [DONE 2026-08-24]
      The address buses are combinational and PHASE-GATED, so outside its staging
      phase a read port's address reads '0 — a result observed in a later phase
@@ -769,16 +807,17 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
        - a preload that reads one of the module's own signals. The simulator
          evaluates a captured port ONCE at construction; an `initial` block samples
          it at time 0. Two different things that look alike in source.
-  ☐ Memory constructs still outside the transpiled path, each pinned with its own
-     diagnostic in copper-codegen/tests/unsupported_constructs.rs. Every pin is
-     measured against `single_cycle_readfirst_memory_is_supported`, the baseline
-     DUT that DOES transpile, so a pin can only fail for the construct it names:
-       - READ_LAT / WRITE_LAT > 1 (the emitted array has no stage registers)
-     And two rules that are rejections rather than gaps — hardware cannot express
-     them, so they must not lower silently:
+  ☐ Memory RULES — no longer unimplemented constructs, but shapes that must not
+     lower silently. Each pinned with its own diagnostic in
+     copper-codegen/tests/unsupported_constructs.rs, measured against
+     `single_cycle_readfirst_memory_is_supported`, the baseline that DOES transpile:
        - two accesses to one port in a cycle (the sim keeps the last; one physical
          address bus cannot)
        - `data()` / `is_ready()` observed before the tick that produces them
+       - a plain `Out` driven straight from a read result across phases (use RegOut)
+       - contents computed at run time, a non-inline `from_fn` fill, or a preload
+         that reads one of the module's own signals
+       - READ_LAT / WRITE_LAT of 0
   ☐ REVISIT out-of-range addressing now that a synthesised counterpart EXISTS.
      The deliberate panic (copper-core/src/memory.rs::out_of_range) was decided on
      diagnostic grounds precisely because there was nothing to be faithful to.

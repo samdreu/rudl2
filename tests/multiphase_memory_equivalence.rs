@@ -10,8 +10,8 @@
 //!
 //! ```systemverilog
 //! always_ff @(posedge clk) begin
-//!     rom_rd0_q <= rom_rd0_data;   // unguarded: the simulator's pipeline
-//!     rom_rd0_v <= rom_rd0_en;     // advances on EVERY edge
+//!     rom_rd0_q0 <= rom_rd0_data;  // unguarded: the simulator's pipeline
+//!     rom_rd0_v0 <= rom_rd0_en;    // advances on EVERY edge
 //! end
 //! ```
 //!
@@ -178,18 +178,18 @@ fn read_result_uses_the_register_after_the_capture_edge() {
 
     let direct = emit("rom_direct");
     assert!(
-        direct.contains("rom_rd0_q <= rom_rd0_data;") && direct.contains("assign data = rom_rd0_q;"),
+        direct.contains("rom_rd0_q0 <= rom_rd0_data;") && direct.contains("assign data = rom_rd0_q0;"),
         "a post-tick consumer must read the CAPTURED word, not the live array read — \
          reading `rom_rd0_data` here is the one-cycle-early bug, got:\n{direct}"
     );
 
     let mp = emit("mp_reg");
     assert!(
-        mp.contains("rom_rd0_q <= rom_rd0_data;"),
+        mp.contains("rom_rd0_q0 <= rom_rd0_data;"),
         "a cross-phase read needs the pipeline register, got:\n{mp}"
     );
     assert!(
-        mp.contains("rom_rd0_v <= rom_rd0_en;"),
+        mp.contains("rom_rd0_v0 <= rom_rd0_en;"),
         "`is_ready()` across a phase needs the valid register too, got:\n{mp}"
     );
 
@@ -207,7 +207,7 @@ fn read_result_uses_the_register_after_the_capture_edge() {
     )
     .expect("dual_port_ram should transpile");
     assert!(
-        sv.contains("memory_rd0_data : data") && !sv.contains("memory_rd0_q"),
+        sv.contains("memory_rd0_data : data") && !sv.contains("memory_rd0_q0"),
         "a same-edge consumer must read the combinational value — a pipeline register \
          would be one cycle late here, got:\n{sv}"
     );

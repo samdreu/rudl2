@@ -165,9 +165,7 @@ pub struct CHIRRegDecl {
 ///
 /// A memory is a hardware *submodule*, not a local variable: an array of `depth`
 /// elements of `elem_ty` wired to the parent through `read_ports` read buses and
-/// `write_ports` write buses. Only `READ_LAT == WRITE_LAT == 1` is representable
-/// here — a deeper pipeline needs stage registers this struct does not describe,
-/// so `chir_lower` rejects it rather than silently flattening the latency.
+/// `write_ports` write buses, each with its own latency pipeline.
 #[derive(Debug, Clone)]
 pub struct CHIRMemoryDecl {
     pub name: String,
@@ -175,6 +173,11 @@ pub struct CHIRMemoryDecl {
     pub depth: usize,
     pub read_ports: usize,
     pub write_ports: usize,
+    /// Cycles from presenting an address to the result reaching the port output
+    /// (`READ_LAT`), and from staging a write to it committing (`WRITE_LAT`).
+    /// Both are at least 1.
+    pub read_lat: usize,
+    pub write_lat: usize,
     /// Preloaded contents from `from_fn` / `from_contents`; `None` for `new`
     /// (which zero-fills, matching an unwritten array).
     pub init: Option<CHIRMemInit>,
