@@ -138,7 +138,8 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
 
 fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
     let submodules = c.submodules.iter().map(|s| lower_submodule(s, leg)).collect::<LowerResult<_>>()?;
-    let (mut comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg)?;
+    // A combinational module has no clock, so it has no registered outputs.
+    let (mut comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg, &HashSet::new())?;
     hoist_branch_local_defaults(&mut comb_stmts);
     check_no_latches(&comb_stmts)?;
     Ok(VLIRCombBody { submodules, comb_stmts, output_assigns })
@@ -180,7 +181,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
     let mut ff_stmts = Vec::new();
 
     for phase in &s.phases {
-        let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg)?;
+        let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg, registered_outs)?;
         // Output continuous assigns are module-level; collect from every phase.
         output_assigns.append(&mut outs);
 
@@ -310,6 +311,7 @@ fn lower_reg_updates(updates: &[SHIRRegUpdate], leg: &Legalizer) -> LowerResult<
 fn lower_flat_stmts(
     stmts: &[SHIRStmt],
     leg: &Legalizer,
+    registered_outs: &HashSet<String>,
 ) -> LowerResult<(Vec<VLIRStmt>, Vec<VLIRContinuousAssign>)> {
     let mut comb = Vec::new();
     let mut assigns = Vec::new();
@@ -320,6 +322,21 @@ fn lower_flat_stmts(
                 width: width_of(ty),
                 value: lower_expr(value, leg)?,
             }),
+            // An UNCONDITIONAL write to a `RegOut` must still become a flip-flop.
+            // Emitting it as a module-level continuous `assign` here would put it
+            // out of reach of `split_output_regs` below — the `registered` flag
+            // would be silently ignored, and in a multi-phase module the phase
+            // guard would be lost too, so the output would follow a phase-gated
+            // combinational value instead of holding. Keep it as a `PortAssign`
+            // in the phase's statements and let the split move it to `always_ff`.
+            SHIRStmt::PortDrive { port_name, value }
+                if registered_outs.contains(&leg.get(port_name)) =>
+            {
+                comb.push(VLIRStmt::PortAssign {
+                    port_name: leg.get(port_name),
+                    value: lower_expr(value, leg)?,
+                })
+            }
             SHIRStmt::PortDrive { port_name, value } => assigns.push(VLIRContinuousAssign {
                 target: leg.get(port_name),
                 value: lower_expr(value, leg)?,
