@@ -98,45 +98,188 @@ fn arithmetic_shift_right_is_unsupported() {
     );
 }
 
-// ── Memory is not transpilable at all (P4) ───────────────────────────────────
+// ── Memory: what lowers, and where the boundary is (P4) ──────────────────────
+//
+// `Memory` used to be listed here as a whole feature with NO transpiled path —
+// an entire first-class construct that existed only in the simulator, so every
+// memory guarantee was sim-only and the project's central claim (one source both
+// simulates and synthesises, provably in agreement) did not extend to designs
+// using it.
+//
+// As of 2026-08-24 the single-cycle ReadFirst form lowers, and
+// `tests/dual_port_ram_equivalence.rs` carries sim ≡ transpiled SV for the
+// shipped example — which in turn is checked against an independent hand-written
+// `examples/memory/sv/dual_port_ram.sv`. What remains is pinned below, one test
+// per construct, each measured against the baseline that does transpile.
+//
+// One decision still rests on the absence of a synthesised counterpart:
+// out-of-range addressing is a deliberate panic naming the port, address and size
+// (`copper-core/src/memory.rs::out_of_range`). That was decided on diagnostic
+// grounds because nothing existed to adjudicate against. An emitted array now
+// exists, so it is worth revisiting — SystemVerilog reads X out of range.
 
-/// `Memory` — the first-class memory construct — has **no transpiled path**.
-///
-/// This is a larger gap than the operator/port limitations above: it is not one
-/// construct being rejected, it is an entire feature that exists only in the
-/// simulator. `examples/memory/dual_port_ram.rs` is a shipped example with an
-/// independent hand-written SV reference (`examples/memory/sv/dual_port_ram.sv`),
-/// and its Copper source cannot be lowered.
-///
-/// **What this costs:** every memory guarantee is sim-only. `tests/memory_new.rs`,
-/// the 16 in-crate tests, and `tests/memory_multiport_arbitration.rs` all check the
-/// simulator against a Rust reference; `tests/verilog_fifo_memory_new.rs` anchors to
-/// *hand-written* Verilog rather than to transpiled output. So the project's central
-/// claim — the same source simulates and synthesises, provably in agreement — simply
-/// does not extend to designs using `Memory`. That is worth stating plainly rather
-/// than leaving as an absence.
-///
-/// It also removes the usual way of settling semantics questions here: out-of-range
-/// addressing was decided on diagnostic grounds (a deliberate panic naming the port,
-/// address and size) precisely because there is no synthesised counterpart to be
-/// faithful to. See `copper-core/src/memory.rs::out_of_range`.
+/// A `Memory<..>` DUT that differs from the transpilable baseline in exactly one
+/// way. Every pin below shares this shape so the *only* reason each fails is the
+/// construct it names.
+fn mem_dut(decl: &str, body: &str) -> String {
+    format!(
+        r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, d: In<Bits<16>, MainClk>,
+           we: In<Logic, MainClk>, o: Out<Bits<16>, MainClk>) {{
+    {decl}
+    let mut q: Bits<16> = Bits::zero();
+    loop {{
+        {body}
+        clk.tick().await;
+        if mem.read_port::<0>().is_ready() {{ q = mem.read_port::<0>().data(); }}
+        o.write(q);
+    }}
+}}
+"#
+    )
+}
+
+const MEM_DECL: &str = "let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256);";
+const MEM_BODY: &str = r#"
+        if we.read() == Logic::One { mem.write_port::<0>().write(a.read().as_usize(), d.read()); }
+        mem.read_port::<0>().read(a.read().as_usize());
+"#;
+
+/// The control for every memory pin below: this exact shape DOES transpile, so a
+/// failure in one of them is about the construct it changes and nothing else.
+/// `tests/dual_port_ram_equivalence.rs` at the repo root carries the behavioural
+/// sim ≡ transpiled-SV check for the real example.
 #[test]
-fn memory_is_not_transpilable() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../examples/memory/dual_port_ram.rs"
-    ))
-    .expect("read the dual_port_ram example");
+fn single_cycle_readfirst_memory_is_supported() {
+    let sv = transpile(&mem_dut(MEM_DECL, MEM_BODY))
+        .expect("the baseline memory shape must transpile — every pin below assumes it");
+    assert!(
+        sv.contains("logic [15:0] mem [0:255];"),
+        "expected a packed memory array, got:\n{sv}"
+    );
+}
 
+/// Read/write latency greater than one cycle. The simulator's pipelines are real
+/// behaviour (`copper-core/src/memory.rs` has the LAT=2 tests); the emitted array
+/// has no stage registers, so a deeper pipeline is refused rather than flattened.
+#[test]
+fn memory_latency_above_one_is_unsupported() {
+    let src = mem_dut(
+        "let mem = Memory::<Bits<16>, 1, 1, MainClk, 2, 1>::new(clk.clone(), 256);",
+        MEM_BODY,
+    );
     let err = transpile(&src).expect_err(
-        "Memory now transpiles! Promote this to a real equivalence test against \
-         examples/memory/sv/dual_port_ram.sv, extend P4's from_fn/from_contents \
-         preload check through the transpiled path, and revisit the out-of-range \
-         decision now that a synthesised counterpart exists to adjudicate against.",
+        "NOW SUPPORTED: pipelined memory latency transpiles. Give it an equivalence test that \
+         drives a read every cycle and checks the result appears READ_LAT edges later.",
     );
     assert!(
-        err.contains("cannot infer bit width"),
-        "the Memory transpile gap changed shape; it used to fail bit-width inference. \
-         New error: {err}"
+        err.contains("READ_LAT = 2") && err.contains("single-cycle"),
+        "reproduced a *different* error than the tracked latency gap: {err}"
+    );
+}
+
+/// WriteFirst read-during-write. ReadFirst falls out of non-blocking assignment
+/// for free; WriteFirst needs explicit same-address bypass logic.
+#[test]
+fn write_first_memory_is_unsupported() {
+    let src = mem_dut(
+        "let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256).write_first();",
+        MEM_BODY,
+    );
+    let err = transpile(&src).expect_err(
+        "NOW SUPPORTED: WriteFirst transpiles. Add an equivalence test whose stimulus reads and \
+         writes the SAME address on one edge — the only cycle where the two modes differ.",
+    );
+    assert!(
+        err.contains("WriteFirst") && err.contains("ReadFirst"),
+        "reproduced a *different* error than the tracked WriteFirst gap: {err}"
+    );
+}
+
+/// Preloaded contents (`from_fn` / `from_contents`). Named in the `TODO` P4 item:
+/// preload equivalence through the transpiled path is still open, now for want of
+/// an emitted form rather than for want of memory support at all.
+#[test]
+fn preloaded_memory_is_unsupported() {
+    let src = mem_dut(
+        "let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::from_fn(clk.clone(), 256, |i| Bits::from_usize(i));",
+        MEM_BODY,
+    );
+    let err = transpile(&src).expect_err(
+        "NOW SUPPORTED: preloaded memory transpiles. Close P4's from_fn/from_contents preload \
+         check through the transpiled path.",
+    );
+    assert!(
+        err.contains("from_fn") && err.contains("not supported"),
+        "reproduced a *different* error than the tracked preload gap: {err}"
+    );
+}
+
+/// Two accesses to one port in a single cycle. The simulator silently keeps the
+/// last one (it overwrites pipeline stage 0); one physical address bus cannot.
+#[test]
+fn two_accesses_to_one_memory_port_are_rejected() {
+    let src = mem_dut(
+        MEM_DECL,
+        &format!("{MEM_BODY}\n        mem.write_port::<0>().write(0, d.read());"),
+    );
+    let err = transpile(&src).expect_err("a port driven twice in one cycle must be rejected");
+    assert!(
+        err.contains("accessed 2 times in one cycle"),
+        "reproduced a *different* error than the double-drive rule: {err}"
+    );
+}
+
+/// Multi-phase memory access. A second tick would need phase-guarded address
+/// buses and a read result that survives into a later phase; neither exists.
+#[test]
+fn memory_in_a_multi_phase_loop_is_unsupported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainClk>) {
+    let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256);
+    let mut q: Bits<16> = Bits::zero();
+    loop {
+        mem.read_port::<0>().read(a.read().as_usize());
+        clk.tick().await;
+        if mem.read_port::<0>().is_ready() { q = mem.read_port::<0>().data(); }
+        o.write(q);
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err(
+        "NOW SUPPORTED: multi-phase memory transpiles. The phase guard on the address buses and \
+         the cross-phase read result both need equivalence coverage.",
+    );
+    assert!(
+        err.contains("exactly one `clk.tick().await`"),
+        "reproduced a *different* error than the multi-phase gap: {err}"
+    );
+}
+
+/// The read result observed on the wrong side of the tick. `data()` is what the
+/// clock edge produced, so reading it before the edge would shift the design by a
+/// cycle — silently, since the value is well-typed either way.
+#[test]
+fn memory_read_result_before_the_tick_is_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainClk>) {
+    let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256);
+    let mut q: Bits<16> = Bits::zero();
+    loop {
+        mem.read_port::<0>().read(a.read().as_usize());
+        q = mem.read_port::<0>().data();
+        o.write(q);
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("observing a read result before the edge must be rejected");
+    assert!(
+        err.contains("is read before `clk.tick().await`"),
+        "reproduced a *different* error than the read-ordering rule: {err}"
     );
 }

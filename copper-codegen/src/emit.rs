@@ -9,7 +9,8 @@ use copper_core::chir::Width;
 use copper_core::vlir::{
     ToolchainProfile, VLIRAlwaysFF, VLIRBinOp, VLIRBody, VLIRCombBody, VLIRCombPhase,
     VLIRContinuousAssign, VLIRExpr, VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind,
-    VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRStructuralBody, VLIRSubmoduleInst, VLIRUnOp,
+    VLIRMemDecl, VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRStructuralBody, VLIRSubmoduleInst,
+    VLIRUnOp,
 };
 
 pub struct EmitConfig {
@@ -129,6 +130,8 @@ impl Emitter<'_> {
             self.out.push('\n');
         }
 
+        self.mem_decls(&s.memories);
+
         self.submodules(&s.submodules);
 
         // Declare intermediate combinational wires used in the pre-edge phases.
@@ -168,6 +171,10 @@ impl Emitter<'_> {
             self.out.push_str(&format!("{}end\n\n", self.indent(1)));
         }
 
+        // Continuous reads of the arrays. Emitted after the combinational block
+        // so the address nets they reference are already declared.
+        self.mem_read_assigns(&s.memories);
+
         self.always_ff(&s.always_ff);
         self.out.push('\n');
         self.output_assigns(&s.output_assigns);
@@ -204,6 +211,50 @@ impl Emitter<'_> {
             self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range_str(width), name));
         }
         if !decls.is_empty() {
+            self.out.push('\n');
+        }
+    }
+
+    /// `logic [W-1:0] <name> [0:DEPTH-1];` plus the read-port output nets.
+    fn mem_decls(&mut self, mems: &[VLIRMemDecl]) {
+        for m in mems {
+            self.out.push_str(&format!(
+                "{}logic {}{} [0:{}];\n",
+                self.indent(1),
+                range_str(&m.width),
+                m.name,
+                m.depth - 1
+            ));
+            for n in &m.read_data_nets {
+                self.out.push_str(&format!(
+                    "{}logic {}{};\n",
+                    self.indent(1),
+                    range_str(&n.width),
+                    n.data
+                ));
+            }
+        }
+        if !mems.is_empty() {
+            self.out.push('\n');
+        }
+    }
+
+    /// `assign <data> = <mem>[<addr>];` — one per observed read port.
+    fn mem_read_assigns(&mut self, mems: &[VLIRMemDecl]) {
+        let mut any = false;
+        for m in mems {
+            for n in &m.read_data_nets {
+                any = true;
+                self.out.push_str(&format!(
+                    "{}assign {} = {}[{}];\n",
+                    self.indent(1),
+                    n.data,
+                    m.name,
+                    n.addr
+                ));
+            }
+        }
+        if any {
             self.out.push('\n');
         }
     }
@@ -283,6 +334,15 @@ impl Emitter<'_> {
             VLIRFFStmt::NonBlockingAssign { target, value } => {
                 self.out
                     .push_str(&format!("{}{} <= {};\n", self.indent(level), target, expr_str(value)));
+            }
+            VLIRFFStmt::MemAssign { mem, addr, value } => {
+                self.out.push_str(&format!(
+                    "{}{}[{}] <= {};\n",
+                    self.indent(level),
+                    mem,
+                    expr_str(addr),
+                    expr_str(value)
+                ));
             }
             VLIRFFStmt::If { condition, then_stmts, else_stmts } => {
                 self.out

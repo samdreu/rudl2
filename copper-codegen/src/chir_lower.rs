@@ -1,6 +1,6 @@
 use copper_core::chir::{
     CHIRBinOp, CHIRBody, CHIRCaseArm, CHIRCombBody, CHIRExpr, CHIRLit, CHIRLowerError,
-    CHIRMatchArm, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
+    CHIRMatchArm, CHIRMemoryDecl, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
     CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
 use copper_core::frontend_ir::{
@@ -1190,6 +1190,9 @@ fn lower_seq_body(
         })?;
 
     let mut registers = Vec::new();
+    let mut memories: Vec<CHIRMemoryDecl> = Vec::new();
+    let mut mem_infos: std::collections::HashMap<String, MemInfo> =
+        std::collections::HashMap::new();
     let mut loop_body_stmts: Option<&[RawStmt]> = None;
     // Pre-loop non-`mut` `let`s: combinational constants/wires available in the
     // loop body. Collected here, lowered once the context exists, and prepended
@@ -1224,6 +1227,22 @@ fn lower_seq_body(
                 });
             }
             RawStmtKind::Local(local) => {
+                // A `Memory<..>` binding is a hardware submodule (an array plus
+                // per-port buses), not a wire — it has no bit width to infer.
+                if let Some(decl) =
+                    parse_memory_decl(&local.name, local.init.as_ref(), local.span)?
+                {
+                    mem_infos.insert(
+                        local.name.clone(),
+                        MemInfo {
+                            elem_ty: decl.elem_ty.clone(),
+                            read_ports: decl.read_ports,
+                            write_ports: decl.write_ports,
+                        },
+                    );
+                    memories.push(decl);
+                    continue;
+                }
                 // Pre-loop non-`mut` `let` → a combinational wire (often a
                 // constant) visible throughout the loop body.
                 if let Some(init) = &local.init {
@@ -1277,6 +1296,7 @@ fn lower_seq_body(
     ctx.fns = build_fn_registry(fir);
     ctx.structs = build_struct_registry(fir);
     ctx.write_inferred = build_write_inferred_types(fir, &ctx.symbols);
+    ctx.memories = mem_infos;
 
     // Emit pre-loop wires first so they are declared before any use, then the
     // loop body itself.
@@ -1301,9 +1321,12 @@ fn lower_seq_body(
         });
     }
 
+    validate_memory_usage(&loop_body, &memories, fir.span)?;
+
     Ok(CHIRSeqBody {
         clock,
         registers,
+        memories,
         submodules: ctx.submodules,
         loop_body,
     })
@@ -1581,6 +1604,8 @@ pub(crate) struct LowerCtx<'a> {
     /// ctor>` (e.g. `Bits::zero()`) whose width the bottom-up pass can't derive
     /// takes the type of the output port it is later written to (`out.write(x)`).
     write_inferred: SymbolTable,
+    /// `Memory<..>` instances declared before the loop, by binding name.
+    memories: std::collections::HashMap<String, MemInfo>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1602,6 +1627,7 @@ impl<'a> LowerCtx<'a> {
             inlining: std::collections::HashSet::new(),
             structs: std::collections::HashMap::new(),
             write_inferred: SymbolTable::new(),
+            memories: std::collections::HashMap::new(),
         }
     }
 
@@ -1643,6 +1669,11 @@ fn lower_local_binding(
 
     let ty = match &local.ty {
         Some(t) => resolve_type(&t.ty_text, t.span)?,
+        // A memory read result carries the memory's element type, which the
+        // generic width inference below cannot see through the port handle.
+        None if mem_result_type(init, ctx, local.span)?.is_some() => {
+            mem_result_type(init, ctx, local.span)?.expect("just checked")
+        }
         // Bottom-up inference first; if the width is ambiguous (a context-width
         // ctor like `Bits::zero()`), fall back to the type of the output port this
         // local is later written to (forward inference).
@@ -1843,6 +1874,36 @@ fn lower_expr_stmt(
                     suggested_rewrite: Some("use clk.tick().await to wait for a clock edge".to_string()),
                 });
             }
+        }
+
+        // mem.write_port::<J>().write(addr, value) → MemWrite
+        ExprType::MethodCall(mc) if mc.method == "write" && mc.args.len() == 2 => {
+            let Some((mem, port)) = parse_mem_port(&mc.receiver, "write_port", ctx, span)? else {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: "two-argument `.write()` on something that is not a memory \
+                                  write port".to_string(),
+                    span,
+                    suggested_rewrite: None,
+                });
+            };
+            let addr = lower_expr(&mc.args[0], ctx)?;
+            let value = lower_expr(&mc.args[1], ctx)?;
+            out.push(CHIRStmt::MemWrite { mem, port, addr, value, span });
+        }
+
+        // mem.read_port::<I>().read(addr) → MemRead. A port read (`in.read()`)
+        // takes no argument, so the arity separates the two.
+        ExprType::MethodCall(mc) if mc.method == "read" && mc.args.len() == 1 => {
+            let Some((mem, port)) = parse_mem_port(&mc.receiver, "read_port", ctx, span)? else {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: "one-argument `.read()` on something that is not a memory \
+                                  read port".to_string(),
+                    span,
+                    suggested_rewrite: None,
+                });
+            };
+            let addr = lower_expr(&mc.args[0], ctx)?;
+            out.push(CHIRStmt::MemRead { mem, port, addr, span });
         }
 
         // port.write(value) → PortWrite
@@ -2649,6 +2710,10 @@ fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
             width_of_chir_expr(then_val, ctx).or_else(|| width_of_chir_expr(else_val, ctx))
         }
         CHIRExpr::Slice { high, low, .. } => Some(high - low + 1),
+        // A memory read result: the element width lives in the memory's
+        // declaration, which this expression-only walk does not carry.
+        CHIRExpr::MemData { mem, .. } => ctx.memories.get(mem).map(|m| width_of_type(&m.elem_ty)),
+        CHIRExpr::MemValid { .. } => Some(1),
         CHIRExpr::DynBit { .. } => Some(1),
         CHIRExpr::Resize { width, .. } => match width {
             Width::Concrete(n) => Some(*n),
@@ -2873,6 +2938,30 @@ fn lower_method_call(
     mc: &copper_core::frontend_ir::ExprMethodCall,
     ctx: &mut LowerCtx,
 ) -> Result<CHIRExpr, CHIRLowerError> {
+    // `mem.read_port::<I>().data()` / `.is_ready()` — the read port's output
+    // and its valid flag. Checked before the passthrough list below, which would
+    // otherwise swallow nothing here but keeps the memory forms adjacent.
+    if mc.args.is_empty() && (mc.method == "data" || mc.method == "is_ready") {
+        let span = mc.span;
+        if let Some((mem, port)) = parse_mem_port(&mc.receiver, "read_port", ctx, span)? {
+            return Ok(if mc.method == "data" {
+                CHIRExpr::MemData { mem, port }
+            } else {
+                CHIRExpr::MemValid { mem, port }
+            });
+        }
+        // A *write* port's `is_ready()` is unconditionally true in the simulator
+        // (a pipelined write port always accepts), so it lowers to a constant.
+        if mc.method == "is_ready" {
+            if parse_mem_port(&mc.receiver, "write_port", ctx, span)?.is_some() {
+                return Ok(CHIRExpr::Lit(CHIRLit {
+                    ty: CHIRType::Bool,
+                    value: 1,
+                }));
+            }
+        }
+    }
+
     match mc.method.as_str() {
         // Value passthroughs (simulation-only conversions on already-hardware
         // values): `port.read()`, `logic.as_bool()`. Lower to the receiver.
@@ -3203,6 +3292,13 @@ fn validate_stmts(
                 body_known.insert(var.clone());
                 validate_stmts(body, &mut body_known, *s)?;
             }
+            CHIRStmt::MemRead { addr, span: s, .. } => {
+                validate_expr(addr, known, *s)?;
+            }
+            CHIRStmt::MemWrite { addr, value, span: s, .. } => {
+                validate_expr(addr, known, *s)?;
+                validate_expr(value, known, *s)?;
+            }
             CHIRStmt::IndexAssign { base, index, value, span: s } => {
                 // `base` must be an already-declared signal; the bit-assign drives
                 // one of its bits.
@@ -3274,6 +3370,9 @@ fn validate_expr(
             validate_expr(index, known, span)?;
         }
         CHIRExpr::Resize { expr, .. } => validate_expr(expr, known, span)?,
+        // A memory read result names a memory, not a local — nothing to resolve
+        // against `known` (the declaration was checked when it was recognized).
+        CHIRExpr::MemData { .. } | CHIRExpr::MemValid { .. } => {}
     }
     Ok(())
 }
@@ -3444,6 +3543,475 @@ fn find_top_level_pipe(s: &str) -> Option<usize> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// ── Memory recognition ────────────────────────────────────────────────────────
+//
+// A `Memory<T, R, W, D, READ_LAT, WRITE_LAT>` bound before the loop is a
+// hardware submodule (an array plus per-port address/data buses), not a local
+// wire. Recognition happens here so the rest of the pipeline sees explicit
+// `MemRead`/`MemWrite` statements and `MemData`/`MemValid` expressions rather
+// than opaque method calls.
+//
+// Only the `READ_LAT == WRITE_LAT == 1` form lowers today. Everything outside
+// that is a *clean* error naming the construct, never a silent mis-lowering:
+// the sim's deeper pipelines are real behaviour that the emitted array does not
+// reproduce.
+
+/// What the pre-loop scan learned about one `Memory<..>` binding, kept in the
+/// lowering context so a `mem.read_port::<I>()` chain resolves and range-checks.
+#[derive(Debug, Clone)]
+pub(crate) struct MemInfo {
+    pub(crate) elem_ty: CHIRType,
+    pub(crate) read_ports: usize,
+    pub(crate) write_ports: usize,
+}
+
+/// The index of the matching `>` for the `<` at `open` in `s` (byte offsets).
+fn matching_angle(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices().skip(open) {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Recognize a `Memory<..>` constructor bound to a pre-loop `let`.
+///
+/// `Ok(None)` means "not a memory at all" — the caller falls through to normal
+/// wire lowering. `Err` means "a memory, but not one this pipeline can emit".
+fn parse_memory_decl(
+    name: &str,
+    init: Option<&ExprType>,
+    span: SourceSpan,
+) -> Result<Option<CHIRMemoryDecl>, CHIRLowerError> {
+    let Some(init) = init else { return Ok(None) };
+
+    // `Memory::<..>::new(..).read_first()` — the mode this lowering emits.
+    // `.write_first()` is a different RAM, so it is refused rather than ignored.
+    if let ExprType::MethodCall(mc) = init {
+        return match mc.method.as_str() {
+            "read_first" if mc.args.is_empty() => parse_memory_decl(name, Some(&mc.receiver), span),
+            "write_first" if mc.args.is_empty() => Err(CHIRLowerError::UnsupportedConstruct {
+                description: "WriteFirst memory (`.write_first()`) is not supported by the \
+                              transpiler yet; only the ReadFirst default lowers"
+                    .to_string(),
+                span,
+                suggested_rewrite: None,
+            }),
+            _ => Ok(None),
+        };
+    }
+
+    let ExprType::Call(call) = init else { return Ok(None) };
+    let Some(path) = call_path(call) else { return Ok(None) };
+
+    // Split the path *head* (everything before the turbofish) into segments, so a
+    // module qualifier and the constructor name are both visible:
+    //   `copper_core::Memory::<..>::new` → head `copper_core::Memory::` → [copper_core, Memory]
+    //   `Memory::new`                    → head `Memory::new`            → [Memory, new]
+    let head_end = path.find('<').unwrap_or(path.len());
+    let segs: Vec<&str> =
+        path[..head_end].split("::").filter(|s| !s.is_empty()).collect();
+    let has_generics = head_end < path.len();
+    let is_memory_ctor = if has_generics {
+        segs.last() == Some(&"Memory")
+    } else {
+        segs.len() >= 2 && segs[segs.len() - 2] == "Memory"
+    };
+    if !is_memory_ctor {
+        return Ok(None);
+    }
+    if !has_generics {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "memory `{name}` is declared without an explicit type; the transpiler needs the \
+                 element type and port counts from the turbofish"
+            ),
+            span,
+            suggested_rewrite: Some(
+                "annotate the declaration: `Memory::<Bits<16>, 1, 1, D, 1, 1>::new(clk, N)`"
+                    .to_string(),
+            ),
+        });
+    }
+
+    let open = head_end;
+    let close = matching_angle(&path, open).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("unbalanced generic arguments on memory `{name}`"),
+        span,
+        suggested_rewrite: None,
+    })?;
+    let ctor = path[close + 1..].trim_start_matches(':').to_string();
+    if ctor != "new" {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "memory constructor `{ctor}` is not supported by the transpiler yet; only \
+                 `Memory::<..>::new(clk, size)` lowers (preloaded contents have no emitted form)"
+            ),
+            span,
+            suggested_rewrite: None,
+        });
+    }
+
+    // `Memory::<Bits<16>,1,1,MainClk,1,1>::new` → the generic argument list.
+    let args = split_top_level_commas(&path[open + 1..close]);
+    if args.len() < 4 {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "memory `{name}` needs at least `Memory::<T, R, W, D>`; found {} generic argument(s)",
+                args.len()
+            ),
+            span,
+            suggested_rewrite: None,
+        });
+    }
+
+    let elem_ty = resolve_type(args[0], span)?;
+    let read_ports = parse_const_usize(args[1], "read port count", name, span)?;
+    let write_ports = parse_const_usize(args[2], "write port count", name, span)?;
+    // READ_LAT / WRITE_LAT both default to 1 when the turbofish omits them.
+    let read_lat = match args.get(3 + 1) {
+        Some(a) => parse_const_usize(a, "READ_LAT", name, span)?,
+        None => 1,
+    };
+    let write_lat = match args.get(3 + 2) {
+        Some(a) => parse_const_usize(a, "WRITE_LAT", name, span)?,
+        None => 1,
+    };
+    if read_lat != 1 || write_lat != 1 {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "memory `{name}` has READ_LAT = {read_lat}, WRITE_LAT = {write_lat}; the \
+                 transpiler only lowers single-cycle memories (READ_LAT = WRITE_LAT = 1). A \
+                 deeper pipeline is real behaviour in the simulator that the emitted array \
+                 would not reproduce"
+            ),
+            span,
+            suggested_rewrite: None,
+        });
+    }
+
+    // `new(clk, size)` — the depth must be a literal to size the array.
+    let depth_arg = call.args.get(1).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("memory `{name}`: `new` takes a clock and a size"),
+        span,
+        suggested_rewrite: None,
+    })?;
+    let depth = match depth_arg {
+        ExprType::Lit(l) => l
+            .text
+            .trim()
+            .trim_end_matches("usize")
+            .trim_end_matches('_')
+            .replace('_', "")
+            .parse::<usize>()
+            .ok(),
+        _ => None,
+    }
+    .ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("memory `{name}`: the size argument must be an integer literal"),
+        span,
+        suggested_rewrite: None,
+    })?;
+    if depth == 0 {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!("memory `{name}` has size 0"),
+            span,
+            suggested_rewrite: None,
+        });
+    }
+
+    Ok(Some(CHIRMemoryDecl {
+        name: name.to_string(),
+        elem_ty,
+        depth,
+        read_ports,
+        write_ports,
+        span,
+    }))
+}
+
+fn parse_const_usize(
+    text: &str,
+    what: &str,
+    mem: &str,
+    span: SourceSpan,
+) -> Result<usize, CHIRLowerError> {
+    text.trim().parse::<usize>().map_err(|_| CHIRLowerError::UnsupportedConstruct {
+        description: format!(
+            "memory `{mem}`: {what} `{}` is not a concrete number; generic memories are not \
+             transpilable (the CLI only handles concrete modules)",
+            text.trim()
+        ),
+        span,
+        suggested_rewrite: None,
+    })
+}
+
+/// The type of `mem.read_port::<I>().data()` / `.is_ready()` — the element type
+/// and a single bit respectively. `None` when `init` is not a memory read result.
+fn mem_result_type(
+    init: &ExprType,
+    ctx: &LowerCtx,
+    span: SourceSpan,
+) -> Result<Option<CHIRType>, CHIRLowerError> {
+    let ExprType::MethodCall(mc) = init else { return Ok(None) };
+    if !mc.args.is_empty() {
+        return Ok(None);
+    }
+    let Some((mem, _)) = parse_mem_port(&mc.receiver, "read_port", ctx, span)? else {
+        return Ok(None);
+    };
+    Ok(match mc.method.as_str() {
+        "data" => ctx.memories.get(&mem).map(|m| m.elem_ty.clone()),
+        "is_ready" => Some(CHIRType::Bool),
+        _ => None,
+    })
+}
+
+/// Enforce the boundaries of the memory support that actually lowers.
+///
+/// Each rule guards a place where the emitted array would *silently* disagree
+/// with the simulator, so all of them are hard errors rather than warnings:
+///
+/// - **One tick.** A memory in a multi-phase FSM needs phase-guarded address
+///   buses and a read result that survives into a later phase; neither is built.
+/// - **Access before the edge, result after it.** `read`/`write` stage buses
+///   that the *following* clock edge captures; `data`/`is_ready` observe what
+///   that edge produced. Reversing either side shifts the design by a cycle.
+/// - **One access per port.** A physical port has one address bus. The simulator
+///   silently keeps the last write of a cycle; hardware cannot.
+fn validate_memory_usage(
+    loop_body: &[CHIRStmt],
+    memories: &[CHIRMemoryDecl],
+    module_span: SourceSpan,
+) -> Result<(), CHIRLowerError> {
+    if memories.is_empty() {
+        return Ok(());
+    }
+
+    let ticks = loop_body.iter().filter(|s| matches!(s, CHIRStmt::AwaitTick { .. })).count();
+    if ticks != 1 {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "a module using `Memory` must have exactly one `clk.tick().await` in its loop; \
+                 this one has {ticks}. Multi-phase memory access is not supported yet"
+            ),
+            span: module_span,
+            suggested_rewrite: None,
+        });
+    }
+
+    let mut after_tick = false;
+    let mut reads: std::collections::HashMap<(String, usize), usize> = Default::default();
+    let mut writes: std::collections::HashMap<(String, usize), usize> = Default::default();
+
+    for stmt in loop_body {
+        if matches!(stmt, CHIRStmt::AwaitTick { .. }) {
+            after_tick = true;
+            continue;
+        }
+        check_mem_stmt(stmt, after_tick, &mut reads, &mut writes)?;
+    }
+
+    for ((mem, port), n) in reads.iter().chain(writes.iter()) {
+        if *n > 1 {
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: format!(
+                    "memory `{mem}` port {port} is accessed {n} times in one cycle; a physical \
+                     port has a single address bus. Merge the accesses into one, selecting the \
+                     address and data with a conditional"
+                ),
+                span: module_span,
+                suggested_rewrite: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Recursive half of `validate_memory_usage`: tally accesses and reject any that
+/// sit on the wrong side of the tick.
+fn check_mem_stmt(
+    stmt: &CHIRStmt,
+    after_tick: bool,
+    reads: &mut std::collections::HashMap<(String, usize), usize>,
+    writes: &mut std::collections::HashMap<(String, usize), usize>,
+) -> Result<(), CHIRLowerError> {
+    let staged = |kind: &str, span: SourceSpan| CHIRLowerError::UnsupportedConstruct {
+        description: format!(
+            "memory {kind} after `clk.tick().await`: an access stages the address and data buses \
+             that the *next* clock edge captures, so it must appear before the tick"
+        ),
+        span,
+        suggested_rewrite: Some("move the access above `clk.tick().await`".to_string()),
+    };
+
+    match stmt {
+        CHIRStmt::MemRead { mem, port, addr, span } => {
+            if after_tick {
+                return Err(staged("read", *span));
+            }
+            *reads.entry((mem.clone(), *port)).or_insert(0) += 1;
+            check_mem_expr(addr, after_tick, *span)?;
+        }
+        CHIRStmt::MemWrite { mem, port, addr, value, span } => {
+            if after_tick {
+                return Err(staged("write", *span));
+            }
+            *writes.entry((mem.clone(), *port)).or_insert(0) += 1;
+            check_mem_expr(addr, after_tick, *span)?;
+            check_mem_expr(value, after_tick, *span)?;
+        }
+        CHIRStmt::Wire { value, span, .. } => check_mem_expr(value, after_tick, *span)?,
+        CHIRStmt::Assign { value, span, .. } => check_mem_expr(value, after_tick, *span)?,
+        CHIRStmt::PortWrite { value, span, .. } => check_mem_expr(value, after_tick, *span)?,
+        CHIRStmt::IndexAssign { index, value, span, .. } => {
+            check_mem_expr(index, after_tick, *span)?;
+            check_mem_expr(value, after_tick, *span)?;
+        }
+        CHIRStmt::If { condition, then_body, else_body, span } => {
+            check_mem_expr(condition, after_tick, *span)?;
+            for s in then_body {
+                check_mem_stmt(s, after_tick, reads, writes)?;
+            }
+            for s in else_body.iter().flatten() {
+                check_mem_stmt(s, after_tick, reads, writes)?;
+            }
+        }
+        CHIRStmt::Match { scrutinee, arms, span } => {
+            check_mem_expr(scrutinee, after_tick, *span)?;
+            for arm in arms {
+                for s in &arm.body {
+                    check_mem_stmt(s, after_tick, reads, writes)?;
+                }
+            }
+        }
+        CHIRStmt::ForLoop { body, .. } => {
+            for s in body {
+                check_mem_stmt(s, after_tick, reads, writes)?;
+            }
+        }
+        CHIRStmt::AwaitTick { .. } => {}
+    }
+    Ok(())
+}
+
+/// Reject `data()` / `is_ready()` read before the clock edge that produces them.
+fn check_mem_expr(
+    expr: &CHIRExpr,
+    after_tick: bool,
+    span: SourceSpan,
+) -> Result<(), CHIRLowerError> {
+    if after_tick {
+        return Ok(());
+    }
+    let mut found: Option<(&'static str, String, usize)> = None;
+    walk_chir_expr(expr, &mut |e| match e {
+        CHIRExpr::MemData { mem, port } => {
+            found.get_or_insert_with(|| ("data", mem.clone(), *port));
+        }
+        CHIRExpr::MemValid { mem, port } => {
+            found.get_or_insert_with(|| ("is_ready", mem.clone(), *port));
+        }
+        _ => {}
+    });
+    match found {
+        None => Ok(()),
+        Some((what, mem, port)) => Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "`{mem}.read_port::<{port}>().{what}()` is read before `clk.tick().await`. The \
+                 read result appears at the clock edge, so it must be observed after the tick"
+            ),
+            span,
+            suggested_rewrite: Some("move the observation below `clk.tick().await`".to_string()),
+        }),
+    }
+}
+
+/// Pre-order walk over every sub-expression.
+fn walk_chir_expr(expr: &CHIRExpr, f: &mut impl FnMut(&CHIRExpr)) {
+    f(expr);
+    match expr {
+        CHIRExpr::BinOp { left, right, .. } => {
+            walk_chir_expr(left, f);
+            walk_chir_expr(right, f);
+        }
+        CHIRExpr::UnOp { expr, .. } | CHIRExpr::Resize { expr, .. } => walk_chir_expr(expr, f),
+        CHIRExpr::Mux { cond, then_val, else_val } => {
+            walk_chir_expr(cond, f);
+            walk_chir_expr(then_val, f);
+            walk_chir_expr(else_val, f);
+        }
+        CHIRExpr::Case { scrutinee, arms, default } => {
+            walk_chir_expr(scrutinee, f);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    walk_chir_expr(g, f);
+                }
+                walk_chir_expr(&arm.value, f);
+            }
+            if let Some(d) = default {
+                walk_chir_expr(d, f);
+            }
+        }
+        CHIRExpr::Concat(parts) => {
+            for p in parts {
+                walk_chir_expr(p, f);
+            }
+        }
+        CHIRExpr::Slice { expr, .. } => walk_chir_expr(expr, f),
+        CHIRExpr::DynBit { base, index } => {
+            walk_chir_expr(base, f);
+            walk_chir_expr(index, f);
+        }
+        CHIRExpr::Var(_) | CHIRExpr::Lit(_) | CHIRExpr::MemData { .. } | CHIRExpr::MemValid { .. } => {}
+    }
+}
+
+/// If `recv` is `<mem>.<kind>::<I>()` for a known memory, return `(mem, I)`.
+/// `kind` is `read_port` or `write_port`.
+fn parse_mem_port(
+    recv: &ExprType,
+    kind: &str,
+    ctx: &LowerCtx,
+    span: SourceSpan,
+) -> Result<Option<(String, usize)>, CHIRLowerError> {
+    let ExprType::MethodCall(mc) = recv else { return Ok(None) };
+    if mc.method != kind || !mc.args.is_empty() {
+        return Ok(None);
+    }
+    let ExprType::Path(p) = mc.receiver.as_ref() else { return Ok(None) };
+    let mem = p.path_text.trim().to_string();
+    let Some(info) = ctx.memories.get(&mem) else { return Ok(None) };
+
+    let idx_text = mc.turbofish.first().ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("`{mem}.{kind}()` needs an explicit port index, e.g. `{kind}::<0>()`"),
+        span,
+        suggested_rewrite: None,
+    })?;
+    let port = parse_const_usize(idx_text, "port index", &mem, span)?;
+    let count = if kind == "read_port" { info.read_ports } else { info.write_ports };
+    if port >= count {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "memory `{mem}` has {count} {kind}(s); index {port} is out of range"
+            ),
+            span,
+            suggested_rewrite: None,
+        });
+    }
+    Ok(Some((mem, port)))
+}
 
 #[cfg(test)]
 mod tests {

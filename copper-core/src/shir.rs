@@ -71,6 +71,8 @@ pub struct SHIRCombBody {
 pub struct SHIRSeqBody {
     pub clock: String,
     pub registers: Vec<SHIRReg>,
+    /// `Memory<..>` instances — 1:1 with `CHIRSeqBody::memories`.
+    pub memories: Vec<SHIRMemory>,
     pub submodules: Vec<SHIRSubmoduleInst>,
     /// One entry per phase (tick boundary).
     /// Single-tick modules have exactly one phase (phase_idx = 0).
@@ -84,6 +86,16 @@ pub struct SHIRReg {
     pub name: String,
     pub ty: CHIRType,
     pub init: Option<SHIRLit>,
+}
+
+/// A memory array instance. Mirrors `CHIRMemoryDecl` minus the span.
+#[derive(Debug)]
+pub struct SHIRMemory {
+    pub name: String,
+    pub elem_ty: CHIRType,
+    pub depth: usize,
+    pub read_ports: usize,
+    pub write_ports: usize,
 }
 
 /// A `#[hardware]` submodule instance. The output_wire is a combinational
@@ -159,6 +171,19 @@ pub enum SHIRStmt {
         index: SHIRExpr,
         value: SHIRExpr,
     },
+    /// Stage a read address on a memory read port — see `CHIRStmt::MemRead`.
+    MemRead {
+        mem: String,
+        port: usize,
+        addr: SHIRExpr,
+    },
+    /// Stage a write on a memory write port — see `CHIRStmt::MemWrite`.
+    MemWrite {
+        mem: String,
+        port: usize,
+        addr: SHIRExpr,
+        value: SHIRExpr,
+    },
 }
 
 #[derive(Debug)]
@@ -219,6 +244,10 @@ pub enum SHIRExpr {
     },
     /// Compares phase_r == idx. Used in multi-phase post_edge conditions.
     PhaseEq(usize),
+    /// `mem.read_port::<port>().data()` — the read port's output value.
+    MemData { mem: String, port: usize },
+    /// `mem.read_port::<port>().is_ready()` — the read port's output-valid flag.
+    MemValid { mem: String, port: usize },
 }
 
 #[derive(Debug, Clone)]

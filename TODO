@@ -14,8 +14,8 @@ TRANSPILATION:
 
   ── TRANSPILER COVERAGE, MEASURED 2026-08-24 ────────────────────────────────
   Every #[hardware] module in examples/ probed through the copper-transpile CLI.
-  BEFORE this pass: 19/34 modules transpiled. AFTER fixes A+B below: 20/34.
-  The 14 still failing, by ROOT CAUSE (several share one cause — fix the cause,
+  BEFORE this pass: 19/34 modules transpiled. AFTER A+B: 20/34. AFTER E: 21/34.
+  The 13 still failing, by ROOT CAUSE (several share one cause — fix the cause,
   not the module):
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
@@ -24,7 +24,9 @@ TRANSPILATION:
         array-typed ports .................. bsg_counter_up_down (MOD),
                                              bsg_encode_one_hot (WIDTH),
                                              bsg_mux_one_hot, mux
-    E ☐ `Memory` does not transpile at all ....... dual_port_ram (+ both CPUs)
+    E ✔ FIXED — `Memory` now transpiles ......... dual_port_ram. Both CPUs stay
+        blocked, but on their OWN causes (re-measured): rv32i_cpu on G,
+        rv32i_cpu_pipelined on F — not on memory.
     F ☐ `Vec` ports .............................. rv32i_cpu_pipelined
     G ☐ transpiler PANICS (not a clean error) .... rv32i_cpu
         control_extract.rs:95 `.expect("gate guarantees at least one tick")`
@@ -64,6 +66,51 @@ TRANSPILATION:
       (`In<Bits<8>, some_mod::Dom>`) is untouched. Literal, path and pattern texts
       deliberately do NOT go through it — a qualifier is meaningful there
       (`Logic::One`, `Opcode::LUI`).
+
+  ✔ FIXED (2026-08-24, with user sign-off) — E: `Memory` had NO transpiled path.
+    Not one construct being rejected — an entire first-class feature that existed
+    only in the simulator. The IRs had no memory node at all (`grep -i memory`
+    over chir/shir/vlir/frontend_ir: zero hits), so every memory guarantee was
+    sim-only and the central claim (one source simulates AND synthesises, provably
+    in agreement) did not extend to any design using memory.
+      SCOPE, chosen with the user: single-cycle (READ_LAT = WRITE_LAT = 1)
+      ReadFirst, N read + M write ports, no preload. Everything else is a CLEAN
+      error naming the construct — never a silent mis-lowering — and every one of
+      those boundaries is pinned in copper-codegen/tests/unsupported_constructs.rs
+      against a baseline DUT that DOES transpile, so a pin can only fail for the
+      construct it names.
+      THE LOWERING IS MECHANICAL because the sim API is already the hardware
+      staging pattern (this is why the OUTDATED MEMORY_DESIGN.md indexing API was
+      NOT adopted — the transpiler lowers the API the examples actually use):
+        Memory::<T,R,W,D,1,1>::new(clk, N)  → logic [W-1:0] mem [0:N-1];
+        pre-tick  wp::<j>().write(a,d)      → if (en) mem[a] <= d;   in always_ff
+        pre-tick  rp::<i>().read(a)         → en/addr comb nets
+        post-tick rp::<i>().data()          → assign rd_data = mem[rd_addr];
+        post-tick rp::<i>().is_ready()      → the enable net (LAT=1: ready ⟺ staged)
+      ReadFirst falls out of non-blocking assignment for free — the continuous
+      read sees the array before the edge commits the write — which is exactly
+      what the hand-written reference does (`if (enb) dob <= ram[addrb];`).
+      IR: CHIRMemoryDecl + CHIRStmt::MemRead/MemWrite + CHIRExpr::MemData/MemValid,
+      mirrored through SHIR, into VLIRMemDecl + VLIRFFStmt::MemAssign. The net
+      names are reserved in the legalizer from the DECLARATION, so a user signal
+      cannot collide with a synthesized one.
+      WHY THE NETS ARE COMB WIRES, not registers: the post-tick `data()` read
+      observes what the edge PRODUCED. Lowering it to a pipeline register would
+      read the register's pre-edge value inside always_ff and lag the design by a
+      cycle. Feeding the register update from a continuous read of the array
+      collapses to `if (en) q <= mem[addr]` — the reference's own shape.
+      VERIFIED BEHAVIOURALLY: tests/dual_port_ram_equivalence.rs — sim ≡ transpiled
+      SV under Verilator over 11 cycles including a deliberate read-during-write at
+      the same address (the one cycle where a wrong lowering is otherwise
+      invisible), PLUS a shape assertion, PLUS an independent Rust reference model.
+      The example's own sim ≡ hand-written-SV check still passes, so the generated
+      SV is transitively anchored to a memory neither Copper nor its transpiler
+      wrote. Example `include!`d, not copied — one source of truth.
+      ALSO REMOVED: dual_port_ram declared a `data_out_a` output it never drove.
+      Harmless in simulation, a Verilator UNDRIVEN error once it transpiled. The
+      hand-written reference has no `doa` either (it is commented out), so the
+      interfaces now match. NOTE the open language question this exposes: Copper
+      does not reject an undriven `Out` at compile time — the transpiler found it.
 
   ✔ A+B UNBLOCKED sipo_block THROUGH THE FRONT END, WHICH IMMEDIATELY EXPOSED THE
      multi-phase RegOut codegen bug — and, verifying that, a second one in the
@@ -545,22 +592,49 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      and the valid range.
      Rejected alternatives: X (what SV does on an out-of-range read) and wrap (what
      real address decoding does). Both silently substitute a value, turning an
-     addressing bug into a wrong-answer bug downstream. There is no transpiled Memory
-     path to be faithful to (below), so no sim≡synth pressure — the diagnostic is
-     worth more than the fidelity here. REVISIT if Memory ever transpiles.
+     addressing bug into a wrong-answer bug downstream. When this was decided there
+     was no transpiled Memory path to be faithful to, so no sim≡synth pressure and
+     the diagnostic was worth more than the fidelity. THAT PREMISE EXPIRED on
+     2026-08-24 — see the REVISIT item below.
      Pinned by tests/memory_multiport_arbitration.rs::out_of_range (4 tests, incl. the
      boundary address and "panics at the call, not at the edge").
+  ✔ Memory TRANSPILES  [DONE 2026-08-24, user-scoped]
+     Was: "Memory does not transpile AT ALL" — the largest single hole in the
+     project's central claim. Now: single-cycle (READ_LAT = WRITE_LAT = 1)
+     ReadFirst memories lower, and examples/memory/dual_port_ram.rs has
+     sim ≡ transpiled SV under Verilator (tests/dual_port_ram_equivalence.rs) on
+     top of its existing sim ≡ hand-written-SV check — so the generated SV is
+     transitively anchored to third-party hardware. Full write-up in the
+     TRANSPILATION section above (fix E).
   ☐ from_fn / from_contents preload equivalence through the transpiled path
-     BLOCKED — **Memory does not transpile AT ALL.** examples/memory/dual_port_ram.rs
-     fails with "cannot infer bit width; add an explicit type annotation". This is
-     bigger than one construct: an entire first-class feature exists only in the
-     simulator, so EVERY memory guarantee is sim-only and the project's central claim
-     (same source simulates and synthesises, provably in agreement) does not extend to
-     designs using Memory. tests/verilog_fifo_memory_new.rs anchors to HAND-WRITTEN
-     Verilog, not to transpiled output.
-     PINNED: copper-codegen/tests/unsupported_constructs.rs::memory_is_not_transpilable
-     — flips loudly if support lands, and says what to do then (promote to a real
-     equivalence test, extend the preload check, revisit out-of-range).
+     STILL OPEN, but no longer blocked on memory support existing — only on an
+     emitted form for the initial contents. Deferred deliberately (the user's
+     call): the two candidates are an `initial` block (Verilator-fine, not
+     universally synthesizable, makes sim ≡ SV depend on initial-block ordering)
+     and `$readmemh` + a second artifact file (portable, but nothing in the
+     pipeline emits a second file today).
+     PINNED: copper-codegen/tests/unsupported_constructs.rs::preloaded_memory_is_unsupported
+  ☐ Memory constructs still outside the transpiled path, each pinned with its own
+     diagnostic in copper-codegen/tests/unsupported_constructs.rs. Every pin is
+     measured against `single_cycle_readfirst_memory_is_supported`, the baseline
+     DUT that DOES transpile, so a pin can only fail for the construct it names:
+       - READ_LAT / WRITE_LAT > 1 (the emitted array has no stage registers)
+       - WriteFirst (needs explicit same-address bypass; ReadFirst is free)
+       - preloaded contents (above)
+       - memory inside a multi-phase loop (needs phase-guarded address buses and
+         a read result that survives into a later phase)
+     And two rules that are rejections rather than gaps — hardware cannot express
+     them, so they must not lower silently:
+       - two accesses to one port in a cycle (the sim keeps the last; one physical
+         address bus cannot)
+       - `data()` / `is_ready()` observed before the tick that produces them
+  ☐ REVISIT out-of-range addressing now that a synthesised counterpart EXISTS.
+     The deliberate panic (copper-core/src/memory.rs::out_of_range) was decided on
+     diagnostic grounds precisely because there was nothing to be faithful to.
+     There is now: SystemVerilog reads X out of range, and the emitted address net
+     is clog2(depth) bits, so a wider address truncates in the SV where the
+     simulator panics. Not a divergence any passing test reaches (the sim panics
+     first), but it is a real sim-vs-synth difference that is now decidable.
 
 --------------------------------------------------------------------------------
 P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)

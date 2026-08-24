@@ -8,7 +8,7 @@ use copper_core::chir::{
 use copper_core::frontend_ir::SourceSpan;
 use copper_core::shir::{
     SHIRBody, SHIRCaseArm, SHIRCombBody, SHIRExpr, SHIRLit, SHIRLowerError, SHIRMatchArm,
-    SHIRModule, SHIRPattern, SHIRPhase, SHIRPort,
+    SHIRMemory, SHIRModule, SHIRPattern, SHIRPhase, SHIRPort,
     SHIRPortDir, SHIRPortKind, SHIRReg, SHIRRegUpdate, SHIRSeqBody, SHIRStmt,
     SHIRStructuralBody, SHIRSubmoduleInst,
 };
@@ -185,6 +185,24 @@ fn lower_stmt_list(
                 out.push(SHIRStmt::IndexAssign {
                     base: base.clone(),
                     index: rename_vars(lower_expr(index)?, renames),
+                    value: rename_vars(lower_expr(value)?, renames),
+                });
+            }
+            // Memory accesses stage the address/data buses that this segment's
+            // clock edge captures. They ride along with the pre-edge statements so
+            // their surrounding `if` structure (the port enable) is preserved.
+            CHIRStmt::MemRead { mem, port, addr, .. } => {
+                out.push(SHIRStmt::MemRead {
+                    mem: mem.clone(),
+                    port: *port,
+                    addr: rename_vars(lower_expr(addr)?, renames),
+                });
+            }
+            CHIRStmt::MemWrite { mem, port, addr, value, .. } => {
+                out.push(SHIRStmt::MemWrite {
+                    mem: mem.clone(),
+                    port: *port,
+                    addr: rename_vars(lower_expr(addr)?, renames),
                     value: rename_vars(lower_expr(value)?, renames),
                 });
             }
@@ -402,6 +420,13 @@ fn lower_seq_body(
     Ok(SHIRSeqBody {
         clock: seq.clock.clone(),
         registers,
+        memories: seq.memories.iter().map(|m| SHIRMemory {
+            name: m.name.clone(),
+            elem_ty: m.elem_ty.clone(),
+            depth: m.depth,
+            read_ports: m.read_ports,
+            write_ports: m.write_ports,
+        }).collect(),
         submodules,
         phases,
     })
@@ -756,6 +781,11 @@ fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
             collect_expr_vars(index, visitor);
             collect_expr_vars(value, visitor);
         }
+        CHIRStmt::MemRead { addr, .. } => collect_expr_vars(addr, visitor),
+        CHIRStmt::MemWrite { addr, value, .. } => {
+            collect_expr_vars(addr, visitor);
+            collect_expr_vars(value, visitor);
+        }
         CHIRStmt::AwaitTick { .. } => {}
     }
 }
@@ -789,6 +819,8 @@ fn collect_expr_vars(expr: &CHIRExpr, visitor: &mut impl FnMut(&str)) {
             collect_expr_vars(index, visitor);
         }
         CHIRExpr::Resize { expr, .. } => collect_expr_vars(expr, visitor),
+        // A memory read result is not a variable reference.
+        CHIRExpr::MemData { .. } | CHIRExpr::MemValid { .. } => {}
     }
 }
 
@@ -799,7 +831,10 @@ fn subst_vars(expr: SHIRExpr, subst: &HashMap<String, SHIRExpr>) -> SHIRExpr {
     if subst.is_empty() { return expr; }
     match expr {
         SHIRExpr::Var(ref name) => subst.get(name).cloned().unwrap_or(expr),
-        SHIRExpr::Lit(_) | SHIRExpr::PhaseEq(_) => expr,
+        SHIRExpr::Lit(_)
+        | SHIRExpr::PhaseEq(_)
+        | SHIRExpr::MemData { .. }
+        | SHIRExpr::MemValid { .. } => expr,
         SHIRExpr::BinOp { left, op, right } => SHIRExpr::BinOp {
             left: Box::new(subst_vars(*left, subst)),
             op,
@@ -911,6 +946,12 @@ pub fn lower_expr(expr: &CHIRExpr) -> Result<SHIRExpr, SHIRLowerError> {
             expr: Box::new(lower_expr(expr)?),
             width: width.clone(),
         }),
+        CHIRExpr::MemData { mem, port } => {
+            Ok(SHIRExpr::MemData { mem: mem.clone(), port: *port })
+        }
+        CHIRExpr::MemValid { mem, port } => {
+            Ok(SHIRExpr::MemValid { mem: mem.clone(), port: *port })
+        }
     }
 }
 

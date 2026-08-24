@@ -96,6 +96,8 @@ pub struct VLIRCombBody {
 pub struct VLIRSeqBody {
     pub clock: String,
     pub reg_decls: Vec<VLIRRegDecl>,
+    /// Memory arrays declared by this module, with their read-port output nets.
+    pub memories: Vec<VLIRMemDecl>,
     pub submodules: Vec<VLIRSubmoduleInst>,
     /// One `always_comb` block per phase (pre-edge wires + conditional port
     /// drives). Single-phase modules have exactly one, with `phase_guard: None`.
@@ -108,6 +110,28 @@ pub struct VLIRSeqBody {
 #[derive(Debug)]
 pub struct VLIRRegDecl {
     pub name: String,
+    pub width: Width,
+}
+
+/// A memory array: `logic [width-1:0] <name> [0:depth-1];`.
+///
+/// The address/enable/data *input* nets are ordinary `always_comb` wires (they
+/// are `WireAssign` targets, so the emitter declares them with every other wire).
+/// The read-port *output* nets are not written by any statement — they are
+/// continuous reads of the array — so they are declared and assigned from here.
+#[derive(Debug)]
+pub struct VLIRMemDecl {
+    pub name: String,
+    pub width: Width,
+    pub depth: usize,
+    pub read_data_nets: Vec<VLIRMemReadNet>,
+}
+
+/// `logic [width-1:0] <data>;` + `assign <data> = <mem>[<addr>];`
+#[derive(Debug)]
+pub struct VLIRMemReadNet {
+    pub data: String,
+    pub addr: String,
     pub width: Width,
 }
 
@@ -194,6 +218,12 @@ pub enum VLIRStmt {
 pub enum VLIRFFStmt {
     NonBlockingAssign {
         target: String,
+        value: VLIRExpr,
+    },
+    /// `<mem>[<addr>] <= <value>;` — a memory write commit.
+    MemAssign {
+        mem: String,
+        addr: VLIRExpr,
         value: VLIRExpr,
     },
     If {

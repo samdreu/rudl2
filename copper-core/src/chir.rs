@@ -144,6 +144,8 @@ pub struct CHIRSeqBody {
     pub clock: String,
     /// State registers — variables that live across a tick boundary.
     pub registers: Vec<CHIRRegDecl>,
+    /// `Memory<..>` instances declared before the loop.
+    pub memories: Vec<CHIRMemoryDecl>,
     /// `#[hardware]` submodule instantiations used in this module.
     pub submodules: Vec<CHIRSubmoduleInst>,
     /// The infinite loop body containing one or more AwaitTick boundaries.
@@ -156,6 +158,23 @@ pub struct CHIRRegDecl {
     pub ty: CHIRType,
     /// Initial value for simulation. Not emitted in synthesis output.
     pub init: Option<CHIRLit>,
+    pub span: SourceSpan,
+}
+
+/// A `Memory<T, R, W, D, READ_LAT, WRITE_LAT>` declared in a sequential body.
+///
+/// A memory is a hardware *submodule*, not a local variable: an array of `depth`
+/// elements of `elem_ty` wired to the parent through `read_ports` read buses and
+/// `write_ports` write buses. Only `READ_LAT == WRITE_LAT == 1` is representable
+/// here — a deeper pipeline needs stage registers this struct does not describe,
+/// so `chir_lower` rejects it rather than silently flattening the latency.
+#[derive(Debug, Clone)]
+pub struct CHIRMemoryDecl {
+    pub name: String,
+    pub elem_ty: CHIRType,
+    pub depth: usize,
+    pub read_ports: usize,
+    pub write_ports: usize,
     pub span: SourceSpan,
 }
 
@@ -253,6 +272,25 @@ pub enum CHIRStmt {
         value: CHIRExpr,
         span: SourceSpan,
     },
+
+    /// Stage a read address — `mem.read_port::<port>().read(addr)`. The capture
+    /// happens at the clock edge that ends the segment holding this statement.
+    MemRead {
+        mem: String,
+        port: usize,
+        addr: CHIRExpr,
+        span: SourceSpan,
+    },
+
+    /// Stage a write — `mem.write_port::<port>().write(addr, value)`. The commit
+    /// happens at the clock edge that ends the segment holding this statement.
+    MemWrite {
+        mem: String,
+        port: usize,
+        addr: CHIRExpr,
+        value: CHIRExpr,
+        span: SourceSpan,
+    },
 }
 
 impl CHIRStmt {
@@ -266,6 +304,8 @@ impl CHIRStmt {
             CHIRStmt::Match { span, .. } => span,
             CHIRStmt::ForLoop { span, .. } => span,
             CHIRStmt::IndexAssign { span, .. } => span,
+            CHIRStmt::MemRead { span, .. } => span,
+            CHIRStmt::MemWrite { span, .. } => span,
         }
     }
 }
@@ -331,6 +371,10 @@ pub enum CHIRExpr {
         expr: Box<CHIRExpr>,
         width: Width,
     },
+    /// `mem.read_port::<port>().data()` — the read port's output value.
+    MemData { mem: String, port: usize },
+    /// `mem.read_port::<port>().is_ready()` — the read port's output-valid flag.
+    MemValid { mem: String, port: usize },
 }
 
 #[derive(Debug, Clone)]
