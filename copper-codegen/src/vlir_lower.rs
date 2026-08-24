@@ -176,12 +176,24 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
 
     let multi_phase = s.phases.len() > 1;
 
+    // Outputs that must behave as implicit-hold registers rather than wires:
+    // explicitly-declared `RegOut` ports, plus plain `Out` ports written in some
+    // phases but not all (see `phase_scoped_output_ports`). Both need their
+    // drives kept in the phase's statements so `split_output_regs` can move them
+    // into `always_ff` under the phase guard — a module-level continuous assign
+    // would lose both the register and the guard.
+    let hold_outs: HashSet<String> = registered_outs
+        .iter()
+        .cloned()
+        .chain(phase_scoped_output_ports(&s.phases).into_iter().map(|p| leg.get(&p)))
+        .collect();
+
     let mut comb_phases = Vec::new();
     let mut output_assigns = Vec::new();
     let mut ff_stmts = Vec::new();
 
     for phase in &s.phases {
-        let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg, registered_outs)?;
+        let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg, &hold_outs)?;
         // Output continuous assigns are module-level; collect from every phase.
         output_assigns.append(&mut outs);
 
@@ -200,7 +212,7 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         // explicitly-declared `RegOut` ports (registered even when written on all
         // paths — an unconditional `RegOut` is a plain D flip-flop).
         let mut cond_outs = conditional_output_ports(&stmts);
-        cond_outs.extend(registered_outs.iter().cloned());
+        cond_outs.extend(hold_outs.iter().cloned());
         if !cond_outs.is_empty() {
             let (cleaned, out_ff) = split_output_regs(&stmts, &cond_outs);
             stmts = cleaned;
@@ -311,7 +323,7 @@ fn lower_reg_updates(updates: &[SHIRRegUpdate], leg: &Legalizer) -> LowerResult<
 fn lower_flat_stmts(
     stmts: &[SHIRStmt],
     leg: &Legalizer,
-    registered_outs: &HashSet<String>,
+    hold_outs: &HashSet<String>,
 ) -> LowerResult<(Vec<VLIRStmt>, Vec<VLIRContinuousAssign>)> {
     let mut comb = Vec::new();
     let mut assigns = Vec::new();
@@ -322,15 +334,17 @@ fn lower_flat_stmts(
                 width: width_of(ty),
                 value: lower_expr(value, leg)?,
             }),
-            // An UNCONDITIONAL write to a `RegOut` must still become a flip-flop.
-            // Emitting it as a module-level continuous `assign` here would put it
-            // out of reach of `split_output_regs` below — the `registered` flag
-            // would be silently ignored, and in a multi-phase module the phase
-            // guard would be lost too, so the output would follow a phase-gated
-            // combinational value instead of holding. Keep it as a `PortAssign`
-            // in the phase's statements and let the split move it to `always_ff`.
+            // An UNCONDITIONAL write to an output that must HOLD — a `RegOut`,
+            // or a plain `Out` written in only some phases — must still become a
+            // flip-flop. Emitting it as a module-level continuous `assign` here
+            // would put it out of reach of `split_output_regs` below, so the
+            // hold would be silently dropped, and in a multi-phase module the
+            // phase guard would be lost too: the output would follow a
+            // phase-gated combinational value instead of holding. Keep it as a
+            // `PortAssign` in the phase's statements and let the split move it
+            // to `always_ff`.
             SHIRStmt::PortDrive { port_name, value }
-                if registered_outs.contains(&leg.get(port_name)) =>
+                if hold_outs.contains(&leg.get(port_name)) =>
             {
                 comb.push(VLIRStmt::PortAssign {
                     port_name: leg.get(port_name),
@@ -772,7 +786,161 @@ fn ports_driven_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
     any
 }
 
-/// Output ports driven on some-but-not-all paths — a conditional output. In a
+/// Names referenced by an SHIR expression.
+fn shir_expr_vars(e: &SHIRExpr, out: &mut HashSet<String>) {
+    match e {
+        SHIRExpr::Var(n) => {
+            out.insert(n.clone());
+        }
+        SHIRExpr::BinOp { left, right, .. } => {
+            shir_expr_vars(left, out);
+            shir_expr_vars(right, out);
+        }
+        SHIRExpr::UnOp { expr, .. } | SHIRExpr::Slice { expr, .. } | SHIRExpr::Resize { expr, .. } => {
+            shir_expr_vars(expr, out)
+        }
+        SHIRExpr::Mux { cond, then_val, else_val } => {
+            shir_expr_vars(cond, out);
+            shir_expr_vars(then_val, out);
+            shir_expr_vars(else_val, out);
+        }
+        SHIRExpr::Case { scrutinee, arms, default } => {
+            shir_expr_vars(scrutinee, out);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    shir_expr_vars(g, out);
+                }
+                shir_expr_vars(&a.value, out);
+            }
+            shir_expr_vars(default, out);
+        }
+        SHIRExpr::Concat(parts) => {
+            for p in parts {
+                shir_expr_vars(p, out);
+            }
+        }
+        SHIRExpr::DynBit { base, index } => {
+            shir_expr_vars(base, out);
+            shir_expr_vars(index, out);
+        }
+        SHIRExpr::Lit(_) | SHIRExpr::PhaseEq(_) => {}
+    }
+}
+
+/// Combinational wire names declared in a phase's pre-edge statements.
+fn shir_phase_local_wires(stmts: &[SHIRStmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            SHIRStmt::Wire { name, .. } => {
+                out.insert(name.clone());
+            }
+            SHIRStmt::If { then_stmts, else_stmts, .. } => {
+                shir_phase_local_wires(then_stmts, out);
+                if let Some(e) = else_stmts {
+                    shir_phase_local_wires(e, out);
+                }
+            }
+            SHIRStmt::Match { arms, .. } => {
+                for a in arms {
+                    shir_phase_local_wires(&a.stmts, out);
+                }
+            }
+            SHIRStmt::ForLoop { body, .. } => shir_phase_local_wires(body, out),
+            SHIRStmt::PortDrive { .. } | SHIRStmt::IndexAssign { .. } => {}
+        }
+    }
+}
+
+/// Output-port drives in a phase, as (port, names the driven value reads).
+fn shir_port_drives(stmts: &[SHIRStmt], out: &mut Vec<(String, HashSet<String>)>) {
+    for s in stmts {
+        match s {
+            SHIRStmt::PortDrive { port_name, value } => {
+                let mut vars = HashSet::new();
+                shir_expr_vars(value, &mut vars);
+                out.push((port_name.clone(), vars));
+            }
+            SHIRStmt::If { then_stmts, else_stmts, .. } => {
+                shir_port_drives(then_stmts, out);
+                if let Some(e) = else_stmts {
+                    shir_port_drives(e, out);
+                }
+            }
+            SHIRStmt::Match { arms, .. } => {
+                for a in arms {
+                    shir_port_drives(&a.stmts, out);
+                }
+            }
+            SHIRStmt::ForLoop { body, .. } => shir_port_drives(body, out),
+            SHIRStmt::Wire { .. } | SHIRStmt::IndexAssign { .. } => {}
+        }
+    }
+}
+
+/// Output ports that must HOLD across the phases that do not write them, because
+/// the value they are driven from does **not** survive outside its own phase.
+///
+/// A top-level drive lowers to a module-level continuous `assign`, which has no
+/// phase guard and therefore reads its right-hand side on *every* cycle. Whether
+/// that is correct depends entirely on what the right-hand side is outside the
+/// writing phase:
+///
+/// * a **register** (or port, or constant) retains its value, so the continuous
+///   assign is right — `mac_pipeline`'s `out.write(sum)` reads the inferred
+///   register `sum_r`, and `assign out = sum_r` tracks it correctly;
+/// * a **phase-local combinational wire** is defaulted to `'0` at the top of
+///   `always_comb`, so the continuous assign propagates zeros — `sipo_block`'s
+///   `w0_dbg.write(w0)` reads the phase-0 wire `w0`, and `assign w0_dbg = w0`
+///   collapses to 0 on every other cycle.
+///
+/// Only the second case needs converting to an implicit-hold register, which is
+/// the simulator's semantics: a sequential plain `Out` holds when unwritten (the
+/// enabled-register idiom, verified against BaseJump's `bsg_dff_en`).
+///
+/// Narrow by construction: a port written in EVERY phase is driven on every cycle
+/// and is excluded, and so is a port whose value is register-backed. Getting this
+/// wrong in the widening direction lags an output by a cycle — `mac_pipeline` is
+/// the measured witness, which is why the rule keys on the value and not merely on
+/// "written in some phases but not all".
+fn phase_scoped_output_ports(phases: &[SHIRPhase]) -> HashSet<String> {
+    if phases.len() < 2 {
+        return HashSet::new();
+    }
+
+    let mut drives_per_phase: Vec<Vec<(String, HashSet<String>)>> = Vec::new();
+    let mut locals_per_phase: Vec<HashSet<String>> = Vec::new();
+    for p in phases {
+        let mut d = Vec::new();
+        shir_port_drives(&p.pre_edge, &mut d);
+        drives_per_phase.push(d);
+        let mut w = HashSet::new();
+        shir_phase_local_wires(&p.pre_edge, &mut w);
+        locals_per_phase.push(w);
+    }
+
+    let written_in: Vec<HashSet<String>> = drives_per_phase
+        .iter()
+        .map(|d| d.iter().map(|(port, _)| port.clone()).collect())
+        .collect();
+
+    let mut hold = HashSet::new();
+    for (idx, drives) in drives_per_phase.iter().enumerate() {
+        for (port, reads) in drives {
+            // Driven on every cycle → genuinely combinational.
+            if written_in.iter().all(|w| w.contains(port)) {
+                continue;
+            }
+            // Register-backed value → the continuous assign already holds.
+            if reads.is_disjoint(&locals_per_phase[idx]) {
+                continue;
+            }
+            hold.insert(port.clone());
+        }
+    }
+    hold
+}
+
+/// Output ports driven on some-but-not-all paths — a conditional output./// Output ports driven on some-but-not-all paths — a conditional output. In a
 /// sequential module these become **implicit-hold registers**: the `.write()`
 /// holds its value between writes, so the drive belongs in `always_ff`
 /// (`if (guard) out <= v`, holding otherwise) rather than `always_comb` (where an

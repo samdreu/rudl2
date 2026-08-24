@@ -61,6 +61,11 @@ async fn sipo_block(
     }
 }
 
+// Gated so `tests/sipo_block_equivalence.rs` can `include!` this file as the
+// single source of truth for the module (the established pattern — see
+// `tests/rv32i_integration.rs`). Unset when built as an example, so `main` is
+// still the standalone self-check against BaseJump.
+#[cfg(not(test))]
 fn main() {
     let mut clk = copper_core::Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
