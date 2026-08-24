@@ -606,6 +606,41 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      top of its existing sim ≡ hand-written-SV check — so the generated SV is
      transitively anchored to third-party hardware. Full write-up in the
      TRANSPILATION section above (fix E).
+  ✔ WriteFirst read-during-write  [DONE 2026-08-24]
+     ReadFirst needed no logic — the non-blocking write commits at the edge, so a
+     continuous read of the array already sees the pre-write contents. WriteFirst
+     cannot work that way (the array does not hold the new value until after the
+     edge), so the read port's output net becomes a same-address forwarding mux:
+         assign mem_rd0_data =
+             ((mem_wr0_en && (mem_wr0_addr == mem_rd0_addr)) ? mem_wr0_data
+                                                            : mem[mem_rd0_addr]);
+     MUX ORDER IS LOAD-BEARING: with several write ports aimed at one address, the
+     forwarded value must be the one the array ends up holding. The simulator
+     commits writes in ascending port order, so the HIGHEST index wins — the rule
+     tests/memory_multiport_arbitration.rs establishes at four ports, where "highest
+     index", "second one" and "last issued" finally disagree. The mux therefore
+     checks the highest index FIRST.
+     → tests/write_first_memory_equivalence.rs (5 tests). Two things could be wrong
+     and each has its own check:
+       1. forwarding missing — a WriteFirst that silently behaved like ReadFirst
+          would pass every WriteFirst-only check, since the modes agree on every
+          cycle EXCEPT a same-address read/write. So both modes run on identical
+          stimulus and must disagree on exactly those cycles.
+       2. mux order wrong — ram_wf_priority drives two write ports at one address
+          with different data.
+     BOTH NEGATIVE CONTROLS MEASURED, not argued: forcing ReadFirst made the
+     WriteFirst equivalence fail at cycles 2 and 5 (0xAA vs 0x55) while ReadFirst
+     stayed green; reversing the mux order made only the priority test fail
+     (0xB0 vs 0xB1). The single-port test correctly stayed green for the second —
+     priority is unobservable with one write port.
+     FALLOUT worth knowing: this surfaced a latent hole in copper-analysis.
+     `reference_sv_registers` strips bracket groups, so `mem[a] <= d` reduced to
+     `mem <= d` and a memory array was reported as a flip-flop named `mem`, which
+     no source-level inference can produce — register_reconciliation failed on the
+     new fixtures. Unpacked-array declarations are now excluded there (with two
+     unit tests, including one that a bit-assigned register `q[3] <= …` is STILL a
+     register). The same hole was latent for any hand-written reference SV with a
+     RAM — examples/memory/sv/dual_port_ram.sv declares `reg [15:0] ram [1023:0]`.
   ✔ from_fn / from_contents preload equivalence through the transpiled path
      [DONE 2026-08-24, user chose the `initial` block over `$readmemh`]
      → tests/preloaded_memory_equivalence.rs — sim ≡ transpiled SV for BOTH
@@ -646,7 +681,6 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      measured against `single_cycle_readfirst_memory_is_supported`, the baseline
      DUT that DOES transpile, so a pin can only fail for the construct it names:
        - READ_LAT / WRITE_LAT > 1 (the emitted array has no stage registers)
-       - WriteFirst (needs explicit same-address bypass; ReadFirst is free)
        - memory inside a multi-phase loop (needs phase-guarded address buses and
          a read result that survives into a later phase)
      And two rules that are rejections rather than gaps — hardware cannot express

@@ -98,6 +98,8 @@ pub struct SHIRMemory {
     pub write_ports: usize,
     /// Preloaded contents — see `CHIRMemInit`.
     pub init: Option<SHIRMemInit>,
+    /// Read-during-write ordering — see `CHIRMemoryDecl::write_mode`.
+    pub write_mode: crate::memory::WriteMode,
 }
 
 /// 1:1 with `CHIRMemInit`, over `SHIRExpr`.

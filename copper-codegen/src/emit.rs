@@ -284,18 +284,18 @@ impl Emitter<'_> {
         }
     }
 
-    /// `assign <data> = <mem>[<addr>];` — one per observed read port.
+    /// `assign <data> = <value>;` — one per observed read port. The value is a
+    /// plain array read for ReadFirst, or a write-forwarding mux for WriteFirst.
     fn mem_read_assigns(&mut self, mems: &[VLIRMemDecl]) {
         let mut any = false;
         for m in mems {
             for n in &m.read_data_nets {
                 any = true;
                 self.out.push_str(&format!(
-                    "{}assign {} = {}[{}];\n",
+                    "{}assign {} = {};\n",
                     self.indent(1),
                     n.data,
-                    m.name,
-                    n.addr
+                    expr_str(&n.value)
                 ));
             }
         }
@@ -625,6 +625,7 @@ fn expr_str(e: &VLIRExpr) -> String {
             }
         }
         VLIRExpr::DynBit { base, index } => format!("{}[{}]", expr_str(base), loop_bound_str(index)),
+        VLIRExpr::MemIndex { mem, addr } => format!("{}[{}]", mem, expr_str(addr)),
         // `width'(expr)` — SV width-cast; the size may be a parameter.
         VLIRExpr::Resize { expr, width } => {
             let size = match width {

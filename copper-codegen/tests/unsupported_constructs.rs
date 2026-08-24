@@ -110,9 +110,9 @@ fn arithmetic_shift_right_is_unsupported() {
 // `tests/dual_port_ram_equivalence.rs` carries sim ≡ transpiled SV for the
 // shipped example — which in turn is checked against an independent hand-written
 // `examples/memory/sv/dual_port_ram.sv`. Preloaded contents followed on the same
-// day (`initial` block; `tests/preloaded_memory_equivalence.rs`). What remains is
-// pinned below, one test per construct, each measured against the baseline that
-// does transpile.
+// day (`initial` block; `tests/preloaded_memory_equivalence.rs`), then WriteFirst
+// (`tests/write_first_memory_equivalence.rs`). What remains is pinned below, one
+// test per construct, each measured against the baseline that does transpile.
 //
 // One decision still rests on the absence of a synthesised counterpart:
 // out-of-range addressing is a deliberate panic naming the port, address and size
@@ -181,21 +181,21 @@ fn memory_latency_above_one_is_unsupported() {
     );
 }
 
-/// WriteFirst read-during-write. ReadFirst falls out of non-blocking assignment
-/// for free; WriteFirst needs explicit same-address bypass logic.
+/// WriteFirst read-during-write DOES transpile, as a same-address forwarding mux
+/// on the read port's output net. `tests/write_first_memory_equivalence.rs` at the
+/// repo root carries the behavioural check, including a differential against
+/// ReadFirst on identical stimulus (the two modes agree on every cycle except a
+/// same-address read/write, so nothing else can tell them apart).
 #[test]
-fn write_first_memory_is_unsupported() {
+fn write_first_memory_is_supported() {
     let src = mem_dut(
         "let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256).write_first();",
         MEM_BODY,
     );
-    let err = transpile(&src).expect_err(
-        "NOW SUPPORTED: WriteFirst transpiles. Add an equivalence test whose stimulus reads and \
-         writes the SAME address on one edge — the only cycle where the two modes differ.",
-    );
+    let sv = transpile(&src).expect("a WriteFirst memory must transpile");
     assert!(
-        err.contains("WriteFirst") && err.contains("ReadFirst"),
-        "reproduced a *different* error than the tracked WriteFirst gap: {err}"
+        sv.contains("mem_wr0_en && (mem_wr0_addr == mem_rd0_addr)"),
+        "WriteFirst must forward a same-address write to the read, got:\n{sv}"
     );
 }
 

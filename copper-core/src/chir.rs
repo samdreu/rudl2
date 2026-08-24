@@ -178,6 +178,10 @@ pub struct CHIRMemoryDecl {
     /// Preloaded contents from `from_fn` / `from_contents`; `None` for `new`
     /// (which zero-fills, matching an unwritten array).
     pub init: Option<CHIRMemInit>,
+    /// Read-during-write ordering, from the `.read_first()` / `.write_first()`
+    /// builder. `ReadFirst` (the default) means a read sees the contents before
+    /// this cycle's write commits; `WriteFirst` means it sees the new value.
+    pub write_mode: crate::memory::WriteMode,
     pub span: SourceSpan,
 }
 

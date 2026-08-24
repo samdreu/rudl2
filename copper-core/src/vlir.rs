@@ -142,12 +142,16 @@ pub enum VLIRMemInit {
     Words(Vec<VLIRExpr>),
 }
 
-/// `logic [width-1:0] <data>;` + `assign <data> = <mem>[<addr>];`
+/// `logic [width-1:0] <data>;` + `assign <data> = <value>;`
+///
+/// `value` is a plain `<mem>[<addr>]` read for a ReadFirst memory. A WriteFirst
+/// memory needs same-address write forwarding, so it is a priority mux over this
+/// cycle's write ports with the array read as the fallback.
 #[derive(Debug)]
 pub struct VLIRMemReadNet {
     pub data: String,
-    pub addr: String,
     pub width: Width,
+    pub value: VLIRExpr,
 }
 
 #[derive(Debug)]
@@ -304,6 +308,11 @@ pub enum VLIRExpr {
     Resize {
         expr: Box<VLIRExpr>,
         width: Width,
+    },
+    /// `<mem>[<addr>]` — a read of a memory array.
+    MemIndex {
+        mem: String,
+        addr: Box<VLIRExpr>,
     },
 }
 

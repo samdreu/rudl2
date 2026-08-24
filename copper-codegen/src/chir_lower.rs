@@ -3,6 +3,7 @@ use copper_core::chir::{
     CHIRMatchArm, CHIRMemInit, CHIRMemoryDecl, CHIRModule, CHIRPattern, CHIRPort, CHIRPortDir, CHIRPortKind, CHIRRegDecl,
     CHIRSeqBody, CHIRStmt, CHIRStructuralBody, CHIRSubmoduleInst, CHIRType, CHIRUnOp, Width,
 };
+use copper_core::memory::WriteMode;
 use copper_core::frontend_ir::{
     ExprCall, ExprIndex, ExprRepeat, ExprStruct, ExprType, FrontendClassification, FrontendFnIR,
     FrontendModuleIR, ItemStruct, LocalStmt, RawStmt, RawStmtKind, SourceSpan,
@@ -3698,14 +3699,17 @@ fn parse_memory_decl<'a>(
     // `.write_first()` is a different RAM, so it is refused rather than ignored.
     if let ExprType::MethodCall(mc) = init {
         return match mc.method.as_str() {
-            "read_first" if mc.args.is_empty() => parse_memory_decl(name, Some(&mc.receiver), span),
-            "write_first" if mc.args.is_empty() => Err(CHIRLowerError::UnsupportedConstruct {
-                description: "WriteFirst memory (`.write_first()`) is not supported by the \
-                              transpiler yet; only the ReadFirst default lowers"
-                    .to_string(),
-                span,
-                suggested_rewrite: None,
-            }),
+            "read_first" | "write_first" if mc.args.is_empty() => {
+                let mut parsed = parse_memory_decl(name, Some(&mc.receiver), span)?;
+                if let Some((decl, _)) = parsed.as_mut() {
+                    decl.write_mode = if mc.method == "write_first" {
+                        WriteMode::WriteFirst
+                    } else {
+                        WriteMode::ReadFirst
+                    };
+                }
+                Ok(parsed)
+            }
             _ => Ok(None),
         };
     }
@@ -3898,6 +3902,9 @@ fn parse_memory_decl<'a>(
             read_ports,
             write_ports,
             init: None, // filled in by the caller, once expressions can be lowered
+            // The default; a `.read_first()` / `.write_first()` wrapper overrides
+            // it on the way back out of the recursion above.
+            write_mode: WriteMode::ReadFirst,
             span,
         },
         raw_init,

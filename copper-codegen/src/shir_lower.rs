@@ -428,6 +428,7 @@ fn lower_seq_body(
             read_ports: m.read_ports,
             write_ports: m.write_ports,
             init: m.init.as_ref().map(lower_mem_init).transpose()?,
+            write_mode: m.write_mode,
         })).collect::<Result<Vec<_>, SHIRLowerError>>()?,
         submodules,
         phases,

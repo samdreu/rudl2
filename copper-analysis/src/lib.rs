@@ -138,10 +138,63 @@ pub fn check_definite_assignment(f: &ItemFn) -> Result<(), syn::Error> {
 pub fn reference_sv_registers(sv: &str) -> BTreeSet<String> {
     let text = strip_sv_noise(sv);
     let outputs = output_port_names(&text);
+    let arrays = memory_array_names(sv);
     nonblocking_assign_targets(&text)
         .difference(&outputs)
+        .filter(|n| !arrays.contains(*n))
         .cloned()
         .collect()
+}
+
+/// Identifiers declared as *unpacked arrays* — `logic [15:0] mem [0:255];`,
+/// `reg [15:0] ram [1023:0];`. These are memory arrays, a different storage class
+/// from the flip-flops this module reasons about.
+///
+/// They have to be excluded explicitly. `strip_sv_noise` removes bracket groups,
+/// so a memory write `mem[addr] <= data;` reduces to `mem <= data;` and would
+/// otherwise be counted as a flip-flop named `mem` — which no source-level
+/// register inference will ever produce, since `infer_registers` names locals that
+/// live across a tick and a `Memory<..>` binding is not one. The same applies to a
+/// hand-written reference SV: `examples/memory/sv/dual_port_ram.sv` declares
+/// `reg [15:0] ram [1023:0]` and writes `ram[addra] <= dia`.
+///
+/// Nothing is lost by excluding them: Copper has no unpacked-array registers —
+/// `Bits<N>` is packed — so an excluded name could never have been a real match.
+fn memory_array_names(sv: &str) -> BTreeSet<String> {
+    const DECL_KW: [&str; 4] = ["reg", "logic", "wire", "bit"];
+    let mut names = BTreeSet::new();
+    for line in sv.lines() {
+        let line = match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let line = line.trim();
+        // A declaration, not a use: `assign d = mem[a];` also ends in `];`.
+        let Some(first) = line.split_whitespace().next() else { continue };
+        if !DECL_KW.contains(&first) {
+            continue;
+        }
+        let Some(body) = line.strip_suffix(';') else { continue };
+        let body = body.trim_end();
+        // An unpacked dimension trails the name: `… mem [0:255]`.
+        if !body.ends_with(']') {
+            continue;
+        }
+        let Some(open) = body.rfind('[') else { continue };
+        let before = body[..open].trim_end();
+        let name: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if !name.is_empty() && !DECL_KW.contains(&name.as_str()) {
+            names.insert(name);
+        }
+    }
+    names
 }
 
 /// The two ways G2 compares an inferred register set to a reference SV's registers.
@@ -331,6 +384,47 @@ pub fn registers_from_fir(_ir: &copper_core::frontend_ir::FrontendModuleIR) -> V
 
 #[cfg(test)]
 mod tests {
+    /// A memory array is storage, but not a flip-flop: `strip_sv_noise` turns
+    /// `mem[a] <= d;` into `mem <= d;`, which would otherwise be reported as a
+    /// register named `mem` that no source-level inference can ever produce.
+    #[test]
+    fn memory_arrays_are_not_reference_registers() {
+        let sv = r#"
+module m (input logic clk, input logic [7:0] a, output logic [15:0] o);
+    logic [15:0] mem [0:255];
+    logic [15:0] q;
+    always_ff @(posedge clk) begin
+        q <= mem[a];
+        mem[a] <= 16'd7;
+    end
+    assign o = q;
+endmodule
+"#;
+        let regs = reference_sv_registers(sv);
+        assert!(regs.contains("q"), "a real flip-flop must still be reported: {regs:?}");
+        assert!(
+            !regs.contains("mem"),
+            "an unpacked array is a memory, not a register: {regs:?}"
+        );
+    }
+
+    /// The exclusion must key on the DECLARATION, not on the name appearing with
+    /// brackets anywhere — a plain register indexed on the left (`q[3] <= x`) is
+    /// still a register.
+    #[test]
+    fn bit_assigned_register_is_still_a_reference_register() {
+        let sv = r#"
+module m (input logic clk, output logic o);
+    logic [7:0] q;
+    always_ff @(posedge clk) begin
+        q[3] <= 1'b1;
+    end
+    assign o = q[0];
+endmodule
+"#;
+        assert!(reference_sv_registers(sv).contains("q"));
+    }
+
     use super::*;
 
     /// The `mac_fsm` coding (mirrors `tests/fixtures/mac_fsm_dut.rs`): a single-tick

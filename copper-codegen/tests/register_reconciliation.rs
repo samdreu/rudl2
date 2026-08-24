@@ -19,6 +19,13 @@
 //!     multi-tick / control-extracted FSMs (`codegen − inferred ⊆ {phase, pc}`),
 //!     which the source-level inference has no name for.
 //!
+//! **Memory arrays are not in scope** and are filtered out inside
+//! `reference_sv_registers` rather than here: `mem[addr] <= data` reduces to
+//! `mem <= data` once bit-selects are stripped, so a memory would otherwise read
+//! as a flip-flop named `mem`. It is storage, but a different storage class —
+//! `infer_registers` names locals live across a tick, and a `Memory<..>` binding
+//! is not one. Adding the WriteFirst RAM fixtures is what first surfaced this.
+//!
 //! **Scope: clocked modules — `sequential` *and* `synchronizer`.** Synchronizers
 //! were excluded until 2026-08-21, and that exclusion hid a real bug: inference
 //! reported one flip-flop for the 2-FF synchronizer where codegen emits two (`ff2`

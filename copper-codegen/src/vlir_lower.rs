@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use copper_core::chir::{CHIRBinOp, CHIRType, CHIRUnOp, Width};
+use copper_core::memory::WriteMode;
 use copper_core::shir::{
     SHIRBody, SHIRCombBody, SHIRExpr, SHIRLit, SHIRMemInit, SHIRMemory, SHIRModule, SHIRPhase, SHIRPortDir, SHIRPortKind,
     SHIRRegUpdate, SHIRSeqBody, SHIRStmt, SHIRStructuralBody, SHIRSubmoduleInst,
@@ -1618,8 +1619,8 @@ fn lower_mem_decls(
                 .filter(|p| use_.read_data.contains(&(m.name.clone(), *p)))
                 .map(|p| VLIRMemReadNet {
                     data: leg.get(&mem_net(&m.name, true, p, "data")),
-                    addr: leg.get(&mem_net(&m.name, true, p, "addr")),
                     width: width_of(&m.elem_ty),
+                    value: read_net_value(m, p, use_, leg),
                 })
                 .collect(),
             init: match &m.init {
@@ -1640,6 +1641,53 @@ fn lower_mem_decls(
             },
         }))
         .collect()
+}
+
+/// What a read port's output net is driven from.
+///
+/// **ReadFirst** is a plain continuous read of the array. The write commits at the
+/// edge with a non-blocking assign, so the read sees the pre-write contents for
+/// free — no logic needed, which is why it was the first mode supported.
+///
+/// **WriteFirst** must forward this cycle's write to the read when the addresses
+/// match, because the array itself will not hold the new value until after the
+/// edge. That is a priority mux over the write ports, **highest index first**: the
+/// simulator commits writes in ascending port order (`for port in 0..W`), so a
+/// later port overwrites an earlier one and the highest index is what a read
+/// observes. `tests/memory_multiport_arbitration.rs` establishes that rule at four
+/// ports, where "highest index", "second one" and "last issued" finally disagree.
+fn read_net_value(m: &SHIRMemory, port: usize, use_: &MemPortUse, leg: &Legalizer) -> VLIRExpr {
+    let array_read = VLIRExpr::MemIndex {
+        mem: leg.get(&m.name),
+        addr: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "addr")))),
+    };
+    if m.write_mode == WriteMode::ReadFirst {
+        return array_read;
+    }
+
+    // Wrap ascending, so port 0 ends up innermost and the highest index outermost
+    // — i.e. checked first, which is the priority the simulator implements.
+    let mut value = array_read;
+    for wp in 0..m.write_ports {
+        if !use_.writes.contains(&(m.name.clone(), wp)) {
+            continue;
+        }
+        let same_addr = VLIRExpr::BinOp {
+            left: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, false, wp, "addr")))),
+            op: VLIRBinOp::Eq,
+            right: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "addr")))),
+        };
+        value = VLIRExpr::Ternary {
+            cond: Box::new(VLIRExpr::BinOp {
+                left: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, false, wp, "en")))),
+                op: VLIRBinOp::LogicalAnd,
+                right: Box::new(same_addr),
+            }),
+            then_val: Box::new(VLIRExpr::Var(leg.get(&mem_net(&m.name, false, wp, "data")))),
+            else_val: Box::new(value),
+        };
+    }
+    value
 }
 
 /// `if (<mem>_wr<J>_en) <mem>[<mem>_wr<J>_addr] <= <mem>_wr<J>_data;` — one per
