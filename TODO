@@ -300,24 +300,80 @@ TRANSPILATION:
      apart — which is why the handshake test exists); making `break` jump to a new
      state instead of inlining broke all three.
 
-  ☐ THE OTHER ORDERING — `loop { clk.tick().await; <test> }` — IS REFUSED, and the
-     reason is NOT the flattening. Testing after the tick puts the read in the
-     window where the simulator and a testbench disagree about which input value is
-     current: the simulator's post-edge settle still holds the value driven for the
-     cycle whose edge just passed, while the emitted FSM state reads the value
-     driven for the cycle about to end. MEASURED on
-     `loop { clk.tick().await; if go { break; } }`: the transpiled module reacted a
-     full cycle EARLIER than the simulator on every detection.
-     ATTRIBUTED, not guessed: a plain post-tick `In` read with no extraction at all
-     (`loop { tick; if go { n = n+1; } o.write(n); }`) transpiles and MATCHES, so
-     this is not the general post-tick-read path — it is what happens when that
-     read drives the FSM's own state transition.
-     WHY IT MATTERS: this is the ordering examples/cpu/rv32i_cpu.rs is written in
-     (~15 nested waits are `loop { clk.tick().await; if ready { break; } }`), so
-     settling it is what would put the CPU's control flow within reach — though the
-     CPU is independently blocked on `Vec` ports.
-     NEEDS A SEMANTICS DECISION about which side is right, not a codegen patch.
+  ── THE MID-PHASE READ SEAM, MEASURED 2026-08-24 ────────────────────────────
+  Went looking for one thing and found three. The refusal of
+  `loop { clk.tick().await; <test> }` was blamed on a read-timing seam; that blame
+  was PARTLY WRONG, and taking it apart turned up a silent miscompilation that had
+  nothing to do with control flow.
+
+  ✔ FIXED — A REGISTER REWRITTEN INSIDE ONE BRANCH LOST EVERY WRITE BUT THE FIRST.
+     `shir_lower::extract_updates_from_stmts` merges a branch's register updates
+     into one muxed next-value, and looked each register's value up with `.find()`
+     — the FIRST update in the branch. A register written twice kept the earlier
+     write:
+         t <= (t + 4'd1);          // emitted
+         //   `if t == 3 { t = 0; }` — GONE
+     That is the mod-N counter idiom, i.e. how anyone writes a clock divider, and
+     it silently produced a free-running counter that wrapped at its full width.
+     Silent because the surviving value is perfectly well-typed.
+     WHY IT SURVIVED THIS LONG: outside a branch the merge does not happen — the
+     updates emit as separate non-blocking assignments and SV's last-write-wins
+     makes the result right anyway. So it needed a register rewritten INSIDE an
+     `if` or a `match` arm, and nothing in the corpus had one: every FSM arm here
+     assigns each register once.
+     FIX: `last_update_for` — take the branch's LAST assignment. One line, plus a
+     name and a comment so the next reader knows why order matters.
+     → tests/rewritten_register_equivalence.rs (3 tests: a `match`-arm divider, a
+       rewrite inside a nested `if`, and a shape pin). All three fail with the fix
+       reverted; the `if` case needed the two writes in the SAME branch, since a
+       top-level write plus a branch write does not reproduce it.
+     RECORD THE CLASS, not just the bug: a merge that silently keeps ONE of several
+     candidates keeps the wrong one for as long as nothing produces two.
+
+  ✔ THE SEAM IS NOT ABOUT CONTROL FLOW, and it is narrower than it looked.
+     With the miscompilation fixed, `loop { clk.tick().await; <test> }` is CORRECT
+     when the test reads a REGISTER — measured, sim ≡ SV over a divide-by-three
+     wait. So the flattening (and the body rotation it needs — the head state is
+     the one the tick ENTERS) was right all along.
+     What still diverges is exactly one thing: an `In` read in the post-tick window.
+
+  ☐ THE REMAINING SEAM — needs a decision, stated precisely:
+     A post-tick `In` read is sampled by the SIMULATOR at the START of the window
+     (`Immediate`, per SYNCHRONOUS_SEMANTICS.md: "consumes the value the just-past
+     edge produced") and by the EMITTED HARDWARE at the END of it (a flip-flop
+     samples just before its own edge). Under the harness convention "drive, then
+     clock", those are different input values, one cycle apart.
+     NOT a "which of two adjacent samples" question: holding each stimulus value
+     for TWO cycles does not make them agree, because the two models read in
+     different WINDOWS, not at different points of the same one.
+     Note what this means in real hardware: an `In` driven by a clocked module in
+     the same domain changes just after an edge and is stable thereafter, so start
+     and end of the window carry the same value and the two models AGREE. The
+     divergence needs an input that changes mid-cycle — which a testbench does and
+     synchronous hardware does not.
+     THE FORK (each has a real cost, so it is not mine to pick):
+       (a) Make the hardware faithful to the simulator: register a post-tick `In`
+           read at the entering edge and use the register. Exact, but adds a flop
+           and changes the circuit the user wrote.
+       (b) Declare the simulator's reading normative only for edge-aligned inputs,
+           and require equivalence harnesses to hold inputs across the boundary.
+           Restricts the TEST METHOD rather than the language — but the project's
+           correctness bar IS sim ≡ SV under exactly that method.
+       (c) Keep refusing a post-tick `In` read that drives control flow (today's
+           behaviour). Safe, and excludes the idiom rv32i_cpu is written in.
      Pinned by unsupported_constructs.rs::ticking_before_the_test_in_a_wait_is_unsupported.
+
+  ☐ `RegOut` IS NOT IMMUNE TO SEQUENTIAL FORWARDING, contrary to
+     PRETICK_ALIGNMENT_GUARDRAIL.md, which lists it as the first remedy and calls
+     it "immune: it commits at the edge, so *when* the write executes is
+     unobservable". Measured: with a `RegOut` written AFTER a register update in
+     the same segment, codegen emits `out <= n` — the register's OLD value — while
+     the simulator forwards the update and writes the new one. The D1 compile error
+     exempts `RegOut`, so this shape passes the guardrail and diverges anyway.
+     The immunity claim holds for the PHASE question it was written about (when the
+     segment runs); it does not extend to forwarding WITHIN the segment. Worth
+     correcting in the doc either way, and deciding whether D1's exemption should
+     be narrowed.
 
   ☐ `continue` inside a nested loop. Jumping to the loop head mid-cycle needs the
      head's LOWERED body at a point where it is still being lowered. `break` avoids

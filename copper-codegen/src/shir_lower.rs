@@ -588,6 +588,20 @@ fn extract_reg_updates(
 ///
 /// `forwarding`: maps register name → its current effective next-value expression.
 /// `renames`: maps promoted wire name → `<name>_r` for the current phase.
+/// The value a register ends a branch with: its LAST assignment there, if any.
+///
+/// A branch's updates are recorded in source order, so a register written more
+/// than once appears more than once and only the final write is the branch's
+/// result. Reading the first instead drops every later write — silently, since
+/// the earlier one is still a well-typed value.
+fn last_update_for(updates: &[SHIRRegUpdate], target: &str) -> Option<SHIRExpr> {
+    updates
+        .iter()
+        .rev()
+        .find(|u| u.target == target)
+        .map(|u| u.next_value.clone())
+}
+
 fn extract_updates_from_stmts(
     stmts: &[CHIRStmt],
     reg_names: &HashSet<String>,
@@ -633,14 +647,14 @@ fn extract_updates_from_stmts(
                     let hold = || forwarding.get(&target).cloned()
                         .unwrap_or_else(|| SHIRExpr::Var(target.clone()));
 
-                    let then_val = then_updates.iter()
-                        .find(|u| u.target == target)
-                        .map(|u| u.next_value.clone())
+                    // The LAST assignment in the branch is the branch's result.
+                    // Taking the first silently discarded a re-assignment, which is
+                    // exactly the mod-N counter idiom `t = t + 1; if t == N { t = 0 }`
+                    // — the reset vanished and the counter ran free.
+                    let then_val = last_update_for(&then_updates, &target)
                         .unwrap_or_else(hold);
 
-                    let else_val = else_updates.iter()
-                        .find(|u| u.target == target)
-                        .map(|u| u.next_value.clone())
+                    let else_val = last_update_for(&else_updates, &target)
                         .unwrap_or_else(hold);
 
                     let mux_val = SHIRExpr::Mux {
@@ -679,10 +693,8 @@ fn extract_updates_from_stmts(
                     let mut default_val: Option<SHIRExpr> = None;
 
                     for (arm, upds) in arms.iter().zip(arm_updates.iter()) {
-                        let next_val = upds.iter()
-                            .find(|u| u.target == target)
-                            .map(|u| u.next_value.clone())
-                            .unwrap_or_else(hold);
+                        // Last assignment wins — see the note in the `If` arm.
+                        let next_val = last_update_for(upds, &target).unwrap_or_else(hold);
 
                         let guard = arm.guard.as_ref()
                             .map(|g| Ok(resolve(lower_expr(g)?, forwarding)))

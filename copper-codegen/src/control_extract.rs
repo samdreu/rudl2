@@ -263,19 +263,39 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
                 break_stmts: rest.to_vec(),
                 outer: Some(ctx),
             };
-            // The gate guarantees the body's tick is its LAST statement, so the
-            // body is exactly "the code between two ticks" — one state. Lowering
-            // it with `head` as the back-edge target makes its trailing tick emit
-            // `pc = head`, i.e. stay here another cycle.
-            let mut head_body = Vec::new();
-            lower_into(&loop_expr.body, &mut head_body, sm, &inner);
-            // Entering runs the first iteration in the CURRENT cycle, so the entry
-            // gets the lowered body itself rather than a jump to `head` — a jump
-            // would burn a cycle the source never asked for. Cloning the LOWERED
-            // form shares the sub-states its ticks allocated, so a loop costs one
-            // extra state, not a doubling.
-            target.extend(head_body.iter().cloned());
-            sm.set_body(head, head_body);
+            let body = &loop_expr.body;
+            // A state is "the code between two ticks", so for a body `W ; tick ; C`
+            // the repeating unit is `C ; W` — the post-tick tail wrapped round onto
+            // the pre-tick prefix. Making the head `W ; tick` instead splits C and W
+            // across two states and the loop takes two clock cycles per source
+            // iteration (measured: `loop { tick; if go { break } }` tested `go` on
+            // every OTHER cycle).
+            match body.iter().position(is_tick_stmt) {
+                Some(t) => {
+                    let mut rotated: Vec<RawStmt> = body[t + 1..].to_vec();
+                    rotated.extend_from_slice(&body[..t]);
+                    let mut head_body = Vec::new();
+                    lower_into(&rotated, &mut head_body, sm, &inner);
+                    sm.set_body(head, head_body);
+                    // Entering runs the pre-tick prefix in the CURRENT cycle and
+                    // lets this state's own tick be the loop's first tick. With an
+                    // empty prefix this is just `pc = head`, emitted by the
+                    // fall-through inside `lower_into`.
+                    lower_into(&body[..t], target, sm, &inner);
+                }
+                None => {
+                    // Ticks only inside branches: no top-level split point, and
+                    // every path out of the body diverges (a fall-through with no
+                    // tick would be a zero-time loop, which the reachability
+                    // guarantee forbids). Cloning the LOWERED body into the entry
+                    // shares the sub-states its ticks allocated, so the loop costs
+                    // one extra state rather than a doubling.
+                    let mut head_body = Vec::new();
+                    lower_into(body, &mut head_body, sm, &inner);
+                    target.extend(head_body.iter().cloned());
+                    sm.set_body(head, head_body);
+                }
+            }
             return; // everything after the loop is reachable only through `break`
         }
 
