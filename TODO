@@ -363,6 +363,32 @@ TRANSPILATION:
            behaviour). Safe, and excludes the idiom rv32i_cpu is written in.
      Pinned by unsupported_constructs.rs::ticking_before_the_test_in_a_wait_is_unsupported.
 
+     WHAT IT DOES *NOT* UNBLOCK — measured 2026-08-24, correcting an earlier
+     overstatement in this file ("settling it is what would put the CPU's control
+     flow within reach"). The seam is the FOURTH thing standing between
+     examples/cpu/rv32i_cpu.rs and transpilation, not the first:
+       1. `program: In<Vec<Bits<32>>, MainClk>` — a `Vec` input port. A
+          variable-length vector is not a wire bundle; this is not a missing
+          feature so much as a value that is not a signal.
+       2. `let flat = { let mut v = program.read(); v.resize(1024, …); v };` —
+          host-side Rust running at construction.
+       3. `from_contents(clk, flat.clone())` for imem AND dmem — a run-time
+          computed preload, refused because there is nothing to emit.
+       4. the 17 tick-then-test waits — the seam.
+     Items 1-3 are one thing: the program image arrives as a host-side Rust value,
+     which is how the example is WRITTEN (to be simulated with a program handed in
+     by the testbench), not a transpiler gap. A synthesizable CPU takes its program
+     from a fixed image (`from_fn`, or `from_contents` with literals — both work
+     now) or fetches it over a bus port. So settling the seam in the most permissive
+     direction still leaves the CPU needing that rewrite.
+     ALSO WORTH KNOWING before assuming the waits can just be flipped: of the 17,
+     EIGHT wait on a *write* port's `is_ready()`, which the simulator always
+     returns true for — they are "tick exactly once" written in a general form, and
+     `loop { if wp.is_ready() { break; } tick; }` would never tick at all, which
+     the reachability guarantee rejects. Only the nine read-port waits (READ_LAT=2)
+     are genuine variable waits, and flipping those still changes when the first
+     test happens.
+
   ☐ `RegOut` IS NOT IMMUNE TO SEQUENTIAL FORWARDING, contrary to
      PRETICK_ALIGNMENT_GUARDRAIL.md, which lists it as the first remedy and calls
      it "immune: it commits at the edge, so *when* the write executes is
