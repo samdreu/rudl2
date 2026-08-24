@@ -172,7 +172,8 @@ fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
     let submodules = c.submodules.iter().map(|s| lower_submodule(s, leg, &MemBinding::new())).collect::<LowerResult<_>>()?;
     // A combinational module has no clock, so it has no registered outputs.
     let (mut comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg, &HashSet::new(), &MemWidths::default(), &MemBinding::new())?;
-    hoist_branch_local_defaults(&mut comb_stmts);
+    // A combinational module has no registers, so nothing is exempt.
+    hoist_branch_local_defaults(&mut comb_stmts, &HashSet::new());
     check_no_latches(&comb_stmts)?;
     Ok(VLIRCombBody { submodules, comb_stmts, output_assigns })
 }
@@ -293,7 +294,16 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         } else {
             None
         };
-        hoist_branch_local_defaults(&mut stmts);
+        // Registers and registered outputs are exempt: a conditionally-driven
+        // register is the implicit-hold idiom (verified against BaseJump's
+        // `bsg_dff_en`), not a latch bug, and an unconditional zero default
+        // would clear it on every untaken path.
+        let protected: HashSet<String> = reg_decls
+            .iter()
+            .map(|r| r.name.clone())
+            .chain(registered_outs.iter().cloned())
+            .collect();
+        hoist_branch_local_defaults(&mut stmts, &protected);
         check_no_latches(&stmts)?;
         comb_phases.push(VLIRCombPhase { phase_guard, stmts });
 
@@ -1437,11 +1447,27 @@ fn assigned_on_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
 /// Scoped narrowly: only a `WireAssign` with a *literal* value (a default) whose
 /// name is not already assigned at the top level is hoisted — conditional drives
 /// of real signals/ports are untouched.
-fn hoist_branch_local_defaults(stmts: &mut Vec<VLIRStmt>) {
+/// Give branch-local temporaries an unconditional default, so a value that is
+/// written and read entirely inside one branch does not read as a latch.
+///
+/// Two shapes, one rule. A `let` inside a branch is scoped to that branch in
+/// Rust, so nothing outside can observe it and a default is always safe:
+///
+/// * a **literal** initializer is moved to the top outright — evaluating a
+///   constant early is the same as evaluating it in the branch;
+/// * a **computed** initializer gets a zero default at the top and keeps the
+///   computation where it was written, because hoisting the computation itself
+///   would evaluate it on paths the source never runs it on.
+///
+/// `protected` names are exempt: a register must never be given an
+/// unconditional default, since a conditionally-driven register is the *hold*
+/// idiom (`bsg_dff_en`), not a latch bug — defaulting it to zero would clear it
+/// on every untaken path.
+fn hoist_branch_local_defaults(stmts: &mut Vec<VLIRStmt>, protected: &HashSet<String>) {
     let top_assigned: HashSet<String> = stmts.iter().filter_map(top_level_assign_name).collect();
     let mut hoisted: Vec<VLIRStmt> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    strip_nested_defaults(stmts, false, &top_assigned, &mut hoisted, &mut seen);
+    strip_nested_defaults(stmts, false, &top_assigned, protected, &mut hoisted, &mut seen);
     // Prepend in original first-seen order.
     for h in hoisted.into_iter().rev() {
         stmts.insert(0, h);
@@ -1461,6 +1487,7 @@ fn strip_nested_defaults(
     body: &mut Vec<VLIRStmt>,
     is_nested: bool,
     top_assigned: &HashSet<String>,
+    protected: &HashSet<String>,
     hoisted: &mut Vec<VLIRStmt>,
     seen: &mut HashSet<String>,
 ) {
@@ -1469,43 +1496,60 @@ fn strip_nested_defaults(
         // Recurse into sub-bodies first (they are one level more nested).
         match &mut s {
             VLIRStmt::If { then_stmts, else_stmts, .. } => {
-                strip_nested_defaults(then_stmts, true, top_assigned, hoisted, seen);
+                strip_nested_defaults(then_stmts, true, top_assigned, protected, hoisted, seen);
                 if let Some(e) = else_stmts {
-                    strip_nested_defaults(e, true, top_assigned, hoisted, seen);
+                    strip_nested_defaults(e, true, top_assigned, protected, hoisted, seen);
                 }
             }
             VLIRStmt::Case { arms, default, .. } => {
                 for a in arms {
-                    strip_nested_defaults(&mut a.stmts, true, top_assigned, hoisted, seen);
+                    strip_nested_defaults(&mut a.stmts, true, top_assigned, protected, hoisted, seen);
                 }
                 if let Some(d) = default {
-                    strip_nested_defaults(d, true, top_assigned, hoisted, seen);
+                    strip_nested_defaults(d, true, top_assigned, protected, hoisted, seen);
                 }
             }
             VLIRStmt::ForLoop { body, .. } => {
-                strip_nested_defaults(body, true, top_assigned, hoisted, seen);
+                strip_nested_defaults(body, true, top_assigned, protected, hoisted, seen);
             }
             _ => {}
         }
-        // A nested literal-init WireAssign to a not-top-assigned name is a
-        // block-local default: hoist it (once) and strip it from the branch.
+        // A nested WireAssign to a name nothing assigns unconditionally is a
+        // block-local temporary. A literal initializer moves to the top whole; a
+        // computed one leaves a zero default behind and stays where it is.
         let hoistable = if is_nested {
             match &s {
-                VLIRStmt::WireAssign { name, value: VLIRExpr::Lit { .. }, .. }
-                    if !top_assigned.contains(name) =>
+                VLIRStmt::WireAssign { name, value, width }
+                    if !top_assigned.contains(name) && !protected.contains(name) =>
                 {
-                    Some(name.clone())
+                    let default_width =
+                        if matches!(value, VLIRExpr::Lit { .. }) { None } else { Some(width.clone()) };
+                    Some((name.clone(), default_width))
                 }
                 _ => None,
             }
         } else {
             None
         };
-        if let Some(name) = hoistable {
-            if seen.insert(name) {
-                hoisted.push(s);
+        match hoistable {
+            // Literal: the assignment IS the default.
+            Some((name, None)) => {
+                if seen.insert(name) {
+                    hoisted.push(s);
+                }
+                continue; // stripped from the branch either way
             }
-            continue; // stripped from the branch either way
+            // Computed: default at the top, computation stays in the branch.
+            Some((name, Some(width))) => {
+                if seen.insert(name.clone()) {
+                    hoisted.push(VLIRStmt::WireAssign {
+                        name,
+                        width: width.clone(),
+                        value: VLIRExpr::Lit { width, value: 0 },
+                    });
+                }
+            }
+            None => {}
         }
         keep.push(s);
     }

@@ -293,7 +293,7 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **760 tests pass, 0 fail, 4 ignored** across 90 test binaries
+- **764 tests pass, 0 fail, 4 ignored** across 92 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
 - all three wiring guards (G-A / G-B / G-C) clean
 
@@ -301,8 +301,8 @@ Current state, as of the last full regression run:
 
 ## Limitations
 
-Measured, not guessed — **23 of 34** `#[hardware]` modules in `examples/`
-currently transpile. The 11 that do not, grouped by root cause:
+Measured, not guessed — **24 of 34** `#[hardware]` modules in `examples/`
+currently transpile. The 10 that do not, grouped by root cause:
 
 | Cause | Blocks |
 |---|---|
@@ -312,7 +312,6 @@ currently transpile. The 11 that do not, grouped by root cause:
 | no structural parent in simulation | `uart/system` (`uart_tx`, `uart_rx`) |
 | `while` loops unsupported | `uart/rx` |
 | a tick inside a conditional branch | `det_010_awaits` |
-| a branch-local `let` read as a latch | `bsg_counter_up_down` |
 
 Note that transpiling and *linting* are different bars: the equivalence harness
 runs Verilator under `-Wall`, and a module can emit SystemVerilog that the CLI

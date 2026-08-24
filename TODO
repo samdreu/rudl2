@@ -14,8 +14,8 @@ TRANSPILATION:
 
   ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-24 (after D-a) ─────────────────
   Every #[hardware] module in examples/ probed through the copper-transpile CLI.
-  19/34 → A+B 20/34 → E 21/34 → **D-a 23/34**. The 11 still failing, by ROOT
-  CAUSE (several share one cause — fix the cause, not the module):
+  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → **I 24/34**. The 10 still failing,
+  by ROOT CAUSE (several share one cause — fix the cause, not the module):
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
     C ☐ `while` loops unsupported ................ uart/rx
@@ -37,18 +37,8 @@ TRANSPILATION:
     H ☐ no structural parent module .............. uart/system (uart_tx, uart_rx)
         spawn_uart is a plain sim-wiring fn, so the UART has no hierarchy module
         to transpile. two_domain_top shows the pattern already works.
-    I ☐ a branch-local `let` with a COMPUTED initializer is reported as a latch
-        ...................................... bsg_counter_up_down
-        NEW, exposed by D-a (it was behind the const error). Minimal repro:
-          if r { count = 0 } else { let up = up_i.read(); if up == One { … } }
-        → "would infer a latch: up assigned on some control paths but not all".
-        `up` is written and read entirely inside the one branch, so it cannot
-        latch. `vlir_lower::hoist_branch_local_defaults` already handles exactly
-        this shape but only when the initializer is a LITERAL — it moves the
-        whole assignment to the top, which is only sound for a constant. A
-        computed initializer needs the other half: hoist a zero DEFAULT and leave
-        the computation in the branch. That is a change to latch handling, so it
-        needs sign-off rather than a default.
+    I ✔ FIXED — a branch-local `let` with a COMPUTED initializer read as a latch.
+        Unblocked bsg_counter_up_down. See the write-up below.
     J ☐ bit-width inference on a bare integer local
         ................ bsg_gray_to_binary (24:4), ripple_carry_adder (27:8)
         Both were previously recorded as blocked "behind" other causes; measured
@@ -59,14 +49,47 @@ TRANSPILATION:
 
   ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
   A module can pass the CLI and still fail the equivalence harness, which runs
-  Verilator under `-Wall`. bsg_encode_one_hot is the live case: it transpiles now
-  (D-a), but `let mut addr = 0usize;` emits `logic [63:0] addr`, and the 3-bit
-  `assign addr_o = addr` is a WIDTHTRUNC error plus an UNUSEDSIGNAL on
-  `addr[63:3]`. So it has no equivalence test yet. Two ways out, undecided:
-  narrow the example's local to `Bits<ADDR_W>` (an example edit; also better
-  hardware style, since `usize` is not a hardware type), or infer a narrower
-  width for an integer local from its uses (codegen work, cause J's neighbourhood).
+  Verilator under `-Wall`. TWO modules unblocked above are in exactly that state,
+  both for the same reason — a bare `usize` local:
+    bsg_encode_one_hot (D-a): `let mut addr = 0usize;` emits `logic [63:0] addr`;
+      the 3-bit `assign addr_o = addr` is WIDTHTRUNC, plus UNUSEDSIGNAL on
+      `addr[63:3]`.
+    bsg_counter_up_down (I): `let mut count: usize = 0;` emits `logic [31:0]`;
+      `assign count_o = count` is WIDTHTRUNC, and `up = (up_i == 1'b1)` is
+      WIDTHEXPAND (a 1-bit RHS into a 32-bit target).
+  NOTE the two widths disagree — 64 bits for `0usize`, 32 for `: usize = 0` —
+  which is worth understanding before fixing either; they are reaching different
+  inference paths for what the source says is the same type.
+  So neither has an equivalence test yet. Two ways out, undecided: narrow the
+  examples' locals to `Bits<N>` (an example edit; also better hardware style,
+  since `usize` is not a hardware type), or infer a narrower width for an integer
+  local from its uses (codegen work, cause J's neighbourhood).
   The count above is "the CLI emits SystemVerilog", not "the SystemVerilog lints".
+
+  ✔ FIXED (2026-08-24, with user sign-off) — I: a branch-local `let` with a
+    COMPUTED initializer was reported as a latch. Minimal repro:
+      if r { count = 0 } else { let up = up_i.read(); if up == One { … } }
+    → "would infer a latch: up assigned on some control paths but not all".
+    `up` is written and read entirely inside the one branch — Rust SCOPES it
+    there, so nothing outside can observe it and it cannot latch.
+    `vlir_lower::hoist_branch_local_defaults` already handled exactly this shape,
+    but only when the initializer was a LITERAL: it moved the whole assignment to
+    the top, which is sound only for a constant. A computed initializer cannot
+    move (it would be evaluated on paths the source never runs it on), so it now
+    leaves a zero DEFAULT at the top and stays where it was written.
+    THE RULE IS ONLY SAFE BECAUSE OF WHAT IT LEAVES ALONE. A conditionally-driven
+    REGISTER is indistinguishable from a latch by the "not assigned on all paths"
+    test, but it is the implicit-HOLD idiom (verified against BaseJump's
+    `bsg_dff_en` — see the `Out` holds-when-unwritten entry). An unconditional
+    default would clear it on every untaken path: a silent, cycle-accurate wrong
+    answer rather than a compile error. Registers and registered outputs are
+    therefore passed in as an explicit exempt set rather than being distinguished
+    by inspection, and a test pins that they never receive a blocking default.
+    Tests: `copper-codegen/tests/branch_local_defaults.rs` (3 — the default plus
+    kept computation, the register-never-defaulted invariant, and the unchanged
+    literal path) and `tests/branch_local_temp_equivalence.rs` (sim ≡ transpiled
+    SV under Verilator for a DUT that carries BOTH shapes at once, with hold
+    cycles in the stimulus that would fail if the register were defaulted).
 
   ✔ FIXED (2026-08-24, with user sign-off) — D-a: file-scope `const` items had
     no lowering. `const WIDTH: usize = 8;` sitting next to a module is visible to
