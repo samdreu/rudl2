@@ -2139,8 +2139,11 @@ fn lower_expr_stmt(
         ExprType::Loop(l) => {
             return Err(CHIRLowerError::UnsupportedConstruct {
                 description: if stmts_contain_tick(&l.body) {
-                    "a nested `loop` containing `clk.tick().await` is a repeating wait; \
-                     control extraction does not build the self-looping state it needs yet"
+                    "a repeating wait must be written as `loop { <test>; clk.tick().await; }` \
+                     — the tick has to be the LAST statement of the loop body. Testing after \
+                     the tick instead puts the read in the window where the simulator and the \
+                     emitted hardware disagree about which input value is current, so it is \
+                     refused rather than lowered to something that reacts a cycle early"
                         .to_string()
                 } else {
                     "a nested `loop` with no `clk.tick().await` would never terminate in \
@@ -2148,8 +2151,8 @@ fn lower_expr_stmt(
                 },
                 span,
                 suggested_rewrite: Some(
-                    "restructure the wait as a state of the module's own top-level loop: \
-                     `if !ready { /* hold state */ } else { /* advance */ } clk.tick().await;`"
+                    "move the test before the tick: `loop { if ready { break; } \
+                     clk.tick().await; }`"
                         .to_string(),
                 ),
             });

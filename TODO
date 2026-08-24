@@ -273,23 +273,56 @@ TRANSPILATION:
       the module's per-cycle internal capture, which is exactly what the
       mid-phase-read question sipo_block was built to answer.
 
-  ☐ CONTROL EXTRACTION INCREMENT B — repeating waits (`loop { … tick … }`).
-     The pass handles straight-line code, `if`/`else` and `match`: it inlines each
-     continuation into the branches and gives every tick its own state. A tick
-     inside a nested `loop` is a *repeating* wait, and needs two things the pass
-     does not model:
-       - a state that can loop back to ITSELF (`pc = k` rather than `pc = k+1`),
-         which is the natural lowering of `loop { if ready { break } tick; }`; and
-       - `break` / `continue` as control flow — the FIR carries `ExprBreak` /
-         `ExprContinue` nodes but `lower_into` never looks at them.
-     WHY IT MATTERS: this is the idiom `examples/cpu/rv32i_cpu.rs` is written in
-     (~15 nested waits), and it is how a designer naturally writes "stall until the
-     memory answers" — which is now a shape the transpiler can otherwise support,
-     since Memory lowers with real latency. It is a genuine language feature, not a
-     robustness patch. Currently a clean error naming the construct.
-     Care: the duplication cost of inlining continuations is already per-branch;
-     a loop adds a back edge, so the state count is no longer bounded by the number
-     of ticks in the source. Worth measuring before committing to the approach.
+  ✔ CONTROL EXTRACTION INCREMENT B — repeating waits  [DONE 2026-08-24]
+     `loop { <test>; clk.tick().await; }` nested inside the module's own loop, left
+     by `break`. Increment A flattened ticks nested in `if`/`match` by inlining each
+     continuation into the branches; a nested loop adds the one thing that model
+     lacked — a state that loops back to ITSELF.
+     THE LOWERING: the loop gets a head state H; its body is lowered once with H as
+     the back-edge target, so the body's trailing tick emits `pc = H` (stay another
+     cycle) and `break` INLINES the loop's continuation (leave, in the same cycle —
+     breaking is not a clock boundary). Entering must not cost a cycle either, so
+     the already-lowered body is CLONED into the entry point. Cloning the lowered
+     form rather than re-lowering the source is what keeps it cheap: the two copies
+     share the sub-states their ticks allocated, so a wait costs ONE extra state,
+     not a doubling. (The state-count worry recorded when this was proposed turned
+     out not to bite, for that reason.)
+     `if ready { break; }` also forces a split increment A would not have made: the
+     branch holds no tick, but control still leaves it, so the continuation must be
+     inlined per-branch anyway. "Contains a tick" became "diverges" as the splitting
+     rule.
+     → tests/wait_loop_equivalence.rs (4 tests): a single wait, TWO SEQUENTIAL
+       waits with a tick between them, a shape pin that one wait costs one extra
+       state, and the refused ordering. Stimulus uses uneven runs (2, 1, 3 cycles)
+       so a wait that held for a FIXED number of cycles could not pass.
+     BOTH NEGATIVE CONTROLS MEASURED: making the back edge target state 0 instead of
+     the loop head broke the two-wait handshake (a single wait cannot tell the two
+     apart — which is why the handshake test exists); making `break` jump to a new
+     state instead of inlining broke all three.
+
+  ☐ THE OTHER ORDERING — `loop { clk.tick().await; <test> }` — IS REFUSED, and the
+     reason is NOT the flattening. Testing after the tick puts the read in the
+     window where the simulator and a testbench disagree about which input value is
+     current: the simulator's post-edge settle still holds the value driven for the
+     cycle whose edge just passed, while the emitted FSM state reads the value
+     driven for the cycle about to end. MEASURED on
+     `loop { clk.tick().await; if go { break; } }`: the transpiled module reacted a
+     full cycle EARLIER than the simulator on every detection.
+     ATTRIBUTED, not guessed: a plain post-tick `In` read with no extraction at all
+     (`loop { tick; if go { n = n+1; } o.write(n); }`) transpiles and MATCHES, so
+     this is not the general post-tick-read path — it is what happens when that
+     read drives the FSM's own state transition.
+     WHY IT MATTERS: this is the ordering examples/cpu/rv32i_cpu.rs is written in
+     (~15 nested waits are `loop { clk.tick().await; if ready { break; } }`), so
+     settling it is what would put the CPU's control flow within reach — though the
+     CPU is independently blocked on `Vec` ports.
+     NEEDS A SEMANTICS DECISION about which side is right, not a codegen patch.
+     Pinned by unsupported_constructs.rs::ticking_before_the_test_in_a_wait_is_unsupported.
+
+  ☐ `continue` inside a nested loop. Jumping to the loop head mid-cycle needs the
+     head's LOWERED body at a point where it is still being lowered. `break` avoids
+     this because its target (the loop's continuation) is plain source. Refused with
+     a spanned diagnostic; pinned.
 
   ── LATENT HOLES SURFACED BY THE MEMORY WORK, 2026-08-24 ────────────────────
   Each of these was invisible until a memory design happened to walk into it.

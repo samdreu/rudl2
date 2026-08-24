@@ -98,36 +98,93 @@ fn arithmetic_shift_right_is_unsupported() {
     );
 }
 
-/// A tick inside a nested `loop` — the "wait until ready" idiom. This is the
-/// shape that used to CRASH the transpiler (`control_extract.rs`'s gate and its
-/// tick search disagreed about where a tick can live), so the pin is on the
-/// diagnostic: it must name the construct and carry a span.
-/// `no_transpiler_panics.rs` guards the failure MODE corpus-wide.
+/// A tick inside a nested `loop` — the "wait until ready" idiom — DOES transpile,
+/// as a self-looping FSM state (control extraction increment B).
+/// `tests/wait_loop_equivalence.rs` at the repo root carries the behavioural
+/// checks; this is the control that the shape reaches the flattener at all.
+///
+/// Historically this is also the shape that used to CRASH the transpiler: the gate
+/// and the tick search in `control_extract.rs` disagreed about where a tick can
+/// live. `no_transpiler_panics.rs` guards that failure MODE corpus-wide.
 #[test]
-fn tick_inside_a_nested_loop_is_unsupported() {
+fn tick_inside_a_nested_loop_is_supported() {
     let src = r#"
 #[hardware(sequential)]
-async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: Out<Bits<8>, MainClk>) {
+async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainClk>) {
     let mut n: Bits<8> = Bits::zero();
     loop {
+        o.write(n);
         loop {
             if go.read() == Logic::One { break; }
             clk.tick().await;
         }
-        n = n.wrapping_add(Bits::from_u8(1));
+        n = n + Bits::from_lit::<1>();
+        clk.tick().await;
+    }
+}
+"#;
+    let sv = transpile(src).expect("a repeating wait must transpile");
+    assert!(
+        sv.contains("case (pc)"),
+        "a nested wait must flatten to a pc FSM, got:\n{sv}"
+    );
+}
+
+/// The tick must be the LAST statement of the wait's body. The other ordering puts
+/// the test in the window where the simulator and a testbench disagree about which
+/// input value is current — measured, the transpiled module reacted a full cycle
+/// early — so it is refused rather than lowered to a guess.
+#[test]
+fn ticking_before_the_test_in_a_wait_is_unsupported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
         o.write(n);
+        loop {
+            clk.tick().await;
+            if go.read() == Logic::One { break; }
+        }
+        n = n + Bits::from_lit::<1>();
         clk.tick().await;
     }
 }
 "#;
     let err = transpile(src).expect_err(
-        "NOW SUPPORTED: a repeating wait transpiles — control extraction grew the self-looping \
-         state. Give it an equivalence test that holds for a VARIABLE number of cycles, which \
-         is the whole point of the idiom.",
+        "NOW SUPPORTED: testing after the tick transpiles. That means the mid-phase-read \
+         window was decided — verify the transpiled module no longer reacts a cycle earlier \
+         than the simulator.",
     );
     assert!(
-        err.contains("repeating wait") && !err.starts_with("0:0:"),
-        "the nested-loop diagnostic must name the construct and carry a span: {err}"
+        err.contains("LAST statement"),
+        "the diagnostic must state the ordering rule: {err}"
+    );
+}
+
+/// `continue` is refused: jumping to the loop head mid-cycle needs the head's
+/// *lowered* body at a point where it is still being lowered.
+#[test]
+fn continue_in_a_wait_is_unsupported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        o.write(n);
+        loop {
+            if go.read() == Logic::Zero { continue; }
+            break;
+        }
+        n = n + Bits::from_lit::<1>();
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("`continue` must be refused");
+    assert!(
+        !err.is_empty() && !err.starts_with("0:0:"),
+        "the `continue` diagnostic must carry a span: {err}"
     );
 }
 
