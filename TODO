@@ -235,6 +235,59 @@ TRANSPILATION:
       the module's per-cycle internal capture, which is exactly what the
       mid-phase-read question sipo_block was built to answer.
 
+  ── LATENT HOLES SURFACED BY THE MEMORY WORK, 2026-08-24 ────────────────────
+  Each of these was invisible until a memory design happened to walk into it.
+  None was caught by a failing example; two were caught by a corpus guard and one
+  by Verilator's linter. Recorded here because the CLASS matters — a check that
+  cannot see a construct reports green on it.
+
+  ✔ FIXED — copper-analysis counted a MEMORY ARRAY as a flip-flop.
+     `reference_sv_registers` strips bracket groups before scanning for `<=`
+     targets, so a memory write `mem[a] <= d` reduced to `mem <= d` and was
+     reported as a register named `mem`. No source-level inference can ever produce
+     that name (`infer_registers` names locals live across a tick; a `Memory<..>`
+     binding is not one), so `register_reconciliation` failed the moment a fixture
+     contained a memory write.
+     THE HOLE WAS ALREADY THERE, unrelated to codegen: the same miscount applies to
+     any HAND-WRITTEN reference SV containing a RAM, which is the G2 path —
+     examples/memory/sv/dual_port_ram.sv declares `reg [15:0] ram [1023:0]` and
+     writes `ram[addra] <= dia`. Anyone calling `with_reference_registers` on a
+     memory design would have compared against a register set with a phantom entry.
+     FIX: unpacked-array declarations are excluded in `reference_sv_registers`, with
+     unit tests BOTH ways — a memory is not a register, and a bit-assigned register
+     (`q[3] <= …`) still is one.
+     Related, same file, same shape of blind spot: the memory read PIPELINE
+     registers (`<mem>_rd<N>_q` / `_v`) are synthesized by lowering and have no
+     source-level name, so register_reconciliation now treats them like the
+     phase/pc counter it already excluded.
+
+  ☐ Multi-tick loops SILENTLY DROP combinational statements after the LAST tick.
+     `shir_lower::lower_seq_body`'s multi-tick path never passes the trailing
+     segment through `lower_pre_edge_stmts` — only the single-tick path does (where
+     the trailing segment shares the one phase). Its REGISTER updates do flow, so
+     the loss is partial and quiet: an `out.write(x)` after the last tick simply
+     vanished, leaving an undriven port. Measured on a two-tick module with two
+     outputs: the second had no driver at all in the emitted SV.
+     NOW LOUD, not fixed — it is a clean error, pinned by
+     unsupported_constructs.rs::trailing_combinational_statements_in_a_multi_tick_loop_are_rejected.
+     DECIDING where those statements belong is a real semantics question (the
+     trailing segment runs in the NEXT iteration's phase-0 window, but the existing
+     model attributes its register updates to the LAST phase's edge), so it needs
+     sign-off rather than a default. Note the two halves currently disagree, which
+     is worth resolving at the same time.
+
+  ☐ Copper does not reject an UNDRIVEN `Out` — only Verilator does.
+     examples/memory/dual_port_ram.rs shipped a `data_out_a` port it never wrote.
+     Harmless in simulation (the wire just keeps its initial value) and invisible
+     until the module transpiled, where it is a fatal UNDRIVEN warning under -Wall.
+     The port was removed, but the language gap stands: an output a module never
+     drives is a design error the front end could catch with the analysis it
+     already has (`ports_driven_all_paths` and friends live in vlir_lower).
+     Care needed on the sequential side: a plain `Out` HOLDS when unwritten (the
+     enabled-register idiom, verified against BaseJump's bsg_dff_en), so the rule
+     is "never written on ANY path", not "not written on all paths".
+
+
 SIMULATOR:
   ☐ Add tests for semantic corner cases
      ✔ Back to back tick awaits            → tests/slow_counter_equivalence.rs (Verilator-checked)
@@ -606,6 +659,46 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      top of its existing sim ≡ hand-written-SV check — so the generated SV is
      transitively anchored to third-party hardware. Full write-up in the
      TRANSPILATION section above (fix E).
+  ✔ Multi-phase memory access  [DONE 2026-08-24]
+     The address buses are combinational and PHASE-GATED, so outside its staging
+     phase a read port's address reads '0 — a result observed in a later phase
+     cannot be a continuous read of the array. The lowering now emits a read
+     pipeline stage:
+         always_ff @(posedge clk) begin
+             rom_rd0_q <= rom_rd0_data;   // UNGUARDED, deliberately
+             rom_rd0_v <= rom_rd0_en;
+         end
+     Unguarded is the faithful choice: advance_read_pipelines is a plain clock
+     listener in copper-core/src/memory.rs — the memory knows nothing about phases,
+     and its pipeline advances on every edge. Outside the staging phase the enable
+     is 0, so _v goes false, which is exactly is_ready() after a cycle with no
+     staged address. The captured word survives one cycle and no longer, in both.
+     TWO FORMS, and picking wrong shifts a cycle EITHER WAY:
+       - a consumer that latches at the SAME edge as the capture (a register update
+         in the staging phase) reads the COMBINATIONAL value — the pipeline
+         register has not updated yet at that edge;
+       - everything else reads the REGISTER.
+     Chosen per (phase, region) by vlir_lower::mem_binding.
+     ✔ BUG FOUND AND FIXED, in code shipped earlier the same day: a single-tick
+       loop whose post-tick segment drives an output straight from data() — no
+       mediating register — read the continuous array net, so it tracked the
+       address being staged for the NEXT edge. A full cycle early. It shipped
+       because every memory test up to then put a register in between.
+       Regression: tests/multiphase_memory_equivalence.rs::single_tick_direct_read.
+     ☐ STILL REFUSED (pinned, with the counterexample kept in the fixture as
+       `mp_rom`): a plain `Out` driven straight from a read result in a phase that
+       does not stage it. Neither emitted form is right — a continuous assign
+       tracks the pipeline into the phases that do not observe it, and the usual
+       implicit-hold conversion latches at the end of the OBSERVING phase, one edge
+       after the capture (measured: a full cycle late on every sampled value). The
+       error points at RegOut, which works — the same Out/RegOut distinction the
+       pre-tick alignment guardrail makes. Resolving it means reworking how
+       split_output_regs interacts with expression timing; that is a semantics
+       change to shared codegen machinery, not a memory detail.
+     → tests/multiphase_memory_equivalence.rs (5 tests): the single-tick direct
+       read, cross-phase into a register, cross-phase into a RegOut, shape pins for
+       BOTH forms (so a future change cannot collapse them back into one — which is
+       the bug above), and the rejection.
   ✔ WriteFirst read-during-write  [DONE 2026-08-24]
      ReadFirst needed no logic — the non-blocking write commits at the edge, so a
      continuous read of the array already sees the pre-write contents. WriteFirst
@@ -681,8 +774,6 @@ P4 — Memory (first-class construct; MEMORY_DESIGN.md)
      measured against `single_cycle_readfirst_memory_is_supported`, the baseline
      DUT that DOES transpile, so a pin can only fail for the construct it names:
        - READ_LAT / WRITE_LAT > 1 (the emitted array has no stage registers)
-       - memory inside a multi-phase loop (needs phase-guarded address buses and
-         a read result that survives into a later phase)
      And two rules that are rejections rather than gaps — hardware cannot express
      them, so they must not lower silently:
        - two accesses to one port in a cycle (the sim keeps the last; one physical

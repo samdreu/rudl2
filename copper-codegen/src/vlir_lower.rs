@@ -43,6 +43,10 @@ pub enum VLIRLowerError {
     /// does not flag this, so it is rejected until phase-muxed / registered outputs
     /// are decided (the conditional-output-semantics milestone).
     MultiplyDrivenOutput { port: String },
+    /// A plain `Out` is driven from a memory read result in a multi-phase module.
+    /// See `reject_memory_driven_comb_outputs` for why neither emitted form is
+    /// correct.
+    MemoryResultDrivesPlainOutput { port: String },
     /// A memory access reached the 1:1 statement lowering. It produces several
     /// statements, so it must go through `lower_comb_stmts`; reaching here means a
     /// new caller bypassed that.
@@ -60,6 +64,14 @@ impl std::fmt::Display for VLIRLowerError {
                 write!(f, "match-as-expression nested inside another expression is not yet implemented"),
             VLIRLowerError::SymbolicWidthUnsupported =>
                 write!(f, "parametric/symbolic bit widths are not yet implemented (M2)"),
+            VLIRLowerError::MemoryResultDrivesPlainOutput { port } => write!(
+                f,
+                "output port '{port}' is driven from a memory read result in a multi-phase \
+                 module. The read pipeline re-captures on every clock edge, so a plain `Out` \
+                 either tracks it into the phases that do not observe it, or holds one edge \
+                 late — neither matches the simulator. Declare the port `RegOut<T, D>`, or \
+                 latch the result into a register and drive the output from that"
+            ),
             VLIRLowerError::MemoryAccessOutOfLine =>
                 write!(f, "internal: a memory access was lowered outside `lower_comb_stmts`"),
             VLIRLowerError::LatchInferred { signals } =>
@@ -144,9 +156,9 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
 // ── Combinational body ──────────────────────────────────────────────────────
 
 fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
-    let submodules = c.submodules.iter().map(|s| lower_submodule(s, leg)).collect::<LowerResult<_>>()?;
+    let submodules = c.submodules.iter().map(|s| lower_submodule(s, leg, &MemBinding::new())).collect::<LowerResult<_>>()?;
     // A combinational module has no clock, so it has no registered outputs.
-    let (mut comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg, &HashSet::new(), &MemWidths::default())?;
+    let (mut comb_stmts, output_assigns) = lower_flat_stmts(&c.stmts, leg, &HashSet::new(), &MemWidths::default(), &MemBinding::new())?;
     hoist_branch_local_defaults(&mut comb_stmts);
     check_no_latches(&comb_stmts)?;
     Ok(VLIRCombBody { submodules, comb_stmts, output_assigns })
@@ -156,7 +168,7 @@ fn lower_comb(c: &SHIRCombBody, leg: &Legalizer) -> LowerResult<VLIRCombBody> {
 
 fn lower_structural(st: &SHIRStructuralBody, leg: &Legalizer) -> LowerResult<VLIRStructuralBody> {
     let nets = st.nets.iter().map(|(n, ty)| (leg.get(n), width_of(ty))).collect();
-    let submodules = st.submodules.iter().map(|s| lower_submodule(s, leg)).collect::<LowerResult<_>>()?;
+    let submodules = st.submodules.iter().map(|s| lower_submodule(s, leg, &MemBinding::new())).collect::<LowerResult<_>>()?;
     Ok(VLIRStructuralBody { nets, submodules })
 }
 
@@ -165,13 +177,13 @@ fn lower_structural(st: &SHIRStructuralBody, leg: &Legalizer) -> LowerResult<VLI
 fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>) -> LowerResult<VLIRSeqBody> {
     let clock = leg.get(&s.clock);
 
-    let reg_decls = s
+    let mut reg_decls: Vec<VLIRRegDecl> = s
         .registers
         .iter()
         .map(|r| VLIRRegDecl { name: leg.get(&r.name), width: width_of(&r.ty) })
         .collect();
 
-    let submodules = s.submodules.iter().map(|m| lower_submodule(m, leg)).collect::<LowerResult<_>>()?;
+    let submodules = s.submodules.iter().map(|m| lower_submodule(m, leg, &MemBinding::new())).collect::<LowerResult<_>>()?;
 
     // Width of the phase register (for phase guards / PhaseEq literals).
     let phase_r_width = s
@@ -195,33 +207,41 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         .chain(phase_scoped_output_ports(&s.phases).into_iter().map(|p| leg.get(&p)))
         .collect();
 
-    // Memory nets: widths for the accesses to drive, and which ports are used at
-    // all (an unused port of a multi-port memory gets no nets).
-    let mem_widths = MemWidths::build(&s.memories);
+    // Memory nets: widths for the accesses to drive, which ports are used at all
+    // (an unused port of a multi-port memory gets no nets), and — for read results
+    // — whether each observation reads the combinational value or the registered
+    // capture. See `MemPortUse`.
+    reject_memory_driven_comb_outputs(&s.phases, registered_outs, leg)?;
+
     let mut mem_use = MemPortUse::default();
-    for phase in &s.phases {
-        collect_mem_use(&phase.pre_edge, &mut mem_use);
-        // A read result observed after the tick lands in a register update, not
-        // in the pre-edge statements — that is the whole point of `data()`.
-        for u in &phase.post_edge {
-            collect_mem_use_expr(&u.next_value, &mut mem_use);
-        }
-    }
+    collect_phase_mem_use(&s.phases, &mut mem_use);
+    let mem_widths = MemWidths::build(&s.memories, &mem_use);
     let memories = lower_mem_decls(&s.memories, &mem_use, leg)?;
+    reg_decls.extend(mem_read_pipeline_regs(&s.memories, &mem_use, leg));
 
     let mut comb_phases = Vec::new();
     let mut output_assigns = Vec::new();
     let mut ff_stmts = Vec::new();
 
     for phase in &s.phases {
-        let (mut stmts, mut outs) = lower_flat_stmts(&phase.pre_edge, leg, &hold_outs, &mem_widths)?;
+        let staged_here = staged_read_ports(&phase.pre_edge);
+        // Pre-edge statements run after the capture edge, so a read result they
+        // observe is the registered one.
+        let pre_bind = mem_binding(&s.memories, &staged_here, false, leg);
+        let (mut stmts, mut outs) =
+            lower_flat_stmts(&phase.pre_edge, leg, &hold_outs, &mem_widths, &pre_bind)?;
+
         // Memory net defaults go first, so a port driven only inside an `if` is
         // still assigned on every path (no latch, and the enable reads as 0).
-        // A module using memory has exactly one phase, so phase 0 owns them.
+        // Scoped to what THIS phase drives; a multi-phase module gets the
+        // cross-phase clearing from the emitter's top-of-block defaults.
+        let mut driven = MemPortUse::default();
+        collect_mem_use(&phase.pre_edge, &mut driven);
+        let mut defaults = mem_net_defaults(&s.memories, &driven, &mem_use, leg);
         if phase.phase_idx == 0 {
-            let defaults = mem_net_defaults(&s.memories, &mem_use, leg);
-            stmts.splice(0..0, defaults);
+            defaults.extend(unstaged_read_defaults(&s.memories, &mem_use, leg));
         }
+        stmts.splice(0..0, defaults);
         // Output continuous assigns are module-level; collect from every phase.
         output_assigns.append(&mut outs);
 
@@ -265,8 +285,10 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         comb_phases.push(VLIRCombPhase { phase_guard, stmts });
 
         // Register updates -> always_ff non-blocking assigns, guarded by phase
-        // for multi-phase modules.
-        let updates = lower_reg_updates(&phase.post_edge, leg)?;
+        // for multi-phase modules. These latch at THIS phase's edge, so a read
+        // staged in this phase is read combinationally (same edge) here.
+        let post_bind = mem_binding(&s.memories, &staged_here, true, leg);
+        let updates = lower_reg_updates(&phase.post_edge, leg, &post_bind)?;
         if multi_phase {
             ff_stmts.push(VLIRFFStmt::If {
                 condition: phase_eq(phase.phase_idx, &phase_r_width),
@@ -288,8 +310,10 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         }
     }
 
-    // Memory write commits close out `always_ff`; nonblocking assignment makes
-    // their position relative to the register updates immaterial.
+    // The read pipeline stage and the write commits close out `always_ff`;
+    // nonblocking assignment makes their position relative to the register
+    // updates immaterial.
+    ff_stmts.extend(mem_read_pipeline(&s.memories, &mem_use, leg));
     ff_stmts.extend(mem_write_commits(&s.memories, &mem_use, leg));
 
     Ok(VLIRSeqBody {
@@ -311,13 +335,17 @@ fn phase_eq(idx: usize, width: &Width) -> VLIRExpr {
     }
 }
 
-fn lower_reg_updates(updates: &[SHIRRegUpdate], leg: &Legalizer) -> LowerResult<Vec<VLIRFFStmt>> {
+fn lower_reg_updates(
+    updates: &[SHIRRegUpdate],
+    leg: &Legalizer,
+    mb: &MemBinding,
+) -> LowerResult<Vec<VLIRFFStmt>> {
     let mut out = Vec::new();
     for u in updates {
         let target = leg.get(&u.target);
         // Top-level case-as-expression is lifted into a case statement.
         if let SHIRExpr::Case { scrutinee, arms, default } = &u.next_value {
-            let selector = lower_expr(scrutinee, leg)?;
+            let selector = lower_expr(scrutinee, leg, mb)?;
             let mut ff_arms = Vec::new();
             for arm in arms {
                 let selector_value = pattern_to_selector(&arm.pattern)?;
@@ -325,7 +353,7 @@ fn lower_reg_updates(updates: &[SHIRRegUpdate], leg: &Legalizer) -> LowerResult<
                     selector_value,
                     stmts: vec![VLIRFFStmt::NonBlockingAssign {
                         target: target.clone(),
-                        value: lower_expr(&arm.value, leg)?,
+                        value: lower_expr(&arm.value, leg, mb)?,
                     }],
                 });
             }
@@ -334,13 +362,13 @@ fn lower_reg_updates(updates: &[SHIRRegUpdate], leg: &Legalizer) -> LowerResult<
                 arms: ff_arms,
                 default: Some(vec![VLIRFFStmt::NonBlockingAssign {
                     target: target.clone(),
-                    value: lower_expr(default, leg)?,
+                    value: lower_expr(default, leg, mb)?,
                 }]),
             });
         } else {
             out.push(VLIRFFStmt::NonBlockingAssign {
                 target,
-                value: lower_expr(&u.next_value, leg)?,
+                value: lower_expr(&u.next_value, leg, mb)?,
             });
         }
     }
@@ -358,6 +386,7 @@ fn lower_flat_stmts(
     leg: &Legalizer,
     hold_outs: &HashSet<String>,
     mems: &MemWidths,
+    mb: &MemBinding,
 ) -> LowerResult<(Vec<VLIRStmt>, Vec<VLIRContinuousAssign>)> {
     let mut comb = Vec::new();
     let mut assigns = Vec::new();
@@ -366,7 +395,7 @@ fn lower_flat_stmts(
             SHIRStmt::Wire { name, ty, value } => comb.push(VLIRStmt::WireAssign {
                 name: leg.get(name),
                 width: width_of(ty),
-                value: lower_expr(value, leg)?,
+                value: lower_expr(value, leg, mb)?,
             }),
             // An UNCONDITIONAL write to an output that must HOLD — a `RegOut`,
             // or a plain `Out` written in only some phases — must still become a
@@ -382,24 +411,24 @@ fn lower_flat_stmts(
             {
                 comb.push(VLIRStmt::PortAssign {
                     port_name: leg.get(port_name),
-                    value: lower_expr(value, leg)?,
+                    value: lower_expr(value, leg, mb)?,
                 })
             }
             SHIRStmt::PortDrive { port_name, value } => assigns.push(VLIRContinuousAssign {
                 target: leg.get(port_name),
-                value: lower_expr(value, leg)?,
+                value: lower_expr(value, leg, mb)?,
             }),
             // Conditional structures — including ones that drive output ports
             // (a Moore output). These lower into `always_comb`, where the port is
             // assigned on every path, so no latch is inferred.
             SHIRStmt::If { .. } | SHIRStmt::Match { .. } | SHIRStmt::ForLoop { .. }
             | SHIRStmt::IndexAssign { .. } => {
-                comb.push(lower_comb_stmt(s, leg, mems)?);
+                comb.push(lower_comb_stmt(s, leg, mems, mb)?);
             }
             // A memory access drives its port's nets; unconditionally here, or
             // under the enclosing `if` when it came from one.
             SHIRStmt::MemRead { .. } | SHIRStmt::MemWrite { .. } => {
-                comb.extend(lower_mem_access(s, leg, mems)?);
+                comb.extend(lower_mem_access(s, leg, mems, mb)?);
             }
         }
     }
@@ -414,14 +443,15 @@ fn lower_comb_stmts(
     stmts: &[SHIRStmt],
     leg: &Legalizer,
     mems: &MemWidths,
+    mb: &MemBinding,
 ) -> LowerResult<Vec<VLIRStmt>> {
     let mut out = Vec::new();
     for s in stmts {
         match s {
             SHIRStmt::MemRead { .. } | SHIRStmt::MemWrite { .. } => {
-                out.extend(lower_mem_access(s, leg, mems)?)
+                out.extend(lower_mem_access(s, leg, mems, mb)?)
             }
-            _ => out.push(lower_comb_stmt(s, leg, mems)?),
+            _ => out.push(lower_comb_stmt(s, leg, mems, mb)?),
         }
     }
     Ok(out)
@@ -432,6 +462,7 @@ fn lower_mem_access(
     s: &SHIRStmt,
     leg: &Legalizer,
     mems: &MemWidths,
+    mb: &MemBinding,
 ) -> LowerResult<Vec<VLIRStmt>> {
     let one = Width::Concrete(1);
     let (mem, is_read, port, addr, value) = match s {
@@ -444,23 +475,24 @@ fn lower_mem_access(
     // wrap — except the simulator panics on an out-of-range address instead, so
     // a design that reaches this truncation has already failed in simulation.
     let addr_net = leg.get(&mem_net(mem, is_read, port, "addr"));
-    let mut out = vec![
-        VLIRStmt::WireAssign {
+    let mut out = Vec::new();
+    if !is_read || mems.wants_read_en(mem, port) {
+        out.push(VLIRStmt::WireAssign {
             name: leg.get(&mem_net(mem, is_read, port, "en")),
             width: one.clone(),
             value: VLIRExpr::Lit { width: one, value: 1 },
-        },
-        VLIRStmt::WireAssign {
-            name: addr_net,
-            width: mems.addr(mem),
-            value: lower_expr(addr, leg)?,
-        },
-    ];
+        });
+    }
+    out.push(VLIRStmt::WireAssign {
+        name: addr_net,
+        width: mems.addr(mem),
+        value: lower_expr(addr, leg, mb)?,
+    });
     if let Some(v) = value {
         out.push(VLIRStmt::WireAssign {
             name: leg.get(&mem_net(mem, is_read, port, "data")),
             width: mems.data(mem),
-            value: lower_expr(v, leg)?,
+            value: lower_expr(v, leg, mb)?,
         });
     }
     Ok(out)
@@ -472,33 +504,34 @@ fn lower_comb_stmt(
     s: &SHIRStmt,
     leg: &Legalizer,
     mems: &MemWidths,
+    mb: &MemBinding,
 ) -> LowerResult<VLIRStmt> {
     match s {
         SHIRStmt::Wire { name, ty, value } => Ok(VLIRStmt::WireAssign {
             name: leg.get(name),
             width: width_of(ty),
-            value: lower_expr(value, leg)?,
+            value: lower_expr(value, leg, mb)?,
         }),
         // A port driven inside a conditional becomes a blocking assign in
         // `always_comb` (the port is a `logic` output, assigned on every path).
         SHIRStmt::PortDrive { port_name, value } => Ok(VLIRStmt::PortAssign {
             port_name: leg.get(port_name),
-            value: lower_expr(value, leg)?,
+            value: lower_expr(value, leg, mb)?,
         }),
         SHIRStmt::If { condition, then_stmts, else_stmts } => Ok(VLIRStmt::If {
-            condition: lower_expr(condition, leg)?,
-            then_stmts: lower_comb_stmts(then_stmts, leg, mems)?,
+            condition: lower_expr(condition, leg, mb)?,
+            then_stmts: lower_comb_stmts(then_stmts, leg, mems, mb)?,
             else_stmts: match else_stmts {
-                Some(e) => Some(lower_comb_stmts(e, leg, mems)?),
+                Some(e) => Some(lower_comb_stmts(e, leg, mems, mb)?),
                 None => None,
             },
         }),
         SHIRStmt::Match { scrutinee, arms } => {
-            let selector = lower_expr(scrutinee, leg)?;
+            let selector = lower_expr(scrutinee, leg, mb)?;
             let mut case_arms = Vec::new();
             let mut default = None;
             for arm in arms {
-                let stmts = lower_comb_stmts(&arm.stmts, leg, mems)?;
+                let stmts = lower_comb_stmts(&arm.stmts, leg, mems, mb)?;
                 // A bare wildcard arm becomes the `default` case.
                 if arm.patterns.len() == 1
                     && matches!(arm.patterns[0], copper_core::shir::SHIRPattern::Wildcard)
@@ -521,14 +554,14 @@ fn lower_comb_stmt(
         }
         SHIRStmt::ForLoop { var, start, end, body } => Ok(VLIRStmt::ForLoop {
             var: var.clone(),
-            start: lower_expr(start, leg)?,
-            end: lower_expr(end, leg)?,
-            body: lower_comb_stmts(body, leg, mems)?,
+            start: lower_expr(start, leg, mb)?,
+            end: lower_expr(end, leg, mb)?,
+            body: lower_comb_stmts(body, leg, mems, mb)?,
         }),
         SHIRStmt::IndexAssign { base, index, value } => Ok(VLIRStmt::IndexAssign {
             base: leg.get(base),
-            index: lower_expr(index, leg)?,
-            value: lower_expr(value, leg)?,
+            index: lower_expr(index, leg, mb)?,
+            value: lower_expr(value, leg, mb)?,
         }),
         // Handled by `lower_comb_stmts`, the only caller that sees a list.
         SHIRStmt::MemRead { .. } | SHIRStmt::MemWrite { .. } => {
@@ -582,14 +615,18 @@ fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
 
 // ── Submodule ───────────────────────────────────────────────────────────────
 
-fn lower_submodule(m: &SHIRSubmoduleInst, leg: &Legalizer) -> LowerResult<VLIRSubmoduleInst> {
+fn lower_submodule(
+    m: &SHIRSubmoduleInst,
+    leg: &Legalizer,
+    mb: &MemBinding,
+) -> LowerResult<VLIRSubmoduleInst> {
     Ok(VLIRSubmoduleInst {
         inst_name: leg.get(&m.inst_name),
         module_name: leg.get(&m.module_name),
         inputs: m
             .inputs
             .iter()
-            .map(|(port, e)| Ok((leg.get(port), lower_expr(e, leg)?)))
+            .map(|(port, e)| Ok((leg.get(port), lower_expr(e, leg, mb)?)))
             .collect::<LowerResult<_>>()?,
         output_wire: leg.get(&m.output_wire),
         output_width: width_of(&m.output_ty),
@@ -603,47 +640,54 @@ fn lower_submodule(m: &SHIRSubmoduleInst, leg: &Legalizer) -> LowerResult<VLIRSu
 
 // ── Expression lowering ─────────────────────────────────────────────────────
 
-fn lower_expr(e: &SHIRExpr, leg: &Legalizer) -> LowerResult<VLIRExpr> {
+fn lower_expr(e: &SHIRExpr, leg: &Legalizer, mb: &MemBinding) -> LowerResult<VLIRExpr> {
     Ok(match e {
         SHIRExpr::Var(name) => VLIRExpr::Var(leg.get(name)),
         SHIRExpr::Lit(lit) => lower_lit(lit),
-        // The read port's output net, and its valid flag — which at a one-cycle
-        // read latency is exactly "an address was staged for the edge that just
-        // passed", i.e. the enable net itself.
-        SHIRExpr::MemData { mem, port } => {
-            VLIRExpr::Var(leg.get(&mem_net(mem, true, *port, "data")))
-        }
-        SHIRExpr::MemValid { mem, port } => {
-            VLIRExpr::Var(leg.get(&mem_net(mem, true, *port, "en")))
-        }
+        // The read port's output, and its valid flag. WHICH net that is depends
+        // on where this expression sits relative to the capture edge — see
+        // `mem_binding`. Resolving it here rather than at the use site is what
+        // keeps a single-tick post-tick read and a later-phase read both correct.
+        SHIRExpr::MemData { mem, port } => VLIRExpr::Var(
+            mb.get(&(mem.clone(), *port))
+                .ok_or(VLIRLowerError::MemoryAccessOutOfLine)?
+                .0
+                .clone(),
+        ),
+        SHIRExpr::MemValid { mem, port } => VLIRExpr::Var(
+            mb.get(&(mem.clone(), *port))
+                .ok_or(VLIRLowerError::MemoryAccessOutOfLine)?
+                .1
+                .clone(),
+        ),
         SHIRExpr::BinOp { left, op, right } => VLIRExpr::BinOp {
-            left: Box::new(lower_expr(left, leg)?),
+            left: Box::new(lower_expr(left, leg, mb)?),
             op: lower_binop(op),
-            right: Box::new(lower_expr(right, leg)?),
+            right: Box::new(lower_expr(right, leg, mb)?),
         },
         SHIRExpr::UnOp { op, expr } => VLIRExpr::UnOp {
             op: lower_unop(op),
-            expr: Box::new(lower_expr(expr, leg)?),
+            expr: Box::new(lower_expr(expr, leg, mb)?),
         },
         SHIRExpr::Mux { cond, then_val, else_val } => VLIRExpr::Ternary {
-            cond: Box::new(lower_expr(cond, leg)?),
-            then_val: Box::new(lower_expr(then_val, leg)?),
-            else_val: Box::new(lower_expr(else_val, leg)?),
+            cond: Box::new(lower_expr(cond, leg, mb)?),
+            then_val: Box::new(lower_expr(then_val, leg, mb)?),
+            else_val: Box::new(lower_expr(else_val, leg, mb)?),
         },
         SHIRExpr::Concat(parts) => {
-            VLIRExpr::Concat(parts.iter().map(|p| lower_expr(p, leg)).collect::<LowerResult<_>>()?)
+            VLIRExpr::Concat(parts.iter().map(|p| lower_expr(p, leg, mb)).collect::<LowerResult<_>>()?)
         }
         SHIRExpr::Slice { expr, high, low } => VLIRExpr::Slice {
-            expr: Box::new(lower_expr(expr, leg)?),
+            expr: Box::new(lower_expr(expr, leg, mb)?),
             high: *high,
             low: *low,
         },
         SHIRExpr::DynBit { base, index } => VLIRExpr::DynBit {
-            base: Box::new(lower_expr(base, leg)?),
-            index: Box::new(lower_expr(index, leg)?),
+            base: Box::new(lower_expr(base, leg, mb)?),
+            index: Box::new(lower_expr(index, leg, mb)?),
         },
         SHIRExpr::Resize { expr, width } => VLIRExpr::Resize {
-            expr: Box::new(lower_expr(expr, leg)?),
+            expr: Box::new(lower_expr(expr, leg, mb)?),
             width: width.clone(),
         },
         SHIRExpr::PhaseEq(idx) => VLIRExpr::BinOp {
@@ -659,8 +703,8 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer) -> LowerResult<VLIRExpr> {
         // register update is lifted to a `case` statement instead — see
         // `lower_reg_updates`.
         SHIRExpr::Case { scrutinee, arms, default } => {
-            let sel = lower_expr(scrutinee, leg)?;
-            let mut result = lower_expr(default, leg)?;
+            let sel = lower_expr(scrutinee, leg, mb)?;
+            let mut result = lower_expr(default, leg, mb)?;
             // Fold from the last arm backwards so earlier arms take priority.
             for arm in arms.iter().rev() {
                 let mut cond = VLIRExpr::BinOp {
@@ -672,12 +716,12 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer) -> LowerResult<VLIRExpr> {
                     cond = VLIRExpr::BinOp {
                         left: Box::new(cond),
                         op: VLIRBinOp::LogicalAnd,
-                        right: Box::new(lower_expr(g, leg)?),
+                        right: Box::new(lower_expr(g, leg, mb)?),
                     };
                 }
                 result = VLIRExpr::Ternary {
                     cond: Box::new(cond),
-                    then_val: Box::new(lower_expr(&arm.value, leg)?),
+                    then_val: Box::new(lower_expr(&arm.value, leg, mb)?),
                     else_val: Box::new(result),
                 };
             }
@@ -934,7 +978,10 @@ fn shir_expr_vars(e: &SHIRExpr, out: &mut HashSet<String>) {
             shir_expr_vars(index, out);
         }
         // A memory read result names nets synthesized by the memory lowering,
-        // not signals the phase analysis can move or promote.
+        // not signals the phase analysis can move or promote. A multi-phase module
+        // may not drive a plain `Out` from one at all (see
+        // `reject_memory_driven_comb_outputs`), so the phase-hold analysis never
+        // has to reason about one.
         SHIRExpr::Lit(_)
         | SHIRExpr::PhaseEq(_)
         | SHIRExpr::MemData { .. }
@@ -1023,6 +1070,73 @@ fn shir_port_drives(stmts: &[SHIRStmt], out: &mut Vec<(String, HashSet<String>)>
 /// wrong in the widening direction lags an output by a cycle — `mac_pipeline` is
 /// the measured witness, which is why the rule keys on the value and not merely on
 /// "written in some phases but not all".
+/// Reject a plain `Out` driven directly from a memory read result in a
+/// **multi-phase** module.
+///
+/// Neither available form is right, which is why this is an error rather than a
+/// choice. A module-level continuous assign tracks the read pipeline, which
+/// re-captures on every edge, so the output would change again in the phases that
+/// do not observe it. Converting it to the usual implicit-hold register latches it
+/// at the end of the observing phase, one edge after the capture the simulator
+/// reads — measured: `data` came out a full cycle late on every sampled value.
+///
+/// `RegOut` is the form that works, and it is the same `Out`/`RegOut` distinction
+/// the pre-tick alignment guardrail points at. A single-phase module is unaffected
+/// — there the post-tick segment shares the phase, and a plain `Out` driven from
+/// `data()` is correct and covered by `tests/multiphase_memory_equivalence.rs`.
+fn reject_memory_driven_comb_outputs(
+    phases: &[SHIRPhase],
+    registered_outs: &HashSet<String>,
+    leg: &Legalizer,
+) -> LowerResult<()> {
+    if phases.len() < 2 {
+        return Ok(());
+    }
+    for phase in phases {
+        let mut drives = Vec::new();
+        shir_port_drives_with_values(&phase.pre_edge, &mut drives);
+        for (port, value) in drives {
+            if registered_outs.contains(&leg.get(&port)) {
+                continue;
+            }
+            let (mut data, mut valid) = (HashSet::new(), HashSet::new());
+            collect_read_uses_expr(value, &mut data, &mut valid);
+            if !data.is_empty() || !valid.is_empty() {
+                return Err(VLIRLowerError::MemoryResultDrivesPlainOutput { port });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Output-port drives paired with the expression driving them.
+fn shir_port_drives_with_values<'a>(
+    stmts: &'a [SHIRStmt],
+    out: &mut Vec<(String, &'a SHIRExpr)>,
+) {
+    for s in stmts {
+        match s {
+            SHIRStmt::PortDrive { port_name, value } => out.push((port_name.clone(), value)),
+            SHIRStmt::If { then_stmts, else_stmts, .. } => {
+                shir_port_drives_with_values(then_stmts, out);
+                if let Some(e) = else_stmts {
+                    shir_port_drives_with_values(e, out);
+                }
+            }
+            SHIRStmt::Match { arms, .. } => {
+                for a in arms {
+                    shir_port_drives_with_values(&a.stmts, out);
+                }
+            }
+            SHIRStmt::ForLoop { body, .. } => shir_port_drives_with_values(body, out),
+            SHIRStmt::Wire { .. }
+            | SHIRStmt::IndexAssign { .. }
+            | SHIRStmt::MemRead { .. }
+            | SHIRStmt::MemWrite { .. } => {}
+        }
+    }
+}
+
 fn phase_scoped_output_ports(phases: &[SHIRPhase]) -> HashSet<String> {
     if phases.len() < 2 {
         return HashSet::new();
@@ -1420,22 +1534,34 @@ fn check_no_latches(stmts: &[VLIRStmt]) -> LowerResult<()> {
 /// Threaded into statement lowering because a memory access has to size the nets
 /// it drives and only the declaration knows those widths.
 #[derive(Default)]
-struct MemWidths(HashMap<String, (Width, Width)>);
+struct MemWidths {
+    widths: HashMap<String, (Width, Width)>,
+    /// Read ports that need an enable net (see `MemPortUse::needs_read_en`).
+    read_en: HashSet<MemPort>,
+}
 
 impl MemWidths {
-    fn build(memories: &[SHIRMemory]) -> Self {
-        MemWidths(
-            memories
+    fn build(memories: &[SHIRMemory], use_: &MemPortUse) -> Self {
+        MemWidths {
+            widths: memories
                 .iter()
                 .map(|m| (m.name.clone(), (addr_width(m.depth), width_of(&m.elem_ty))))
                 .collect(),
-        )
+            read_en: memories
+                .iter()
+                .flat_map(|m| (0..m.read_ports).map(|p| (m.name.clone(), p)))
+                .filter(|k| use_.needs_read_en(k))
+                .collect(),
+        }
     }
     fn addr(&self, mem: &str) -> Width {
-        self.0.get(mem).map(|(a, _)| a.clone()).unwrap_or(Width::Concrete(1))
+        self.widths.get(mem).map(|(a, _)| a.clone()).unwrap_or(Width::Concrete(1))
     }
     fn data(&self, mem: &str) -> Width {
-        self.0.get(mem).map(|(_, d)| d.clone()).unwrap_or(Width::Concrete(1))
+        self.widths.get(mem).map(|(_, d)| d.clone()).unwrap_or(Width::Concrete(1))
+    }
+    fn wants_read_en(&self, mem: &str, port: usize) -> bool {
+        self.read_en.contains(&(mem.to_string(), port))
     }
 }
 
@@ -1449,18 +1575,39 @@ fn addr_width(depth: usize) -> Width {
     Width::Concrete(bits)
 }
 
-/// Which memory ports a body actually touches. Only these get nets, so an
-/// unused port of a multi-port memory does not leave dangling signals behind.
+/// A memory read port, identified by `(memory name, port index)`.
+type MemPort = (String, usize);
+
+/// Which nets a `MemData` / `MemValid` expression resolves to at one point in the
+/// lowering. Built per (phase, region) by [`mem_binding`] — see the doc there for
+/// why the answer is not the same everywhere.
+type MemBinding = HashMap<MemPort, (String, String)>;
+
+/// Which memory ports a body touches, and — for read results — in which FORM.
+///
+/// A read result has two forms, and picking the wrong one shifts the design by a
+/// cycle in one direction or the other:
+///
+/// * the **combinational** net (`<m>_rd<i>_data`), a continuous read of the array.
+///   Correct only for a consumer that latches at the SAME edge as the capture: an
+///   `always_ff` register update in the phase that stages the read. There the
+///   register and the memory capture the same pre-edge value together.
+/// * the **registered** net (`<m>_rd<i>_q`), holding what the capture edge
+///   produced. Correct for every other consumer — anything reading the result
+///   *after* the capture edge, which includes a plain combinational use in the
+///   same single-tick loop (it runs post-edge) and any use in a later phase.
 #[derive(Default)]
 struct MemPortUse {
     /// `(mem, port)` staged by a `read()` call.
-    reads: HashSet<(String, usize)>,
+    reads: HashSet<MemPort>,
     /// `(mem, port)` staged by a `write()` call.
-    writes: HashSet<(String, usize)>,
-    /// `(mem, port)` whose `data()` output is observed.
-    read_data: HashSet<(String, usize)>,
-    /// `(mem, port)` whose `is_ready()` flag is observed.
-    read_valid: HashSet<(String, usize)>,
+    writes: HashSet<MemPort>,
+    /// `data()` observed at the capture edge / after it.
+    data_comb: HashSet<MemPort>,
+    data_reg: HashSet<MemPort>,
+    /// `is_ready()` observed at the capture edge / after it.
+    valid_comb: HashSet<MemPort>,
+    valid_reg: HashSet<MemPort>,
 }
 
 impl MemPortUse {
@@ -1468,108 +1615,233 @@ impl MemPortUse {
     /// observed: a `data()` read with no `read()` anywhere is a port that never
     /// becomes ready, which the emitted `en = 1'b0` default reproduces exactly.
     /// Without this the observation would reference nets nothing declares.
-    fn read_touched(&self, mem: &str, port: usize) -> bool {
-        let key = (mem.to_string(), port);
-        self.reads.contains(&key)
-            || self.read_data.contains(&key)
-            || self.read_valid.contains(&key)
+    fn read_touched(&self, k: &MemPort) -> bool {
+        self.reads.contains(k)
+            || self.data_comb.contains(k)
+            || self.data_reg.contains(k)
+            || self.valid_comb.contains(k)
+            || self.valid_reg.contains(k)
+    }
+    /// The continuous array-read net is needed by a combinational consumer
+    /// directly, and by a registered one as the register's input.
+    fn needs_data_net(&self, k: &MemPort) -> bool {
+        self.data_comb.contains(k) || self.data_reg.contains(k)
+    }
+    /// A READ port's enable exists only to answer `is_ready()` — the array read
+    /// itself needs only an address. A design that never asks (a ROM read
+    /// unconditionally, say) would otherwise carry a net nothing reads, which is a
+    /// fatal Verilator UNUSEDSIGNAL under `-Wall`.
+    fn needs_read_en(&self, k: &MemPort) -> bool {
+        self.valid_comb.contains(k) || self.valid_reg.contains(k)
     }
 }
 
+/// The nets `MemData` / `MemValid` resolve to in one phase and region.
+///
+/// `staged_here` is the set of read ports this phase stages. A consumer in the
+/// phase's **post_edge** (a register update) latches at the very edge that
+/// captures, so it must read the combinational value; everything else runs after
+/// that edge and must read the register.
+fn mem_binding(
+    memories: &[SHIRMemory],
+    staged_here: &HashSet<MemPort>,
+    post_edge: bool,
+    leg: &Legalizer,
+) -> MemBinding {
+    let mut b = MemBinding::new();
+    for m in memories {
+        for port in 0..m.read_ports {
+            let key = (m.name.clone(), port);
+            let same_edge = post_edge && staged_here.contains(&key);
+            let nets = if same_edge {
+                (
+                    leg.get(&mem_net(&m.name, true, port, "data")),
+                    leg.get(&mem_net(&m.name, true, port, "en")),
+                )
+            } else {
+                (
+                    leg.get(&mem_net(&m.name, true, port, "q")),
+                    leg.get(&mem_net(&m.name, true, port, "v")),
+                )
+            };
+            b.insert(key, nets);
+        }
+    }
+    b
+}
+
+/// Read ports staged by a `read()` somewhere in these statements.
+fn staged_read_ports(stmts: &[SHIRStmt]) -> HashSet<MemPort> {
+    let mut u = MemPortUse::default();
+    collect_mem_use(stmts, &mut u);
+    u.reads
+}
+
+/// Tally every port a body stages, and classify every read-result observation as
+/// combinational or registered, phase by phase.
+fn collect_phase_mem_use(phases: &[SHIRPhase], use_: &mut MemPortUse) {
+    for phase in phases {
+        collect_mem_use(&phase.pre_edge, use_);
+        let staged = staged_read_ports(&phase.pre_edge);
+
+        // Pre-edge statements run AFTER the edge that captured (in a single-tick
+        // loop the post-tick segment lands here), so they always read the register.
+        let (mut data, mut valid) = (HashSet::new(), HashSet::new());
+        collect_read_uses(&phase.pre_edge, &mut data, &mut valid);
+        use_.data_reg.extend(data.drain());
+        use_.valid_reg.extend(valid.drain());
+
+        // Register updates latch at this phase's edge: combinational iff this
+        // phase is the one staging the read.
+        for u in &phase.post_edge {
+            collect_read_uses_expr(&u.next_value, &mut data, &mut valid);
+        }
+        for k in data {
+            if staged.contains(&k) {
+                use_.data_comb.insert(k);
+            } else {
+                use_.data_reg.insert(k);
+            }
+        }
+        for k in valid {
+            if staged.contains(&k) {
+                use_.valid_comb.insert(k);
+            } else {
+                use_.valid_reg.insert(k);
+            }
+        }
+    }
+}
+
+/// Staged accesses (`read()` / `write()`) in a statement tree.
 fn collect_mem_use(stmts: &[SHIRStmt], use_: &mut MemPortUse) {
     for s in stmts {
         match s {
-            SHIRStmt::MemRead { mem, port, addr } => {
+            SHIRStmt::MemRead { mem, port, .. } => {
                 use_.reads.insert((mem.clone(), *port));
-                collect_mem_use_expr(addr, use_);
             }
-            SHIRStmt::MemWrite { mem, port, addr, value } => {
+            SHIRStmt::MemWrite { mem, port, .. } => {
                 use_.writes.insert((mem.clone(), *port));
-                collect_mem_use_expr(addr, use_);
-                collect_mem_use_expr(value, use_);
             }
-            SHIRStmt::Wire { value, .. } | SHIRStmt::PortDrive { value, .. } => {
-                collect_mem_use_expr(value, use_)
-            }
-            SHIRStmt::If { condition, then_stmts, else_stmts } => {
-                collect_mem_use_expr(condition, use_);
+            SHIRStmt::If { then_stmts, else_stmts, .. } => {
                 collect_mem_use(then_stmts, use_);
                 if let Some(e) = else_stmts {
                     collect_mem_use(e, use_);
                 }
             }
-            SHIRStmt::Match { scrutinee, arms } => {
-                collect_mem_use_expr(scrutinee, use_);
+            SHIRStmt::Match { arms, .. } => {
                 for a in arms {
-                    if let Some(g) = &a.guard {
-                        collect_mem_use_expr(g, use_);
-                    }
                     collect_mem_use(&a.stmts, use_);
                 }
             }
+            SHIRStmt::ForLoop { body, .. } => collect_mem_use(body, use_),
+            SHIRStmt::Wire { .. } | SHIRStmt::PortDrive { .. } | SHIRStmt::IndexAssign { .. } => {}
+        }
+    }
+}
+
+/// Read-result observations (`data()` / `is_ready()`) in a statement tree.
+fn collect_read_uses(
+    stmts: &[SHIRStmt],
+    data: &mut HashSet<MemPort>,
+    valid: &mut HashSet<MemPort>,
+) {
+    for s in stmts {
+        match s {
+            SHIRStmt::Wire { value, .. } | SHIRStmt::PortDrive { value, .. } => {
+                collect_read_uses_expr(value, data, valid)
+            }
+            SHIRStmt::MemRead { addr, .. } => collect_read_uses_expr(addr, data, valid),
+            SHIRStmt::MemWrite { addr, value, .. } => {
+                collect_read_uses_expr(addr, data, valid);
+                collect_read_uses_expr(value, data, valid);
+            }
+            SHIRStmt::If { condition, then_stmts, else_stmts } => {
+                collect_read_uses_expr(condition, data, valid);
+                collect_read_uses(then_stmts, data, valid);
+                if let Some(e) = else_stmts {
+                    collect_read_uses(e, data, valid);
+                }
+            }
+            SHIRStmt::Match { scrutinee, arms } => {
+                collect_read_uses_expr(scrutinee, data, valid);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        collect_read_uses_expr(g, data, valid);
+                    }
+                    collect_read_uses(&a.stmts, data, valid);
+                }
+            }
             SHIRStmt::ForLoop { start, end, body, .. } => {
-                collect_mem_use_expr(start, use_);
-                collect_mem_use_expr(end, use_);
-                collect_mem_use(body, use_);
+                collect_read_uses_expr(start, data, valid);
+                collect_read_uses_expr(end, data, valid);
+                collect_read_uses(body, data, valid);
             }
             SHIRStmt::IndexAssign { index, value, .. } => {
-                collect_mem_use_expr(index, use_);
-                collect_mem_use_expr(value, use_);
+                collect_read_uses_expr(index, data, valid);
+                collect_read_uses_expr(value, data, valid);
             }
         }
     }
 }
 
-fn collect_mem_use_expr(e: &SHIRExpr, use_: &mut MemPortUse) {
+fn collect_read_uses_expr(
+    e: &SHIRExpr,
+    data: &mut HashSet<MemPort>,
+    valid: &mut HashSet<MemPort>,
+) {
     match e {
         SHIRExpr::MemData { mem, port } => {
-            use_.read_data.insert((mem.clone(), *port));
+            data.insert((mem.clone(), *port));
         }
-        // `is_ready()` reads the enable net.
         SHIRExpr::MemValid { mem, port } => {
-            use_.read_valid.insert((mem.clone(), *port));
+            valid.insert((mem.clone(), *port));
         }
         SHIRExpr::Var(_) | SHIRExpr::Lit(_) | SHIRExpr::PhaseEq(_) => {}
         SHIRExpr::BinOp { left, right, .. } => {
-            collect_mem_use_expr(left, use_);
-            collect_mem_use_expr(right, use_);
+            collect_read_uses_expr(left, data, valid);
+            collect_read_uses_expr(right, data, valid);
         }
-        SHIRExpr::UnOp { expr, .. } | SHIRExpr::Resize { expr, .. } | SHIRExpr::Slice { expr, .. } => {
-            collect_mem_use_expr(expr, use_)
-        }
+        SHIRExpr::UnOp { expr, .. }
+        | SHIRExpr::Resize { expr, .. }
+        | SHIRExpr::Slice { expr, .. } => collect_read_uses_expr(expr, data, valid),
         SHIRExpr::Mux { cond, then_val, else_val } => {
-            collect_mem_use_expr(cond, use_);
-            collect_mem_use_expr(then_val, use_);
-            collect_mem_use_expr(else_val, use_);
+            collect_read_uses_expr(cond, data, valid);
+            collect_read_uses_expr(then_val, data, valid);
+            collect_read_uses_expr(else_val, data, valid);
         }
         SHIRExpr::Case { scrutinee, arms, default } => {
-            collect_mem_use_expr(scrutinee, use_);
+            collect_read_uses_expr(scrutinee, data, valid);
             for a in arms {
                 if let Some(g) = &a.guard {
-                    collect_mem_use_expr(g, use_);
+                    collect_read_uses_expr(g, data, valid);
                 }
-                collect_mem_use_expr(&a.value, use_);
+                collect_read_uses_expr(&a.value, data, valid);
             }
-            collect_mem_use_expr(default, use_);
+            collect_read_uses_expr(default, data, valid);
         }
         SHIRExpr::Concat(parts) => {
             for p in parts {
-                collect_mem_use_expr(p, use_);
+                collect_read_uses_expr(p, data, valid);
             }
         }
         SHIRExpr::DynBit { base, index } => {
-            collect_mem_use_expr(base, use_);
-            collect_mem_use_expr(index, use_);
+            collect_read_uses_expr(base, data, valid);
+            collect_read_uses_expr(index, data, valid);
         }
     }
 }
 
-/// Top-of-`always_comb` defaults for every accessed memory net. Without these an
-/// enable driven only inside an `if` would infer a latch (and `check_no_latches`
-/// would reject the module).
+/// Top-of-`always_comb` defaults for the memory nets THIS phase drives. Without
+/// them an enable driven only inside an `if` would infer a latch (and
+/// `check_no_latches` would reject the module). Scoped per phase because in a
+/// multi-phase module each phase drives only its own accesses — the nets it does
+/// not touch are cleared by the emitter's top-of-block defaults instead, which is
+/// what makes an enable read as 0 outside its staging phase.
 fn mem_net_defaults(
     memories: &[SHIRMemory],
-    use_: &MemPortUse,
+    driven: &MemPortUse,
+    all: &MemPortUse,
     leg: &Legalizer,
 ) -> Vec<VLIRStmt> {
     let mut out = Vec::new();
@@ -1578,8 +1850,11 @@ fn mem_net_defaults(
         let aw = addr_width(m.depth);
         let dw = width_of(&m.elem_ty);
         let mut push = |is_read: bool, port: usize, with_data: bool| {
-            for (suffix, width) in [("en", one_bit.clone()), ("addr", aw.clone())]
+            let en = (!is_read || all.needs_read_en(&(m.name.clone(), port)))
+                .then(|| ("en", one_bit.clone()));
+            for (suffix, width) in en
                 .into_iter()
+                .chain([("addr", aw.clone())])
                 .chain(with_data.then(|| ("data", dw.clone())))
             {
                 out.push(VLIRStmt::WireAssign {
@@ -1590,13 +1865,107 @@ fn mem_net_defaults(
             }
         };
         for port in 0..m.read_ports {
-            if use_.read_touched(&m.name, port) {
+            if driven.reads.contains(&(m.name.clone(), port)) {
                 push(true, port, false);
             }
         }
         for port in 0..m.write_ports {
-            if use_.writes.contains(&(m.name.clone(), port)) {
+            if driven.writes.contains(&(m.name.clone(), port)) {
                 push(false, port, true);
+            }
+        }
+    }
+    out
+}
+
+/// Defaults for read ports that are OBSERVED but never staged anywhere. Their
+/// enable/address nets are still referenced (by the observation, and by the
+/// continuous array read), so they need one unconditional driver. A port that is
+/// never staged never becomes ready, which `en = 1'b0` reproduces exactly.
+fn unstaged_read_defaults(
+    memories: &[SHIRMemory],
+    use_: &MemPortUse,
+    leg: &Legalizer,
+) -> Vec<VLIRStmt> {
+    let mut out = Vec::new();
+    let one_bit = Width::Concrete(1);
+    for m in memories {
+        for port in 0..m.read_ports {
+            let key = (m.name.clone(), port);
+            if use_.reads.contains(&key) || !use_.read_touched(&key) {
+                continue;
+            }
+            let en = use_
+                .needs_read_en(&key)
+                .then(|| ("en", one_bit.clone()));
+            for (suffix, width) in en.into_iter().chain([("addr", addr_width(m.depth))]) {
+                out.push(VLIRStmt::WireAssign {
+                    name: leg.get(&mem_net(&m.name, true, port, suffix)),
+                    width: width.clone(),
+                    value: VLIRExpr::Lit { width, value: 0 },
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `<m>_rd<i>_q <= <m>_rd<i>_data;` / `<m>_rd<i>_v <= <m>_rd<i>_en;` — the read
+/// pipeline stage, for ports whose result is observed after its capture edge.
+///
+/// Deliberately UNGUARDED by phase, because the simulator's pipeline advances on
+/// every posedge regardless of what the design is doing (`advance_read_pipelines`
+/// is a clock listener; the memory knows nothing about phases). Outside its
+/// staging phase the enable net is 0, so `_v` goes false there — which is exactly
+/// the simulator's `is_ready()` after a cycle with no staged address. The captured
+/// data survives for one cycle and no longer, in both.
+fn mem_read_pipeline(
+    memories: &[SHIRMemory],
+    use_: &MemPortUse,
+    leg: &Legalizer,
+) -> Vec<VLIRFFStmt> {
+    let mut out = Vec::new();
+    for m in memories {
+        for port in 0..m.read_ports {
+            let key = (m.name.clone(), port);
+            if use_.data_reg.contains(&key) {
+                out.push(VLIRFFStmt::NonBlockingAssign {
+                    target: leg.get(&mem_net(&m.name, true, port, "q")),
+                    value: VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "data"))),
+                });
+            }
+            if use_.valid_reg.contains(&key) {
+                out.push(VLIRFFStmt::NonBlockingAssign {
+                    target: leg.get(&mem_net(&m.name, true, port, "v")),
+                    value: VLIRExpr::Var(leg.get(&mem_net(&m.name, true, port, "en"))),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Register declarations for the read pipeline stages emitted above.
+fn mem_read_pipeline_regs(
+    memories: &[SHIRMemory],
+    use_: &MemPortUse,
+    leg: &Legalizer,
+) -> Vec<VLIRRegDecl> {
+    let mut out = Vec::new();
+    for m in memories {
+        for port in 0..m.read_ports {
+            let key = (m.name.clone(), port);
+            if use_.data_reg.contains(&key) {
+                out.push(VLIRRegDecl {
+                    name: leg.get(&mem_net(&m.name, true, port, "q")),
+                    width: width_of(&m.elem_ty),
+                });
+            }
+            if use_.valid_reg.contains(&key) {
+                out.push(VLIRRegDecl {
+                    name: leg.get(&mem_net(&m.name, true, port, "v")),
+                    width: Width::Concrete(1),
+                });
             }
         }
     }
@@ -1616,7 +1985,7 @@ fn lower_mem_decls(
             width: width_of(&m.elem_ty),
             depth: m.depth,
             read_data_nets: (0..m.read_ports)
-                .filter(|p| use_.read_data.contains(&(m.name.clone(), *p)))
+                .filter(|p| use_.needs_data_net(&(m.name.clone(), *p)))
                 .map(|p| VLIRMemReadNet {
                     data: leg.get(&mem_net(&m.name, true, p, "data")),
                     width: width_of(&m.elem_ty),
@@ -1625,18 +1994,15 @@ fn lower_mem_decls(
                 .collect(),
             init: match &m.init {
                 None => None,
-                // The fill index is a plain `int` loop variable in the emitted
-                // `initial` block, so it is not routed through the legalizer's
-                // signal namespace — but it must not collide with a signal name
-                // the body references, which `leg.get` on the body's vars ensures
-                // stays distinct only if the source name was distinct. It was: the
-                // closure parameter is a Rust binding in the same scope.
                 Some(SHIRMemInit::Fill { var, value }) => Some(VLIRMemInit::Fill {
                     var: var.clone(),
-                    value: lower_expr(value, leg)?,
+                    value: lower_expr(value, leg, &MemBinding::new())?,
                 }),
                 Some(SHIRMemInit::Words(words)) => Some(VLIRMemInit::Words(
-                    words.iter().map(|w| lower_expr(w, leg)).collect::<LowerResult<_>>()?,
+                    words
+                        .iter()
+                        .map(|w| lower_expr(w, leg, &MemBinding::new()))
+                        .collect::<LowerResult<_>>()?,
                 )),
             },
         }))
@@ -1803,7 +2169,7 @@ fn collect_and_legalize_body_names(body: &SHIRBody, leg: &mut Legalizer) {
                 leg.legalize(&m.name);
                 for (is_read, count) in [(true, m.read_ports), (false, m.write_ports)] {
                     for port in 0..count {
-                        for suffix in ["en", "addr", "data"] {
+                        for suffix in ["en", "addr", "data", "q", "v"] {
                             leg.legalize(&mem_net(&m.name, is_read, port, suffix));
                         }
                     }

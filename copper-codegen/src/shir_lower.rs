@@ -373,6 +373,22 @@ fn lower_seq_body(
             )?;
 
             if phase_idx == n_ticks - 1 {
+                // The trailing segment's REGISTER updates map to this phase. Its
+                // combinational statements have no home in the multi-tick model
+                // (only the single-tick path hoists them, where the trailing
+                // segment shares the one phase) and used to be dropped SILENTLY —
+                // an output written after the last tick simply vanished, leaving
+                // an undriven port. Fail loudly instead; deciding which phase they
+                // belong to is a semantics question, not a lowering detail.
+                let trailing_comb =
+                    lower_pre_edge_stmts(&segments[n_ticks], &promoted_names, &phase_renames)?;
+                if !trailing_comb.is_empty() {
+                    return Err(SHIRLowerError::UnsupportedConstruct {
+                        description: "combinational statements after the last `clk.tick().await`                                       of a multi-tick loop are not supported (an output written                                       there would be silently dropped); move them before the last                                       tick"
+                            .to_string(),
+                        span: module_span,
+                    });
+                }
                 // Trailing segment maps to the same phase — same renames apply
                 let trailing_updates = extract_reg_updates(
                     &segments[n_ticks],

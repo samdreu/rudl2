@@ -46,6 +46,35 @@ use syn::ItemFn;
 /// inference legitimately does not produce (they are synthesized during lowering).
 const SYNTHETIC: &[&str] = &["phase", "pc"];
 
+/// A register synthesized by the lowering rather than named in the source.
+///
+/// Two kinds: the phase/pc counter above, and a memory read port's pipeline stage
+/// (`<mem>_rd<N>_q` / `<mem>_rd<N>_v`), which holds what a capture edge produced
+/// so a later phase can observe it. Neither has a source-level name —
+/// `infer_registers` names locals that live across a tick, and a memory's internal
+/// pipeline is not one; it belongs to the memory the way a submodule's registers
+/// belong to the submodule.
+///
+/// The shape match is safe because `vlir_lower` RESERVES these names in the
+/// legalizer from the memory declaration: a user signal that collided would be the
+/// one renamed, so a name of this shape in the emitted SV really is a memory
+/// pipeline stage.
+fn is_synthetic(name: &str) -> bool {
+    if SYNTHETIC.contains(&name) {
+        return true;
+    }
+    let Some(rest) = name.strip_suffix("_q").or_else(|| name.strip_suffix("_v")) else {
+        return false;
+    };
+    match rest.rfind("_rd") {
+        Some(i) => {
+            let digits = &rest[i + 3..];
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && i > 0
+        }
+        None => false,
+    }
+}
+
 fn strip_r(name: &str) -> String {
     name.strip_suffix("_r").unwrap_or(name).to_string()
 }
@@ -121,7 +150,7 @@ fn codegen_registers_match_shared_inference() {
             let missing: Vec<_> = inferred.difference(&codegen).cloned().collect();
             let extra: Vec<_> = codegen
                 .difference(&inferred)
-                .filter(|r| !SYNTHETIC.contains(&r.as_str()))
+                .filter(|r| !is_synthetic(r))
                 .cloned()
                 .collect();
 

@@ -111,7 +111,8 @@ fn arithmetic_shift_right_is_unsupported() {
 // shipped example — which in turn is checked against an independent hand-written
 // `examples/memory/sv/dual_port_ram.sv`. Preloaded contents followed on the same
 // day (`initial` block; `tests/preloaded_memory_equivalence.rs`), then WriteFirst
-// (`tests/write_first_memory_equivalence.rs`). What remains is pinned below, one
+// (`tests/write_first_memory_equivalence.rs`) and multi-phase access
+// (`tests/multiphase_memory_equivalence.rs`). What remains is pinned below, one
 // test per construct, each measured against the baseline that does transpile.
 //
 // One decision still rests on the absence of a synthesised counterpart:
@@ -298,31 +299,59 @@ fn two_accesses_to_one_memory_port_are_rejected() {
     );
 }
 
-/// Multi-phase memory access. A second tick would need phase-guarded address
-/// buses and a read result that survives into a later phase; neither exists.
+/// Multi-phase memory DOES transpile: the address buses are phase-gated and the
+/// read result is captured into a pipeline register that survives the edge.
+/// `tests/multiphase_memory_equivalence.rs` carries the behavioural checks.
 #[test]
-fn memory_in_a_multi_phase_loop_is_unsupported() {
+fn memory_in_a_multi_phase_loop_is_supported() {
     let src = r#"
 #[hardware(sequential)]
 async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainClk>) {
-    let mem = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256);
+    let mem = Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::new(clk.clone(), 256);
     let mut q: Bits<16> = Bits::zero();
     loop {
+        o.write(q);
         mem.read_port::<0>().read(a.read().as_usize());
         clk.tick().await;
         if mem.read_port::<0>().is_ready() { q = mem.read_port::<0>().data(); }
-        o.write(q);
         clk.tick().await;
     }
 }
 "#;
+    let sv = transpile(src).expect("a two-phase memory read must transpile");
+    assert!(
+        sv.contains("mem_rd0_q <= mem_rd0_data;"),
+        "a cross-phase read result must be captured into a pipeline register, got:\n{sv}"
+    );
+}
+
+/// Combinational statements after the LAST tick of a multi-tick loop. They have
+/// no phase to belong to and used to be dropped silently — an output written
+/// there simply vanished, leaving an undriven port. Not memory-specific; the
+/// memory work is just what surfaced it.
+#[test]
+fn trailing_combinational_statements_in_a_multi_tick_loop_are_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk>,
+           t: Out<Bits<8>, MainClk>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        r = a.read();
+        clk.tick().await;
+        o.write(r);
+        clk.tick().await;
+        t.write(r);
+    }
+}
+"#;
     let err = transpile(src).expect_err(
-        "NOW SUPPORTED: multi-phase memory transpiles. The phase guard on the address buses and \
-         the cross-phase read result both need equivalence coverage.",
+        "NOW SUPPORTED: trailing combinational statements lower. That decides which phase they \
+         belong to — a semantics question; make sure it was decided, not defaulted.",
     );
     assert!(
-        err.contains("exactly one `clk.tick().await`"),
-        "reproduced a *different* error than the multi-phase gap: {err}"
+        err.contains("after the last `clk.tick().await`"),
+        "reproduced a *different* error than the tracked trailing-segment gap: {err}"
     );
 }
 
@@ -346,7 +375,7 @@ async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainCl
 "#;
     let err = transpile(src).expect_err("observing a read result before the edge must be rejected");
     assert!(
-        err.contains("is read before `clk.tick().await`"),
+        err.contains("is read before the `clk.tick().await` that produces it"),
         "reproduced a *different* error than the read-ordering rule: {err}"
     );
 }

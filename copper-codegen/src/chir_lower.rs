@@ -3986,16 +3986,20 @@ fn mem_result_type(
 
 /// Enforce the boundaries of the memory support that actually lowers.
 ///
-/// Each rule guards a place where the emitted array would *silently* disagree
-/// with the simulator, so all of them are hard errors rather than warnings:
+/// The loop body splits at `clk.tick().await` into *segments*: segment k is the
+/// work between tick k-1 and tick k, and the access staged there is captured by
+/// tick k. Every rule below guards a place where the emitted array would silently
+/// disagree with the simulator, so all of them are hard errors:
 ///
-/// - **One tick.** A memory in a multi-phase FSM needs phase-guarded address
-///   buses and a read result that survives into a later phase; neither is built.
-/// - **Access before the edge, result after it.** `read`/`write` stage buses
-///   that the *following* clock edge captures; `data`/`is_ready` observe what
-///   that edge produced. Reversing either side shifts the design by a cycle.
-/// - **One access per port.** A physical port has one address bus. The simulator
-///   silently keeps the last write of a cycle; hardware cannot.
+/// - **One access per port per segment.** A physical port has one address bus.
+///   The simulator silently keeps the last write of a cycle; hardware cannot. Two
+///   accesses in *different* segments are fine — the segments are separate cycles,
+///   and the address bus is muxed by the phase guard.
+/// - **A result is observed after the tick that produces it.** `read`/`write`
+///   stage buses; `data`/`is_ready` observe what the following edge produced.
+///   Observing in the staging segment would read the result a cycle early.
+/// - **A result has a staging before it.** Observing a port that nothing stages
+///   earlier in the loop reads a port that never becomes ready.
 fn validate_memory_usage(
     loop_body: &[CHIRStmt],
     memories: &[CHIRMemoryDecl],
@@ -4005,143 +4009,136 @@ fn validate_memory_usage(
         return Ok(());
     }
 
-    let ticks = loop_body.iter().filter(|s| matches!(s, CHIRStmt::AwaitTick { .. })).count();
-    if ticks != 1 {
-        return Err(CHIRLowerError::UnsupportedConstruct {
-            description: format!(
-                "a module using `Memory` must have exactly one `clk.tick().await` in its loop; \
-                 this one has {ticks}. Multi-phase memory access is not supported yet"
-            ),
-            span: module_span,
-            suggested_rewrite: None,
-        });
-    }
-
-    let mut after_tick = false;
-    let mut reads: std::collections::HashMap<(String, usize), usize> = Default::default();
-    let mut writes: std::collections::HashMap<(String, usize), usize> = Default::default();
-
+    // Split at ticks, mirroring `shir_lower::split_at_ticks`.
+    let mut segments: Vec<Vec<&CHIRStmt>> = vec![Vec::new()];
     for stmt in loop_body {
         if matches!(stmt, CHIRStmt::AwaitTick { .. }) {
-            after_tick = true;
-            continue;
+            segments.push(Vec::new());
+        } else {
+            segments.last_mut().expect("seeded with one segment").push(stmt);
         }
-        check_mem_stmt(stmt, after_tick, &mut reads, &mut writes)?;
     }
 
-    for ((mem, port), n) in reads.iter().chain(writes.iter()) {
-        if *n > 1 {
-            return Err(CHIRLowerError::UnsupportedConstruct {
-                description: format!(
-                    "memory `{mem}` port {port} is accessed {n} times in one cycle; a physical \
-                     port has a single address bus. Merge the accesses into one, selecting the \
-                     address and data with a conditional"
-                ),
-                span: module_span,
-                suggested_rewrite: None,
-            });
+    // Where each port is staged, and where each result is observed.
+    let mut staged: std::collections::HashMap<(String, usize), Vec<usize>> = Default::default();
+    let mut observed: Vec<((String, usize), usize, &'static str, SourceSpan)> = Vec::new();
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        // Keyed by (memory, is_read, port): read port 0 and write port 0 are
+        // different buses and must not be conflated.
+        let mut here: std::collections::HashMap<(String, bool, usize), usize> = Default::default();
+        for stmt in seg {
+            collect_mem_accesses(stmt, seg_idx, &mut here, &mut observed)?;
         }
+        for ((mem, is_read, port), n) in here {
+            if n > 1 {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "memory `{mem}` {} port {port} is accessed {n} times in one cycle; a \
+                         physical port has a single address bus. Merge the accesses into one, \
+                         selecting the address and data with a conditional",
+                        if is_read { "read" } else { "write" }
+                    ),
+                    span: module_span,
+                    suggested_rewrite: None,
+                });
+            }
+            if is_read {
+                staged.entry((mem, port)).or_default().push(seg_idx);
+            }
+        }
+    }
+
+    for ((mem, port), seg_idx, what, span) in observed {
+        let stagings = staged.get(&(mem.clone(), port));
+        let has_earlier = stagings.is_some_and(|v| v.iter().any(|&s| s < seg_idx));
+        if has_earlier {
+            continue;
+        }
+        let in_same = stagings.is_some_and(|v| v.contains(&seg_idx));
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: if in_same {
+                format!(
+                    "`{mem}.read_port::<{port}>().{what}()` is read before the \
+                     `clk.tick().await` that produces it. The read result appears at the clock \
+                     edge, so it must be observed after the tick"
+                )
+            } else {
+                format!(
+                    "`{mem}.read_port::<{port}>().{what}()` is read, but nothing stages a \
+                     `read()` on that port earlier in the loop — the port never becomes ready"
+                )
+            },
+            span,
+            suggested_rewrite: Some(
+                "stage the address with `read(addr)` before a `clk.tick().await`, and observe \
+                 the result after it"
+                    .to_string(),
+            ),
+        });
     }
     Ok(())
 }
 
-/// Recursive half of `validate_memory_usage`: tally accesses and reject any that
-/// sit on the wrong side of the tick.
-fn check_mem_stmt(
+/// Recursive half of `validate_memory_usage`: tally this segment's staged
+/// accesses and note where each read result is observed.
+fn collect_mem_accesses(
     stmt: &CHIRStmt,
-    after_tick: bool,
-    reads: &mut std::collections::HashMap<(String, usize), usize>,
-    writes: &mut std::collections::HashMap<(String, usize), usize>,
+    seg_idx: usize,
+    here: &mut std::collections::HashMap<(String, bool, usize), usize>,
+    observed: &mut Vec<((String, usize), usize, &'static str, SourceSpan)>,
 ) -> Result<(), CHIRLowerError> {
-    let staged = |kind: &str, span: SourceSpan| CHIRLowerError::UnsupportedConstruct {
-        description: format!(
-            "memory {kind} after `clk.tick().await`: an access stages the address and data buses \
-             that the *next* clock edge captures, so it must appear before the tick"
-        ),
-        span,
-        suggested_rewrite: Some("move the access above `clk.tick().await`".to_string()),
+    let mut note = |e: &CHIRExpr, span: SourceSpan| {
+        walk_chir_expr(e, &mut |x| match x {
+            CHIRExpr::MemData { mem, port } => {
+                observed.push(((mem.clone(), *port), seg_idx, "data", span))
+            }
+            CHIRExpr::MemValid { mem, port } => {
+                observed.push(((mem.clone(), *port), seg_idx, "is_ready", span))
+            }
+            _ => {}
+        })
     };
 
     match stmt {
         CHIRStmt::MemRead { mem, port, addr, span } => {
-            if after_tick {
-                return Err(staged("read", *span));
-            }
-            *reads.entry((mem.clone(), *port)).or_insert(0) += 1;
-            check_mem_expr(addr, after_tick, *span)?;
+            *here.entry((mem.clone(), true, *port)).or_insert(0) += 1;
+            note(addr, *span);
         }
         CHIRStmt::MemWrite { mem, port, addr, value, span } => {
-            if after_tick {
-                return Err(staged("write", *span));
-            }
-            *writes.entry((mem.clone(), *port)).or_insert(0) += 1;
-            check_mem_expr(addr, after_tick, *span)?;
-            check_mem_expr(value, after_tick, *span)?;
+            *here.entry((mem.clone(), false, *port)).or_insert(0) += 1;
+            note(addr, *span);
+            note(value, *span);
         }
-        CHIRStmt::Wire { value, span, .. } => check_mem_expr(value, after_tick, *span)?,
-        CHIRStmt::Assign { value, span, .. } => check_mem_expr(value, after_tick, *span)?,
-        CHIRStmt::PortWrite { value, span, .. } => check_mem_expr(value, after_tick, *span)?,
+        CHIRStmt::Wire { value, span, .. }
+        | CHIRStmt::Assign { value, span, .. }
+        | CHIRStmt::PortWrite { value, span, .. } => note(value, *span),
         CHIRStmt::IndexAssign { index, value, span, .. } => {
-            check_mem_expr(index, after_tick, *span)?;
-            check_mem_expr(value, after_tick, *span)?;
+            note(index, *span);
+            note(value, *span);
         }
         CHIRStmt::If { condition, then_body, else_body, span } => {
-            check_mem_expr(condition, after_tick, *span)?;
-            for s in then_body {
-                check_mem_stmt(s, after_tick, reads, writes)?;
-            }
-            for s in else_body.iter().flatten() {
-                check_mem_stmt(s, after_tick, reads, writes)?;
+            note(condition, *span);
+            for s in then_body.iter().chain(else_body.iter().flatten()) {
+                collect_mem_accesses(s, seg_idx, here, observed)?;
             }
         }
         CHIRStmt::Match { scrutinee, arms, span } => {
-            check_mem_expr(scrutinee, after_tick, *span)?;
+            note(scrutinee, *span);
             for arm in arms {
                 for s in &arm.body {
-                    check_mem_stmt(s, after_tick, reads, writes)?;
+                    collect_mem_accesses(s, seg_idx, here, observed)?;
                 }
             }
         }
         CHIRStmt::ForLoop { body, .. } => {
             for s in body {
-                check_mem_stmt(s, after_tick, reads, writes)?;
+                collect_mem_accesses(s, seg_idx, here, observed)?;
             }
         }
         CHIRStmt::AwaitTick { .. } => {}
     }
     Ok(())
-}
-
-/// Reject `data()` / `is_ready()` read before the clock edge that produces them.
-fn check_mem_expr(
-    expr: &CHIRExpr,
-    after_tick: bool,
-    span: SourceSpan,
-) -> Result<(), CHIRLowerError> {
-    if after_tick {
-        return Ok(());
-    }
-    let mut found: Option<(&'static str, String, usize)> = None;
-    walk_chir_expr(expr, &mut |e| match e {
-        CHIRExpr::MemData { mem, port } => {
-            found.get_or_insert_with(|| ("data", mem.clone(), *port));
-        }
-        CHIRExpr::MemValid { mem, port } => {
-            found.get_or_insert_with(|| ("is_ready", mem.clone(), *port));
-        }
-        _ => {}
-    });
-    match found {
-        None => Ok(()),
-        Some((what, mem, port)) => Err(CHIRLowerError::UnsupportedConstruct {
-            description: format!(
-                "`{mem}.read_port::<{port}>().{what}()` is read before `clk.tick().await`. The \
-                 read result appears at the clock edge, so it must be observed after the tick"
-            ),
-            span,
-            suggested_rewrite: Some("move the observation below `clk.tick().await`".to_string()),
-        }),
-    }
 }
 
 /// Pre-order walk over every sub-expression.
