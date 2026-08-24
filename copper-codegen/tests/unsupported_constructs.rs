@@ -98,6 +98,83 @@ fn arithmetic_shift_right_is_unsupported() {
     );
 }
 
+/// A tick inside a nested `loop` — the "wait until ready" idiom. This is the
+/// shape that used to CRASH the transpiler (`control_extract.rs`'s gate and its
+/// tick search disagreed about where a tick can live), so the pin is on the
+/// diagnostic: it must name the construct and carry a span.
+/// `no_transpiler_panics.rs` guards the failure MODE corpus-wide.
+#[test]
+fn tick_inside_a_nested_loop_is_unsupported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: Out<Bits<8>, MainClk>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        loop {
+            if go.read() == Logic::One { break; }
+            clk.tick().await;
+        }
+        n = n.wrapping_add(Bits::from_u8(1));
+        o.write(n);
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err(
+        "NOW SUPPORTED: a repeating wait transpiles — control extraction grew the self-looping \
+         state. Give it an equivalence test that holds for a VARIABLE number of cycles, which \
+         is the whole point of the idiom.",
+    );
+    assert!(
+        err.contains("repeating wait") && !err.starts_with("0:0:"),
+        "the nested-loop diagnostic must name the construct and carry a span: {err}"
+    );
+}
+
+/// A nested `loop` with no tick, in a module that does tick elsewhere. Distinct
+/// message from the one above because the fix is different — and it has to be its
+/// own case: a module with NO tick at all is caught earlier and better by the
+/// shared reachability guarantee ("every path through a `#[hardware]` loop must
+/// reach `clk.tick().await`"), which is asserted below so the division of labour
+/// between the two checks stays visible.
+#[test]
+fn nested_loop_without_a_tick_is_unsupported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk>) {
+    loop {
+        loop {
+            o.write(a.read());
+        }
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("an unbounded combinational loop must be rejected");
+    assert!(
+        err.contains("would never terminate"),
+        "reproduced a *different* error than the untick'd nested loop: {err}"
+    );
+
+    // Same shape, but the module never ticks at all: the reachability guarantee
+    // owns this one, and its message is the better of the two.
+    let no_tick = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk>) {
+    loop {
+        loop {
+            o.write(a.read());
+        }
+    }
+}
+"#;
+    let err = transpile(no_tick).expect_err("a loop with no tick must be rejected");
+    assert!(
+        err.contains("must reach `clk.tick().await`"),
+        "the reachability guarantee should own the no-tick case: {err}"
+    );
+}
+
 // ── Memory: what lowers, and where the boundary is (P4) ──────────────────────
 //
 // `Memory` used to be listed here as a whole feature with NO transpiled path —

@@ -352,6 +352,87 @@ pub enum ExprType {
     ForLoop(ExprForLoop),
 }
 
+impl ExprType {
+    /// The construct's name as a user would write it, for diagnostics. A
+    /// discriminant is not something to put in front of someone reading an error.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ExprType::Array(_) => "array literal",
+            ExprType::Assign(_) => "assignment",
+            ExprType::Async(_) => "async block",
+            ExprType::Await(_) => "await",
+            ExprType::Binary(_) => "binary operator",
+            ExprType::Block(_) => "block",
+            ExprType::Call(_) => "call",
+            ExprType::Cast(_) => "cast",
+            ExprType::Closure(_) => "closure",
+            ExprType::Field(_) => "field access",
+            ExprType::Index(_) => "index",
+            ExprType::If(_) => "if",
+            ExprType::Let(_) => "let",
+            ExprType::Lit(_) => "literal",
+            ExprType::Loop(_) => "loop",
+            ExprType::Match(_) => "match",
+            ExprType::MethodCall(_) => "method call",
+            ExprType::Path(_) => "path",
+            ExprType::Range(_) => "range",
+            ExprType::Reference(_) => "reference",
+            ExprType::Repeat(_) => "array repeat",
+            ExprType::Return(_) => "return",
+            ExprType::Struct(_) => "struct literal",
+            ExprType::Tuple(_) => "tuple",
+            ExprType::Unary(_) => "unary operator",
+            ExprType::Break(_) => "break",
+            ExprType::Continue(_) => "continue",
+            ExprType::While(_) => "while",
+            ExprType::Yield(_) => "yield",
+            ExprType::Const(_) => "const block",
+            ExprType::Try(_) => "`?`",
+            ExprType::Macro(_) => "macro invocation",
+            ExprType::ForLoop(_) => "for loop",
+        }
+    }
+
+    /// The expression's source span.
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            ExprType::Array(e) => e.span,
+            ExprType::Assign(e) => e.span,
+            ExprType::Async(e) => e.span,
+            ExprType::Await(e) => e.span,
+            ExprType::Binary(e) => e.span,
+            ExprType::Block(e) => e.span,
+            ExprType::Call(e) => e.span,
+            ExprType::Cast(e) => e.span,
+            ExprType::Closure(e) => e.span,
+            ExprType::Field(e) => e.span,
+            ExprType::Index(e) => e.span,
+            ExprType::If(e) => e.span,
+            ExprType::Let(e) => e.span,
+            ExprType::Lit(e) => e.span,
+            ExprType::Loop(e) => e.span,
+            ExprType::Match(e) => e.span,
+            ExprType::MethodCall(e) => e.span,
+            ExprType::Path(e) => e.span,
+            ExprType::Range(e) => e.span,
+            ExprType::Reference(e) => e.span,
+            ExprType::Repeat(e) => e.span,
+            ExprType::Return(e) => e.span,
+            ExprType::Struct(e) => e.span,
+            ExprType::Tuple(e) => e.span,
+            ExprType::Unary(e) => e.span,
+            ExprType::Break(e) => e.span,
+            ExprType::Continue(e) => e.span,
+            ExprType::While(e) => e.span,
+            ExprType::Yield(e) => e.span,
+            ExprType::Const(e) => e.span,
+            ExprType::Try(e) => e.span,
+            ExprType::Macro(e) => e.span,
+            ExprType::ForLoop(e) => e.span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprBlock {
     pub stmts: Vec<RawStmt>,

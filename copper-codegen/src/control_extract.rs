@@ -57,6 +57,22 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
         return;
     }
 
+    // ...and only when every tick sits somewhere this pass can actually flatten.
+    // A tick inside a nested `loop` / `while` / `for` is a repeating wait, which
+    // needs a self-looping state and `break`/`continue` handling — increment B,
+    // not built. DECLINE rather than transform: the linear path downstream then
+    // reports the offending construct with its own span, which is a far better
+    // diagnostic than anything this pass could produce, and it is what the
+    // simulator-only modules using that idiom (`examples/cpu/rv32i_cpu.rs`) get.
+    //
+    // This gate exists because the two halves of this pass disagreed:
+    // `expr_contains_tick` descends into loops but `find_tick_in_expr` does not,
+    // so such a module passed the gate and then hit an `.expect` — a raw panic on
+    // user input, with no span and no name for the construct at fault.
+    if contains_unflattenable_tick(&loop_body) {
+        return;
+    }
+
     let span = fir.raw_statements[loop_idx].span;
 
     // Flatten the CFG into per-state segment bodies (state 0 = loop head).
@@ -92,7 +108,13 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
 
     // The single unconditional trailing tick — reuse a real `clk.tick().await`
     // node from the source so it is byte-for-byte the shape CHIR expects.
-    let tick = find_tick_stmt(&loop_body).expect("gate guarantees at least one tick");
+    //
+    // Declining here is defence in depth: the gate above should guarantee a tick
+    // this walk can find, and if the two ever drift apart again the pass must fall
+    // back to leaving the module alone, never crash.
+    let Some(tick) = find_tick_stmt(&loop_body) else {
+        return;
+    };
 
     let new_loop = RawStmt {
         order: fir.raw_statements[loop_idx].order,
@@ -366,6 +388,41 @@ fn as_match_with_tick(s: &RawStmt) -> Option<&ExprMatch> {
 fn loop_needs_extraction(body: &[RawStmt]) -> bool {
     body.iter()
         .any(|s| stmt_contains_tick(s) && !is_tick_stmt(s))
+}
+
+/// Is there a `clk.tick().await` somewhere this pass cannot flatten?
+///
+/// The flattener handles straight-line code, `if`/`else` and `match` — it inlines
+/// each continuation into the branches and gives every tick its own state. A tick
+/// inside a nested `loop` / `while` / `for` is a *repeating* wait: flattening it
+/// needs a state that loops back to itself and an understanding of `break` /
+/// `continue`, neither of which this pass models. A tick inside a `let`
+/// initializer is not a statement position at all.
+fn contains_unflattenable_tick(stmts: &[RawStmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        RawStmtKind::Expr(es) => unflattenable_tick_in_expr(&es.expr),
+        // A tick inside an initializer expression has no statement position to
+        // become a state.
+        RawStmtKind::Local(l) => l.init.as_ref().is_some_and(expr_contains_tick),
+        RawStmtKind::Item(_) => false,
+    })
+}
+
+fn unflattenable_tick_in_expr(e: &ExprType) -> bool {
+    match e {
+        // Any tick under a repeating construct, however deep.
+        ExprType::Loop(l) => stmts_contain_tick(&l.body),
+        ExprType::While(w) => stmts_contain_tick(&w.body),
+        ExprType::ForLoop(f) => stmts_contain_tick(&f.body),
+        // Structures the flattener DOES descend into — keep looking inside them.
+        ExprType::If(f) => {
+            contains_unflattenable_tick(&f.then_block)
+                || f.else_branch.as_deref().is_some_and(unflattenable_tick_in_expr)
+        }
+        ExprType::Block(b) => contains_unflattenable_tick(&b.stmts),
+        ExprType::Match(m) => m.arms.iter().any(|a| unflattenable_tick_in_expr(&a.body)),
+        _ => false,
+    }
 }
 
 /// The first `clk.tick().await` statement anywhere in `stmts`, cloned.

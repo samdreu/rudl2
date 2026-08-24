@@ -27,9 +27,12 @@ TRANSPILATION:
     E ✔ FIXED — `Memory` now transpiles ......... dual_port_ram. Both CPUs stay
         blocked, but on their OWN causes (re-measured): rv32i_cpu on G,
         rv32i_cpu_pipelined on F — not on memory.
-    F ☐ `Vec` ports .............................. rv32i_cpu_pipelined
-    G ☐ transpiler PANICS (not a clean error) .... rv32i_cpu
-        control_extract.rs:95 `.expect("gate guarantees at least one tick")`
+    F ☐ `Vec` ports ....................... rv32i_cpu_pipelined, rv32i_cpu
+        (rv32i_cpu joined this cause once the G panic stopped masking it)
+    G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
+        reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
+        port at rv32i_cpu.rs:190), not a memory or control-flow limit — the panic
+        was masking the module's actual first blocker. See the fix write-up below.
     H ☐ no structural parent module .............. uart/system
         spawn_uart is a plain sim-wiring fn, so the UART has no hierarchy module
         to transpile. two_domain_top shows the pattern already works.
@@ -111,6 +114,41 @@ TRANSPILATION:
       hand-written reference has no `doa` either (it is commented out), so the
       interfaces now match. NOTE the open language question this exposes: Copper
       does not reject an undriven `Out` at compile time — the transpiler found it.
+
+  ✔ FIXED (2026-08-24) — G: the transpiler PANICKED on `examples/cpu/rv32i_cpu.rs`.
+      thread 'main' panicked at control_extract.rs:95: gate guarantees at least one tick
+    ROOT CAUSE: the two halves of control extraction disagreed about where a
+    `clk.tick().await` can live. The GATE (`expr_contains_tick`) descends into
+    `loop` / `while` / `for`; the FLATTENER's search (`find_tick_in_expr`) descends
+    only into `if` / `block` / `match`. A module whose tick sits inside a nested
+    `loop` — the "wait until ready" idiom the CPU uses ~15 times — passed the gate
+    and then hit an `.expect`. No span, no construct named, nothing to act on.
+    FIX, in three parts:
+      1. The gate now also requires that every tick sit somewhere the flattener can
+         actually handle (`contains_unflattenable_tick`). A tick under a repeating
+         construct means DECLINE — leave the module alone so the linear path
+         downstream reports the real construct with its own span. Note the
+         flattener was never going to handle these: `lower_into` has no `loop` case
+         at all, so had the panic not fired it would have embedded a nested
+         ticking loop inside a state body.
+      2. The `.expect` became a graceful bail, as defence in depth: if the two
+         halves ever drift apart again the pass declines instead of crashing.
+      3. chir_lower gained real diagnostics for the loop family. A nested `loop`
+         used to fall through to a generic handler that printed
+         `0:0: expression type not supported in hardware: Discriminant(14)` — no
+         span, no name. Now: a nested loop WITH a tick says it is a repeating wait
+         and that control extraction does not build the self-looping state yet; one
+         WITHOUT a tick says it would never terminate; `break`/`continue` are named
+         too. `ExprType` gained `kind_name()` and `span()` so the generic
+         fall-through names the construct and points at it instead of printing a
+         discriminant.
+    GUARD: copper-codegen/tests/no_transpiler_panics.rs sweeps every #[hardware]
+    module in examples/ and asserts each one transpiles OR returns a clean Err —
+    a panic is the failure MODE this pins, not a coverage claim. Verified by
+    reverting the fix: the guard failed naming examples/cpu/rv32i_cpu.rs::rv32i_cpu.
+    Construct-level pins in unsupported_constructs.rs cover the nested-loop shapes,
+    including which check owns which (the shared REACHABILITY guarantee owns a
+    module with no tick at all, and its message is the better one).
 
   ✔ A+B UNBLOCKED sipo_block THROUGH THE FRONT END, WHICH IMMEDIATELY EXPOSED THE
      multi-phase RegOut codegen bug — and, verifying that, a second one in the
@@ -234,6 +272,24 @@ TRANSPILATION:
       outputs (data_o + the four wN_dbg), not just data_o. The wN_dbg ports expose
       the module's per-cycle internal capture, which is exactly what the
       mid-phase-read question sipo_block was built to answer.
+
+  ☐ CONTROL EXTRACTION INCREMENT B — repeating waits (`loop { … tick … }`).
+     The pass handles straight-line code, `if`/`else` and `match`: it inlines each
+     continuation into the branches and gives every tick its own state. A tick
+     inside a nested `loop` is a *repeating* wait, and needs two things the pass
+     does not model:
+       - a state that can loop back to ITSELF (`pc = k` rather than `pc = k+1`),
+         which is the natural lowering of `loop { if ready { break } tick; }`; and
+       - `break` / `continue` as control flow — the FIR carries `ExprBreak` /
+         `ExprContinue` nodes but `lower_into` never looks at them.
+     WHY IT MATTERS: this is the idiom `examples/cpu/rv32i_cpu.rs` is written in
+     (~15 nested waits), and it is how a designer naturally writes "stall until the
+     memory answers" — which is now a shape the transpiler can otherwise support,
+     since Memory lowers with real latency. It is a genuine language feature, not a
+     robustness patch. Currently a clean error naming the construct.
+     Care: the duplication cost of inlining continuations is already per-branch;
+     a loop adds a back edge, so the state count is no longer bounded by the number
+     of ticks in the source. Worth measuring before committing to the approach.
 
   ── LATENT HOLES SURFACED BY THE MEMORY WORK, 2026-08-24 ────────────────────
   Each of these was invisible until a memory design happened to walk into it.
@@ -837,9 +893,10 @@ P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
      Structure: cfg(not(test)) on each example `fn main` + `include!` (scalar at crate
      root, pipelined in `mod pl` with its harness `pub`). CPUs don't transpile (Vec
      port + Memory + submodules), so this is a sim self-check, not a Verilator equiv.
-     NOTE (found probing): the standalone transpiler PANICS on rv32i_cpu
-     ("gate guarantees at least one tick", control_extract.rs:95) instead of a clean
-     error — a codegen robustness bug, logged for later (needs sign-off to fix).
+     NOTE (found probing, ✔ FIXED 2026-08-24): the standalone transpiler PANICKED
+     on rv32i_cpu ("gate guarantees at least one tick", control_extract.rs:95)
+     instead of returning a clean error. Fixed — see TRANSPILATION fix G. rv32i_cpu
+     now reports its real first blocker, a `Vec<Bits<32>>` port.
   ✔ uart/system: tx→rx loopback self-check → tests/uart_integration.rs.
      - uart_single_channel_loopback: 6 bytes (framing edges) round-trip tx→rx.
      - uart_dual_channel_no_crosstalk: two channels transmit different bytes on the

@@ -2129,6 +2129,47 @@ fn lower_expr_stmt(
             });
         }
 
+        // A `loop` nested inside the module's own top-level loop. With a tick in
+        // it, it is a repeating wait — a state that loops back to itself, plus
+        // `break`/`continue` handling, which control extraction does not model
+        // (it handles straight-line code, `if`/`else` and `match`). Without a
+        // tick it is an unbounded combinational loop. Both are errors; neither
+        // may be silently dropped, which is what the generic expression
+        // fall-through used to do to it.
+        ExprType::Loop(l) => {
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: if stmts_contain_tick(&l.body) {
+                    "a nested `loop` containing `clk.tick().await` is a repeating wait; \
+                     control extraction does not build the self-looping state it needs yet"
+                        .to_string()
+                } else {
+                    "a nested `loop` with no `clk.tick().await` would never terminate in \
+                     hardware".to_string()
+                },
+                span,
+                suggested_rewrite: Some(
+                    "restructure the wait as a state of the module's own top-level loop: \
+                     `if !ready { /* hold state */ } else { /* advance */ } clk.tick().await;`"
+                        .to_string(),
+                ),
+            });
+        }
+
+        // Only meaningful inside a nested loop, which is rejected above — so
+        // reaching here means one escaped its loop, and dropping it silently
+        // would change the design's control flow.
+        ExprType::Break(_) | ExprType::Continue(_) => {
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: format!(
+                    "`{}` is not supported in hardware; the module's top-level `loop` runs \
+                     forever",
+                    expr.kind_name()
+                ),
+                span,
+                suggested_rewrite: None,
+            });
+        }
+
         ExprType::Lit(_) => {
             // Plain literal as statement — no effect
         }
@@ -2334,8 +2375,8 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
         ExprType::Block(b) => extract_block_expr_value(&b.stmts, b.span, ctx),
 
         other => Err(CHIRLowerError::UnsupportedConstruct {
-            description: format!("expression type not supported in hardware: {:?}", std::mem::discriminant(other)),
-            span: SourceSpan::default(),
+            description: format!("{} is not supported in hardware", other.kind_name()),
+            span: other.span(),
             suggested_rewrite: None,
         }),
     }
