@@ -39,12 +39,18 @@ pub fn lower_to_chir(
     let module = CHIRModule {
         name: fir.module_name.clone(),
         params: build_module_params(fir),
+        // Every file-scope const the module *could* reference. Which ones are
+        // actually emitted is decided at emission, from the rendered
+        // SystemVerilog — an unused `localparam` is a Verilator `UNUSEDPARAM`
+        // error under `-Wall`, so the set has to be exact, and the emitted text
+        // is the only exact source for it.
+        localparams: crate::file_consts::candidates(fir),
         ports,
         body,
         span: fir.span,
     };
 
-    validate_module(&module)?;
+    validate_module(&module, fir)?;
 
     Ok(module)
 }
@@ -3321,7 +3327,38 @@ pub fn parse_or_patterns(text: &str, span: SourceSpan, enums: &EnumRegistry) -> 
 
 /// Validate scope: all `CHIRExpr::Var` references must resolve to a declared name.
 /// Also checks that `emit!` is only used when an output port exists.
-fn validate_module(module: &CHIRModule) -> Result<(), CHIRLowerError> {
+fn validate_module(
+    module: &CHIRModule,
+    fir: &FrontendModuleIR,
+) -> Result<(), CHIRLowerError> {
+    validate_module_scope(module).map_err(|e| explain_skipped_const(e, fir))
+}
+
+/// A reference to a file-scope const that this pass could *not* turn into a
+/// `localparam` surfaces as an ordinary "undefined variable". That is the right
+/// error, but on its own it points at the use site and says nothing about the
+/// const, so the reader has no way to tell it apart from a genuine typo. Attach
+/// the reason the const was skipped.
+fn explain_skipped_const(err: CHIRLowerError, fir: &FrontendModuleIR) -> CHIRLowerError {
+    let CHIRLowerError::UnsupportedConstruct { description, span, suggested_rewrite } = err else {
+        return err;
+    };
+    let name = description
+        .strip_prefix("undefined variable '")
+        .and_then(|rest| rest.split('\'').next())
+        .map(str::to_string);
+    let note = name.and_then(|n| crate::file_consts::rejection_note(fir, &n));
+    match note {
+        Some(note) => CHIRLowerError::UnsupportedConstruct {
+            description: format!("{description} — {note}"),
+            span,
+            suggested_rewrite,
+        },
+        None => CHIRLowerError::UnsupportedConstruct { description, span, suggested_rewrite },
+    }
+}
+
+fn validate_module_scope(module: &CHIRModule) -> Result<(), CHIRLowerError> {
     let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for port in &module.ports {
@@ -3331,6 +3368,10 @@ fn validate_module(module: &CHIRModule) -> Result<(), CHIRLowerError> {
     // bound `N`); they resolve to SystemVerilog parameters at emission.
     for p in &module.params {
         known.insert(p.name.clone());
+    }
+    // File-scope `const` items resolve the same way, as `localparam`s.
+    for lp in &module.localparams {
+        known.insert(lp.name.clone());
     }
 
     match &module.body {
@@ -5135,6 +5176,7 @@ mod tests {
         let module = CHIRModule {
             name: "test".to_string(),
             params: vec![],
+            localparams: vec![],
             ports: vec![],
             body: CHIRBody::Combinational(CHIRCombBody {
                 submodules: vec![],
@@ -5147,7 +5189,7 @@ mod tests {
             span: span(),
         };
         assert!(matches!(
-            validate_module(&module),
+            validate_module_scope(&module),
             Err(CHIRLowerError::UnsupportedConstruct { .. })
         ));
     }
@@ -5158,6 +5200,7 @@ mod tests {
         let module = CHIRModule {
             name: "test".to_string(),
             params: vec![],
+            localparams: vec![],
             ports: vec![
                 CHIRPort {
                     name: "a".to_string(),
@@ -5184,7 +5227,7 @@ mod tests {
             }),
             span: span(),
         };
-        assert!(validate_module(&module).is_ok());
+        assert!(validate_module_scope(&module).is_ok());
     }
 
     #[test]
@@ -5193,6 +5236,7 @@ mod tests {
         let module = CHIRModule {
             name: "test".to_string(),
             params: vec![],
+            localparams: vec![],
             ports: vec![
                 CHIRPort {
                     name: "a".to_string(),
@@ -5231,7 +5275,7 @@ mod tests {
             }),
             span: span(),
         };
-        assert!(validate_module(&module).is_ok());
+        assert!(validate_module_scope(&module).is_ok());
     }
 
     // ── Module registry / hardware call ──────────────────────────────────────

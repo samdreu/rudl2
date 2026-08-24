@@ -34,6 +34,7 @@ pub fn lower_to_shir(chir: &CHIRModule) -> Result<SHIRModule, SHIRLowerError> {
     Ok(SHIRModule {
         name: chir.name.clone(),
         params: chir.params.clone(),
+        localparams: chir.localparams.clone(),
         ports,
         body,
         span: chir.span,

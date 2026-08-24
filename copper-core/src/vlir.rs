@@ -29,8 +29,18 @@ pub struct VLIRModule {
     pub name: String,
     /// SystemVerilog `parameter`s. Empty until the M2 parametric work.
     pub params: Vec<VLIRParam>,
+    /// SystemVerilog `localparam`s, in dependency order. Emitted in the ANSI
+    /// parameter port list, after `params`, so a port width may reference one.
+    pub localparams: Vec<VLIRLocalParam>,
     pub ports: Vec<VLIRPort>,
     pub body: VLIRBody,
+}
+
+/// A module-level constant. `value_expr` is already SystemVerilog text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VLIRLocalParam {
+    pub name: String,
+    pub value_expr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

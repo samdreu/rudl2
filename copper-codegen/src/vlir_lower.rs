@@ -150,7 +150,20 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
         .map(|p| copper_core::vlir::VLIRParam { name: p.name.clone(), default: p.default })
         .collect();
 
-    Ok(VLIRModule { name, params, ports, body })
+    // `localparam` names are already legal SystemVerilog identifiers (they come
+    // from Rust consts, whose spelling rules are a subset), and unlike signals
+    // they are not renamed by the legalizer — a port width referring to `WIDTH`
+    // must still say `WIDTH`.
+    let localparams = shir
+        .localparams
+        .iter()
+        .map(|lp| copper_core::vlir::VLIRLocalParam {
+            name: lp.name.clone(),
+            value_expr: lp.value_expr.clone(),
+        })
+        .collect();
+
+    Ok(VLIRModule { name, params, localparams, ports, body })
 }
 
 // ── Combinational body ──────────────────────────────────────────────────────

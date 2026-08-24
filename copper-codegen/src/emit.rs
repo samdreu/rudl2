@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use copper_core::chir::Width;
 use copper_core::vlir::{
     ToolchainProfile, VLIRAlwaysFF, VLIRBinOp, VLIRBody, VLIRCombBody, VLIRCombPhase,
-    VLIRContinuousAssign, VLIRExpr, VLIRFFStmt, VLIRModule, VLIRPort, VLIRPortDir, VLIRPortKind,
+    VLIRContinuousAssign, VLIRExpr, VLIRFFStmt, VLIRLocalParam, VLIRModule, VLIRPort, VLIRPortDir,
+    VLIRPortKind,
     VLIRMemDecl, VLIRMemInit, VLIRRegDecl, VLIRSeqBody, VLIRStmt, VLIRStructuralBody, VLIRSubmoduleInst,
     VLIRUnOp,
 };
@@ -41,42 +42,82 @@ impl Emitter<'_> {
     }
 
     fn module(&mut self, m: &VLIRModule) {
-        self.emit_port_header(m);
+        // The port declarations and the body are rendered first because the
+        // header depends on them: a `localparam` that nothing references is a
+        // Verilator `UNUSEDPARAM` error under `-Wall`, and the emitted text is
+        // the only exact answer to "does this module use `WIDTH`?". Deriving it
+        // from the IR instead would mean a second traversal that has to stay in
+        // step with every future statement and expression variant.
+        let ports_text = self.ports_block(m);
+        let body_text = {
+            let mut e = Emitter { out: String::new(), cfg: self.cfg };
+            match &m.body {
+                VLIRBody::Combinational(c) => e.comb_body(c),
+                VLIRBody::Sequential(s) => e.seq_body(s),
+                VLIRBody::Structural(st) => e.structural_body(st),
+            }
+            e.out
+        };
+        let used = used_localparams(m, &format!("{ports_text}{body_text}"));
+
+        self.emit_param_header(m, &used);
+        self.out.push_str(&ports_text);
         self.out.push('\n');
-        match &m.body {
-            VLIRBody::Combinational(c) => self.comb_body(c),
-            VLIRBody::Sequential(s) => self.seq_body(s),
-            VLIRBody::Structural(st) => self.structural_body(st),
-        }
+        self.out.push_str(&body_text);
         self.out.push_str("endmodule\n");
     }
 
     // ── Header ──────────────────────────────────────────────────────────────
 
-    fn emit_port_header(&mut self, m: &VLIRModule) {
-        if m.params.is_empty() {
+    /// `module name #(parameter int N = 8, localparam int WIDTH = 8) (`, or a
+    /// bare `module name (` when there is nothing to declare.
+    ///
+    /// `parameter`s come first and `localparam`s after, so a constant may be
+    /// written in terms of a generic parameter but not the reverse — which
+    /// matches Rust, where a `const` item cannot mention a function's generics.
+    /// SystemVerilog resolves the list left to right, and `used` is already in
+    /// dependency order.
+    fn emit_param_header(&mut self, m: &VLIRModule, used: &[&VLIRLocalParam]) {
+        if m.params.is_empty() && used.is_empty() {
             self.out.push_str(&format!("module {} (\n", m.name));
-        } else {
-            // `module name #(parameter int N = 8, parameter int M = 4) (`
-            self.out.push_str(&format!("module {} #(\n", m.name));
-            let last = m.params.len().saturating_sub(1);
-            for (i, p) in m.params.iter().enumerate() {
-                // Always emit a default so the module is valid standalone (a
-                // parameter with no value is a Verilator lint error). Use the
-                // source default when known, else a `1` placeholder that an
-                // instantiation overrides.
-                let default = p.default.unwrap_or(1);
-                let comma = if i == last { "" } else { "," };
-                self.out.push_str(&format!(
-                    "{}parameter int {} = {}{}\n",
-                    self.indent(1),
-                    p.name,
-                    default,
-                    comma
-                ));
-            }
-            self.out.push_str(") (\n");
+            return;
         }
+        self.out.push_str(&format!("module {} #(\n", m.name));
+        let total = m.params.len() + used.len();
+        let mut i = 0usize;
+        for p in m.params.iter() {
+            // Always emit a default so the module is valid standalone (a
+            // parameter with no value is a Verilator lint error). Use the
+            // source default when known, else a `1` placeholder that an
+            // instantiation overrides.
+            let default = p.default.unwrap_or(1);
+            i += 1;
+            let comma = if i == total { "" } else { "," };
+            self.out.push_str(&format!(
+                "{}parameter int {} = {}{}\n",
+                self.indent(1),
+                p.name,
+                default,
+                comma
+            ));
+        }
+        for lp in used {
+            i += 1;
+            let comma = if i == total { "" } else { "," };
+            self.out.push_str(&format!(
+                "{}localparam int {} = {}{}\n",
+                self.indent(1),
+                lp.name,
+                lp.value_expr,
+                comma
+            ));
+        }
+        self.out.push_str(") (\n");
+    }
+
+    /// The port declaration list, `(` … `);`.
+    fn ports_block(&self, m: &VLIRModule) -> String {
+        let mut out = String::new();
         // Clock inputs first, then other inputs, then outputs.
         let mut ordered: Vec<&VLIRPort> = Vec::new();
         ordered.extend(m.ports.iter().filter(|p| p.kind == VLIRPortKind::Clock));
@@ -93,7 +134,7 @@ impl Emitter<'_> {
             };
             let range = range_str(&p.width);
             let comma = if i == last { "" } else { "," };
-            self.out.push_str(&format!(
+            out.push_str(&format!(
                 "{}{} logic {}{}{}\n",
                 self.indent(1),
                 dir,
@@ -102,7 +143,8 @@ impl Emitter<'_> {
                 comma
             ));
         }
-        self.out.push_str(");\n");
+        out.push_str(");\n");
+        out
     }
 
     // ── Combinational body ──────────────────────────────────────────────────
@@ -561,6 +603,49 @@ fn collect_wire_decls(
 
 /// The one place a width becomes Verilog text — so a future symbolic width
 /// (`[N-1:0]`) is a change here only.
+
+/// The `localparam`s the emitted module actually references, in dependency
+/// order.
+///
+/// `text` is the rendered port list plus body. A constant counts as used if its
+/// name appears there as a whole identifier, or if a constant that is itself
+/// used mentions it in its initializer (`MOD = 1 << PTR_W` keeps `PTR_W` alive).
+/// The closure runs to a fixpoint, so a chain of any depth resolves.
+///
+/// Anything not reached is dropped: Verilator's `UNUSEDPARAM` makes an unused
+/// `localparam` a hard error under `-Wall`, so emitting the module's whole
+/// file-scope const environment is not an option.
+fn used_localparams<'a>(m: &'a VLIRModule, text: &str) -> Vec<&'a VLIRLocalParam> {
+    let mut used: HashSet<String> = m
+        .localparams
+        .iter()
+        .filter(|lp| crate::file_consts::contains_ident(text, &lp.name))
+        .map(|lp| lp.name.clone())
+        .collect();
+
+    loop {
+        let mut grew = false;
+        for lp in &m.localparams {
+            if !used.contains(&lp.name) {
+                continue;
+            }
+            for other in &m.localparams {
+                if !used.contains(&other.name)
+                    && crate::file_consts::contains_ident(&lp.value_expr, &other.name)
+                {
+                    used.insert(other.name.clone());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    m.localparams.iter().filter(|lp| used.contains(&lp.name)).collect()
+}
+
 fn range_str(w: &Width) -> String {
     match w {
         Width::Concrete(1) => String::new(),
@@ -685,6 +770,7 @@ mod tests {
         let module = VLIRModule {
             name: "loopy".to_string(),
             params: vec![VLIRParam { name: "N".to_string(), default: Some(8) }],
+            localparams: vec![],
             ports: vec![VLIRPort {
                 name: "out".to_string(),
                 direction: VLIRPortDir::Output,

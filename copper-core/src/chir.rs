@@ -10,9 +10,31 @@ pub struct CHIRModule {
     /// rather than a wide `usize -> Width` retrofit later. See
     /// `TRANSPILATION_ROADMAP.md` decision #4 / task D1a.
     pub params: Vec<ModuleParam>,
+    /// Module-level **constants** (SystemVerilog `localparam`s), lowered from the
+    /// file-scope `const` items the module actually references. Unlike `params`
+    /// these are not overridable at instantiation — a Rust `const` is a fixed
+    /// value, not a knob — which is exactly the `localparam` contract.
+    ///
+    /// They are declared in the ANSI parameter port list rather than the module
+    /// body because a const may appear in a **port width** (`In<Bits<WIDTH>, D>`
+    /// emits `[WIDTH-1:0]`), and a body declaration is not in scope there.
+    /// SystemVerilog permits `local_parameter_declaration` in a
+    /// `parameter_port_list`; verified against Verilator 5.044.
+    pub localparams: Vec<ModuleLocalParam>,
     pub ports: Vec<CHIRPort>,
     pub body: CHIRBody,
     pub span: SourceSpan,
+}
+
+/// A module-level constant, e.g. `localparam int WIDTH = 8`. `value_expr` is the
+/// initializer as SystemVerilog text — the source expression, not an evaluated
+/// number, so `const MOD: usize = 1 << PTR_W` stays legible as
+/// `localparam int MOD = 1 << PTR_W`. Ordering within the list is dependency
+/// order: a constant never precedes one it references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleLocalParam {
+    pub name: String,
+    pub value_expr: String,
 }
 
 /// A module-level parameter, e.g. `parameter N = 8`. `default` is the concrete

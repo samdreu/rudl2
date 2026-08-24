@@ -12,18 +12,19 @@ DOCUMENTATION:
 TRANSPILATION:
   ☐ Figure out TODOs
 
-  ── TRANSPILER COVERAGE, MEASURED 2026-08-24 ────────────────────────────────
+  ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-24 (after D-a) ─────────────────
   Every #[hardware] module in examples/ probed through the copper-transpile CLI.
-  BEFORE this pass: 19/34 modules transpiled. AFTER A+B: 20/34. AFTER E: 21/34.
-  The 13 still failing, by ROOT CAUSE (several share one cause — fix the cause,
-  not the module):
+  19/34 → A+B 20/34 → E 21/34 → **D-a 23/34**. The 11 still failing, by ROOT
+  CAUSE (several share one cause — fix the cause, not the module):
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
-    C ☐ `while` loops unsupported ................ uart/rx, det_010_awaits
-    D ☐ generic const params in loop bounds /
-        array-typed ports .................. bsg_counter_up_down (MOD),
-                                             bsg_encode_one_hot (WIDTH),
-                                             bsg_mux_one_hot, mux
+    C ☐ `while` loops unsupported ................ uart/rx
+    D-a ✔ FIXED — file-scope `const` items now lower to `localparam`s.
+        Unblocked bsg_encode_one_hot AND bsg_adder_one_hot. See the write-up below.
+    D-b ☐ array-typed ports (`In<[Bits<W>; ELS]>`) ... bsg_mux_one_hot, mux
+        NOT a const-generic problem — see D-a's write-up, which corrects the
+        earlier framing. Needs a port-ABI decision (packed `[ELS*W-1:0]`, unpacked
+        `[ELS-1:0][W-1:0]`, or ELS separate ports) before any code.
     E ✔ FIXED — `Memory` now transpiles ......... dual_port_ram. Both CPUs stay
         blocked, but on their OWN causes (re-measured): rv32i_cpu on G,
         rv32i_cpu_pipelined on F — not on memory.
@@ -33,13 +34,87 @@ TRANSPILATION:
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
         port at rv32i_cpu.rs:190), not a memory or control-flow limit — the panic
         was masking the module's actual first blocker. See the fix write-up below.
-    H ☐ no structural parent module .............. uart/system
+    H ☐ no structural parent module .............. uart/system (uart_tx, uart_rx)
         spawn_uart is a plain sim-wiring fn, so the UART has no hierarchy module
         to transpile. two_domain_top shows the pattern already works.
+    I ☐ a branch-local `let` with a COMPUTED initializer is reported as a latch
+        ...................................... bsg_counter_up_down
+        NEW, exposed by D-a (it was behind the const error). Minimal repro:
+          if r { count = 0 } else { let up = up_i.read(); if up == One { … } }
+        → "would infer a latch: up assigned on some control paths but not all".
+        `up` is written and read entirely inside the one branch, so it cannot
+        latch. `vlir_lower::hoist_branch_local_defaults` already handles exactly
+        this shape but only when the initializer is a LITERAL — it moves the
+        whole assignment to the top, which is only sound for a constant. A
+        computed initializer needs the other half: hoist a zero DEFAULT and leave
+        the computation in the branch. That is a change to latch handling, so it
+        needs sign-off rather than a default.
+    J ☐ bit-width inference on a bare integer local
+        ................ bsg_gray_to_binary (24:4), ripple_carry_adder (27:8)
+        Both were previously recorded as blocked "behind" other causes; measured
+        directly, each now reports its own `cannot infer bit width`.
   ALSO STILL BLOCKED, behind causes above rather than their own:
-    ripple_carry_adder → tuple-returning helper gap (below), not A
-    bsg_gray_to_binary → symbolic const expr (`let mut k = WIDTH - 1`) + C
-    bsg_adder_one_hot  → D (`for ia in 0..WIDTH`)
+    det_010_awaits → tick inside a conditional branch (65:8). Previously filed
+      under C (`while` loops); measured, that is not the error it reports.
+
+  ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
+  A module can pass the CLI and still fail the equivalence harness, which runs
+  Verilator under `-Wall`. bsg_encode_one_hot is the live case: it transpiles now
+  (D-a), but `let mut addr = 0usize;` emits `logic [63:0] addr`, and the 3-bit
+  `assign addr_o = addr` is a WIDTHTRUNC error plus an UNUSEDSIGNAL on
+  `addr[63:3]`. So it has no equivalence test yet. Two ways out, undecided:
+  narrow the example's local to `Bits<ADDR_W>` (an example edit; also better
+  hardware style, since `usize` is not a hardware type), or infer a narrower
+  width for an integer local from its uses (codegen work, cause J's neighbourhood).
+  The count above is "the CLI emits SystemVerilog", not "the SystemVerilog lints".
+
+  ✔ FIXED (2026-08-24, with user sign-off) — D-a: file-scope `const` items had
+    no lowering. `const WIDTH: usize = 8;` sitting next to a module is visible to
+    that module's body and port types but is not reachable from the `ItemFn`, so
+    the transpiler reported `undefined variable 'WIDTH'`. `capture_file_scope`
+    had been collecting these into `FrontendModuleIR::file_consts` all along —
+    its own doc said "Nothing consumes the result yet" — so the fix consumes an
+    existing capture path rather than adding one, alongside the file-scope ENUM
+    injection that already worked the same way.
+    FIRST, THE EARLIER FRAMING WAS WRONG. This entry used to read "generic const
+    params in loop bounds". It is not that: `shift_register` is generic over
+    `const N` and has always transpiled, emitting `parameter int N` and using it
+    in loop bounds AND indices. Two of the four modules filed under D were file
+    consts; the other two are array ports, which is a different problem (D-b).
+    THREE DECISIONS, each measured rather than argued:
+      - `localparam`, NOT `parameter`. A Rust `const` is a fixed value, not a
+        knob; an overridable parameter would let a synthesized module elaborate
+        at a width no Copper simulation ever ran.
+      - IN THE PARAMETER PORT LIST, not the module body. A const can appear in a
+        port width (`In<Bits<WIDTH>, D>` → `[WIDTH-1:0]`), and a body declaration
+        is not in scope there. SystemVerilog permits `local_parameter_declaration`
+        inside a `parameter_port_list` — VERIFIED lint-clean against Verilator
+        5.044 before writing any code, because the whole design hinged on it.
+      - THE SOURCE EXPRESSION IS PRESERVED, not evaluated: `const MOD = 1 << PTR_W`
+        emits `localparam int MOD = 1 << PTR_W`, and `PTR_W` is pulled in with it,
+        ahead of it (SV resolves the list left to right). No const evaluator is
+        needed — SystemVerilog evaluates it.
+    THE SET MUST BE EXACT, NOT A SUPERSET. Verilator's UNUSEDPARAM makes an
+    unreferenced `localparam` a hard error under `-Wall` (measured; this is why
+    "just emit every const in the file" is not an option). So the emitted set is
+    computed at emission from the RENDERED port list + body, closed transitively
+    over the initializers. Deriving it from the IR instead would mean a second
+    traversal that has to stay in step with every future statement and expression
+    variant — the "a check that cannot see a construct reports green on it" class
+    this file already records twice.
+    A const with no SystemVerilog form (a `const fn` call — `mux.rs`'s
+    `safe_clog2(ELS_P)` — or a non-integer type) is NOT emitted, and referencing
+    it stays the ordinary "undefined variable" error with the reason appended, so
+    it does not read as a typo.
+    Code: `copper-codegen/src/file_consts.rs` (new), threaded CHIR→SHIR→VLIR as
+    `localparams`, emitted by `emit::emit_param_header`.
+    Tests: `copper-codegen/tests/file_scope_consts.rs` (7 — port width + loop
+    bound, localparam-not-parameter, unused-not-emitted, dependency order and
+    expression preservation, both rejection diagnostics, and the substring guard
+    that keeps `WIDTH` out when only `WIDTH_P` is used) and
+    `tests/file_scope_const_equivalence.rs` (sim ≡ transpiled SV under Verilator
+    for a const-parameterised one-hot encoder, against an independently written
+    reference model).
 
   ✔ FIXED (2026-08-24) — A: `[Logic::Zero; N]` array locals.
     An array local now lowers to the packed vector its repeat length describes —
