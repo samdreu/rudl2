@@ -499,7 +499,7 @@ impl Emitter<'_> {
                 self.out
                     .push_str(&format!("{}{} = {};\n", self.indent(level), name, expr_str(value)));
             }
-            VLIRStmt::PortAssign { port_name, value } => {
+            VLIRStmt::PortAssign { port_name, value, .. } => {
                 self.out.push_str(&format!(
                     "{}{} = {};\n",
                     self.indent(level),

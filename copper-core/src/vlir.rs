@@ -225,9 +225,16 @@ pub enum VLIRStmt {
         value: VLIRExpr,
     },
     /// Drive an output port from within combinational logic (`out = <expr>;`).
+    ///
+    /// `edge_value` is the same drive in PRE-edge terms, used only if
+    /// `split_output_reg` moves this assignment into `always_ff` (where it becomes
+    /// `out <= …`, sampled before the edge rather than read after it). Equal to
+    /// `value` unless the segment assigns a register the drive reads. See
+    /// `SHIRStmt::PortDrive`, which explains why both forms are carried this far.
     PortAssign {
         port_name: String,
         value: VLIRExpr,
+        edge_value: VLIRExpr,
     },
     If {
         condition: VLIRExpr,

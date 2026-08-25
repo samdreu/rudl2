@@ -148,6 +148,99 @@ async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainC
     );
 }
 
+/// **Cause K** — a nested loop whose body ends in ANOTHER tick-bearing loop, so its
+/// clock boundary comes from the inner loop rather than a tick of its own. The
+/// flattener always modelled this (a `break` inlines the enclosing loop's
+/// continuation in the same cycle); only the gate refused it.
+///
+/// `tests/nested_boundary_equivalence.rs` carries the behavioural half.
+#[test]
+fn a_loop_ending_in_a_tick_bearing_loop_is_supported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, step: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        o.write(n);
+        loop {
+            n = n + step.read();
+            clk.tick().await;
+        }
+    }
+}
+"#;
+    let sv = transpile(src).expect("a loop ending in a tick-bearing loop must transpile");
+    assert!(
+        sv.contains("case (pc)"),
+        "the shape must flatten to a pc FSM, got:\n{sv}"
+    );
+}
+
+/// The other half of cause K, and the reason relaxing the gate was not enough on its
+/// own. An enclosing loop whose ONLY boundary is a nested loop that can `break`
+/// before it ticks returns to its top in zero time. Measured before this was
+/// rejected: the simulator livelocks (99.5% CPU, no progress) while the flattened
+/// FSM runs one cycle per iteration — a silent sim ≢ SV divergence, and a false PASS.
+///
+/// Owned by `copper_analysis::check_reachability`, not by the gate, so both
+/// front-ends refuse it. See `copper-analysis/src/cfg.rs::may_exit_without_tick`.
+#[test]
+fn a_loop_whose_only_boundary_can_exit_before_ticking_is_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Logic, MainClk>, b: In<Logic, MainClk>) {
+    loop {
+        loop {
+            if a.read() == Logic::One { break; }
+            loop {
+                if b.read() == Logic::One { break; }
+                clk.tick().await;
+            }
+        }
+    }
+}
+"#;
+    let err = transpile(src).expect_err(
+        "a zero-time outer cycle must be refused; if this transpiles, the transpiler and \
+         the simulator disagree about a program the simulator cannot even run",
+    );
+    assert!(
+        err.contains("left before it ticks"),
+        "the diagnostic must name the nested loop as the missing boundary rather than \
+         advise adding a tick to a body that already has one: {err}"
+    );
+}
+
+/// Ticks that live only inside `if`/`match` arms of a nested loop's body: there is no
+/// single "code between two ticks" segment, so there is no state to build.
+///
+/// Its own message since 2026-08-24. It used to report the tick-ORDERING rule ("the
+/// tick has to be the LAST statement"), which is unfollowable here — the body has no
+/// tick in statement position to move.
+#[test]
+fn ticks_only_inside_branches_has_its_own_diagnostic() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, c: In<Logic, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        o.write(n);
+        loop {
+            if c.read() == Logic::One { clk.tick().await; } else { break; }
+        }
+        n = n + Bits::from_lit::<1>();
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("ticks only inside branches must be refused");
+    assert!(
+        err.contains("no clock boundary of its own"),
+        "must not fall back to the tick-ordering message, which cannot be acted on \
+         when the body has no tick in statement position: {err}"
+    );
+}
+
 /// `continue` is refused: jumping to the loop head mid-cycle needs the head's
 /// *lowered* body at a point where it is still being lowered.
 #[test]

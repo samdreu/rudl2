@@ -54,37 +54,54 @@ TRANSPILATION:
         rv32i_cpu_pipelined on F — not on memory.
     F ☐ `Vec` ports ....................... rv32i_cpu_pipelined, rv32i_cpu
         (rv32i_cpu joined this cause once the G panic stopped masking it)
-    K ☐ **A LOOP WHOSE BODY ENDS IN ANOTHER TICK-BEARING LOOP** cannot flatten.
-        ............................. uart_tx, uart_rx (system.rs), uart/rx
-        THE NEXT PIECE OF WORK — do this BEFORE counted delays (see the
-        write-up), which unblock nothing on their own.
-        `control_extract::tick_is_last_statement` requires a DIRECT
+    K ✔ FIXED (2026-08-24) — **A LOOP WHOSE BODY ENDS IN ANOTHER TICK-BEARING
+        LOOP** now flattens. It does NOT by itself unblock uart_tx / uart_rx /
+        uart/rx: those need the counted `for` as well (see below — the ordering
+        recorded here was backwards, and why is worth reading).
+        `control_extract::tick_is_last_statement` required a DIRECT
         `clk.tick().await` as the last statement of a nested loop's body, so a
-        loop whose clock boundary comes from a loop INSIDE it is declined and the
-        module falls through to the linear path.
-        Not a `for`/counted-delay problem — refused today hand-written:
-            loop { loop { if a { break; } loop { if b { break; } tick; } } }
-        The UART shape that needs it:
+        loop whose clock boundary came from a loop INSIDE it was declined and the
+        module fell through to the linear path. It is now
+        `body_ends_at_a_clock_boundary`, which admits a second spelling: the
+        body's last statement may be another tick-bearing loop.
+        THE FLATTENER ALREADY HANDLED THE SHAPE. Measured before changing
+        anything: `lower_into`'s nested-loop path takes the outer back edge from
+        the inner loop's `break` continuation, which is exactly what the old note
+        below said "the fix has to establish". Only the gate refused it. The two
+        real pieces of work were the two things the gate had been masking:
+        1. `find_tick_in_expr` DID NOT DESCEND INTO A NESTED `loop`. Control
+           extraction ends by reusing a real tick node from the source; that
+           search and the gate must agree about where a tick can live, and they
+           had drifted. It went unnoticed while every flattenable module also had
+           a tick at the top level of its own loop. Cause K is the first shape
+           whose ONLY tick is inside a nested loop: the pass declined silently and
+           the linear path blamed an unrelated construct. Same
+           two-halves-disagree bug class as the panic that G fixed.
+        2. REACHABILITY ACCEPTED A PROGRAM THE SIMULATOR LIVELOCKS ON — the
+           serious one, filed as its own entry under SEMANTICS below.
+        ALSO FIXED: THE DIAGNOSTIC. `chir_lower::nested_loop_error` now sorts the
+        three reasons a nested loop lands there (no tick at all / a tick in
+        statement position but not last / ticks only inside branches) instead of
+        printing the tick-ORDERING rule for all of them — unfollowable advice for
+        two of the three. It also descends to the innermost loop at fault, so a
+        well-formed outer loop is not named for an inner loop's problem.
+        THE ORDERING IN THE OLD NOTE WAS BACKWARDS, and the reason is structural,
+        not incidental: it said to verify against "a hand-written nested-wait DUT
+        (no `for` involved)" before counted delays. NO SUCH WELL-FORMED DUT
+        EXISTS. A nested loop's tick must be LAST, so any inner loop that can exit
+        tests before it ticks and can therefore exit having ticked zero times; an
+        outer loop whose only boundary is one of those is a zero-time cycle. So
+        with `loop` alone, cause K's BACK EDGE is not writable at all. The counted
+        `for` is what breaks the deadlock — `for _ in 0..N { tick }` always ticks
+        AND terminates without an exit test — which makes counted repetition the
+        prerequisite for K's remaining half, not the other way round.
+        WHAT IS PINNED NOW: `tests/nested_boundary_equivalence.rs` (sim ≡
+        Verilator on the ENTRY path — entering the outer loop costs no cycle) and
+        `copper-codegen/tests/unsupported_constructs.rs` (the shape transpiles;
+        the livelock shape is refused; the branch-only shape gets its own
+        message). The back edge is checkable once `for` lands.
+        The UART shape that still needs `for`:
             for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS { tick } }
-        ALSO FIX THE DIAGNOSTIC: this case currently reports "a repeating wait
-        must be written as `loop { <test>; clk.tick().await; }` — the tick has to
-        be the LAST statement", which describes testing-after-the-tick. That is
-        not what is wrong here; the body has no direct tick at all, so the advice
-        is unfollowable. It needs its own message.
-        WHAT THE FIX HAS TO ESTABLISH (the flattener's state model is "a state is
-        the code between two ticks", and this shape does not fit it directly):
-          - the outer loop's back edge is taken when the INNER loop exits, so the
-            outer head must become reachable from the inner loop's break
-            continuation rather than from a tick;
-          - entering the outer loop must still not cost a cycle (the same crux
-            the wait solves by cloning the lowered body into the entry point);
-          - `tick_is_last_statement` becomes "the body's last statement REACHES a
-            tick on every path", which the existing reachability analysis in
-            copper-analysis already answers — worth reusing rather than
-            re-deriving, since the two disagreeing is this file's recurring bug.
-        Verify against a hand-written nested-wait DUT first (no `for` involved),
-        so the flattener change is checked in isolation before counted delays are
-        layered on top.
     G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
         port at rv32i_cpu.rs:190), not a memory or control-flow limit — the panic
@@ -845,6 +862,113 @@ TRANSPILATION:
      enabled-register idiom, verified against BaseJump's bsg_dff_en), so the rule
      is "never written on ANY path", not "not written on all paths".
 
+
+  ── TWO BUGS THE CAUSE-K GATE HAD BEEN MASKING (found 2026-08-24) ──────────
+
+  ✔ FIXED — REACHABILITY ACCEPTED A PROGRAM THE SIMULATOR LIVELOCKS ON.
+    `Cfg::build` folded a tick-bearing nested loop into ONE node with a **Tick**
+    out-edge, unconditionally. The comment justified the optimism as
+    "rejection-sound: a possible 0-iteration exit must not make the outer loop
+    look tickless", citing uart_tx / rv32i_cpu. That is right for a counted `for`
+    — it runs its body, so it ticks — and WRONG for a `loop`/`while` that can
+    break before its first tick, where the zero-tick exit is a real path.
+    An outer loop whose ONLY boundary is such a nested loop therefore returns to
+    its top in zero time. MEASURED, not argued: with the cause-K gate relaxed,
+        loop { loop { if a { break; } loop { if b { break; } tick; } } }
+    transpiled to an FSM running one cycle per iteration while the SIMULATOR SPUN
+    FOREVER — 99.5% CPU, 5m28s, no progress, with a low and b high. A false PASS
+    of the worst kind: the transpiler inventing a clock edge the source has no
+    right to.
+    FIX: `Node::may_exit_without_tick`, set when folding a nested `loop`/`while`
+    whose body can break before its first tick, and read ONLY by
+    `check_reachability` — which now walks that node's Tick edge as a zero-time
+    edge. The edge STAYS `Tick`, because liveness needs it: the loop does cross a
+    clock edge on its other paths and values live across it are still registers.
+    Conflating the two would have silently changed register inference.
+    A nested loop that ALWAYS ticks stays a boundary (`ticks_before_any_break`,
+    mutually recursive with `may_exit_without_tick`), which is what keeps
+    `loop { <work>; for _ in 0..N { tick } }` — the shape cause K exists for —
+    well-formed. Corpus impact measured: zero, nothing newly rejected.
+    KNOWN GAP, recorded rather than relied on: a `for` over an EMPTY constant
+    range would still read as a boundary. Seeing that needs const evaluation, and
+    copper-analysis is syntax-level (`syn`-only) by design.
+    Pinned by 5 tests in `copper-analysis/src/cfg.rs` and one in
+    `copper-codegen/tests/unsupported_constructs.rs`.
+
+  L ✔ FIXED (2026-08-24) — **A `RegOut` WRITE OF A REGISTER ALREADY ASSIGNED IN
+    THE SAME SEGMENT EMITTED THE PRE-EDGE VALUE.** Pre-existing, not a
+    control-flow bug, and it reproduced with no nested loop at all — found while
+    building cause K's DUT.
+        loop { n = n + step.read(); acc.write(n); clk.tick().await; }
+    emitted `acc <= n; n <= (n + step);` — so `acc` lagged `n` by a cycle, and the
+    two ORDERINGS of the same three statements emitted the SAME module. Measured
+    sim ≢ SV: the simulator gave 4, 6, 14, 17 where Verilator gave 0, 4, 6, 14.
+    THE RULE IS THE EMISSION CONTEXT, NOT THE SOURCE ORDER — this took two wrong
+    attempts to find, both caught by existing oracles rather than by argument:
+      - forwarding every read on the pre-edge path broke `branch_local_counter`;
+      - keying on pre-tick vs post-tick SEGMENT broke `lfsr`.
+    Both are plain-`Out` modules, and that is the point:
+      * a `RegOut` drive becomes `acc <= <expr>` inside `always_ff`, evaluated with
+        PRE-edge register values → it must be forwarded;
+      * a plain `Out` drive becomes a continuous `assign o = <expr>`, observed
+        AFTER the edge when the flop already holds the assigned value → forwarding
+        it applies the update twice.
+    FIX: `shir_lower::Forwarding`, keyed on `CHIRPort::registered`. Advancing the
+    map is DELEGATED to `extract_updates_from_stmts` — the same walk that computes
+    the registers' own next-state expressions — rather than reimplemented, so the
+    `if`/`match` branch-merge rule has exactly one definition. It gets the mod-N
+    counter idiom right for free:
+        acc <= (((t + 8'd1) == 8'd5) ? 8'd0 : (t + 8'd1))
+    Pinned by `tests/regout_forwarding_equivalence.rs`, whose sharpest assertion is
+    that the two orderings do NOT emit the same module — that identity WAS the bug.
+    WHY THE CORPUS NEVER CAUGHT IT: every existing module writes its `RegOut`
+    BEFORE mutating (the write-before-tick Moore idiom `waiter`, `handshake` and
+    the BaseJump modules all use), which is the one ordering the bug did not touch.
+
+  L-1 ✔ FIXED (2026-08-25) — **A CONDITIONALLY-DRIVEN PLAIN `Out` HAD THE SAME
+    LAG.** `vlir_lower` turns a conditionally-driven `Out` into an implicit-hold
+    register in `always_ff` (`conditional_output_ports`), so it is sampled at the
+    edge exactly like a `RegOut` despite its port type. Repro:
+        loop { n = n + step.read(); if enable { o.write(n); } tick; }
+    emitted `if (enable) o <= n;` where it must be `o <= (n + step)`. MEASURED with
+    `enable` alternating: simulator 3, 3, 11, 11, 18, 18 vs Verilator 0, 0, 4, 4,
+    13, 13.
+
+  L-2 ✔ FIXED (2026-08-25) — **A `let` WIRE READ AFTER A REGISTER ASSIGN AND FED
+    TO A `RegOut` LAGGED TOO.** The wire lowers to a continuous `assign` over the
+    flop, so a drive sampling it at the edge missed the assignment entirely:
+        loop { n = n + step.read(); let t = n + 1; acc.write(t); tick; }
+    emitted `t = (n + 8'd1); acc <= t;` — the `+ step` never reached `acc`.
+    MEASURED: simulator 4, 5, 12, 14, 19, 23 vs Verilator 1, 4, 5, 12, 14, 19.
+    `extract_updates_from_stmts` now records `let` wires in the forwarding map, so
+    the same fix covers a REGISTER whose next value reads such a wire.
+
+  ── HOW L-1 AND L-2 WERE FIXED, AND WHY THE FIRST ATTEMPT COULD NOT WORK ──────
+    The cause-L fix keyed forwarding on `CHIRPort::registered` in `shir_lower`.
+    That is not sound, and L-1 is the counterexample: whether a drive is sampled at
+    the edge is decided a STAGE LATER, by `vlir_lower`, from
+      registered `RegOut` ∪ phase-scoped `Out` ∪ conditionally-driven `Out`
+    and an output that looks conditional can be un-registered again by
+    `hoist_moore_output_defaults`. It is not a function of the SHIR, so predicting
+    it upstream would be a second implementation to keep in step with the real one
+    — the failure mode that produced cause L in the first place.
+    SO THE DECISION WAS NOT MOVED, THE DATA WAS. `SHIRStmt::PortDrive` now carries
+    BOTH forms — `value` (read after the edge, unforwarded) and `edge_value`
+    (sampled before it, forwarded) — through `VLIRStmt::PortAssign`, and
+    `split_output_reg` picks. That is the one point where a drive actually becomes
+    a non-blocking assignment, so no stage has to predict another's decision.
+    THE DEAD-WIRE CONSEQUENCE, worth knowing about: inlining a `let` wire into the
+    edge form can leave the wire with no readers, and the equivalence harness runs
+    Verilator under `-Wall`, where `UNUSEDSIGNAL` FAILS THE BUILD. So a correct
+    lowering was being rejected for a lint. `vlir_lower::drop_unread_wires` removes
+    them, iterating to a fixpoint. It lives in VLIR and not SHIR for the same
+    reason as the choice itself: liveness is only exact once each drive has
+    committed to one form — a wire read solely by the discarded form still looks
+    live at SHIR level, and the pass was tried there first and did not fire. Its
+    collectors match every enum EXHAUSTIVELY (no `_` arm) so that a variant added
+    later fails to compile rather than silently causing a live wire to be deleted.
+    Pinned by `tests/regout_forwarding_equivalence.rs` (6 tests), including a shape
+    pin that the inlined wire is gone.
 
 SIMULATOR:
   ☐ Add tests for semantic corner cases

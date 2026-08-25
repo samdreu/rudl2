@@ -347,13 +347,19 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
     ff_stmts.extend(mem_write_commits(&s.memories, &mem_use, leg));
     ff_stmts.extend(mem_write_pipeline(&s.memories, &mem_use, leg));
 
+    // Now that every drive has committed to one of its two forms, a `let` wire whose
+    // only reader was the discarded one is genuinely dead — and `-Wall` fails on it.
+    let always_ff = VLIRAlwaysFF { clock: clock.clone(), stmts: ff_stmts };
+    let mut comb_phases = comb_phases;
+    drop_unread_wires(&mut comb_phases, &always_ff, &output_assigns, &memories);
+
     Ok(VLIRSeqBody {
         clock: clock.clone(),
         reg_decls,
         memories,
         submodules,
         comb_phases,
-        always_ff: VLIRAlwaysFF { clock, stmts: ff_stmts },
+        always_ff,
         output_assigns,
     })
 }
@@ -438,15 +444,19 @@ fn lower_flat_stmts(
             // phase-gated combinational value instead of holding. Keep it as a
             // `PortAssign` in the phase's statements and let the split move it
             // to `always_ff`.
-            SHIRStmt::PortDrive { port_name, value }
+            SHIRStmt::PortDrive { port_name, value, edge_value }
                 if hold_outs.contains(&leg.get(port_name)) =>
             {
                 comb.push(VLIRStmt::PortAssign {
                     port_name: leg.get(port_name),
                     value: lower_expr(value, leg, mb)?,
+                    edge_value: lower_expr(edge_value, leg, mb)?,
                 })
             }
-            SHIRStmt::PortDrive { port_name, value } => assigns.push(VLIRContinuousAssign {
+            // Read as a continuous `assign`, i.e. AFTER the edge — so the plain,
+            // unforwarded form is the correct one here. `edge_value` is dropped
+            // deliberately: this drive never becomes a non-blocking assignment.
+            SHIRStmt::PortDrive { port_name, value, .. } => assigns.push(VLIRContinuousAssign {
                 target: leg.get(port_name),
                 value: lower_expr(value, leg, mb)?,
             }),
@@ -550,9 +560,10 @@ fn lower_comb_stmt(
         }),
         // A port driven inside a conditional becomes a blocking assign in
         // `always_comb` (the port is a `logic` output, assigned on every path).
-        SHIRStmt::PortDrive { port_name, value } => Ok(VLIRStmt::PortAssign {
+        SHIRStmt::PortDrive { port_name, value, edge_value } => Ok(VLIRStmt::PortAssign {
             port_name: leg.get(port_name),
             value: lower_expr(value, leg, mb)?,
+            edge_value: lower_expr(edge_value, leg, mb)?,
         }),
         SHIRStmt::If { condition, then_stmts, else_stmts } => Ok(VLIRStmt::If {
             condition: lower_expr(condition, leg, mb)?,
@@ -614,9 +625,10 @@ fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
             outer_dim: outer_dim.clone(),
             value: value.clone(),
         },
-        VLIRStmt::PortAssign { port_name, value } => VLIRStmt::PortAssign {
+        VLIRStmt::PortAssign { port_name, value, edge_value } => VLIRStmt::PortAssign {
             port_name: port_name.clone(),
             value: value.clone(),
+            edge_value: edge_value.clone(),
         },
         VLIRStmt::If { condition, then_stmts, else_stmts } => VLIRStmt::If {
             condition: condition.clone(),
@@ -1057,7 +1069,7 @@ fn shir_phase_local_wires(stmts: &[SHIRStmt], out: &mut HashSet<String>) {
 fn shir_port_drives(stmts: &[SHIRStmt], out: &mut Vec<(String, HashSet<String>)>) {
     for s in stmts {
         match s {
-            SHIRStmt::PortDrive { port_name, value } => {
+            SHIRStmt::PortDrive { port_name, value, .. } => {
                 let mut vars = HashSet::new();
                 shir_expr_vars(value, &mut vars);
                 out.push((port_name.clone(), vars));
@@ -1153,7 +1165,7 @@ fn shir_port_drives_with_values<'a>(
 ) {
     for s in stmts {
         match s {
-            SHIRStmt::PortDrive { port_name, value } => out.push((port_name.clone(), value)),
+            SHIRStmt::PortDrive { port_name, value, .. } => out.push((port_name.clone(), value)),
             SHIRStmt::If { then_stmts, else_stmts, .. } => {
                 shir_port_drives_with_values(then_stmts, out);
                 if let Some(e) = else_stmts {
@@ -1307,7 +1319,10 @@ fn hoist_moore_output_defaults(stmts: &mut Vec<VLIRStmt>) {
 
     // Prepend the defaults (first-seen order) ahead of the case that overrides them.
     for (port_name, value) in to_hoist.into_iter().rev() {
-        stmts.insert(0, VLIRStmt::PortAssign { port_name, value });
+        // A hoisted default exists to make the port driven on all paths so it stays
+        // COMBINATIONAL; it is never split into `always_ff`, so both forms are the
+        // same expression.
+        stmts.insert(0, VLIRStmt::PortAssign { port_name, value: value.clone(), edge_value: value });
     }
 }
 
@@ -1316,7 +1331,7 @@ fn hoist_moore_output_defaults(stmts: &mut Vec<VLIRStmt>) {
 fn first_direct_port_value(arms: &[VLIRCaseArm], port: &str) -> Option<VLIRExpr> {
     for a in arms {
         for s in &a.stmts {
-            if let VLIRStmt::PortAssign { port_name, value } = s {
+            if let VLIRStmt::PortAssign { port_name, value, .. } = s {
                 if port_name == port {
                     return Some(value.clone());
                 }
@@ -1329,6 +1344,194 @@ fn first_direct_port_value(arms: &[VLIRCaseArm], port: &str) -> Option<VLIRExpr>
 /// Split the target output ports' drives out of `stmts` (combinational) and into
 /// mirrored `always_ff` non-blocking assigns, preserving the surrounding
 /// `if`/`case` guard structure. Returns (combinational remainder, ff updates).
+/// Drop `always_comb` wire assignments that nothing reads any more.
+///
+/// Sequential forwarding (`shir_lower::Forwarding`) inlines a `let` wire's definition
+/// into any expression that is sampled at the clock edge — `TODO` cause L-2. When a
+/// wire's ONLY reader was such an expression, the wire is left assigned and unread,
+/// which the equivalence harness rejects: Verilator runs under `-Wall`, where that is
+/// `UNUSEDSIGNAL` and fails the build. Removing the dead assignment is part of doing
+/// the inlining, not cosmetic tidying.
+///
+/// # Why here and not in `shir_lower`
+///
+/// This is the first point at which liveness is EXACT. A `SHIRStmt::PortDrive` carries
+/// both an edge-sampled and a continuous form, and only one of them survives — so at
+/// SHIR level a wire read solely by the discarded form still looks live. It was tried
+/// there first and did not remove the wire.
+///
+/// # Why this cannot delete something live
+///
+/// Every collector below matches its enum EXHAUSTIVELY, with no `_` arm. A variant
+/// added later fails to compile rather than silently going uncounted, which is the
+/// only failure mode that would matter — deleting a wire something still reads.
+fn drop_unread_wires(
+    comb_phases: &mut [VLIRCombPhase],
+    always_ff: &VLIRAlwaysFF,
+    output_assigns: &[VLIRContinuousAssign],
+    memories: &[VLIRMemDecl],
+) {
+    loop {
+        let mut read: HashSet<String> = HashSet::new();
+        for phase in comb_phases.iter() {
+            if let Some(g) = &phase.phase_guard {
+                collect_vlir_reads(g, &mut read);
+            }
+            for st in &phase.stmts {
+                collect_vlir_reads_stmt(st, &mut read);
+            }
+        }
+        for st in &always_ff.stmts {
+            collect_vlir_reads_ff(st, &mut read);
+        }
+        for a in output_assigns {
+            collect_vlir_reads(&a.value, &mut read);
+        }
+        // A memory's read-data nets are assigned from the array rather than by a
+        // statement, and their value expressions index it with ordinary wires —
+        // those addresses must stay live.
+        for m in memories {
+            for net in &m.read_data_nets {
+                collect_vlir_reads(&net.value, &mut read);
+            }
+        }
+
+        let mut removed = false;
+        for phase in comb_phases.iter_mut() {
+            let before = phase.stmts.len();
+            phase.stmts.retain(|st| match st {
+                // Only a TOP-LEVEL wire assignment is considered: a nested one is
+                // part of a conditional structure whose other paths may assign the
+                // same name, and dropping one arm would create a latch.
+                VLIRStmt::WireAssign { name, .. } => read.contains(name),
+                _ => true,
+            });
+            removed |= phase.stmts.len() != before;
+        }
+        // Dropping one wire can orphan another, so iterate to a fixpoint.
+        if !removed {
+            return;
+        }
+    }
+}
+
+fn collect_vlir_reads_stmt(stmt: &VLIRStmt, out: &mut HashSet<String>) {
+    match stmt {
+        VLIRStmt::WireAssign { value, .. } => collect_vlir_reads(value, out),
+        VLIRStmt::PortAssign { value, edge_value, .. } => {
+            collect_vlir_reads(value, out);
+            collect_vlir_reads(edge_value, out);
+        }
+        VLIRStmt::If { condition, then_stmts, else_stmts } => {
+            collect_vlir_reads(condition, out);
+            for s in then_stmts {
+                collect_vlir_reads_stmt(s, out);
+            }
+            if let Some(e) = else_stmts {
+                for s in e {
+                    collect_vlir_reads_stmt(s, out);
+                }
+            }
+        }
+        VLIRStmt::Case { selector, arms, default } => {
+            collect_vlir_reads(selector, out);
+            for a in arms {
+                collect_vlir_reads(&a.selector_value, out);
+                for s in &a.stmts {
+                    collect_vlir_reads_stmt(s, out);
+                }
+            }
+            if let Some(d) = default {
+                for s in d {
+                    collect_vlir_reads_stmt(s, out);
+                }
+            }
+        }
+        VLIRStmt::ForLoop { start, end, body, .. } => {
+            collect_vlir_reads(start, out);
+            collect_vlir_reads(end, out);
+            for s in body {
+                collect_vlir_reads_stmt(s, out);
+            }
+        }
+        // `base` is read-modify-written.
+        VLIRStmt::IndexAssign { base, index, value } => {
+            out.insert(base.clone());
+            collect_vlir_reads(index, out);
+            collect_vlir_reads(value, out);
+        }
+    }
+}
+
+fn collect_vlir_reads_ff(stmt: &VLIRFFStmt, out: &mut HashSet<String>) {
+    match stmt {
+        VLIRFFStmt::NonBlockingAssign { value, .. } => collect_vlir_reads(value, out),
+        VLIRFFStmt::MemAssign { addr, value, .. } => {
+            collect_vlir_reads(addr, out);
+            collect_vlir_reads(value, out);
+        }
+        VLIRFFStmt::If { condition, then_stmts, else_stmts } => {
+            collect_vlir_reads(condition, out);
+            for s in then_stmts {
+                collect_vlir_reads_ff(s, out);
+            }
+            if let Some(e) = else_stmts {
+                for s in e {
+                    collect_vlir_reads_ff(s, out);
+                }
+            }
+        }
+        VLIRFFStmt::Case { selector, arms, default } => {
+            collect_vlir_reads(selector, out);
+            for a in arms {
+                collect_vlir_reads(&a.selector_value, out);
+                for s in &a.stmts {
+                    collect_vlir_reads_ff(s, out);
+                }
+            }
+            if let Some(d) = default {
+                for s in d {
+                    collect_vlir_reads_ff(s, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_vlir_reads(expr: &VLIRExpr, out: &mut HashSet<String>) {
+    match expr {
+        VLIRExpr::Var(name) => {
+            out.insert(name.clone());
+        }
+        VLIRExpr::Lit { .. } => {}
+        VLIRExpr::BinOp { left, right, .. } => {
+            collect_vlir_reads(left, out);
+            collect_vlir_reads(right, out);
+        }
+        VLIRExpr::UnOp { expr, .. } => collect_vlir_reads(expr, out),
+        VLIRExpr::Ternary { cond, then_val, else_val } => {
+            collect_vlir_reads(cond, out);
+            collect_vlir_reads(then_val, out);
+            collect_vlir_reads(else_val, out);
+        }
+        VLIRExpr::Concat(parts) => {
+            for p in parts {
+                collect_vlir_reads(p, out);
+            }
+        }
+        VLIRExpr::Slice { expr, .. } => collect_vlir_reads(expr, out),
+        VLIRExpr::DynBit { base, index } => {
+            collect_vlir_reads(base, out);
+            collect_vlir_reads(index, out);
+        }
+        VLIRExpr::Resize { expr, .. } => collect_vlir_reads(expr, out),
+        VLIRExpr::MemIndex { mem, addr } => {
+            out.insert(mem.clone());
+            collect_vlir_reads(addr, out);
+        }
+    }
+}
+
 fn split_output_regs(stmts: &[VLIRStmt], targets: &HashSet<String>) -> (Vec<VLIRStmt>, Vec<VLIRFFStmt>) {
     let mut comb = Vec::new();
     let mut ff = Vec::new();
@@ -1342,8 +1545,15 @@ fn split_output_regs(stmts: &[VLIRStmt], targets: &HashSet<String>) -> (Vec<VLIR
 
 fn split_output_reg(s: &VLIRStmt, targets: &HashSet<String>) -> (Option<VLIRStmt>, Vec<VLIRFFStmt>) {
     match s {
-        VLIRStmt::PortAssign { port_name, value } if targets.contains(port_name) => {
-            (None, vec![VLIRFFStmt::NonBlockingAssign { target: port_name.clone(), value: value.clone() }])
+        // The one point where a drive actually becomes edge-sampled, and therefore
+        // the one place the choice between the two forms can be made correctly —
+        // `targets` is only known here, after `hoist_moore_output_defaults` has had
+        // its say. See `SHIRStmt::PortDrive`.
+        VLIRStmt::PortAssign { port_name, edge_value, .. } if targets.contains(port_name) => {
+            (None, vec![VLIRFFStmt::NonBlockingAssign {
+                target: port_name.clone(),
+                value: edge_value.clone(),
+            }])
         }
         VLIRStmt::If { condition, then_stmts, else_stmts } => {
             let (tc, tf) = split_output_regs(then_stmts, targets);

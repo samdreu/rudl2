@@ -308,7 +308,7 @@ currently transpile. The 6 that do not, grouped by root cause:
 |---|---|
 | `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
 | tuple-returning helper functions | `ripple_carry_adder` |
-| a loop whose body ends in another tick-bearing loop | `uart/rx`, `uart_tx`, `uart_rx` |
+| a tick inside a counted `for` | `uart/rx`, `uart_tx`, `uart_rx` |
 
 Note that transpiling and *linting* are different bars: the equivalence harness
 runs Verilator under `-Wall`, and a module can emit SystemVerilog that the CLI
@@ -320,6 +320,16 @@ signed arithmetic / arithmetic shift right, division, `continue` inside a nested
 loop, and several memory shapes that would lower to something subtly wrong
 (two accesses to one port in a cycle, run-time-computed preloads, zero-latency
 memories).
+
+One correctness rule is worth knowing when reading the generated Verilog: an
+output drive that is *sampled at the clock edge* is emitted from the values the
+registers hold **before** that edge, while one emitted as a continuous `assign` is
+read **after** it. Copper carries both forms and picks at the point where the
+choice actually exists, because "is this drive edge-sampled?" is not answerable
+from the port type — a plain `Out` written conditionally becomes a register too.
+Getting this wrong is a silent one-cycle error, so it is pinned by
+`tests/regout_forwarding_equivalence.rs` rather than left to inspection; `TODO`
+causes L, L-1 and L-2 record the measurements.
 
 Two further notes on what "unsupported" means here. Some of these are
 **decisions, not gaps** — a construct that cannot be given the same meaning in

@@ -447,7 +447,7 @@ pub struct CHIRLit {
     pub value: u128,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CHIRBinOp {
     Add { wrapping: bool },
     Sub { wrapping: bool },
@@ -468,7 +468,7 @@ pub enum CHIRBinOp {
     LogicalOr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CHIRUnOp {
     BitNot,
     LogicalNot,

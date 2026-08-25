@@ -5,8 +5,8 @@ use copper_core::chir::{
 };
 use copper_core::memory::WriteMode;
 use copper_core::frontend_ir::{
-    ExprCall, ExprIndex, ExprRepeat, ExprStruct, ExprType, FrontendClassification, FrontendFnIR,
-    FrontendModuleIR, ItemStruct, LocalStmt, RawStmt, RawStmtKind, SourceSpan,
+    ExprCall, ExprIndex, ExprLoop, ExprRepeat, ExprStruct, ExprType, FrontendClassification,
+    FrontendFnIR, FrontendModuleIR, ItemStruct, LocalStmt, RawStmt, RawStmtKind, SourceSpan,
 };
 
 // ── Public type aliases ───────────────────────────────────────────────────────
@@ -2228,36 +2228,15 @@ fn lower_expr_stmt(
             });
         }
 
-        // A `loop` nested inside the module's own top-level loop. With a tick in
-        // it, it is a repeating wait — a state that loops back to itself, plus
-        // `break`/`continue` handling, which control extraction does not model
-        // (it handles straight-line code, `if`/`else` and `match`). Without a
-        // tick it is an unbounded combinational loop. Both are errors; neither
-        // may be silently dropped, which is what the generic expression
-        // fall-through used to do to it.
+        // A `loop` nested inside the module's own top-level loop that control
+        // extraction declined to flatten. Reaching CHIR at all means the flattener
+        // passed on the whole module, so this is the module's *reported* blocker and
+        // the message has to be followable — see `nested_loop_error`, which sorts
+        // the three distinct reasons a nested loop lands here. Neither may be
+        // silently dropped, which is what the generic expression fall-through used
+        // to do to it.
         ExprType::Loop(l) => {
-            return Err(CHIRLowerError::UnsupportedConstruct {
-                description: if stmts_contain_tick(&l.body) {
-                    "a repeating wait must be written as `loop { <test>; clk.tick().await; }` \
-                     — the tick has to be the LAST statement of the loop body. Testing AFTER \
-                     the tick reads an input in the window where a simulator samples the value \
-                     the just-past edge produced and a flip-flop samples the value present \
-                     before its own edge; the two are a cycle apart under any testbench that \
-                     changes inputs between edges. Copper does not choose between them — the \
-                     ordering is outside the language, the same way a pre-tick alignment hazard \
-                     is"
-                        .to_string()
-                } else {
-                    "a nested `loop` with no `clk.tick().await` would never terminate in \
-                     hardware".to_string()
-                },
-                span,
-                suggested_rewrite: Some(
-                    "move the test before the tick: `loop { if ready { break; } \
-                     clk.tick().await; }`"
-                        .to_string(),
-                ),
-            });
+            return Err(nested_loop_error(l, span));
         }
 
         // Only meaningful inside a nested loop, which is rejected above — so
@@ -3702,6 +3681,89 @@ fn extract_block_expr_value(
         span,
         suggested_rewrite: None,
     })
+}
+
+/// Why a nested `loop` could not be flattened, as a diagnostic.
+///
+/// Three distinct reasons land here and they need three messages — the fix for
+/// each is different, and until 2026-08-24 all of them printed the ordering rule.
+/// That was unfollowable for two of the three: "the tick has to be the LAST
+/// statement" is not advice you can act on when the body has no tick in statement
+/// position at all.
+///
+///  1. **no tick anywhere** — an unbounded combinational loop;
+///  2. **a tick in statement position, but not last** — the refused ordering
+///     (`loop { tick; <test> }`), which is outside the language by decision;
+///  3. **ticks only inside branches** — no single "code between two ticks"
+///     segment, so there is no state for the flattener to build.
+///
+/// The span walks INWARD first: when the body's last statement is another
+/// tick-bearing loop (cause K's shape, which the flattener does accept), the outer
+/// loop is well-formed and the fault is somewhere inside, so reporting the outer
+/// one names a construct the author has no reason to doubt.
+fn nested_loop_error(l: &ExprLoop, span: SourceSpan) -> CHIRLowerError {
+    // Descend to the innermost loop that is actually at fault.
+    if let Some(last) = l.body.last() {
+        if let RawStmtKind::Expr(es) = &last.kind {
+            if let ExprType::Loop(inner) = &es.expr {
+                if stmts_contain_tick(&inner.body) {
+                    return nested_loop_error(inner, last.span);
+                }
+            }
+        }
+    }
+
+    let has_statement_tick = l.body.iter().any(is_tick_stmt);
+    let (description, suggested_rewrite) = if !stmts_contain_tick(&l.body) {
+        (
+            "a nested `loop` with no `clk.tick().await` would never terminate in hardware"
+                .to_string(),
+            Some("give the loop a `clk.tick().await`, or write it as a `for` over a constant \
+                  range if it is meant to unroll"
+                .to_string()),
+        )
+    } else if has_statement_tick {
+        (
+            "a repeating wait must be written as `loop { <test>; clk.tick().await; }` \
+             — the tick has to be the LAST statement of the loop body. Testing AFTER \
+             the tick reads an input in the window where a simulator samples the value \
+             the just-past edge produced and a flip-flop samples the value present \
+             before its own edge; the two are a cycle apart under any testbench that \
+             changes inputs between edges. Copper does not choose between them — the \
+             ordering is outside the language, the same way a pre-tick alignment hazard \
+             is"
+                .to_string(),
+            Some("move the test before the tick: `loop { if ready { break; } \
+                  clk.tick().await; }`"
+                .to_string()),
+        )
+    } else {
+        (
+            "this nested `loop`'s body has no clock boundary of its own: every \
+             `clk.tick().await` in it sits inside an `if` or `match` arm, so the body is \
+             not one segment of code between two ticks and there is no state to build \
+             from it. A nested loop's body must END at its boundary — either \
+             `clk.tick().await` as the last statement, or another tick-bearing loop as \
+             the last statement"
+                .to_string(),
+            Some("lift the tick out of the branches so it is the body's last statement: \
+                  `loop { if ready { break; } <work>; clk.tick().await; }`"
+                .to_string()),
+        )
+    };
+
+    CHIRLowerError::UnsupportedConstruct { description, span, suggested_rewrite }
+}
+
+/// Is this statement a bare `clk.tick().await`, in statement position?
+fn is_tick_stmt(stmt: &RawStmt) -> bool {
+    match &stmt.kind {
+        RawStmtKind::Expr(es) => match &es.expr {
+            ExprType::Await(a) => is_tick_await(&a.base),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// True if any statement issues a `clk.tick().await` at any nesting depth. A tick

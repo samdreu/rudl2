@@ -72,6 +72,19 @@ struct Node {
     /// conservative all-outputs over-approximation (not a real single `port.write`).
     /// The multi-write-collapse detector must not read it as an explicit write.
     folded: bool,
+    /// True iff this is a folded **tick-bearing** nested loop that can nonetheless
+    /// be left *without* ever reaching one of its ticks — a `loop`/`while` whose
+    /// body can `break` (or fall out of a `while` test) before its first tick.
+    ///
+    /// The out-edge stays [`EdgeKind::Tick`], because the loop *does* cross a clock
+    /// edge on its other paths and every value live across it must still be a
+    /// register. This flag is read **only** by
+    /// [`check_reachability`](Cfg::check_reachability), which must additionally
+    /// consider the zero-tick path: an enclosing loop whose sole clock boundary is
+    /// such a nested loop can cycle in zero time, and that is a livelock the
+    /// simulator exhibits (measured) while the transpiled FSM would happily run one
+    /// cycle per iteration.
+    may_exit_without_tick: bool,
     /// Source span, for spanned diagnostics.
     span: Span,
 }
@@ -87,6 +100,7 @@ impl Node {
             succs: Vec::new(),
             writes: BTreeSet::new(),
             folded: false,
+            may_exit_without_tick: false,
             span,
         }
     }
@@ -484,21 +498,49 @@ impl Cfg {
         let mut color = vec![Color::White; self.nodes.len()];
 
         // Iterative DFS (avoid recursion depth limits on large bodies). The stack
-        // holds (node, next-successor-index); a Gray successor over a Comb edge is a
-        // back-edge — a tickless cycle.
+        // holds (node, next-successor-index); a Gray successor over a zero-time edge
+        // is a back-edge — a tickless cycle.
+        //
+        // A zero-time edge is a Comb edge, OR the Tick edge of a folded nested loop
+        // that can be left before it ever ticks (`may_exit_without_tick`): that
+        // loop's zero-tick exit is a real path through the parent, even though the
+        // edge stays Tick for liveness.
         let mut stack: Vec<(usize, usize)> = vec![(self.head, 0)];
         color[self.head] = Color::Gray;
         while let Some(&mut (n, ref mut si)) = stack.last_mut() {
-            // Advance to the next Comb successor of n.
+            // Advance to the next zero-time successor of n.
             let mut advanced = false;
             while *si < self.nodes[n].succs.len() {
                 let (s, kind) = self.nodes[n].succs[*si];
                 *si += 1;
-                if kind != EdgeKind::Comb {
+                if kind != EdgeKind::Comb && !self.nodes[n].may_exit_without_tick {
                     continue;
                 }
                 match color[s] {
                     Color::Gray => {
+                        // Name the nested loop when one is on the cycle: "add a tick"
+                        // is unfollowable advice for a path that already has ticks on
+                        // its *other* branches, and the fix is a different one.
+                        let culprit = stack
+                            .iter()
+                            .position(|&(m, _)| m == s)
+                            .map(|start| &stack[start..])
+                            .unwrap_or(&stack[..])
+                            .iter()
+                            .find(|&&(m, _)| self.nodes[m].may_exit_without_tick);
+                        if let Some(&(m, _)) = culprit {
+                            return Err((
+                                self.nodes[m].span,
+                                "this loop's only clock boundary is a nested loop that can be \
+                                 left before it ticks, so the enclosing loop can return to its \
+                                 top in zero time — a livelock in simulation, and a loop the \
+                                 transpiler cannot give the same meaning in hardware. Give the \
+                                 enclosing loop a `clk.tick().await` of its own, or make the \
+                                 nested loop one that always ticks (a `for` over a constant \
+                                 range, whose body runs before any exit test)"
+                                    .to_string(),
+                            ));
+                        }
                         return Err((
                             self.nodes[n].span,
                             "this control-flow path returns to the top of the loop without \
@@ -874,16 +916,25 @@ impl Builder {
                 })
             }
             // A **nested** loop (`for` / `while` / `loop`). In the *parent* graph it
-            // stays folded into a single node (rejection-sound: a possible
-            // 0-iteration exit must not make the outer loop look tickless — a design
-            // that only ticks inside a `for`/`while`, e.g. `uart_tx`/`rv32i_cpu`,
-            // stays well-formed). If it *contains a tick* its out-edge is a **Tick**
-            // edge (a clock boundary for the parent's liveness) and — new in the
-            // nested-loop builder — its body is *also* built as a real sub-CFG
+            // stays folded into a single node. If it *contains a tick* its out-edge is
+            // a **Tick** edge (a clock boundary for the parent's liveness) and — new in
+            // the nested-loop builder — its body is *also* built as a real sub-CFG
             // (`nested`) so the tickless-cycle invariant is enforced *inside* it
             // (recursively, with `break`/`continue` modeled). A tick-free nested loop
             // is combinational (unrolled) and neither ticks nor is checked. `defs`
             // stays empty (don't kill across the opaque region); interior reads → `uses`.
+            //
+            // The Tick out-edge used to make the fold *unconditionally* optimistic —
+            // "a possible 0-iteration exit must not make the outer loop look tickless",
+            // so that a design ticking only inside a `for` (`uart_tx`, `rv32i_cpu`)
+            // stays well-formed. That is right for a counted `for`, which runs its body
+            // and therefore ticks; it is **wrong** for a `loop`/`while` that can break
+            // before its first tick, where the zero-tick exit is a real path. An
+            // enclosing loop whose only boundary is such a nested loop then cycles in
+            // zero time — measured: the simulator livelocks (99.5% CPU, no progress)
+            // while the flattened FSM runs one cycle per iteration. `may_exit_without_tick`
+            // records that path for `check_reachability` WITHOUT weakening the Tick
+            // edge, which liveness still needs (see the field's docs).
             Expr::While(_) | Expr::ForLoop(_) | Expr::Loop(_) => {
                 let mut uses = BTreeSet::new();
                 collect_reads(expr, &mut uses);
@@ -900,6 +951,7 @@ impl Builder {
                     uses,
                     is_tick,
                     tick_clock: clock,
+                    may_exit_without_tick: is_tick && may_exit_without_tick(expr),
                     succs: vec![(next, kind)],
                     // Opaque region: conservatively assume it drives every output
                     // (so the definite-assignment check never *false*-flags a partial
@@ -1133,6 +1185,96 @@ fn loop_body_stmts(expr: &Expr) -> &[Stmt] {
         Expr::ForLoop(f) => &f.body.stmts,
         Expr::Loop(l) => &l.body.stmts,
         _ => &[],
+    }
+}
+
+/// Can this **tick-bearing** nested loop be left without ever reaching a tick?
+///
+/// Only the *zero-tick exit* is asked about here; a loop that can cycle internally
+/// without ticking is a different (and separately enforced) defect, caught by
+/// `check_reachability` recursing into the loop's own sub-CFG.
+///
+/// * `loop` — exits only by `break`, so the answer is "yes" unless every top-level
+///   path reaches a tick before any `break` can be taken.
+/// * `while` — the test can be false on entry, so it always can (a zero-iteration
+///   exit needs no `break` at all). This matches what the transpiler sees: a
+///   tick-bearing `while` is desugared to `loop { if !cond { break; } … }`, whose
+///   leading `break` gives the same answer. The two front-ends agreeing about this
+///   is the point — them disagreeing is this pipeline's recurring bug class.
+/// * `for` — assumed to run its body, so "no". A counted repetition over a constant
+///   range is the shape the fold's optimism was built for (`uart_tx`, `rv32i_cpu`,
+///   `for _ in 0..CLKS_PER_BIT { clk.tick().await; }`) and it genuinely does tick.
+///   The assumption is only wrong for an **empty** range, which needs const
+///   evaluation to see and which this crate (syntax-level, `syn`-only) cannot do.
+///   Recorded rather than silently relied on: an empty constant range would make
+///   the enclosing loop tickless and is not detected here.
+fn may_exit_without_tick(expr: &Expr) -> bool {
+    match expr {
+        Expr::ForLoop(_) => false,
+        Expr::While(_) => true,
+        Expr::Loop(l) => !ticks_before_any_break(&l.body.stmts),
+        _ => false,
+    }
+}
+
+/// Does every top-level path through this loop body reach a tick before it can
+/// `break` out of the loop?
+///
+/// Deliberately conservative: a tick that sits inside a branch (`if c { tick; }`)
+/// answers "no", because the other branch reaches the body's end — and thus the
+/// loop head — without ticking. Only a tick in *statement* position counts, or a
+/// nested loop that is itself a guaranteed boundary (mutually recursive with
+/// [`may_exit_without_tick`]; both descend structurally, so this terminates).
+fn ticks_before_any_break(body: &[Stmt]) -> bool {
+    for stmt in body {
+        let Stmt::Expr(e, _) = stmt else {
+            // A `let` whose initializer breaks or ticks is not a shape this walk
+            // models; treat it as neither, and keep looking.
+            continue;
+        };
+        if tick_clock(e).is_some() {
+            return true; // an unconditional clock boundary, reached first
+        }
+        if matches!(e, Expr::Loop(_) | Expr::While(_) | Expr::ForLoop(_)) {
+            // A nested loop that always ticks is itself a boundary: reaching it
+            // guarantees a clock edge. Without this clause `loop { <work>; for _ in
+            // 0..N { tick; } }` — the shape cause K exists to support — would read
+            // as tickless and be false-rejected.
+            if first_tick_clock(e).is_some() && !may_exit_without_tick(e) {
+                return true;
+            }
+            return false;
+        }
+        if breaks_enclosing_loop(e) {
+            return false; // an exit is reachable with no tick behind it
+        }
+        if first_tick_clock(e).is_some() {
+            return false; // ticks only on *some* path through this statement
+        }
+    }
+    false // fell out of the body without ticking
+}
+
+/// Does `expr` contain a `break` belonging to the loop that encloses it? A `break`
+/// under a nested loop of its own belongs to *that* loop and does not count.
+fn breaks_enclosing_loop(expr: &Expr) -> bool {
+    match expr {
+        Expr::Break(_) => true,
+        Expr::If(f) => {
+            f.then_branch.stmts.iter().any(stmt_breaks_enclosing_loop)
+                || f.else_branch.as_ref().is_some_and(|(_, e)| breaks_enclosing_loop(e))
+        }
+        Expr::Block(b) => b.block.stmts.iter().any(stmt_breaks_enclosing_loop),
+        Expr::Match(m) => m.arms.iter().any(|a| breaks_enclosing_loop(&a.body)),
+        Expr::Loop(_) | Expr::While(_) | Expr::ForLoop(_) => false,
+        _ => false,
+    }
+}
+
+fn stmt_breaks_enclosing_loop(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e, _) => breaks_enclosing_loop(e),
+        _ => false,
     }
 }
 
@@ -2084,6 +2226,123 @@ mod tests {
                 loop {
                     loop {
                         if r.read() == Logic::One { break; }
+                        clk.tick().await;
+                    }
+                    o.write(Logic::One);
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(check(src).is_ok());
+    }
+
+    /// The **zero-tick exit**. `outer`'s only clock boundary is `inner`, and `inner`
+    /// is the mandated test-before-tick shape — so when `b` is high on entry it
+    /// breaks without ticking and `outer` returns to its top in zero time.
+    ///
+    /// Measured before this was rejected: the simulator livelocks on it (99.5% CPU,
+    /// no progress) while the flattened FSM runs one cycle per iteration. The
+    /// optimistic fold accepted it because a tick-bearing nested loop contributed a
+    /// Tick edge unconditionally.
+    #[test]
+    fn nested_loop_that_can_exit_before_ticking_is_not_a_clock_boundary() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, a: In<Logic, C>, b: In<Logic, C>) {
+                loop {
+                    loop {
+                        if a.read() == Logic::One { break; }
+                        loop {
+                            if b.read() == Logic::One { break; }
+                            clk.tick().await;
+                        }
+                    }
+                }
+            }
+        "#;
+        let err = check(src).expect_err(
+            "a loop whose only boundary is a nested loop that can break before ticking \
+             is a zero-time cycle — the simulator livelocks on it",
+        );
+        assert!(
+            err.contains("left before it ticks"),
+            "the diagnostic must name the nested loop, not advise adding a tick to a \
+             body that already has one: {}",
+            err
+        );
+    }
+
+    /// The same zero-tick exit one level up: the module's own loop has no tick of its
+    /// own and the `loop` it delegates to can break immediately.
+    #[test]
+    fn a_lone_nested_wait_is_not_a_clock_boundary_for_the_module_loop() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, go: In<Logic, C>) {
+                loop {
+                    loop {
+                        if go.read() == Logic::One { break; }
+                        clk.tick().await;
+                    }
+                }
+            }
+        "#;
+        assert!(check(src).is_err());
+    }
+
+    /// A `while` needs no `break` to exit in zero iterations, so it is never a
+    /// guaranteed boundary either. The transpiler desugars a tick-bearing `while`
+    /// to `loop { if !cond { break; } … }`, which reaches the same verdict by the
+    /// `break`-before-tick route — the two front-ends must not disagree.
+    #[test]
+    fn a_lone_while_wait_is_not_a_clock_boundary() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn bad(clk: Clock<C>, go: In<Logic, C>) {
+                loop {
+                    while go.read() == Logic::One {
+                        clk.tick().await;
+                    }
+                }
+            }
+        "#;
+        assert!(check(src).is_err());
+    }
+
+    /// The counted case the fold's optimism exists for, and which keeps it: a `for`
+    /// runs its body, so it ticks. This is `uart_tx`'s bit-timing delay, and the
+    /// shape cause K ultimately has to support — it must stay well-formed.
+    #[test]
+    fn a_counted_for_is_still_a_clock_boundary() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, o: Out<Logic, C>) {
+                loop {
+                    o.write(Logic::One);
+                    for _ in 0..8 {
+                        clk.tick().await;
+                    }
+                }
+            }
+        "#;
+        assert!(
+            check(src).is_ok(),
+            "a counted repetition runs its body and therefore ticks; rejecting it \
+             would break uart_tx and rv32i_cpu"
+        );
+    }
+
+    /// A wait that can exit early is fine as long as the *enclosing* loop ticks on
+    /// its own — the zero-tick exit only matters when it is the only boundary. This
+    /// is the common `waiter` idiom and must not be caught by the tightening.
+    #[test]
+    fn an_early_exiting_wait_is_fine_when_the_outer_loop_ticks_too() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn ok(clk: Clock<C>, go: In<Logic, C>, o: Out<Logic, C>) {
+                loop {
+                    loop {
+                        if go.read() == Logic::One { break; }
                         clk.tick().await;
                     }
                     o.write(Logic::One);

@@ -161,9 +161,30 @@ pub enum SHIRStmt {
     },
     /// Drive an output port. May appear flat or inside If/Match for
     /// conditional drives (e.g. Moore FSM output from match on state register).
+    ///
+    /// Carries the drive in BOTH forms, because which one is correct depends on
+    /// where the drive is finally emitted — a decision `vlir_lower` makes, later
+    /// than this IR is built:
+    ///
+    /// * `value` — read as a continuous `assign`, i.e. AFTER the clock edge, when
+    ///   the registers this segment assigns already hold their new values;
+    /// * `edge_value` — the same drive written in PRE-edge terms (registers this
+    ///   segment assigns are substituted for the values it assigns them, and its
+    ///   `let` wires are inlined where that matters), for a drive that becomes a
+    ///   non-blocking assignment inside `always_ff` and is therefore sampled BEFORE
+    ///   the edge.
+    ///
+    /// The two are equal unless the segment assigns a register the drive reads.
+    /// Carrying both is what stops this stage from having to PREDICT the
+    /// registration decision — `vlir_lower` chooses at `split_output_reg`, the one
+    /// point where a drive actually becomes edge-sampled. Predicting it here was
+    /// tried and is not sound: `hoist_moore_output_defaults` un-registers some
+    /// outputs after the fact, so the answer is not a function of this IR alone.
+    /// See `TODO` causes L, L-1 and L-2.
     PortDrive {
         port_name: String,
         value: SHIRExpr,
+        edge_value: SHIRExpr,
     },
     If {
         condition: SHIRExpr,
@@ -209,7 +230,7 @@ pub struct SHIRMatchArm {
     pub stmts: Vec<SHIRStmt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SHIRPattern {
     Lit(SHIRLit),
     Wildcard,
@@ -219,7 +240,7 @@ pub enum SHIRPattern {
 
 // ── Expression model ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SHIRExpr {
     Var(String),
     Lit(SHIRLit),
@@ -266,7 +287,7 @@ pub enum SHIRExpr {
     MemValid { mem: String, port: usize },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SHIRCaseArm {
     pub pattern: SHIRPattern,
     pub guard: Option<SHIRExpr>,

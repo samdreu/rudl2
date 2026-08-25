@@ -74,7 +74,13 @@ fn lower_comb_body(
     let mut wire_types = HashMap::new();
     collect_wire_types(&comb.stmts, &mut wire_types);
 
-    let stmts = lower_stmt_list(&comb.stmts, &std::collections::HashSet::new(), &HashMap::new(), &wire_types)?;
+    let stmts = lower_stmt_list(
+        &comb.stmts,
+        &std::collections::HashSet::new(),
+        &HashMap::new(),
+        &wire_types,
+        &mut Forwarding::disabled(),
+    )?;
 
     Ok(SHIRCombBody { submodules, stmts })
 }
@@ -101,6 +107,108 @@ fn collect_wire_types(
     }
 }
 
+/// The value each register holds at the current point of ONE segment, given the
+/// assignments already executed in it.
+///
+/// # What it is for
+///
+/// A register assignment emits no statement on the pre-edge path — it becomes a
+/// non-blocking update at the clock edge. So a **registered** output written after
+/// it, which is also sampled AT that edge, would read the register's pre-edge value
+/// and land a full cycle late. Without forwarding,
+///
+/// ```text
+/// n = n + step.read();   acc.write(n);      // and its reverse
+/// acc.write(n);          n = n + step.read();
+/// ```
+///
+/// lower to the SAME SystemVerilog (`acc <= n; n <= n + step;`) — two programs with
+/// different meanings, one silently wrong by a cycle. `TODO` records this as cause
+/// L, with the measured sim ≢ SV trace.
+///
+/// # Why BOTH forms are produced, and neither is chosen here
+///
+/// Whether a drive is sampled at the edge is not a property of the port type. A
+/// `RegOut` always is; a plain `Out` is too when it is written CONDITIONALLY, since
+/// `vlir_lower` turns that into an implicit-hold register. And an output that looks
+/// conditional can be un-registered again by `hoist_moore_output_defaults`. So the
+/// answer is not a function of this IR, and predicting it here would be a second
+/// implementation to keep in step with the real one — the failure mode that produced
+/// this bug in the first place.
+///
+/// So every `PortDrive` carries both: `value` (read after the edge, unforwarded) and
+/// `edge_value` (sampled before it, forwarded). `vlir_lower::split_output_reg` picks,
+/// at the one point where a drive actually becomes a non-blocking assignment.
+///
+/// * a drive emitted as a continuous `assign o = <expr>` is read AFTER the edge, when
+///   the flop already holds the assigned value → `value`, unforwarded; forwarding it
+///   would apply the update twice (measured on `lfsr`);
+/// * a drive emitted as `o <= <expr>` inside `always_ff` is evaluated with pre-edge
+///   register values → `edge_value`; without it the drive lands a full cycle late
+///   (measured on the cause-L repro, and on a conditional plain `Out` for L-1).
+///
+/// # Why advancing it is delegated
+///
+/// [`Forwarding::advance`] calls `extract_updates_from_stmts` — the same walk that
+/// computes the registers' own next-state expressions — rather than reimplementing
+/// the rule. A second implementation would have to agree with that one about
+/// `if`/`match` branch merging forever, and two halves of a lowering drifting apart
+/// is this pipeline's most persistent bug class (`find_tick_in_expr` had just done
+/// exactly that). The returned updates are discarded; only the map is wanted.
+///
+#[derive(Clone)]
+struct Forwarding {
+    /// `None` on the **combinational** path, where a reassignment lowers to a real
+    /// blocking assign and SystemVerilog already sequences it — substituting there
+    /// would duplicate work the language does.
+    map: Option<HashMap<String, SHIRExpr>>,
+    reg_names: HashSet<String>,
+    span: SourceSpan,
+}
+
+impl Forwarding {
+    /// The combinational path: no substitution, and assignments are not recorded.
+    fn disabled() -> Self {
+        Forwarding { map: None, reg_names: HashSet::new(), span: SourceSpan::default() }
+    }
+
+    /// A fresh map for one sequential segment. Segments do not share it: a register
+    /// assigned before a tick is *latched* by that tick, so the next segment reads
+    /// the register itself, not the expression that fed it.
+    fn for_segment(reg_names: HashSet<String>, span: SourceSpan) -> Self {
+        Forwarding { map: Some(HashMap::new()), reg_names, span }
+    }
+
+    /// The pre-edge form of an expression: registers this segment has assigned stand
+    /// for the values it assigned them, and its `let` wires are inlined where that
+    /// makes a difference. Returns the expression untouched on the combinational
+    /// path, and wherever the segment has assigned nothing the expression reads.
+    fn at_edge(&self, expr: &SHIRExpr) -> SHIRExpr {
+        match &self.map {
+            None => expr.clone(),
+            Some(map) => subst_vars(expr.clone(), map),
+        }
+    }
+
+    /// Step past one statement, recording what it assigns. A no-op when disabled.
+    fn advance(
+        &mut self,
+        stmt: &CHIRStmt,
+        renames: &HashMap<String, String>,
+    ) -> Result<(), SHIRLowerError> {
+        if let Some(map) = self.map.as_mut() {
+            extract_updates_from_stmts(
+                std::slice::from_ref(stmt),
+                &self.reg_names,
+                self.span,
+                renames,
+                map,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Lower a CHIR statement list into SHIR statements, handling wire promotion renames.
 /// Used in both comb body lowering and pre_edge lowering. `wire_types` names the
 /// combinational wires that a reassignment may target (empty for the sequential
@@ -110,6 +218,7 @@ fn lower_stmt_list(
     promoted_names: &std::collections::HashSet<String>,
     renames: &HashMap<String, String>,
     wire_types: &HashMap<String, copper_core::chir::CHIRType>,
+    fwd: &mut Forwarding,
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
     let mut out = Vec::new();
     for stmt in stmts {
@@ -132,28 +241,36 @@ fn lower_stmt_list(
                 });
             }
             CHIRStmt::PortWrite { port_name, value, .. } => {
+                let value = rename_vars(lower_expr(value)?, renames);
+                let edge_value = fwd.at_edge(&value);
                 out.push(SHIRStmt::PortDrive {
                     port_name: port_name.clone(),
-                    value: rename_vars(lower_expr(value)?, renames),
+                    value,
+                    edge_value,
                 });
             }
             CHIRStmt::If { condition, then_body, else_body, .. } => {
-                let then_stmts = lower_stmt_list(then_body, promoted_names, renames, wire_types)?;
+                // The condition is read BEFORE either branch runs, so it resolves
+                // against the forwarding as it stands here. Each branch then gets
+                // its own copy — an assignment in one arm must not leak into the
+                // other. Merging the two back afterwards is `advance`'s job.
+                let condition = rename_vars(lower_expr(condition)?, renames);
+                let then_stmts =
+                    lower_stmt_list(then_body, promoted_names, renames, wire_types, &mut fwd.clone())?;
                 let else_stmts = else_body.as_ref()
-                    .map(|eb| lower_stmt_list(eb, promoted_names, renames, wire_types))
+                    .map(|eb| lower_stmt_list(eb, promoted_names, renames, wire_types, &mut fwd.clone()))
                     .transpose()?;
                 if !then_stmts.is_empty() || else_stmts.as_ref().map_or(false, |e| !e.is_empty()) {
-                    out.push(SHIRStmt::If {
-                        condition: rename_vars(lower_expr(condition)?, renames),
-                        then_stmts,
-                        else_stmts,
-                    });
+                    out.push(SHIRStmt::If { condition, then_stmts, else_stmts });
                 }
             }
             CHIRStmt::Match { scrutinee, arms, .. } => {
+                let scrutinee = rename_vars(lower_expr(scrutinee)?, renames);
                 let shir_arms = arms.iter()
                     .map(|arm| {
-                        let stmts = lower_stmt_list(&arm.body, promoted_names, renames, wire_types)?;
+                        let stmts = lower_stmt_list(
+                            &arm.body, promoted_names, renames, wire_types, &mut fwd.clone(),
+                        )?;
                         Ok(SHIRMatchArm {
                             patterns: arm.patterns.iter()
                                 .map(|p| lower_pattern(p))
@@ -166,14 +283,12 @@ fn lower_stmt_list(
                     })
                     .collect::<Result<Vec<_>, SHIRLowerError>>()?;
                 if shir_arms.iter().any(|a| !a.stmts.is_empty()) {
-                    out.push(SHIRStmt::Match {
-                        scrutinee: rename_vars(lower_expr(scrutinee)?, renames),
-                        arms: shir_arms,
-                    });
+                    out.push(SHIRStmt::Match { scrutinee, arms: shir_arms });
                 }
             }
             CHIRStmt::ForLoop { var, start, end, body, .. } => {
-                let body_stmts = lower_stmt_list(body, promoted_names, renames, wire_types)?;
+                let body_stmts =
+                    lower_stmt_list(body, promoted_names, renames, wire_types, &mut fwd.clone())?;
                 if !body_stmts.is_empty() {
                     out.push(SHIRStmt::ForLoop {
                         var: var.clone(),
@@ -208,9 +323,12 @@ fn lower_stmt_list(
                     value: rename_vars(lower_expr(value)?, renames),
                 });
             }
-            // Assign, AwaitTick — not pre_edge statements
+            // Assign (to a register), AwaitTick — not pre_edge statements. A
+            // register assign still has to be STEPPED OVER below, so later reads in
+            // this segment see the value it produced.
             _ => {}
         }
+        fwd.advance(stmt, renames)?;
     }
     Ok(out)
 }
@@ -310,7 +428,13 @@ fn lower_seq_body(
         // post_edge = reg_assigns from seg_0 (captured at clock edge) +
         //             reg_assigns from seg_1 / trailing (same edge, next iteration wraps here).
         // Both segments share a forwarding map so seg_1 sees seg_0's register assignments.
-        let mut pre_edge = lower_pre_edge_stmts(&segments[0], &promoted_names, &no_renames)?;
+        let mut pre_edge = lower_pre_edge_stmts(
+            &segments[0],
+            &promoted_names,
+            &no_renames,
+            &seq.registers,
+            module_span,
+        )?;
         // The trailing (post-tick) segment's *combinational* logic — wires and
         // output-port drives, including inside `if`/`match` — belongs to this
         // phase's pre-edge: it computes the registered outputs from the state the
@@ -319,7 +443,13 @@ fn lower_seq_body(
         // the register reassignments (which `extract_reg_updates` below turns into
         // this edge's post_edge updates). Previously only `Wire`s were hoisted, so
         // a post-tick `out.write(...)` was silently dropped.
-        pre_edge.extend(lower_pre_edge_stmts(&segments[1], &promoted_names, &no_renames)?);
+        pre_edge.extend(lower_pre_edge_stmts(
+            &segments[1],
+            &promoted_names,
+            &no_renames,
+            &seq.registers,
+            module_span,
+        )?);
         let mut all_post_edge = extract_reg_updates(
             &segments[0],
             &seq.registers,
@@ -363,7 +493,13 @@ fn lower_seq_body(
                 .map(|(wire_name, _, _)| (wire_name.clone(), format!("{}_r", wire_name)))
                 .collect();
 
-            let pre_edge = lower_pre_edge_stmts(&segments[seg_idx], &promoted_names, &phase_renames)?;
+            let pre_edge = lower_pre_edge_stmts(
+            &segments[seg_idx],
+            &promoted_names,
+            &phase_renames,
+            &seq.registers,
+            module_span,
+        )?;
 
             let mut post_edge = extract_reg_updates(
                 &segments[seg_idx],
@@ -382,7 +518,13 @@ fn lower_seq_body(
                 // an undriven port. Fail loudly instead; deciding which phase they
                 // belong to is a semantics question, not a lowering detail.
                 let trailing_comb =
-                    lower_pre_edge_stmts(&segments[n_ticks], &promoted_names, &phase_renames)?;
+                    lower_pre_edge_stmts(
+            &segments[n_ticks],
+            &promoted_names,
+            &phase_renames,
+            &seq.registers,
+            module_span,
+        )?;
                 if !trailing_comb.is_empty() {
                     return Err(SHIRLowerError::UnsupportedConstruct {
                         description: "combinational statements after the last `clk.tick().await`                                       of a multi-tick loop are not supported (an output written                                       there would be silently dropped); move them before the last                                       tick"
@@ -552,15 +694,33 @@ fn check_no_tick_in_branch(stmt: &CHIRStmt, span: SourceSpan) -> Result<(), SHIR
 /// Lower the wire/port-drive/conditional statements from a segment into `SHIRStmt`s for `pre_edge`.
 /// Register assigns and AwaitTick are skipped (they go to post_edge).
 /// PortWrite → PortDrive (output port drives are allowed here, including inside branches).
+///
+/// A register assign emits nothing here but is not *ignored*: it advances the
+/// segment's [`Forwarding`], so a later read in the same segment gets the value the
+/// assignment produced rather than the register's pre-edge value. Skipping that
+/// step made `n = n + step; acc.write(n);` and `acc.write(n); n = n + step;` emit
+/// identical SystemVerilog — `TODO` cause L.
 fn lower_pre_edge_stmts(
     stmts: &[CHIRStmt],
     promoted_names: &HashSet<String>,
     renames: &HashMap<String, String>,
+    registers: &[CHIRRegDecl],
+    span: SourceSpan,
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
     // The sequential pre-edge path has no combinational reassignments (an `Assign`
     // there is a register update handled by the segment logic), so the wire-type
     // map is empty and such assigns are left for that path.
-    lower_stmt_list(stmts, promoted_names, renames, &HashMap::new())
+    let mut fwd = Forwarding::for_segment(reg_name_set(registers, promoted_names), span);
+    lower_stmt_list(stmts, promoted_names, renames, &HashMap::new(), &mut fwd)
+}
+
+/// The names the segment walks treat as registers: declared registers plus the
+/// `<name>_r` a promoted cross-phase wire becomes.
+fn reg_name_set(registers: &[CHIRRegDecl], promoted_names: &HashSet<String>) -> HashSet<String> {
+    registers.iter()
+        .map(|r| r.name.clone())
+        .chain(promoted_names.iter().map(|n| format!("{}_r", n)))
+        .collect()
 }
 
 // ── Helpers: register update extraction ──────────────────────────────────────
@@ -576,10 +736,7 @@ fn extract_reg_updates(
     span: SourceSpan,
     renames: &HashMap<String, String>,
 ) -> Result<Vec<SHIRRegUpdate>, SHIRLowerError> {
-    let reg_names: HashSet<String> = registers.iter()
-        .map(|r| r.name.clone())
-        .chain(promoted_names.iter().map(|n| format!("{}_r", n)))
-        .collect();
+    let reg_names = reg_name_set(registers, promoted_names);
     let mut forwarding: HashMap<String, SHIRExpr> = HashMap::new();
     extract_updates_from_stmts(stmts, &reg_names, span, renames, &mut forwarding)
 }
@@ -624,6 +781,26 @@ fn extract_updates_from_stmts(
                 // Update forwarding so later assigns in this segment see the new value.
                 forwarding.insert(target.clone(), resolved.clone());
                 updates.push(SHIRRegUpdate { target: target.clone(), next_value: resolved });
+            }
+
+            // A `let` wire declared in this segment. It is not a register update, so
+            // nothing is pushed — it emits its own continuous assign elsewhere. But it
+            // has to be RECORDED when its value reads a register this segment has
+            // already assigned: the wire's `assign` reads the flop, which is still the
+            // old value at the edge, so anything sampled at the edge through that wire
+            // lags a cycle. Substituting the wire's definition closes it — `TODO`
+            // cause L-2, measured as `acc <= t` dropping a whole `+ step`.
+            //
+            // Recorded ONLY when it changes something. A wire that reads no reassigned
+            // register keeps its name, so existing Verilog is emitted unchanged and the
+            // wire does not go unused — which `-Wall` would flag, failing the
+            // equivalence harness rather than merely looking untidy.
+            CHIRStmt::Wire { name, value, .. } => {
+                let plain = rename_vars(lower_expr(value)?, renames);
+                let resolved = subst_vars(plain.clone(), forwarding);
+                if resolved != plain {
+                    forwarding.insert(name.clone(), resolved);
+                }
             }
 
             CHIRStmt::If { condition, then_body, else_body, span: s } => {
@@ -1133,7 +1310,7 @@ mod tests {
         if let SHIRBody::Combinational(body) = &shir.body {
             // Final expression `a + b` becomes PortDrive to "out"
             assert_eq!(body.stmts.len(), 1);
-            if let SHIRStmt::PortDrive { port_name, value } = &body.stmts[0] {
+            if let SHIRStmt::PortDrive { port_name, value, .. } = &body.stmts[0] {
                 assert_eq!(port_name, "out");
                 assert!(matches!(value, SHIRExpr::BinOp { .. }));
             } else {

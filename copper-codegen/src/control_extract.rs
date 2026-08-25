@@ -65,7 +65,7 @@ const PC_SUFFIX: &str = "u8";
 /// The two are the same program. `while` tests before each iteration and the
 /// tick is the last statement of the body, which is exactly the supported
 /// ordering — the one where the test reads outside the window that makes a
-/// simulator and a flip-flop disagree (see `tick_is_last_statement`). So this is
+/// simulator and a flip-flop disagree (see `body_ends_at_a_clock_boundary`). So this is
 /// sugar, not a new control-flow construct: after the rewrite the wait lands on
 /// machinery that is already verified end-to-end.
 ///
@@ -853,8 +853,25 @@ fn contains_unflattenable_control(stmts: &[RawStmt]) -> bool {
     })
 }
 
-/// A nested loop body must be exactly one "code between two ticks" segment: its
-/// tick has to be the LAST statement, so the body is `<test> ; tick`.
+/// A nested loop body must be exactly one "code between two ticks" segment: it has
+/// to END at a clock boundary. Two spellings do that:
+///
+/// * `<test> ; clk.tick().await` — the boundary is the body's own last statement;
+/// * `<test> ; loop { … }` — the body's last statement is **another tick-bearing
+///   loop**, which is where this segment's boundary comes from. The enclosing
+///   loop's back edge is then taken when the inner loop *breaks*, not at a tick of
+///   its own. `lower_into` already models exactly that (a `break` inlines the
+///   enclosing loop's continuation in the same cycle), so admitting the shape is a
+///   gate change rather than a new lowering.
+///
+/// The second clause is what `TODO` records as cause K, and it is worth knowing
+/// what it does *not* unblock on its own. Because the tick must come last, every
+/// hand-written nested `loop` can be left before it ticks — so an enclosing loop
+/// whose only boundary is one of them cycles in zero time, which
+/// `copper_analysis::check_reachability` now rejects (it used to accept it, and
+/// the simulator livelocked while this pass' FSM ran a cycle per iteration). The
+/// shapes that survive both are the ones whose inner loop always ticks: a counted
+/// `for`, which is where the UART's `for _ in 0..CLKS_PER_BIT { … }` will land.
 ///
 /// The other ordering — `loop { tick; <test> }` — is **outside the language, by
 /// decision** (2026-08-24), not merely unimplemented. It puts the test in the
@@ -875,12 +892,24 @@ fn contains_unflattenable_control(stmts: &[RawStmt]) -> bool {
 /// clocked module in the same domain is stable across the window, so both models
 /// read the same value — it is a testbench-observable difference, which is
 /// precisely why it cannot be left in: sim ≡ SV under a testbench is the bar.
-fn tick_is_last_statement(body: &[RawStmt]) -> bool {
+fn body_ends_at_a_clock_boundary(body: &[RawStmt]) -> bool {
     match body.iter().position(is_tick_stmt) {
-        // Ticks only inside branches: no single "between two ticks" segment, and
-        // no verified lowering. Declined for the same reason.
-        None => false,
         Some(t) => t + 1 == body.len(),
+        // No tick of its own — the segment may still end by entering another
+        // tick-bearing loop as its last statement. Recursing (rather than merely
+        // asking whether that loop contains a tick) keeps this predicate
+        // self-sufficient: it can only ever be *stricter* than the statement walk
+        // that also visits the inner loop, never looser, so the two halves of the
+        // gate cannot drift into disagreeing about what is admissible.
+        //
+        // Still declined here: ticks that live only inside `if`/`match` arms of the
+        // body (`loop { if c { tick; } else { tick; } }`). There is no single last
+        // statement that is the boundary, and no hardware-anchored check that the
+        // shape lowers correctly.
+        None => body
+            .last()
+            .and_then(as_nested_loop)
+            .is_some_and(|inner| body_ends_at_a_clock_boundary(&inner.body)),
     }
 }
 
@@ -891,7 +920,7 @@ fn unflattenable_in_expr(e: &ExprType, in_loop: bool) -> bool {
         ExprType::Continue(_) => true,
         ExprType::Break(b) => !in_loop || b.label.is_some() || b.expr.is_some(),
         ExprType::Loop(l) => {
-            !tick_is_last_statement(&l.body)
+            !body_ends_at_a_clock_boundary(&l.body)
                 || l.body.iter().any(|s| match &s.kind {
                     RawStmtKind::Expr(es) => unflattenable_in_expr(&es.expr, true),
                     RawStmtKind::Local(loc) => loc.init.as_ref().is_some_and(expr_contains_tick),
@@ -943,6 +972,16 @@ fn find_tick_in_expr(e: &ExprType) -> Option<RawStmt> {
             .or_else(|| f.else_branch.as_deref().and_then(find_tick_in_expr)),
         ExprType::Block(b) => find_tick_stmt(&b.stmts),
         ExprType::Match(m) => m.arms.iter().find_map(|a| find_tick_in_expr(&a.body)),
+        // Nested loops must be searched too. This walk and the gate have to agree
+        // about where a tick can live — when they drift, `extract_control` silently
+        // declines a module the gate admitted and the linear path downstream reports
+        // some unrelated construct. Omitting `Loop` here went unnoticed for as long
+        // as every flattenable module also had a tick at the top level of its own
+        // loop; a body whose ONLY tick is inside a nested loop (cause K) is the first
+        // shape where that stopped being true.
+        ExprType::Loop(l) => find_tick_stmt(&l.body),
+        ExprType::While(w) => find_tick_stmt(&w.body),
+        ExprType::ForLoop(f) => find_tick_stmt(&f.body),
         _ => None,
     }
 }
