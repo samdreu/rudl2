@@ -24,18 +24,24 @@ fn bsg_encode_one_hot(
     v_o: Out<Logic, ()>,
 ) {
     let inp = i.read();
-    let mut addr = 0usize;
+    // `Bits<ADDR_W>`, not a bare `usize`: a `usize` local is a 32-bit signal, so
+    // driving the 3-bit `addr_o` from it is a width truncation Verilator rejects
+    // under `-Wall`. The accumulator is an address; its type should say so.
+    let mut addr = Bits::<ADDR_W>::zero();
     let mut valid = Logic::Zero;
     for k in 0..WIDTH {
         if inp[k] == Logic::One {
-            addr = k;
+            addr = Bits::from_usize(k);
             valid = Logic::One;
         }
     }
-    addr_o.write(Bits::from_usize(addr));
+    addr_o.write(addr);
     v_o.write(valid);
 }
 
+// `#[cfg(not(test))]` so `tests/` can `include!` this file for its own
+// harness without pulling in a second `main` (same structure as sipo_block).
+#[cfg(not(test))]
 fn main() {
     let mut exec = HardwareExecutor::new();
 

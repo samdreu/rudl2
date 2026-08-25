@@ -72,15 +72,31 @@ TRANSPILATION:
   expression, where the mismatch is a silent width conversion, not an error.
   Pinned by transpile_inference_gaps.rs::both_spellings_of_usize_give_the_same_width.
 
-  ☐ BUT THAT DID NOT UNBLOCK EITHER MODULE — measured after the fix, correcting an
-  expectation recorded earlier in this session. Both still fail `-Wall`, now at 32
-  bits instead of 64/32: a wide integer local driving a NARROW port is the actual
-  blocker, and it is independent of which width `usize` resolves to.
-  So neither has an equivalence test yet. Two ways out, undecided: narrow the
-  examples' locals to `Bits<N>` (an example edit; also better hardware style,
-  since `usize` is not a hardware type), or give a bare integer local its width
-  from context rather than from its type (codegen work, cause J's neighbourhood).
-  The count above is "the CLI emits SystemVerilog", not "the SystemVerilog lints".
+  ✔ BOTH MODULES NOW LINT AND HAVE EQUIVALENCE TESTS (2026-08-24, user's call).
+  The `usize` alignment above did NOT unblock them — measured, both still failed
+  `-Wall`, just at 32 bits instead of 64/32, because a wide integer local driving
+  a NARROW port is a separate blocker independent of what `usize` resolves to.
+  Resolved by narrowing the examples rather than by inference: `usize` is not a
+  hardware type, and an accumulator typed at its real width is what the design
+  means. `bsg_encode_one_hot`'s `addr` → `Bits<ADDR_W>`; `bsg_counter_up_down`'s
+  `count` → `Bits<PTR_W>`, which also let the `(count + MOD - down + up) % MOD`
+  dance go — that existed only to keep a `usize` from underflowing, and `Bits<3>`
+  wraps on its own. What is left is BaseJump's own recurrence, `count - down + up`.
+  Both still pass their sim ≡ BaseJump self-check, and both gained
+  sim ≡ transpiled-SV: tests/bsg_encode_one_hot_equivalence.rs and
+  tests/bsg_counter_up_down_equivalence.rs, `include!`ing the example rather than
+  copying it, so the two checks cannot drift (same structure as sipo_block).
+  That chains the anchors — the GENERATED SystemVerilog is now transitively tied
+  to hardware neither Copper nor its transpiler wrote.
+
+  ☐ STILL OPEN, and now the standing question rather than a blocker: should a bare
+  integer local get its width from its TYPE (today: `usize` → 32) or from its USES?
+  Nothing in the corpus needs the answer any more, so this is a language-design
+  call, not a bug. Note the related footgun found while narrowing: `Bits::one()`
+  is ALL ONES, not the value 1 — `Bits::<3>::one()` is 7. `Bits::zero()` reads as
+  the value 0 and IS 0, so the pair invites exactly the wrong guess (use
+  `Bits::from_lit::<1>()` for the value). Worth renaming or documenting.
+  The transpile count above is "the CLI emits SystemVerilog", not "it lints".
 
   ✔ FIXED (2026-08-24, with user sign-off) — I: a branch-local `let` with a
     COMPUTED initializer was reported as a latch. Minimal repro:

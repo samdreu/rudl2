@@ -31,20 +31,32 @@ async fn bsg_counter_up_down(
     down_i: In<Logic, MainClk>,
     count_o: Out<Bits<PTR_W>, MainClk>,
 ) {
-    let mut count: usize = 0; // init_val_p
+    // `Bits<PTR_W>`, not a bare `usize`: a `usize` local is a 32-bit signal, so
+    // driving the 3-bit `count_o` from it is a width truncation Verilator rejects
+    // under `-Wall`. Typing the counter at its real width also removes the
+    // `+ MOD … % MOD` dance — that existed only to keep a `usize` from
+    // underflowing, and `Bits<3>` wraps on its own, which is what the hardware
+    // does. The recurrence below is now BaseJump's own: `count_o - down_i + up_i`.
+    let mut count = Bits::<PTR_W>::zero(); // init_val_p
     loop {
         clk.tick().await;
         if reset_i.read() == Logic::One {
-            count = 0;
+            count = Bits::zero();
         } else {
-            let up = (up_i.read() == Logic::One) as usize;
-            let down = (down_i.read() == Logic::One) as usize;
-            count = (count + MOD - down + up) % MOD; // 3-bit modular, subtract-then-add
+            // NOTE `Bits::one()` is ALL ONES (7 here), not the value 1 — use a
+            // literal for the step.
+            let step: Bits<PTR_W> = Bits::from_lit::<1>();
+            let up: Bits<PTR_W> = if up_i.read() == Logic::One { step } else { Bits::zero() };
+            let down: Bits<PTR_W> = if down_i.read() == Logic::One { step } else { Bits::zero() };
+            count = count - down + up; // 3-bit wrap-around, no saturation
         }
-        count_o.write(Bits::from_usize(count));
+        count_o.write(count);
     }
 }
 
+// `#[cfg(not(test))]` so `tests/` can `include!` this file for its own
+// harness without pulling in a second `main` (same structure as sipo_block).
+#[cfg(not(test))]
 fn main() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
