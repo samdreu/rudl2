@@ -55,6 +55,17 @@ pub fn lower_to_chir(
     Ok(module)
 }
 
+/// Every name that resolves to a SystemVerilog `parameter`/`localparam` rather
+/// than a signal: the module's const generics plus the file-scope constants it
+/// can reference. Both emit as `int`, so both are 32 bits wide.
+fn param_names(fir: &FrontendModuleIR) -> std::collections::HashSet<String> {
+    build_module_params(fir)
+        .into_iter()
+        .map(|p| p.name)
+        .chain(crate::file_consts::candidates(fir).into_iter().map(|lp| lp.name))
+        .collect()
+}
+
 /// Module-level parameters from the FIR's const generics (`<const N: usize>`).
 /// Type/lifetime/domain generics are not module parameters. `default` is the
 /// source-declared default (`<const N: usize = 8>`) when present — the transpiler
@@ -130,6 +141,7 @@ pub fn resolve_type(ty_text: &str, span: SourceSpan) -> Result<CHIRType, CHIRLow
         "Bit"  => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
         "Logic" => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
         _ if compact.starts_with("Bits<") => parse_bits_type(&compact, span),
+        _ if compact.starts_with('[') => parse_array_type(&compact, span),
         _ => Err(CHIRLowerError::UnresolvableType {
             ty_text: ty_text.to_string(),
             span,
@@ -158,6 +170,39 @@ fn parse_bits_type(compact: &str, span: SourceSpan) -> Result<CHIRType, CHIRLowe
             span,
         }),
     }
+}
+
+/// Parse `[Bits<W>; ELS]` — a fixed-length array of a hardware type.
+///
+/// Both the element type and the length may be symbolic: `ELS` is a const
+/// generic (`mux`) or a file-scope const lowered to a `localparam`
+/// (`bsg_mux_one_hot`). Neither dimension needs width arithmetic, which is the
+/// point of the packed-2-D ABI — see `design_docs/ARRAY_PORT_ABI.md`.
+fn parse_array_type(compact: &str, span: SourceSpan) -> Result<CHIRType, CHIRLowerError> {
+    let unresolvable = || CHIRLowerError::UnresolvableType {
+        ty_text: compact.to_string(),
+        span,
+    };
+    let inner = compact
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(unresolvable)?;
+    // Split on the LAST `;` so a nested element type keeps its own punctuation.
+    let (elem_text, len_text) = inner.rsplit_once(';').ok_or_else(unresolvable)?;
+    let elem = resolve_type(elem_text, span)?;
+    let len = if let Ok(n) = len_text.parse::<usize>() {
+        Width::Concrete(n)
+    } else if is_ident(len_text) {
+        Width::Param(len_text.to_string())
+    } else {
+        return Err(unresolvable());
+    };
+    // An array OF arrays would need a third packed dimension and has no instance
+    // in the corpus; refuse it rather than emit a shape that was never verified.
+    if matches!(elem, CHIRType::Array { .. }) {
+        return Err(unresolvable());
+    }
+    Ok(CHIRType::Array { elem: Box::new(elem), len })
 }
 
 // ── Type inference from expressions ──────────────────────────────────────────
@@ -718,6 +763,10 @@ fn width_of_type(ty: &CHIRType) -> usize {
     match ty {
         CHIRType::UInt { width } | CHIRType::SInt { width } => width.concrete(),
         CHIRType::Bool => 1,
+        // The only value obtainable from an array is an element, so every
+        // expression-level width question about one is about the element. The
+        // outer dimension travels on the port declaration instead.
+        CHIRType::Array { elem, .. } => width_of_type(elem),
     }
 }
 
@@ -727,6 +776,8 @@ fn chir_type_width(ty: &CHIRType) -> Width {
     match ty {
         CHIRType::UInt { width } | CHIRType::SInt { width } => width.clone(),
         CHIRType::Bool => Width::Concrete(1),
+        // Element width — see `width_of_type`.
+        CHIRType::Array { elem, .. } => chir_type_width(elem),
     }
 }
 
@@ -1146,6 +1197,7 @@ fn lower_comb_body(
 ) -> Result<CHIRCombBody, CHIRLowerError> {
     let has_return = fir.signature.return_ty.is_some();
     let mut ctx = LowerCtx::new(hardware_fns, registry);
+    ctx.params = param_names(fir);
     ctx.output_ports = fir.signature.params.iter()
         .filter_map(|p| {
             let compact = compact_type(&p.ty.ty_text);
@@ -1304,6 +1356,7 @@ fn lower_seq_body(
     })?;
 
     let mut ctx = LowerCtx::new(hardware_fns, registry);
+    ctx.params = param_names(fir);
     ctx.clock_name = clock.clone();
     ctx.output_ports = fir.signature.params.iter()
         .filter_map(|p| {
@@ -1707,6 +1760,12 @@ pub(crate) struct LowerCtx<'a> {
     write_inferred: SymbolTable,
     /// `Memory<..>` instances declared before the loop, by binding name.
     memories: std::collections::HashMap<String, MemInfo>,
+    /// Module parameters and file-scope constants in scope. These are NOT
+    /// signals — they emit as SystemVerilog `parameter int` / `localparam int`,
+    /// i.e. 32 bits — so a bare literal compared against one must be sized to 32
+    /// rather than left at the 64-bit default (`ELS_P == 64'd1` is a Verilator
+    /// WIDTHEXPAND error under `-Wall`).
+    params: std::collections::HashSet<String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1729,6 +1788,7 @@ impl<'a> LowerCtx<'a> {
             structs: std::collections::HashMap::new(),
             write_inferred: SymbolTable::new(),
             memories: std::collections::HashMap::new(),
+            params: std::collections::HashSet::new(),
         }
     }
 
@@ -2776,6 +2836,8 @@ fn type_width(ty: &CHIRType) -> Width {
     match ty {
         CHIRType::UInt { width } | CHIRType::SInt { width } => width.clone(),
         CHIRType::Bool => Width::Concrete(1),
+        // Element width — see `width_of_type`.
+        CHIRType::Array { elem, .. } => type_width(elem),
     }
 }
 
@@ -2848,7 +2910,12 @@ fn retype_default_literals_in_values(e: CHIRExpr, width: Width) -> CHIRExpr {
 /// bindings have been substituted by then (`t` → `timer`).
 fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
     match e {
-        CHIRExpr::Var(name) => ctx.symbols.get(name).map(width_of_type),
+        CHIRExpr::Var(name) => ctx
+            .symbols
+            .get(name)
+            .map(width_of_type)
+            // Not a signal: a `parameter int` / `localparam int` is 32 bits.
+            .or_else(|| ctx.params.contains(name).then_some(32)),
         CHIRExpr::Lit(l) => Some(width_of_type(&l.ty)),
         CHIRExpr::BinOp { left, right, .. } => {
             width_of_chir_expr(left, ctx).or_else(|| width_of_chir_expr(right, ctx))

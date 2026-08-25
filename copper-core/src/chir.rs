@@ -82,6 +82,16 @@ pub enum CHIRType {
     UInt { width: Width },
     SInt { width: Width },
     Bool,
+    /// `[Bits<W>; ELS]` — a fixed-length array of a hardware type, emitted as a
+    /// **packed 2-D** SystemVerilog vector: `[ELS-1:0][W-1:0]`.
+    ///
+    /// Packed rather than unpacked, and 2-D rather than a flat `[ELS*W-1:0]`:
+    /// see `design_docs/ARRAY_PORT_ABI.md`. In short — both independent BaseJump
+    /// references declare it this way, Verilator gives packed 2-D and flat 1-D
+    /// the identical C++ interface (so the testbench harness is unaffected), and
+    /// keeping the dimensions separate means neither needs width *arithmetic*:
+    /// `len` and the element width are each independently `Concrete` or `Param`.
+    Array { elem: Box<CHIRType>, len: Width },
 }
 
 /// The bit width of a hardware value.

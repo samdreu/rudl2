@@ -25,15 +25,22 @@ fn bsg_mux_one_hot(
 ) {
     let d = data_i.read();
     let sel = sel_one_hot_i.read();
-    let mut acc: usize = 0;
+    // `Bits<WIDTH>` accumulator, not a bare `usize`: a `usize` local is a 32-bit
+    // signal, so driving the 4-bit `data_o` from it is a width truncation
+    // Verilator rejects under `-Wall`. This is also the reference's own shape —
+    // mask each input by its select bit and OR the results together.
+    let mut acc = Bits::<WIDTH>::zero();
     for i in 0..ELS {
         if sel[i] == Logic::One {
-            acc |= d[i].as_usize();
+            acc = acc | d[i];
         }
     }
-    data_o.write(Bits::from_usize(acc));
+    data_o.write(acc);
 }
 
+// `#[cfg(not(test))]` so `tests/` can `include!` this file for its own
+// harness without pulling in a second `main` (same structure as sipo_block).
+#[cfg(not(test))]
 fn main() {
     let mut exec = HardwareExecutor::new();
 

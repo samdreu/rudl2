@@ -132,7 +132,13 @@ impl Emitter<'_> {
                 VLIRPortDir::Input => "input ",
                 VLIRPortDir::Output => "output",
             };
-            let range = range_str(&p.width);
+            // An array port declares BOTH packed dimensions, outer first:
+            // `[ELS-1:0][W-1:0]`. `range_str` returns a trailing space, so the
+            // outer range is emitted without one to keep them adjacent.
+            let range = match &p.outer_dim {
+                Some(outer) => format!("{}{}", range_str(outer).trim_end(), range_str(&p.width)),
+                None => range_str(&p.width),
+            };
             let comma = if i == last { "" } else { "," };
             out.push_str(&format!(
                 "{}{} logic {}{}{}\n",
@@ -184,8 +190,14 @@ impl Emitter<'_> {
         for st in phase_stmts {
             collect_wire_decls(std::slice::from_ref(st), &mut decls, &mut seen);
         }
-        for (name, width) in &decls {
-            self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range_str(width), name));
+        for (name, width, outer_dim) in &decls {
+            // An array wire declares both packed dimensions, outer first — the
+            // same shape as an array port.
+            let range = match outer_dim {
+                Some(o) => format!("{}{}", range_str(o).trim_end(), range_str(width)),
+                None => range_str(width),
+            };
+            self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range, name));
         }
         if !decls.is_empty() {
             self.out.push('\n');
@@ -203,7 +215,7 @@ impl Emitter<'_> {
             // default at the top drives every path — no latch, same behavior.
             let multi_phase = s.comb_phases.iter().any(|p| p.phase_guard.is_some());
             if multi_phase {
-                for (name, _) in &decls {
+                for (name, _, _) in &decls {
                     self.out.push_str(&format!("{}{} = '0;\n", self.indent(2), name));
                 }
             }
@@ -249,8 +261,14 @@ impl Emitter<'_> {
         let mut decls = Vec::new();
         let mut seen = HashSet::new();
         collect_wire_decls(stmts, &mut decls, &mut seen);
-        for (name, width) in &decls {
-            self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range_str(width), name));
+        for (name, width, outer_dim) in &decls {
+            // An array wire declares both packed dimensions, outer first — the
+            // same shape as an array port.
+            let range = match outer_dim {
+                Some(o) => format!("{}{}", range_str(o).trim_end(), range_str(width)),
+                None => range_str(width),
+            };
+            self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range, name));
         }
         if !decls.is_empty() {
             self.out.push('\n');
@@ -567,14 +585,14 @@ impl Emitter<'_> {
 /// combinational statement tree, deduplicated by `seen`.
 fn collect_wire_decls(
     stmts: &[VLIRStmt],
-    out: &mut Vec<(String, Width)>,
+    out: &mut Vec<(String, Width, Option<Width>)>,
     seen: &mut HashSet<String>,
 ) {
     for s in stmts {
         match s {
-            VLIRStmt::WireAssign { name, width, .. } => {
+            VLIRStmt::WireAssign { name, width, outer_dim, .. } => {
                 if seen.insert(name.clone()) {
-                    out.push((name.clone(), width.clone()));
+                    out.push((name.clone(), width.clone(), outer_dim.clone()));
                 }
             }
             VLIRStmt::PortAssign { .. } => {}
@@ -773,6 +791,7 @@ mod tests {
             localparams: vec![],
             ports: vec![VLIRPort {
                 name: "out".to_string(),
+                outer_dim: None,
                 direction: VLIRPortDir::Output,
                 kind: VLIRPortKind::Logic,
                 width: Width::Concrete(8),
@@ -787,6 +806,7 @@ mod tests {
                     body: vec![VLIRStmt::WireAssign {
                         name: "acc".to_string(),
                         width: Width::Concrete(8),
+                        outer_dim: None,
                         value: VLIRExpr::Var("i".to_string()),
                     }],
                 }],

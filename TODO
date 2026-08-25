@@ -14,17 +14,16 @@ TRANSPILATION:
 
   ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-24 (after D-a) ─────────────────
   Every #[hardware] module in examples/ probed through the copper-transpile CLI.
-  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → **I 24/34**. The 10 still failing,
-  by ROOT CAUSE (several share one cause — fix the cause, not the module):
+  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → **D-b 26/34**. The 8 still
+  failing, by ROOT CAUSE (several share one cause — fix the cause, not the module):
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
     C ☐ `while` loops unsupported ................ uart/rx
     D-a ✔ FIXED — file-scope `const` items now lower to `localparam`s.
         Unblocked bsg_encode_one_hot AND bsg_adder_one_hot. See the write-up below.
-    D-b ☐ array-typed ports (`In<[Bits<W>; ELS]>`) ... bsg_mux_one_hot, mux
-        NOT a const-generic problem — see D-a's write-up, which corrects the
-        earlier framing. Needs a port-ABI decision (packed `[ELS*W-1:0]`, unpacked
-        `[ELS-1:0][W-1:0]`, or ELS separate ports) before any code.
+    D-b ✔ FIXED — array-typed ports lower as PACKED 2-D. Unblocked mux and
+        bsg_mux_one_hot. Scoped first in design_docs/ARRAY_PORT_ABI.md (three
+        options, measured); see the write-up below.
     E ✔ FIXED — `Memory` now transpiles ......... dual_port_ram. Both CPUs stay
         blocked, but on their OWN causes (re-measured): rv32i_cpu on G,
         rv32i_cpu_pipelined on F — not on memory.
@@ -98,6 +97,49 @@ TRANSPILATION:
   exactly the wrong guess; `Bits::from_lit::<1>()` is the value. Hard rename, no
   deprecated alias — leaving `one()` reachable would leave the trap reachable.)
   The transpile count above is "the CLI emits SystemVerilog", not "it lints".
+
+  ✔ FIXED (2026-08-24, with user sign-off) — D-b: array-typed ports
+    (`In<[Bits<W>; ELS], D>`) had no lowering. Chosen ABI: a **packed 2-D**
+    SystemVerilog vector, `[ELS-1:0][W-1:0]`. Full option analysis with the
+    measurements in design_docs/ARRAY_PORT_ABI.md; the three reasons, in order:
+      1. Both independent BaseJump references declare exactly that, so a Copper
+         module stays drop-in interchangeable with the hardware it is checked
+         against.
+      2. It needs NO width arithmetic. `Width` is `Concrete | Param` with no
+         operators, and BOTH blocked modules are symbolic in both dimensions
+         (`mux` is generic; `bsg_mux_one_hot`'s consts are localparams), so the
+         flat `[ELS*W-1:0]` alternative could not have avoided adding a product
+         variant — ~11 match sites plus the exhaustiveness errors behind them.
+      3. Indexing stays a direct element select, so the body reads like the
+         reference instead of an indexed part-select.
+    MEASURED FIRST, and it is what collapsed the decision: Verilator gives packed
+    2-D and flat 1-D the IDENTICAL C++ interface (`VL_IN(&x,31,0)` for both), so
+    the two are bit-identical and harness-identical — the testbench generator
+    needed no change, and the "element 0 at the LSBs" flattening the mux example
+    already used stays correct. The same measurement rules OUT an unpacked array,
+    which appears in C++ as a member array that `top->d = value` cannot assign.
+    ARRAY LOCALS NEEDED THE SAME SHAPE, and this is the bug worth remembering:
+    `let d = data_i.read();` was declared at the ELEMENT width, so the array
+    silently truncated into one element and every `d[i]` became a bit-select. The
+    emitted module compiled and was wrong. Found on bsg_mux_one_hot; the outer
+    dimension is now carried on wire declarations too, pinned by
+    array_ports.rs::a_local_holding_an_array_keeps_both_dimensions.
+    ALSO FIXED IN PASSING: a bare literal compared against a module parameter was
+    sized at the 64-bit default (`ELS_P == 64'd1`), a WIDTHEXPAND error under
+    `-Wall`. `balance_binop_literals` existed for exactly this but could not see a
+    parameter's width, since a parameter is not a signal. Parameters and
+    localparams emit as `int`, so they are 32 bits — consistent with the `usize`
+    resolution and the SV `int` loop variable.
+    Both examples' accumulators were also narrowed to `Bits<N>` (same reason as
+    bsg_encode_one_hot/bsg_counter_up_down), which for the one-hot module also
+    replaced `acc |= …` with the reference's own mask-and-OR shape.
+    Tests: copper-codegen/tests/array_ports.rs (5 — the concrete declaration, the
+    symbolic one with an assertion that NO width product appears, direct-index
+    emission, the array-local declaration, and nested arrays refused) plus
+    tests/mux_equivalence.rs (dynamic index, symbolic dimensions) and
+    tests/bsg_mux_one_hot_equivalence.rs (constant index, array local). The pinned
+    unsupported_constructs.rs::array_typed_port_is_unsupported was removed, as its
+    own message demanded: promoted to positive coverage, not relaxed.
 
   ✔ FIXED (2026-08-24, with user sign-off) — I: a branch-local `let` with a
     COMPUTED initializer was reported as a latch. Minimal repro:

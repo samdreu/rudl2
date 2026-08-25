@@ -293,7 +293,7 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **768 tests pass, 0 fail, 4 ignored** across 94 test binaries
+- **774 tests pass, 0 fail, 4 ignored** across 97 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
 - all three wiring guards (G-A / G-B / G-C) clean
 
@@ -301,12 +301,11 @@ Current state, as of the last full regression run:
 
 ## Limitations
 
-Measured, not guessed — **24 of 34** `#[hardware]` modules in `examples/`
-currently transpile. The 10 that do not, grouped by root cause:
+Measured, not guessed — **26 of 34** `#[hardware]` modules in `examples/`
+currently transpile. The 8 that do not, grouped by root cause:
 
 | Cause | Blocks |
 |---|---|
-| array-typed ports (`In<[Bits<W>; ELS]>`) | `mux`, `bsg_mux_one_hot` |
 | `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
 | bit-width inference on a bare integer local | `bsg_gray_to_binary`, `ripple_carry_adder` |
 | no structural parent in simulation | `uart/system` (`uart_tx`, `uart_rx`) |

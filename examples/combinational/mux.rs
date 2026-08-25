@@ -36,6 +36,9 @@ fn mux<
     }
 }
 
+// `#[cfg(not(test))]` so `tests/` can `include!` this file for its own
+// harness without pulling in a second `main` (same structure as sipo_block).
+#[cfg(not(test))]
 fn main() {
     const WIDTH: usize = 8;
     const ELS: usize = 4;

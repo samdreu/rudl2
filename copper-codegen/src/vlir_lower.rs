@@ -113,6 +113,10 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
         .iter()
         .map(|p| VLIRPort {
             name: leg.get(&p.name),
+            outer_dim: match &p.kind {
+                SHIRPortKind::Clock => None,
+                SHIRPortKind::Data { ty } => outer_dim_of(ty),
+            },
             direction: match p.direction {
                 SHIRPortDir::Input => VLIRPortDir::Input,
                 SHIRPortDir::Output => VLIRPortDir::Output,
@@ -422,6 +426,7 @@ fn lower_flat_stmts(
             SHIRStmt::Wire { name, ty, value } => comb.push(VLIRStmt::WireAssign {
                 name: leg.get(name),
                 width: width_of(ty),
+                outer_dim: outer_dim_of(ty),
                 value: lower_expr(value, leg, mb)?,
             }),
             // An UNCONDITIONAL write to an output that must HOLD — a `RegOut`,
@@ -507,18 +512,21 @@ fn lower_mem_access(
         out.push(VLIRStmt::WireAssign {
             name: leg.get(&mem_net(mem, is_read, port, "en")),
             width: one.clone(),
+            outer_dim: None, // a memory control net is never an array
             value: VLIRExpr::Lit { width: one, value: 1 },
         });
     }
     out.push(VLIRStmt::WireAssign {
         name: addr_net,
         width: mems.addr(mem),
+        outer_dim: None,
         value: lower_expr(addr, leg, mb)?,
     });
     if let Some(v) = value {
         out.push(VLIRStmt::WireAssign {
             name: leg.get(&mem_net(mem, is_read, port, "data")),
             width: mems.data(mem),
+            outer_dim: None,
             value: lower_expr(v, leg, mb)?,
         });
     }
@@ -537,6 +545,7 @@ fn lower_comb_stmt(
         SHIRStmt::Wire { name, ty, value } => Ok(VLIRStmt::WireAssign {
             name: leg.get(name),
             width: width_of(ty),
+            outer_dim: outer_dim_of(ty),
             value: lower_expr(value, leg, mb)?,
         }),
         // A port driven inside a conditional becomes a blocking assign in
@@ -599,9 +608,10 @@ fn lower_comb_stmt(
 
 fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
     match s {
-        VLIRStmt::WireAssign { name, width, value } => VLIRStmt::WireAssign {
+        VLIRStmt::WireAssign { name, width, outer_dim, value } => VLIRStmt::WireAssign {
             name: name.clone(),
             width: width.clone(),
+            outer_dim: outer_dim.clone(),
             value: value.clone(),
         },
         VLIRStmt::PortAssign { port_name, value } => VLIRStmt::PortAssign {
@@ -1519,11 +1529,14 @@ fn strip_nested_defaults(
         // computed one leaves a zero default behind and stays where it is.
         let hoistable = if is_nested {
             match &s {
-                VLIRStmt::WireAssign { name, value, width }
+                VLIRStmt::WireAssign { name, value, width, outer_dim }
                     if !top_assigned.contains(name) && !protected.contains(name) =>
                 {
-                    let default_width =
-                        if matches!(value, VLIRExpr::Lit { .. }) { None } else { Some(width.clone()) };
+                    let default_width = if matches!(value, VLIRExpr::Lit { .. }) {
+                        None
+                    } else {
+                        Some((width.clone(), outer_dim.clone()))
+                    };
                     Some((name.clone(), default_width))
                 }
                 _ => None,
@@ -1540,11 +1553,12 @@ fn strip_nested_defaults(
                 continue; // stripped from the branch either way
             }
             // Computed: default at the top, computation stays in the branch.
-            Some((name, Some(width))) => {
+            Some((name, Some((width, outer_dim)))) => {
                 if seen.insert(name.clone()) {
                     hoisted.push(VLIRStmt::WireAssign {
                         name,
                         width: width.clone(),
+                        outer_dim, // `'0` fills either shape
                         value: VLIRExpr::Lit { width, value: 0 },
                     });
                 }
@@ -1966,6 +1980,7 @@ fn mem_net_defaults(
                 out.push(VLIRStmt::WireAssign {
                     name: leg.get(&mem_net(&m.name, is_read, port, suffix)),
                     width: width.clone(),
+                    outer_dim: None, // a memory control net is never an array
                     value: VLIRExpr::Lit { width, value: 0 },
                 });
             }
@@ -2008,6 +2023,7 @@ fn unstaged_read_defaults(
                 out.push(VLIRStmt::WireAssign {
                     name: leg.get(&mem_net(&m.name, true, port, suffix)),
                     width: width.clone(),
+                    outer_dim: None,
                     value: VLIRExpr::Lit { width, value: 0 },
                 });
             }
@@ -2273,10 +2289,23 @@ fn mem_write_commits(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer
 
 // ── Width helper ────────────────────────────────────────────────────────────
 
+/// The outer packed dimension of an array type — `Some(ELS)` for
+/// `[Bits<W>; ELS]`, `None` for anything else. Paired with `width_of`, which
+/// reports the element width, this gives the two dimensions of the emitted
+/// `[ELS-1:0][W-1:0]` declaration without either needing width arithmetic.
+fn outer_dim_of(ty: &CHIRType) -> Option<Width> {
+    match ty {
+        CHIRType::Array { len, .. } => Some(len.clone()),
+        _ => None,
+    }
+}
+
 fn width_of(ty: &CHIRType) -> Width {
     match ty {
         CHIRType::UInt { width } | CHIRType::SInt { width } => width.clone(),
         CHIRType::Bool => Width::Concrete(1),
+        // Element width — see `width_of_type`.
+        CHIRType::Array { elem, .. } => width_of(elem),
     }
 }
 

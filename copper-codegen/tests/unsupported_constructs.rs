@@ -18,16 +18,6 @@ fn transpile(src: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Array-typed ports (`In<[Bits<W>; ELS]>`) — the `mux` family. The example only
-/// ever checks against a hand-written `mux.sv`; the transpiler cannot lower the
-/// array port type, so there is no sim≡transpiled coverage for it yet.
-const ARRAY_PORT_DUT: &str = r#"
-#[hardware(combinational)]
-fn mux4(data_i: In<[Bits<8>; 4], ()>, sel_i: In<Bits<2>, ()>, data_o: Out<Bits<8>, ()>) {
-    data_o.write(data_i.read()[sel_i.read().as_u128() as usize]);
-}
-"#;
-
 /// The division operator `/`. NOTE the asymmetry discovered while probing: `/` is
 /// rejected, but `%` (remainder) transpiles fine to `(a % b)`. So this pins `/`
 /// only — `%` is a supported construct (a Verilator equivalence for it would need
@@ -49,17 +39,6 @@ fn asr8(a: In<Bits<8>, ()>, o: Out<Bits<8>, ()>) {
 }
 "#;
 
-#[test]
-fn array_typed_port_is_unsupported() {
-    let err = transpile(ARRAY_PORT_DUT).expect_err(
-        "NOW SUPPORTED: array-typed ports transpile. Give the mux family a real \
-         sim≡transpiled equivalence test (it only had a hand-written mux.sv).",
-    );
-    assert!(
-        err.contains("cannot resolve type") && err.contains("hardware type"),
-        "reproduced a *different* transpile error than the tracked array-port gap: {err}"
-    );
-}
 
 #[test]
 fn division_operator_is_unsupported() {

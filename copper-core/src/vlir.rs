@@ -52,6 +52,12 @@ pub struct VLIRParam {
 #[derive(Debug)]
 pub struct VLIRPort {
     pub name: String,
+    /// The **outer** packed dimension of an array port (`[ELS-1:0]` in
+    /// `[ELS-1:0][W-1:0]`); `None` for an ordinary scalar or vector port.
+    /// `width` carries the inner (element) dimension either way, so every
+    /// existing consumer of `width` keeps its meaning.
+    /// See `design_docs/ARRAY_PORT_ABI.md`.
+    pub outer_dim: Option<Width>,
     pub direction: VLIRPortDir,
     pub kind: VLIRPortKind,
     /// Resolved bit width. `Width` (not raw `usize`) so a future parametric
@@ -210,6 +216,12 @@ pub enum VLIRStmt {
     WireAssign {
         name: String,
         width: Width,
+        /// Outer packed dimension when this wire holds an ARRAY (`[Bits<W>; ELS]`,
+        /// e.g. `let d = array_port.read();`). Declared `[ELS-1:0][W-1:0]`, the
+        /// same shape as an array port — without it the wire would be declared at
+        /// the element width and silently truncate the array assigned into it.
+        /// `None` for every ordinary wire.
+        outer_dim: Option<Width>,
         value: VLIRExpr,
     },
     /// Drive an output port from within combinational logic (`out = <expr>;`).
