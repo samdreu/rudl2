@@ -1287,7 +1287,17 @@ fn hoist_moore_output_defaults(stmts: &mut Vec<VLIRStmt>) {
                 Some(c) => c.intersection(&driven).cloned().collect(),
             });
         }
-        let common = common.unwrap_or_default();
+        // An explicit `default` arm is a REACHABLE path, and one that drives
+        // nothing means the output HOLDS — the enabled-register idiom, which this
+        // pass exists not to disturb. Only the arms were being intersected, so
+        // `match s { One => o.write(..), _ => {} }` looked fully driven and got an
+        // unconditional default hoisted over it, turning a hold into a write every
+        // cycle. `default: None` is the case this pass is FOR: no source
+        // fall-through at all, only encodings the state register cannot reach.
+        let mut common = common.unwrap_or_default();
+        if let Some(d) = default {
+            common = common.intersection(&ports_driven_all_paths(d)).cloned().collect();
+        }
         let mut ports: Vec<&String> = common.intersection(&conditional).collect();
         ports.sort(); // deterministic emission order
         let mut hoisted_here = false;
