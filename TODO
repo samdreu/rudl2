@@ -32,7 +32,7 @@ TRANSPILATION:
   and pinned; read the uart/rx entry. L / L-1 / L-2 / N and the hoisted-default bug were
   wrong-CODE bugs, not rejections, so they move no counter either — which is the
   point: coverage was never going to show them, and two of them were silent.
-  The 6 still failing, by ROOT CAUSE, as measured on 2026-08-25:
+  The 5 still failing, by ROOT CAUSE, as measured on 2026-08-25:
     F   Vec ports ................. rv32i_cpu (190:13), rv32i_cpu_pipelined (201:13)
     J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
         error — same message, different mechanism; see J)
