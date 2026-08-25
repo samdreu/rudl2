@@ -308,8 +308,7 @@ currently transpile. The 6 that do not, grouped by root cause:
 |---|---|
 | `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
 | tuple-returning helper functions | `ripple_carry_adder` |
-| no structural parent in simulation | `uart/system` (`uart_tx`, `uart_rx`) |
-| counted delays (`for _ in 0..N { tick }`) | `uart/rx` |
+| a loop whose body ends in another tick-bearing loop | `uart/rx`, `uart_tx`, `uart_rx` |
 
 Note that transpiling and *linting* are different bars: the equivalence harness
 runs Verilator under `-Wall`, and a module can emit SystemVerilog that the CLI

@@ -293,14 +293,14 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
 /// turn state-local temporaries into flip-flops nobody asked for.
 fn hoist_cross_state_locals(sm: &mut StateMachine) -> Vec<RawStmt> {
     // (state index, name, init) for every local declared anywhere in a state.
-    let mut declared: Vec<(usize, String, ExprType, SourceSpan)> = Vec::new();
+    let mut declared: Vec<(usize, String, ExprType, Option<RawTypeRef>, SourceSpan)> = Vec::new();
     for (i, body) in sm.states.iter().enumerate() {
         collect_locals(body, i, &mut declared);
     }
 
     let mut hoisted = Vec::new();
     let mut to_convert: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (state, name, init, span) in declared {
+    for (state, name, init, ty, span) in declared {
         let read_elsewhere = sm
             .states
             .iter()
@@ -313,7 +313,9 @@ fn hoist_cross_state_locals(sm: &mut StateMachine) -> Vec<RawStmt> {
             order: 0,
             kind: RawStmtKind::Local(LocalStmt {
                 is_mut: true,
-                ty: None,
+                // Carry the annotation through: dropping it leaves an init like a
+                // bare `0` with no width the hoisted declaration can infer.
+                ty,
                 name,
                 init: Some(init),
                 attrs: Vec::new(),
@@ -335,13 +337,13 @@ fn hoist_cross_state_locals(sm: &mut StateMachine) -> Vec<RawStmt> {
 fn collect_locals(
     stmts: &[RawStmt],
     state: usize,
-    out: &mut Vec<(usize, String, ExprType, SourceSpan)>,
+    out: &mut Vec<(usize, String, ExprType, Option<RawTypeRef>, SourceSpan)>,
 ) {
     for s in stmts {
         match &s.kind {
             RawStmtKind::Local(l) => {
                 if let Some(init) = &l.init {
-                    out.push((state, l.name.clone(), init.clone(), l.span));
+                    out.push((state, l.name.clone(), init.clone(), l.ty.clone(), l.span));
                 }
             }
             RawStmtKind::Expr(es) => collect_locals_in_expr(&es.expr, state, out),
@@ -353,7 +355,7 @@ fn collect_locals(
 fn collect_locals_in_expr(
     e: &ExprType,
     state: usize,
-    out: &mut Vec<(usize, String, ExprType, SourceSpan)>,
+    out: &mut Vec<(usize, String, ExprType, Option<RawTypeRef>, SourceSpan)>,
 ) {
     match e {
         ExprType::If(f) => {

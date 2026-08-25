@@ -39,12 +39,11 @@ TRANSPILATION:
             combinational module. bsg_gray_to_binary was the only instance and is
             now written as a `for` — its own test fixture already used that
             spelling, so the `while` form had never been transpiled.
-        STILL BLOCKED, on its own causes: uart/rx. Behind the `while` sit a
-        counted delay (`for _ in 0..CLKS_PER_BIT { tick }`, refused with its own
-        diagnostic — it needs a cycle counter + self-loop state, not unrolling),
+        STILL BLOCKED, on its own causes: uart/rx — see cause K, which is its
+        FIRST blocker (re-measured 2026-08-24; an earlier note here named the
+        counted delay, which is second). Behind K sit the counted delay, then
         `continue` in a nested loop (pinned as refused), `|=`, and a bare integer
-        local. Its reported error is now the nested-loop ordering one, which is
-        misleading — the real blocker is the counted delay.
+        local.
     D-a ✔ FIXED — file-scope `const` items now lower to `localparam`s.
         Unblocked bsg_encode_one_hot AND bsg_adder_one_hot. See the write-up below.
     D-b ✔ FIXED — array-typed ports lower as PACKED 2-D. Unblocked mux and
@@ -55,6 +54,37 @@ TRANSPILATION:
         rv32i_cpu_pipelined on F — not on memory.
     F ☐ `Vec` ports ....................... rv32i_cpu_pipelined, rv32i_cpu
         (rv32i_cpu joined this cause once the G panic stopped masking it)
+    K ☐ **A LOOP WHOSE BODY ENDS IN ANOTHER TICK-BEARING LOOP** cannot flatten.
+        ............................. uart_tx, uart_rx (system.rs), uart/rx
+        THE NEXT PIECE OF WORK — do this BEFORE counted delays (see the
+        write-up), which unblock nothing on their own.
+        `control_extract::tick_is_last_statement` requires a DIRECT
+        `clk.tick().await` as the last statement of a nested loop's body, so a
+        loop whose clock boundary comes from a loop INSIDE it is declined and the
+        module falls through to the linear path.
+        Not a `for`/counted-delay problem — refused today hand-written:
+            loop { loop { if a { break; } loop { if b { break; } tick; } } }
+        The UART shape that needs it:
+            for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS { tick } }
+        ALSO FIX THE DIAGNOSTIC: this case currently reports "a repeating wait
+        must be written as `loop { <test>; clk.tick().await; }` — the tick has to
+        be the LAST statement", which describes testing-after-the-tick. That is
+        not what is wrong here; the body has no direct tick at all, so the advice
+        is unfollowable. It needs its own message.
+        WHAT THE FIX HAS TO ESTABLISH (the flattener's state model is "a state is
+        the code between two ticks", and this shape does not fit it directly):
+          - the outer loop's back edge is taken when the INNER loop exits, so the
+            outer head must become reachable from the inner loop's break
+            continuation rather than from a tick;
+          - entering the outer loop must still not cost a cycle (the same crux
+            the wait solves by cloning the lowered body into the entry point);
+          - `tick_is_last_statement` becomes "the body's last statement REACHES a
+            tick on every path", which the existing reachability analysis in
+            copper-analysis already answers — worth reusing rather than
+            re-deriving, since the two disagreeing is this file's recurring bug.
+        Verify against a hand-written nested-wait DUT first (no `for` involved),
+        so the flattener change is checked in isolation before counted delays are
+        layered on top.
     G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
         port at rv32i_cpu.rs:190), not a memory or control-flow limit — the panic
@@ -157,6 +187,64 @@ TRANSPILATION:
     hypotheses now, not measurements. Re-measure before acting on them. The
     conclusion that a synthesizable CPU is a REWRITE rather than a flip does not
     depend on those items and still stands.
+
+  ── COUNTED DELAYS: ATTEMPTED, REVERTED, DIAGNOSED (2026-08-24) ─────────────
+  `for … in 0..N { … clk.tick().await; }` is N CLOCK CYCLES, not a repetition to
+  unroll (a UART bit period is 434). Attempted as a DESUGAR rather than a new
+  state shape, rewriting it into the repeating-wait form control extraction
+  already flattens:
+      let mut ctr = <start>;
+      loop {
+          if ctr == <end> { break; }      // exit test at the TOP
+          <body without its trailing tick>
+          ctr = ctr + 1;
+          clk.tick().await;
+      }
+  The test has to be at the top: the body then runs for ctr = start..end-1 and
+  ticks once per iteration, then re-enters, sees `ctr == end` and breaks in the
+  SAME cycle (break is not a clock boundary). Testing after the tick would both
+  lose a tick and put the test in the window the language refuses.
+
+  REVERTED — it transpiles but is WRONG, and the equivalence tests written for it
+  caught the divergence (sim said 6, Verilator said 5). Diagnosis, from the
+  emitted FSM for a 3-cycle delay:
+      8'd0: __copper_ctr0 <= ((32'd0 == 32'd3) ? …);   // folded to the literal
+      8'd0: if ((__copper_ctr0 == 32'd3)) o <= n;      // NOT folded — reads the reg
+  The entry state carries BOTH a literal-substituted copy of the loop test and a
+  register-reading copy of it. Entering must not cost a cycle, so the flattener
+  clones the lowered head into the entry point (the same trick the wait uses) —
+  but the counter's first value is only knowable as a literal there, since the
+  register does not commit until the edge. One of the two copies got the literal
+  and the other did not, and the register is uninitialised at that point.
+
+  WHAT A REAL FIX NEEDS: entry specialisation — the first iteration inlined with
+  the loop variable bound to `start` as a literal EVERYWHERE it appears in that
+  copy, not just in the counter update. That is a change to how the desugar and
+  the clone-into-entry trick interact, in the most timing-sensitive pass in the
+  codebase, and it deserves its own session rather than being bolted on.
+  Degenerate `0..0` also needs deciding (the entry-inlined form would run once).
+
+  ☐ AND IT IS NOT SUFFICIENT ANYWAY — measured. None of uart_tx, uart_rx or
+    uart/rx would be unblocked by counted delays alone, because each has a
+    counted loop whose body ENDS IN another tick-bearing loop:
+        for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS_PER_BIT { tick } }
+    That shape is refused TODAY even hand-written, with no `for` involved:
+        loop { loop { if a { break; } loop { if b { break; } tick; } } }
+    → "a repeating wait must be written as `loop { <test>; clk.tick().await; }`"
+    `tick_is_last_statement` requires a DIRECT tick as the body's last statement,
+    so a loop whose clock boundary comes from a nested loop cannot flatten. This
+    is a pre-existing flattener limitation, independent of counted delays, and it
+    is the real blocker for the UART family. Note the diagnostic is also wrong for
+    this case — it talks about testing after the tick, when the body has no direct
+    tick at all.
+    ORDER OF WORK, therefore: the nested-loop-tail limitation (cause K, in the
+    coverage table above) FIRST, counted delays second. Doing them the other way
+    round unblocks nothing.
+
+  ✔ KEPT from the attempt — `hoist_cross_state_locals` dropped the TYPE
+    ANNOTATION when hoisting (`ty: None`), so a hoisted local whose init has no
+    inferable width of its own (a bare `0`) failed. Latent in the committed hoist;
+    fixed independently of the reverted work.
 
   ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
   A module can pass the CLI and still fail the equivalence harness, which runs
