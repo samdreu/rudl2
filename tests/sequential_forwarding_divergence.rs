@@ -67,7 +67,7 @@
 mod common;
 use common::{verilator_available, verilator_command};
 use copper::sync_2ff;
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{wire, In, Out, RegOut};
 use copper_core::{Bits, Clock, ClockDomain, Logic};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
@@ -472,4 +472,149 @@ fn d2_is_fixed_and_d1_still_demonstrates_the_hazard() {
     let (f, _, _) = chain_assert_cycles(false);
     assert_eq!(f + 1, fc, "the opted-out fast_counter should still assert a cycle early");
     assert_eq!(oc, qc, "the corrected chain must also have a tracking passthrough");
+}
+
+// ── D1 in a MIDDLE segment: a plain `Out` driven in two phases ────────────────
+//
+// The guardrail plan recorded the middle-segment gap as theoretical (Q5: "no
+// instance in the corpus. If one turns up it should be measured before the rule is
+// widened"). One turned up — a one-cycle output pulse, found while writing the
+// first equivalence test for the UART receiver — and this is the measurement.
+//
+// The shape is a plain `Out` written on BOTH sides of a `clk.tick().await`. It is
+// already refused on the linear multi-tick path ("output port `dv` is driven in
+// more than one phase … hold it in a register"), but control extraction rewrites a
+// body whose ticks live inside branches or loops into a SINGLE-tick `match pc` FSM,
+// so that check counts one tick and passes while the `pc` states are the phases it
+// was meant to count.
+//
+// Widening the D1 rule instead was measured and rejected: extending it to every
+// post-tick segment flags 36 of 120 corpus modules, ~30 of them with passing
+// equivalence tests (`det_010`, `mac_pipeline`, `dual_port_ram`, `bsg_dff_en`,
+// every memory fixture). Writing a plain `Out` after a tick is the ordinary
+// multi-phase pattern and is correct; writing it in *two* phases is not.
+
+const PULSE_PLAIN_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn pulse_plain(clk: Clock<C>, dv: Out<Logic, C>) {
+    loop {
+        for _ in 0..3 { clk.tick().await; }
+        dv.write(Logic::One);
+        clk.tick().await;
+        dv.write(Logic::Zero);
+    }
+}
+"#;
+#[hardware(sequential, allow_pretick_alignment)]
+async fn pulse_plain(clk: Clock<C>, dv: Out<Logic, C>) {
+    loop {
+        for _ in 0..3 { clk.tick().await; }
+        dv.write(Logic::One);
+        clk.tick().await;
+        dv.write(Logic::Zero);
+    }
+}
+
+const PULSE_REG_SRC: &str = r#"
+#[hardware(sequential)]
+async fn pulse_registered(clk: Clock<C>, dv: RegOut<Logic, C>) {
+    loop {
+        for _ in 0..3 { clk.tick().await; }
+        dv.write(Logic::One);
+        clk.tick().await;
+        dv.write(Logic::Zero);
+    }
+}
+"#;
+#[hardware(sequential)]
+async fn pulse_registered(clk: Clock<C>, dv: RegOut<Logic, C>) {
+    loop {
+        for _ in 0..3 { clk.tick().await; }
+        dv.write(Logic::One);
+        clk.tick().await;
+        dv.write(Logic::Zero);
+    }
+}
+
+fn sim_pulse_plain() -> Vec<u8> {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Logic, C>(Logic::Zero);
+    let dh = o.dirty_handle();
+    exec.spawn_wired(pulse_plain(clk.clone(), o), vec![dh], vec![]);
+    (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            u8::from(obs.read() == Logic::One)
+        })
+        .collect()
+}
+
+fn sim_pulse_registered() -> Vec<u8> {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = copper_core::port::registered_wire::<Logic, C>(&clk, Logic::Zero);
+    let dh = o.dirty_handle();
+    exec.spawn_wired(pulse_registered(clk.clone(), o), vec![dh], vec![]);
+    (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            u8::from(obs.read() == Logic::One)
+        })
+        .collect()
+}
+
+/// The measurement the rule rests on: a plain `Out` pulse driven in two phases
+/// diverges from its own transpiled SystemVerilog by exactly one cycle.
+#[test]
+fn a_plain_out_driven_in_two_phases_diverges() {
+    let sim = sim_pulse_plain();
+    // Period 4 (three delay ticks plus the pulse tick); the simulator observes the
+    // write in the post-edge settle of the cycle it was issued in.
+    assert_eq!(
+        sim,
+        vec![0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+        "simulator behaviour changed"
+    );
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(PULSE_PLAIN_SRC, "pulse_plain", "clk", "dv", "");
+    assert_ne!(
+        sim, sv,
+        "sim and SV now AGREE for a plain `Out` driven in two phases — the hazard is \
+         FIXED. Remove `multi_phase_out_write`'s error, promote this to a real \
+         equivalence test, and revert the `RegOut` migrations in examples/uart/system.rs \
+         and examples/cpu/rv32i_cpu.rs."
+    );
+    // The same period, one cycle later — not a different design, a shifted one.
+    assert_eq!(sv, vec![0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0], "transpiled SV behaviour changed");
+}
+
+/// The discriminator, isolated: identical design, `RegOut` instead of `Out`, and
+/// the divergence disappears. This is what makes the diagnostic's advice correct.
+#[test]
+fn the_registered_output_form_agrees() {
+    let sim = sim_pulse_registered();
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(PULSE_REG_SRC, "pulse_registered", "clk", "dv", "");
+    assert_eq!(
+        sim, sv,
+        "the `RegOut` form must stay sim ≡ SV — it is the remedy the guard points at"
+    );
+}
+
+/// …and the rule itself flags exactly the plain form.
+#[test]
+fn the_rule_flags_the_plain_form_and_not_the_registered_one() {
+    let plain: syn::ItemFn = syn::parse_str(PULSE_PLAIN_SRC).expect("parses");
+    let reg: syn::ItemFn = syn::parse_str(PULSE_REG_SRC).expect("parses");
+    assert_eq!(copper_analysis::multi_phase_out_write(&plain), vec!["dv".to_string()]);
+    assert!(
+        copper_analysis::multi_phase_out_write(&reg).is_empty(),
+        "`RegOut` must be exempt — it is excluded by construction, like multi_write_collapse"
+    );
 }

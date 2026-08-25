@@ -1,5 +1,5 @@
 use copper_core::{Bits, Clock, ClockDomain, Logic, Memory};
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, Out, RegOut};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
@@ -188,9 +188,14 @@ fn alu_exec_imm(a: Bits<32>, imm: Bits<32>, f3: Bits<3>, f7: Bits<7>) -> AluOutp
 async fn rv32i_cpu(
     clk: Clock<MainClk>,
     program: In<Vec<Bits<32>>, MainClk>,
-    program_counter: Out<Bits<32>, MainClk>,
-    halted: Out<Logic, MainClk>,
-    a0_out: Out<Bits<32>, MainClk>,
+    // REGISTERED outputs. All three are driven on both sides of a
+    // `clk.tick().await`, and which phase a segment runs in is not pinned unless an
+    // input read precedes it — so a plain `Out` would let the simulator run one of
+    // them a phase early and disagree with the synthesized hardware. `RegOut` is
+    // immune: it commits at the edge, so the phase is unobservable.
+    program_counter: RegOut<Bits<32>, MainClk>,
+    halted: RegOut<Logic, MainClk>,
+    a0_out: RegOut<Bits<32>, MainClk>,
 ) {
     // Both imem and dmem are seeded from the same flat binary so that
     // .rodata constants (e.g. bubblesort's array at 0xC0) are reachable
@@ -436,9 +441,9 @@ fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let mut exec = HardwareExecutor::new();
 
     let (prog_out, prog_in)      = wire::<Vec<Bits<32>>, MainClk>(vec![]);
-    let (pc_out, _pc_in)         = wire::<Bits<32>, MainClk>(Bits::zero());
-    let (halted_out, halted_in)  = wire::<Logic, MainClk>(Logic::Zero);
-    let (a0_out, a0_in)          = wire::<Bits<32>, MainClk>(Bits::zero());
+    let (pc_out, _pc_in)         = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
+    let (halted_out, halted_in)  = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
+    let (a0_out, a0_in)          = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
 
     prog_out.write(program_bits);
     let reads = vec![prog_in.wire_id()];

@@ -976,6 +976,35 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
                 .to_compile_error()
                 .into();
             }
+            // A plain `Out` driven in more than one clock phase. The multi-tick
+            // lowering already refuses this; control extraction hides the phases by
+            // rewriting the body into a single-tick `match pc` FSM, so it has to be
+            // caught here, on the source, where the ticks are still visible.
+            let multi_phase = if allow_pretick_alignment {
+                Vec::new()
+            } else {
+                copper_analysis::multi_phase_out_write(&input_fn)
+            };
+            if let Some(port) = multi_phase.first() {
+                let span = port_param_span(&input_fn.sig, port)
+                    .unwrap_or_else(|| input_fn.sig.ident.span());
+                return Error::new(
+                    span,
+                    format!(
+                        "output port `{port}` is driven in more than one clock phase (on both \
+                         sides of a `clk.tick().await`). Which phase a segment runs in is not \
+                         pinned unless an input read precedes it, so the simulator runs one of \
+                         them a phase early and silently disagrees with the synthesized \
+                         hardware — measured at exactly one cycle on a one-cycle output pulse. \
+                         Declare `{port}` as `RegOut<…>` (a registered output, immune because \
+                         it commits at the clock edge), or drive it in exactly one phase. If \
+                         this module exists to DEMONSTRATE the divergence, opt out explicitly \
+                         with `#[hardware(sequential, {ALLOW_PRETICK})]`."
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
             // c2 (gate G6): the sim macro consumes the SHARED analysis crate — the
             // same one the transpiler consumes — proving a proc-macro can depend on
             // it with no dependency cycle. The inferred register set is logged for

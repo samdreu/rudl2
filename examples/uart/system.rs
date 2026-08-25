@@ -14,7 +14,7 @@
 // Bytes written by the caller come back out on the RX side after one 8N1 frame.
 
 use copper_core::{Bits, Clock, ClockDomain, Logic};
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, Out, RegOut};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
@@ -31,8 +31,13 @@ async fn uart_tx(
     clk: Clock<MainClk>,
     tx_byte:   In<Bits<8>, MainClk>,
     tx_start:  In<Logic, MainClk>,
-    tx_serial: Out<Logic, MainClk>,
-    tx_busy:   Out<Logic, MainClk>,
+    // REGISTERED. Both are driven on both sides of a `clk.tick().await`, and which
+    // phase a segment runs in is not pinned unless an input read precedes it — a
+    // plain `Out` lets the simulator run one of them a phase early and disagree
+    // with the synthesized hardware. `RegOut` commits at the edge, so the phase is
+    // unobservable.
+    tx_serial: RegOut<Logic, MainClk>,
+    tx_busy:   RegOut<Logic, MainClk>,
 ) {
     loop {
         tx_serial.write(Logic::One);
@@ -68,7 +73,9 @@ async fn uart_tx(
 async fn uart_rx(
     clk: Clock<MainClk>,
     rx_serial: In<Logic, MainClk>,
-    rx_dv:     Out<Logic, MainClk>,
+    // REGISTERED — a one-cycle pulse written before the tick that publishes it, so
+    // it is driven in two phases; see `uart_tx` above and `examples/uart/rx.rs`.
+    rx_dv:     RegOut<Logic, MainClk>,
     rx_byte:   Out<Bits<8>, MainClk>,
 ) {
     loop {
@@ -111,15 +118,15 @@ struct UartPorts {
 fn spawn_uart(exec: &mut HardwareExecutor, clk: Clock<MainClk>) -> UartPorts {
     // Internal wire: TX serial output → RX serial input.
     // Starts high (UART idle line is Logic::One).
-    let (serial_out, serial_in) = wire::<Logic, MainClk>(Logic::One);
+    let (serial_out, serial_in) = registered_wire::<Logic, MainClk>(&clk, Logic::One);
 
     // TX caller-side ports
     let (tx_byte_port,  tx_byte_in)  = wire::<Bits<8>, MainClk>(Bits::zero());
     let (tx_start_port, tx_start_in) = wire::<Logic, MainClk>(Logic::Zero);
-    let (tx_busy_out,   tx_busy_in)  = wire::<Logic, MainClk>(Logic::Zero);
+    let (tx_busy_out,   tx_busy_in)  = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
 
     // RX caller-side ports
-    let (rx_dv_out,   rx_dv_in)   = wire::<Logic, MainClk>(Logic::Zero);
+    let (rx_dv_out,   rx_dv_in)   = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
     let (rx_byte_out, rx_byte_in) = wire::<Bits<8>, MainClk>(Bits::zero());
 
     let dh_serial  = serial_out.dirty_handle();

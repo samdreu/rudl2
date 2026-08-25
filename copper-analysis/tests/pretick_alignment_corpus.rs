@@ -157,3 +157,70 @@ fn pretick_alignment_hazard_flags_exactly_the_known_divergent_modules() {
         flagged.len()
     );
 }
+
+
+// ── The multi-phase output rule ───────────────────────────────────────────────
+
+/// Plain combinational `Out` ports driven in **more than one clock phase**
+/// (`copper_analysis::multi_phase_out_write`).
+///
+/// The sibling of the rule above, and the one that covers the case it cannot see.
+/// `unprotected_pretick_out_write` examines only head → first tick (plan Q5, which
+/// recorded the middle-segment gap as theoretical). An instance turned up on
+/// 2026-08-25 — a one-cycle output pulse in the UART receiver — and widening the
+/// D1 rule to every post-tick segment was measured and REJECTED: it flags 36 of
+/// 120 corpus modules, ~30 with passing equivalence tests. Writing a plain `Out`
+/// after a tick is the ordinary multi-phase pattern; writing it in *two* phases is
+/// not, and that is what this rule keys on.
+///
+/// Like the rule above, the expectation is an **exact set** so it fails in both
+/// directions. Every entry here must be a module that exists to DEMONSTRATE the
+/// divergence and carries `#[hardware(sequential, allow_pretick_alignment)]` — the
+/// opt-out silences the error, not the detection, so an opted-out module cannot
+/// quietly disappear from this view. A real design appearing here is a bug in that
+/// design, and the fix is `RegOut`.
+const EXPECTED_MULTI_PHASE: &[&str] = &[
+    "tests/sequential_forwarding_divergence.rs::pulse_plain",
+];
+
+#[test]
+fn multi_phase_out_write_flags_exactly_the_demonstration_modules() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in ["examples", "src", "tests"] {
+        rs_files(&root.join(dir), &mut files);
+    }
+    files.sort();
+
+    let mut scanned = 0usize;
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for path in &files {
+        let Ok(src) = fs::read_to_string(path) else { continue };
+        let Ok(file) = syn::parse_file(&src) else { continue };
+        let mut fns = Vec::new();
+        clocked_hardware_fns(&file.items, &mut fns);
+        for f in &fns {
+            scanned += 1;
+            if !copper_analysis::multi_phase_out_write(f).is_empty() {
+                let rel = path.strip_prefix(&root).unwrap_or(path).display();
+                flagged.insert(format!("{rel}::{}", f.sig.ident));
+            }
+        }
+    }
+
+    assert!(scanned >= 40, "expected to scan the corpus, only saw {scanned} clocked modules");
+
+    let expected: BTreeSet<String> = EXPECTED_MULTI_PHASE.iter().map(|s| s.to_string()).collect();
+    let unexpected: Vec<_> = flagged.difference(&expected).cloned().collect();
+    let missing: Vec<_> = expected.difference(&flagged).cloned().collect();
+    assert!(
+        unexpected.is_empty(),
+        "newly flagged (a plain `Out` driven in two clock phases — declare it `RegOut`, \
+         or if the module exists to demonstrate the hazard add `allow_pretick_alignment` \
+         and list it here): {unexpected:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "no longer flagged — the hazard may be fixed, or the module changed: {missing:?}"
+    );
+}

@@ -89,6 +89,19 @@ pub fn unprotected_pretick_out_write(f: &ItemFn) -> Vec<String> {
 /// combinational loop — and is rejected with a spanned [`syn::Error`].
 ///
 /// A module with no top-level loop has nothing to check and is `Ok`.
+/// Plain combinational `Out` ports driven in **more than one clock phase** — a
+/// shape the multi-tick lowering already refuses, but which control extraction
+/// hides by rewriting the body into a single-tick `match pc` FSM whose states are
+/// the phases. Returns the offending ports, sorted; empty for a combinational
+/// module, one with no top-level loop, or one whose outputs are all `RegOut`.
+///
+/// The remedy is `RegOut`, which is immune by construction. See
+/// [`Cfg::multi_phase_out_write`] for the mechanism, the measured witnesses, and
+/// why widening the D1 rule instead was rejected with corpus evidence.
+pub fn multi_phase_out_write(f: &ItemFn) -> Vec<String> {
+    Cfg::build(f).map(|c| c.multi_phase_out_write()).unwrap_or_default()
+}
+
 pub fn check_reachability(f: &ItemFn) -> Result<(), syn::Error> {
     match Cfg::build(f) {
         Some(cfg) => cfg

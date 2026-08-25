@@ -440,21 +440,42 @@ TRANSPILATION:
      So cause O's machinery paid for itself twice, and the deferral in cause M's
      entry was the wrong call — the shape was reachable, not hypothetical.
 
-  ◐ D1 FALSE NEGATIVE, found here and NOT fixed. With the above corrected, the
-     same repro with a plain `Out` still diverges by exactly one cycle, uniformly:
-     the simulator observes a write issued after a tick in that tick's POST-EDGE
-     SETTLE, while the FSM puts it in the state that runs the next cycle. That is
-     the pre-tick alignment family and `RegOut` is immune by construction
-     (measured: the `RegOut` spelling of the same repro passes). But
-     `unprotected_pretick_out_write` did NOT flag it, because its condition
-     requires the segment to also ASSIGN A REGISTER, and this segment assigns
-     none — it only writes outputs. So the guardrail has a hole for exactly the
-     shape a pulse generator has.
-     uart/rx's `rx_dv`/`rx_byte` are `RegOut` now, which is independently the
-     right call (a one-cycle pulse written before the tick that publishes it IS
-     write-before-tick Moore). The guard's condition is the open question; see
-     design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md before widening it, since three
-     candidate fixes are already recorded there as rejected with evidence.
+  ✔ FIXED (2026-08-25) — THE GUARDRAIL HOLE, and the answer was a SECOND RULE
+     rather than a wider one. Read this before touching either rule.
+     The shape: a plain `Out` driven on BOTH sides of a tick (a one-cycle pulse).
+     It diverges by exactly one cycle, uniformly, and `RegOut` is immune —
+     measured both ways. `unprotected_pretick_out_write` did not flag it because
+     it examines only head → first tick (plan Q5) AND requires the segment to
+     assign a register, which a pulse segment does not.
+     ✘ WIDENING D1 PAST THE HEAD SEGMENT — MEASURED AND REJECTED. It flags 36 of
+       120 corpus modules, ~30 with passing equivalence tests (det_010,
+       mac_pipeline, dual_port_ram, bsg_dff_en, every memory fixture). Writing a
+       plain `Out` after a tick is the ORDINARY multi-phase pattern and is right.
+     ✔ THE ACTUAL RULE WAS ALREADY IN THE LANGUAGE. `shir_lower` refuses "output
+       port `p` is driven in more than one phase … hold it in a register" — but
+       only when it can SEE the phases, and control extraction rewrites the body
+       into a single-tick `match pc` FSM first, so the check counts one tick and
+       passes while the `pc` states are exactly the phases it meant to count. The
+       same blind spot swallows the trailing-statement rule.
+       `copper_analysis::multi_phase_out_write` applies it to the source, where
+       the ticks are still visible, in BOTH front-ends, with the same `RegOut`
+       remedy and the same `allow_pretick_alignment` opt-out. 9 corpus modules
+       flagged, six of them the synthetic witnesses; the three real ones
+       (rv32i_cpu, uart/system.rs's uart_tx and uart_rx) migrated to `RegOut`
+       with their self-checks unchanged — the CPU still sorts and sums.
+     WITNESSES, each flipping ONE condition (tests/sequential_forwarding_divergence.rs,
+     which is the designated home for a pinned divergence and already had the
+     Verilator plumbing): plain `Out` diverges with both traces pinned exactly;
+     `RegOut` agrees; the clear moved OUT of the trailing segment still diverges
+     (so it is not the trailing segment); plain ticks are refused by the linear
+     path outright (which is what identified the real rule).
+     GATE: a second exact-set corpus test in pretick_alignment_corpus.rs, failing
+     in both directions.
+     RECORD THE CLASS: a check that counts a syntactic feature (`clk.tick().await`)
+     rather than the thing it means (a clock phase), placed downstream of a pass
+     that legitimately removes that feature. D1's own rule is unchanged and still
+     head-segment-only, deliberately — the two are complementary the way D1 and
+     `multi_write_collapse` are.
 
   ✔ FIXED (2026-08-25) — **788 STATES FOR A UART RECEIVER, NOW 11.** 16,479 lines
      of SystemVerilog became 260, and `pc` went back to 8 bits.

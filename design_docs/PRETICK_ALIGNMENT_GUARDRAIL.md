@@ -250,7 +250,43 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
   guardrail must point at a *legal* alternative. For `fast_counter` that is the
   post-tick update (`tick; if count[3] { latched = 1 }`), verified to match the
   independent reference — but the general rewriting rule is unstated.
-- **Q5 — ANSWERED 2026-08-21, and the premise was wrong.** The rule examines only
+- **Q5 — REOPENED AND CLOSED 2026-08-25. An instance turned up, and the answer was
+  a SECOND RULE, not a wider one.** The note below ends "if one turns up it should
+  be measured before the rule is widened". One did: a one-cycle output pulse, found
+  while writing the first sim-vs-Verilator test for the UART receiver, whose
+  `rx_dv` is written on both sides of a tick.
+
+  **Widening D1 past the head segment: MEASURED AND REJECTED.** Extending it to
+  every post-tick segment flags **36 of 120** corpus modules, ~30 of which have
+  passing equivalence tests — `det_010`, `mac_pipeline`, `dual_port_ram`,
+  `bsg_dff_en`, every memory fixture. Writing a plain `Out` after a tick is the
+  ORDINARY multi-phase pattern and is correct.
+
+  **What the divergent shape actually is: a plain `Out` driven in TWO phases** —
+  which the multi-tick lowering *already refuses* ("output port `p` is driven in
+  more than one phase … hold it in a register"). Control extraction hides the
+  phases by rewriting the body into a single-tick `match pc` FSM, so the check
+  counts one tick and passes while the `pc` states are the phases it meant to
+  count. Witnesses, each flipping one condition (`tests/sequential_forwarding_divergence.rs`):
+
+  | | shape | verdict |
+  |---|---|---|
+  | plain `Out`, two segments, no `In` | pulse | **DIVERGE**, exactly one cycle |
+  | identical, `RegOut` | pulse | agree |
+  | clear moved out of the trailing segment | pulse | **DIVERGE** — not the trailing segment |
+  | plain ticks, no trailing statements | pulse | **refused by the linear path** |
+
+  So the fix is `Cfg::multi_phase_out_write`, enforced in both front-ends with the
+  same `RegOut` remedy and the same `allow_pretick_alignment` opt-out. It flags 9
+  corpus modules, six of them the synthetic witnesses; the three real ones
+  (`rv32i_cpu`, `uart/system.rs::uart_tx`, `uart/system.rs::uart_rx`) were migrated
+  to `RegOut` and their self-checks are unchanged. Gate: the second exact-set test
+  in `pretick_alignment_corpus.rs`.
+
+  D1's own rule is UNCHANGED and still head-segment-only — deliberately. The two
+  are complementary in the same way D1 and `multi_write_collapse` are.
+
+  *Original note, kept for the measurement:* The rule examines only
   head → first tick, and this was recorded as a known false negative citing the
   multi-tick `accum_2`. **`accum_2` does not diverge.** Its test was `#[ignore]`d as
   "sim and transpiler disagree by one cycle … adjudication pending", but it passes —

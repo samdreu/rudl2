@@ -247,6 +247,21 @@ impl PreparedSource {
     }
 }
 
+/// Does this module carry `#[hardware(sequential, allow_pretick_alignment)]`?
+///
+/// Read from the first token of the attribute list rather than parsed as an ident
+/// list: `parse_args::<syn::Ident>()` fails outright once a flag is present, which
+/// is how modules carrying one have silently vanished from corpus scans before.
+fn opts_out_of_pretick_alignment(f: &syn::ItemFn) -> bool {
+    f.attrs.iter().any(|a| {
+        a.path().segments.last().is_some_and(|s| s.ident == "hardware")
+            && a.meta
+                .require_list()
+                .ok()
+                .is_some_and(|l| l.tokens.to_string().contains("allow_pretick_alignment"))
+    })
+}
+
 /// Run the per-module transpile: the shared reachability well-formedness check,
 /// register inference (logged), then FIR → SV.
 fn transpile_target(
@@ -260,6 +275,25 @@ fn transpile_target(
     // front-ends). In practice a module reaching the transpiler already compiled
     // through the macro's check; this keeps the standalone CLI honest.
     copper_analysis::check_reachability(target).map_err(|e| e.to_string())?;
+    // A plain `Out` driven in more than one clock phase. `shir_lower` refuses this
+    // on the multi-tick path, but control extraction rewrites the body into a
+    // single-tick `match pc` FSM first — so by the time that check runs, the phases
+    // it counts are gone. Check the SOURCE, where the ticks are still visible.
+    //
+    // `allow_pretick_alignment` opts out here exactly as it does in the macro: the
+    // flag silences the ERROR, not the detection, and a module that exists to
+    // DEMONSTRATE the divergence has to be transpilable or there is nothing to
+    // measure it against.
+    if !opts_out_of_pretick_alignment(target) {
+        if let Some(port) = copper_analysis::multi_phase_out_write(target).first() {
+            return Err(format!(
+                "output port '{port}' is driven in more than one clock phase (across \
+                 clk.tick().await boundaries) — the simulator runs one of those segments \
+                 a phase early and disagrees with the synthesized hardware. Declare it as \
+                 RegOut<…>, or drive it in exactly one phase"
+            ));
+        }
+    }
 
     // c2 (gate G6): the transpiler consumes the SAME shared analysis, on the SAME
     // input (`&syn::ItemFn`), that the sim macro consumes — one authoritative

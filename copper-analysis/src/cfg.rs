@@ -34,7 +34,7 @@
 //! back-edges) is the one follow-on phase after v1 lands and is verified — a nested
 //! loop is folded here into a single opaque node.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{Span, TokenStream, TokenTree};
 use syn::spanned::Spanned;
@@ -483,6 +483,91 @@ impl Cfg {
         });
 
         if unprotected { driven.into_iter().collect() } else { Vec::new() }
+    }
+
+    /// Plain combinational `Out` ports driven in **more than one clock phase**.
+    ///
+    /// The multi-tick lowering already refuses this — *"output port `p` is driven in
+    /// more than one phase (across `clk.tick().await` boundaries), which would emit
+    /// multiple conflicting drivers. Drive it in exactly one phase, or hold it in a
+    /// register"* — but only when it can see the phases. **Control extraction hides
+    /// them**: it rewrites a body whose ticks live inside branches or loops into a
+    /// single-tick `match pc { … }` FSM, so the check counts one tick and passes,
+    /// while the `pc` states are exactly the phases it was meant to count.
+    ///
+    /// The consequence is measured, not argued. A one-cycle pulse —
+    ///
+    /// ```text
+    /// loop { for _ in 0..3 { tick } dv.write(One); tick; dv.write(Zero); }
+    /// ```
+    ///
+    /// — diverges from its transpiled SystemVerilog by exactly one cycle, uniformly,
+    /// because with no barrier the simulator runs a segment during the PREVIOUS
+    /// cycle's post-edge settle while the FSM gives it its own state. That is the
+    /// pre-tick alignment family (D1), and `RegOut` is immune to it by construction:
+    /// the phase at which the write executes is unobservable through a port that
+    /// commits at the edge. Replacing the port type is the whole fix, which is why
+    /// the diagnostic points there — the same remedy `multi_write_collapse` and the
+    /// D1 guardrail already point at.
+    ///
+    /// # Why not widen the D1 rule instead
+    ///
+    /// Tried and measured. `unprotected_pretick_out_write` examines only head →
+    /// first tick (plan Q5). Widening it to every post-tick segment flags **36 of
+    /// 120** corpus modules, ~30 of which have passing equivalence tests —
+    /// `det_010`, `mac_pipeline`, `dual_port_ram`, `bsg_dff_en`, every memory
+    /// fixture. Writing a plain `Out` after a tick is the ORDINARY multi-phase
+    /// pattern and is correct; writing it in *two* phases is not. This rule flags
+    /// 9 modules on the same corpus, six of them the synthetic witnesses that
+    /// establish it.
+    ///
+    /// # What a "phase" is here
+    ///
+    /// A Comb-connected component of the CFG. A tick is the only edge that separates
+    /// two of them, and the trailing segment merges with the head — correctly, since
+    /// falling off the end of the body and re-entering it costs no cycle, so they
+    /// run in the same one.
+    ///
+    /// `RegOut` is excluded for free: `Node::writes` holds only combinational
+    /// outputs, the same way `multi_write_collapse` gets its exclusion.
+    pub fn multi_phase_out_write(&self) -> Vec<String> {
+        let n = self.nodes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for i in 0..n {
+            let succs: Vec<usize> = self.nodes[i]
+                .succs
+                .iter()
+                .filter(|(_, k)| *k == EdgeKind::Comb)
+                .map(|&(s, _)| s)
+                .collect();
+            for s in succs {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, s));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut phases: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for i in 0..n {
+            // A `folded` node carries the conservative all-outputs over-approximation
+            // for a nested loop, not a real `port.write` — counting it as evidence
+            // would flag every output of every module with a nested loop.
+            if self.nodes[i].folded || self.nodes[i].writes.is_empty() {
+                continue;
+            }
+            let r = find(&mut parent, i);
+            for w in &self.nodes[i].writes {
+                phases.entry(w.clone()).or_default().insert(r);
+            }
+        }
+        phases.into_iter().filter(|(_, p)| p.len() > 1).map(|(port, _)| port).collect()
     }
 
     /// Enforce the reachability invariant: with every tick edge deleted, the graph
