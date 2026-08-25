@@ -293,7 +293,7 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **781 tests pass, 0 fail, 4 ignored** across 100 test binaries
+- **797 tests pass, 0 fail, 4 ignored** across 102 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
 - all three wiring guards (G-A / G-B / G-C) clean
 
@@ -308,7 +308,13 @@ currently transpile. The 6 that do not, grouped by root cause:
 |---|---|
 | `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
 | tuple-returning helper functions | `ripple_carry_adder` |
-| a tick inside a counted `for` | `uart/rx`, `uart_tx`, `uart_rx` |
+| a tick inside a counted `for` | `uart/rx` |
+| a hardware-typed function without `#[hardware]` in the same file | `uart_tx`, `uart_rx` |
+
+The last row is a whole-file rejection rather than anything about those two
+modules: `examples/uart/system.rs` also defines `spawn_uart`, a plain wiring
+function whose signature takes a `Clock` and ports, which is refused before any
+module is examined. Behind it they hit the counted `for` too.
 
 Note that transpiling and *linting* are different bars: the equivalence harness
 runs Verilator under `-Wall`, and a module can emit SystemVerilog that the CLI

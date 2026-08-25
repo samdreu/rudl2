@@ -303,8 +303,18 @@ construction.
 > sequential forwarding *within* the segment: measured, a `RegOut` written **after** a
 > register update in the same segment emits `out <= n`, the register's **old** value,
 > while the simulator forwards the update and writes the new one. D1's compile error
-> exempts `RegOut`, so that shape passes the guardrail and diverges silently. Whether
-> to narrow the exemption or repair the forwarding is open — see the `TODO`. Every false positive was a `RegOut` module. The corrected rule keys on
+> exempts `RegOut`, so that shape passed the guardrail and diverged silently.
+>
+> **Resolved 2026-08-25 (`TODO` causes L, L-1, L-2): the forwarding was repaired, and
+> the exemption stands.** The two options were "narrow the D1 exemption" or "repair the
+> forwarding"; the second is right, because the shape has a correct lowering — a drive
+> sampled AT the edge simply has to be emitted from pre-edge register values. It is
+> also NOT a `RegOut` question, which is why narrowing the exemption would have been
+> the wrong repair: a plain `Out` written *conditionally* becomes an implicit-hold
+> register too and had exactly the same lag (L-1). The rule is the emission context,
+> not the port type. So `RegOut`'s immunity to the *phase* question this document is
+> about is intact, and unrelated to the forwarding bug that briefly seemed to qualify
+> it. Pinned by `tests/regout_forwarding_equivalence.rs`. Every false positive was a `RegOut` module. The corrected rule keys on
 the output write, which is the same structure `multi_write_collapse` already uses.
 
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)

@@ -12,11 +12,21 @@ DOCUMENTATION:
 TRANSPILATION:
   ☐ Figure out TODOs
 
-  ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-24 (after D-a) ─────────────────
+  ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-25 (after K, L, L-1, L-2) ──────
   Every #[hardware] module in examples/ probed through the copper-transpile CLI.
-  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → **C 28/34**.
-  The 6 still failing, by ROOT CAUSE (several share one cause — fix the cause,
-  not the module):
+  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → C 28/34 →
+  **K 28/34 — NO CHANGE, as predicted**. Cause K unblocks no example on its own;
+  see its entry for why (the shapes it admits need the counted `for` to exist).
+  L / L-1 / L-2 were wrong-CODE bugs, not rejections, so they move no counter
+  either — which is the point: coverage was never going to show them.
+  The 6 still failing, by ROOT CAUSE, as measured on 2026-08-25:
+    F   Vec ports ................. rv32i_cpu (190:13), rv32i_cpu_pipelined (201:13)
+    J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
+        error — same message, different mechanism; see J)
+    M   a tick inside a counted `for` ......................... uart/rx (55:8,
+        and the message names the WRONG construct — see M)
+    H   file-level `spawn_uart` rejection ... uart_tx, uart_rx (examples/uart/system.rs)
+  Full history of every cause, live and retired:
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
     C ✔/☐ SPLIT — `while` was TWO features, and the two modules filed here needed
@@ -39,11 +49,11 @@ TRANSPILATION:
             combinational module. bsg_gray_to_binary was the only instance and is
             now written as a `for` — its own test fixture already used that
             spelling, so the `while` form had never been transpiled.
-        STILL BLOCKED, on its own causes: uart/rx — see cause K, which is its
-        FIRST blocker (re-measured 2026-08-24; an earlier note here named the
-        counted delay, which is second). Behind K sit the counted delay, then
-        `continue` in a nested loop (pinned as refused), `|=`, and a bare integer
-        local.
+        STILL BLOCKED, on its own causes: uart/rx — now cause M (a tick inside a
+        counted `for`), re-measured 2026-08-25. K WAS recorded here as its first
+        blocker; K is fixed and uart/rx did not move, which is consistent with
+        K's own entry. Behind M sit `continue` in a nested loop (pinned as
+        refused), `|=`, and a bare integer local.
     D-a ✔ FIXED — file-scope `const` items now lower to `localparam`s.
         Unblocked bsg_encode_one_hot AND bsg_adder_one_hot. See the write-up below.
     D-b ✔ FIXED — array-typed ports lower as PACKED 2-D. Unblocked mux and
@@ -102,6 +112,47 @@ TRANSPILATION:
         message). The back edge is checkable once `for` lands.
         The UART shape that still needs `for`:
             for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS { tick } }
+    M ☐ **A TICK INSIDE A COUNTED `for`** ......................... uart/rx, and
+        behind cause H, uart_tx and uart_rx.
+        **THE NEXT PIECE OF WORK.** It is now the only control-flow cause left,
+        and cause K's entry explains why it has to come next rather than after:
+        with `loop` alone every exitable inner loop can exit having ticked zero
+        times, so K's back edge is not writable at all. `for _ in 0..N { tick }`
+        is the construct that breaks the deadlock — it always ticks AND
+        terminates without an exit test — which is what makes K's machinery
+        reachable by a real design.
+        Two shapes, and a fix must cover BOTH (measured 2026-08-24; removing only
+        the first leaves uart/rx rejected). The class is counted REPETITION, not
+        counted delay:
+            for _ in 0..CLKS_PER_BIT { clk.tick().await; }   // bit timing
+            for i in 0..8 { rx_byte[i] = …; for _ in 0..CLKS { tick } }  // data
+        The second is exactly cause K's shape with a `for` inside, so K's
+        `body_ends_at_a_clock_boundary` already admits the outer loop once the
+        inner `for` is supported.
+        WHAT IS ALREADY IN PLACE FOR IT:
+          - `copper_analysis::may_exit_without_tick` treats a `for` as a
+            GUARANTEED clock boundary (it runs its body, so it ticks), which is
+            what keeps the uart shape well-formed while rejecting the `loop`
+            equivalent. Its one recorded gap is an EMPTY constant range, which
+            needs const evaluation that crate deliberately does not do.
+          - `control_extract` already flattens a loop whose body ends in a
+            tick-bearing loop (cause K), so the outer `for i in 0..8` needs the
+            counting, not new control flow.
+        THE DIAGNOSTIC IS WRONG TODAY AND SHOULD BE FIXED WITH IT — measured
+        2026-08-25, uart/rx reports at 55:8:
+            "a repeating wait must be written as `loop { <test>; clk.tick().await; }`
+             — the tick has to be the LAST statement"
+        pointing at the `while` on line 55. THAT LOOP IS WELL-FORMED: it desugars
+        to tick-last and would flatten fine. The module is declined because of the
+        `for` on line 60, and the linear path downstream then reports the first
+        nested loop it meets. `chir_lower::nested_loop_error` splits three cases
+        but does not check whether the tick is LAST, so a well-formed loop that
+        reaches it for someone else's reason gets the ordering message. The fix:
+        when the body IS a valid segment, say that the module was declined for a
+        different construct and name it, rather than casting suspicion on a loop
+        the author wrote correctly. Same error-message-is-not-the-cause pattern
+        this file keeps recording — now visible INSIDE one module.
+
     G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
         port at rv32i_cpu.rs:190), not a memory or control-flow limit — the panic
@@ -130,9 +181,11 @@ TRANSPILATION:
             width gap at all — `let (s, c) = full_adder(…)`. Already pinned by
             transpile_inference_gaps.rs::tuple_returning_helper_is_a_known_transpile_gap;
             it was only filed here because it prints the same message.
-  ALSO STILL BLOCKED, behind causes above rather than their own:
-    det_010_awaits → tick inside a conditional branch (65:8). Previously filed
-      under C (`while` loops); measured, that is not the error it reports.
+  NO LONGER BLOCKED (verified by the 2026-08-25 sweep, absent from the failing
+  list): det_010_awaits, which C-a unblocked. It had been filed under C, then
+  re-filed as "tick inside a conditional branch (65:8)" — and neither was its own
+  cause. Its `while` made `contains_unflattenable_control` decline the whole body,
+  so the tick-in-branch fell through to the linear path and was reported there.
 
   ── RE-MEASUREMENT OF EVERY REMAINING CAUSE, 2026-08-24 ─────────────────────
   Prompted by four causes in a row turning out to be masking (D, J, C, and
@@ -144,7 +197,9 @@ TRANSPILATION:
     transpile outright. The recorded cause is the only cause.
 
   ✘ MASKING — uart_tx, uart_rx were filed under "no structural parent module".
-    That row conflates two different things:
+    STILL THE LIVE CAUSE, re-verified 2026-08-25: both still fail at FILE level on
+    `spawn_uart`, before either module is looked at. That row conflates two
+    different things:
       - transpiling the two LEAF modules, which the parent has nothing to do
         with. They failed only because `spawn_uart` has a hardware-looking
         signature with no `#[hardware]`, which `prepare_source` rejects at FILE
@@ -154,7 +209,8 @@ TRANSPILATION:
         feature and is what the row was presumably about.
     Keep them separate; the leaf modules are not blocked on hierarchy.
 
-  ◐ UNDERSTATED — the UART family (uart_tx, uart_rx, uart/rx) is blocked on
+  ◐ UNDERSTATED — **now filed as cause M**, which supersedes this note; kept for
+    the measurement. The UART family (uart_tx, uart_rx, uart/rx) is blocked on
     "a tick inside a `for` loop", which is BROADER than the recorded "counted
     delay". Both `for _ in 0..CLKS_PER_BIT { tick }` (bit timing) AND
     `for i in 0..8 { … tick … }` (the data-bit loop) are instances — removing
@@ -241,22 +297,22 @@ TRANSPILATION:
   codebase, and it deserves its own session rather than being bolted on.
   Degenerate `0..0` also needs deciding (the entry-inlined form would run once).
 
-  ☐ AND IT IS NOT SUFFICIENT ANYWAY — measured. None of uart_tx, uart_rx or
-    uart/rx would be unblocked by counted delays alone, because each has a
-    counted loop whose body ENDS IN another tick-bearing loop:
+  ✔ RESOLVED (2026-08-25) — this entry said counted delays "AND IT IS NOT
+    SUFFICIENT ANYWAY", because each UART loop's body ENDS IN another tick-bearing
+    loop:
         for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS_PER_BIT { tick } }
-    That shape is refused TODAY even hand-written, with no `for` involved:
-        loop { loop { if a { break; } loop { if b { break; } tick; } } }
-    → "a repeating wait must be written as `loop { <test>; clk.tick().await; }`"
-    `tick_is_last_statement` requires a DIRECT tick as the body's last statement,
-    so a loop whose clock boundary comes from a nested loop cannot flatten. This
-    is a pre-existing flattener limitation, independent of counted delays, and it
-    is the real blocker for the UART family. Note the diagnostic is also wrong for
-    this case — it talks about testing after the tick, when the body has no direct
-    tick at all.
-    ORDER OF WORK, therefore: the nested-loop-tail limitation (cause K, in the
-    coverage table above) FIRST, counted delays second. Doing them the other way
-    round unblocks nothing.
+    That was cause K, and it is FIXED — `body_ends_at_a_clock_boundary` admits the
+    shape, and the diagnostic complaint recorded here is fixed too
+    (`chir_lower::nested_loop_error`).
+    THE ORDER OF WORK RECORDED HERE WAS BACKWARDS, and the reason is structural
+    rather than a mis-estimate. It said: nested-loop-tail FIRST, counted delays
+    second, "doing them the other way round unblocks nothing". In fact K on its
+    own unblocks nothing EITHER, and cannot: the tick-last rule means every
+    hand-written inner `loop` can exit having ticked zero times, so an outer loop
+    whose only boundary is one of them is a zero-time cycle that
+    `check_reachability` now rejects. The example above — with a `for` inside — is
+    the FIRST writable instance of the shape. Counted repetition is therefore the
+    prerequisite, not the sequel. See cause M, which is now the next piece of work.
 
   ✔ KEPT from the attempt — `hoist_cross_state_locals` dropped the TYPE
     ANNOTATION when hoisting (`ty: None`), so a hoisted local whose init has no
