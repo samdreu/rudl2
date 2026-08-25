@@ -129,3 +129,60 @@ fn m(i: In<Bits<8>, ()>, o: Out<Bits<8>, ()>) {
     );
     assert_eq!(widths[0], "31:0", "usize is 32-bit throughout, got:\n{sv}");
 }
+
+/// An integer local initialised from a **constant expression** — a module
+/// parameter or file-scope const, with or without arithmetic.
+///
+/// This had no inferable width at all. `let mut k = WIDTH - 1;` asks both sides
+/// of the subtraction for a type: `WIDTH` is not a signal, so it was not in the
+/// symbol table, and `1` is a bare literal with no suffix — both came back
+/// ambiguous and the module was rejected outright. Parameters are now seeded as
+/// 32-bit, which is what they emit as (`parameter int` / `localparam int`), the
+/// same width a `for`-loop variable already gets.
+///
+/// `examples/basejump/bsg_gray_to_binary.rs` is the real instance. Note it is
+/// still not transpilable — with the width resolved it now reports its *actual*
+/// remaining blocker, a `while` loop, which this says nothing about.
+///
+/// Scope: this asserts the construct LOWERS, not that any module using it lints.
+/// A 32-bit local used purely as an index into a narrow vector draws a Verilator
+/// `UNUSEDSIGNAL` on its upper bits — the same standing question the TODO
+/// records, whether a bare integer local should take its width from its type or
+/// from its uses. Fixing the ambiguity did not answer that.
+#[test]
+fn an_integer_local_from_a_const_expression_infers_a_width() {
+    let src = r#"
+const WIDTH: usize = 8;
+
+#[hardware(combinational)]
+fn m(i: In<Bits<WIDTH>, ()>, o: Out<Logic, ()>) {
+    let k = WIDTH - 1;
+    o.write(i.read()[k]);
+}
+"#;
+    let sv = transpile(src).expect("a const-expression integer local must infer a width");
+    assert!(
+        sv.contains("logic [31:0] k;"),
+        "a parameter-derived integer local is 32-bit, like an SV `int`, got:\n{sv}"
+    );
+    assert!(
+        sv.contains("k = (WIDTH - 32'd1)"),
+        "the initializer keeps the parameter symbolic, sized to 32 bits, got:\n{sv}"
+    );
+}
+
+/// The same for a generic const parameter, which is the other way a module gets
+/// one of these names.
+#[test]
+fn an_integer_local_from_a_generic_const_param_infers_a_width() {
+    let src = r#"
+#[hardware(combinational)]
+fn m<const N: usize>(i: In<Bits<N>, ()>, o: Out<Logic, ()>) {
+    let k = N - 1;
+    o.write(i.read()[k]);
+}
+"#;
+    let sv = transpile(src).expect("a generic const param must work the same way");
+    assert!(sv.contains("logic [31:0] k;"), "got:\n{sv}");
+    assert!(sv.contains("k = (N - 32'd1)"), "got:\n{sv}");
+}

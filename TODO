@@ -38,10 +38,25 @@ TRANSPILATION:
         to transpile. two_domain_top shows the pattern already works.
     I ✔ FIXED — a branch-local `let` with a COMPUTED initializer read as a latch.
         Unblocked bsg_counter_up_down. See the write-up below.
-    J ☐ bit-width inference on a bare integer local
-        ................ bsg_gray_to_binary (24:4), ripple_carry_adder (27:8)
-        Both were previously recorded as blocked "behind" other causes; measured
-        directly, each now reports its own `cannot infer bit width`.
+    J ✔/☐ SPLIT — the two modules filed here share an error MESSAGE, not a cause.
+        Measured directly rather than read off the message, which is what the
+        earlier "bare integer local" framing got wrong:
+        J-a ✔ FIXED — an integer local from a CONST EXPRESSION had no inferable
+            width. `let mut k = WIDTH - 1;` (bsg_gray_to_binary) asked both sides
+            of the subtraction for a type: `WIDTH` is not a signal so it was not
+            in the symbol table, and `1` is a bare literal — both ambiguous, so
+            the module was rejected. Parameters and file-scope consts are now
+            seeded into the symbol table as 32-bit, which is what they emit as
+            (`parameter int`/`localparam int`) and the width a `for`-loop
+            variable already got. Pinned by transpile_inference_gaps.rs::
+            an_integer_local_from_a_{const_expression,generic_const_param}_infers_a_width.
+            THIS UNBLOCKED NOTHING BY ITSELF: bsg_gray_to_binary now reports its
+            real remaining blocker, a `while` loop (cause C). Same
+            first-error-was-masking-the-second pattern as rv32i_cpu and D-a.
+        J-b ☐ ripple_carry_adder (27:8) is the TUPLE-RETURNING HELPER gap, not a
+            width gap at all — `let (s, c) = full_adder(…)`. Already pinned by
+            transpile_inference_gaps.rs::tuple_returning_helper_is_a_known_transpile_gap;
+            it was only filed here because it prints the same message.
   ALSO STILL BLOCKED, behind causes above rather than their own:
     det_010_awaits → tick inside a conditional branch (65:8). Previously filed
       under C (`while` loops); measured, that is not the error it reports.
@@ -91,7 +106,13 @@ TRANSPILATION:
   ☐ STILL OPEN, and now the standing question rather than a blocker: should a bare
   integer local get its width from its TYPE (today: `usize` → 32) or from its USES?
   Nothing in the corpus needs the answer any more, so this is a language-design
-  call, not a bug. (The related footgun found while narrowing — `Bits::one()`
+  call, not a bug. J-a sharpened it rather than settling it: a 32-bit integer
+  local used purely as an INDEX into a narrow vector lowers correctly but draws a
+  Verilator `UNUSEDSIGNAL` on its upper bits (measured on `let k = WIDTH - 1;`
+  indexing a `Bits<8>` — `k[31:3]` unused). Verilator's own `for (int k = …)` does
+  not trip this because a loop variable is declared inside the block, not as a
+  module-level signal. A context-derived width would fix that class; narrowing at
+  the source (what the BaseJump accumulators did) sidesteps it. (The related footgun found while narrowing — `Bits::one()`
   returning ALL ONES rather than the value 1 — is ✔ FIXED: renamed `all_ones()`,
   2026-08-24. `Bits::zero()` reads as the value 0 and IS 0, so the pair invited
   exactly the wrong guess; `Bits::from_lit::<1>()` is the value. Hard rename, no

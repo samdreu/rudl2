@@ -293,7 +293,7 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **774 tests pass, 0 fail, 4 ignored** across 97 test binaries
+- **776 tests pass, 0 fail, 4 ignored** across 97 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
 - all three wiring guards (G-A / G-B / G-C) clean
 
@@ -307,9 +307,9 @@ currently transpile. The 8 that do not, grouped by root cause:
 | Cause | Blocks |
 |---|---|
 | `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
-| bit-width inference on a bare integer local | `bsg_gray_to_binary`, `ripple_carry_adder` |
+| tuple-returning helper functions | `ripple_carry_adder` |
 | no structural parent in simulation | `uart/system` (`uart_tx`, `uart_rx`) |
-| `while` loops unsupported | `uart/rx` |
+| `while` loops unsupported | `uart/rx`, `bsg_gray_to_binary` |
 | a tick inside a conditional branch | `det_010_awaits` |
 
 Note that transpiling and *linting* are different bars: the equivalence harness

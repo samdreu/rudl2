@@ -989,8 +989,24 @@ fn ident_of_expr(e: &ExprType) -> Option<String> {
     is_ident(&compact).then_some(compact)
 }
 
-fn build_port_symbols(fir: &FrontendModuleIR) -> SymbolTable {
+/// The names in scope for width inference before any local is seen: the module's
+/// ports, plus every name that resolves to a SystemVerilog `parameter`/
+/// `localparam`.
+///
+/// Parameters are typed 32-bit because that is what they emit as — `parameter int`
+/// / `localparam int` — matching both the `usize` resolution and the `int` a
+/// `for`-loop variable already gets a few hundred lines below. Without them,
+/// `let mut k = WIDTH - 1;` had no inferable width at all: `WIDTH` was not a
+/// signal, `1` is a bare literal, so both sides of the subtraction came back
+/// ambiguous and the module was rejected.
+///
+/// A local that shadows one of these simply overwrites its entry, which is what
+/// Rust's own shadowing does.
+fn build_symbol_table(fir: &FrontendModuleIR) -> SymbolTable {
     let mut symbols = SymbolTable::new();
+    for name in param_names(fir) {
+        symbols.insert(name, CHIRType::UInt { width: Width::Concrete(32) });
+    }
     for p in &fir.signature.params {
         let compact = compact_type(&p.ty.ty_text);
         let inner = strip_port_wrapper("In<", &compact)
@@ -1204,7 +1220,7 @@ fn lower_comb_body(
             if compact.starts_with("Out<") { Some(p.name.clone()) } else { None }
         })
         .collect();
-    ctx.symbols = build_port_symbols(fir);
+    ctx.symbols = build_symbol_table(fir);
     ctx.enums = build_enum_registry(fir);
     ctx.fns = build_fn_registry(fir);
     ctx.structs = build_struct_registry(fir);
@@ -1268,7 +1284,7 @@ fn lower_seq_body(
     let mut pre_loop_wires: Vec<(String, CHIRType, &ExprType, SourceSpan)> = Vec::new();
     // Seeded with the module's ports so pre-loop register inits that reference
     // ports (or later registers) can infer their width.
-    let mut symbols = build_port_symbols(fir);
+    let mut symbols = build_symbol_table(fir);
     let enums = build_enum_registry(fir);
     // Forward inference: a register/wire whose width the init can't determine
     // (`let mut out_n = Bits::x()`) takes the type of the output port it drives.
