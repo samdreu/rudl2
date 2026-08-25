@@ -353,6 +353,33 @@ construction.
 > it. Pinned by `tests/regout_forwarding_equivalence.rs`. Every false positive was a `RegOut` module. The corrected rule keys on
 the output write, which is the same structure `multi_write_collapse` already uses.
 
+### 5.4 Widening D1 to the TRAILING segment — REJECTED 2026-08-25 (two shapes)
+
+The gap is real and measured: D1's canonical shape moved past the last tick,
+
+```rust
+loop { for _ in 0..2 { clk.tick().await; } n = n + 1; o.write(n); }
+```
+
+diverges by one cycle, and `unprotected_pretick_out_write` does not flag it (it
+examines head → first tick). Pinned as
+`sequential_forwarding_divergence.rs::d1_in_the_trailing_segment_is_an_unguarded_gap`.
+The trailing segment runs in the SAME cycle as the head segment — falling off the
+end of the body and re-entering it costs no clock — so it is exposed to the
+identical phase question. Two ways of covering it were implemented and measured:
+
+| widening | newly flagged, all passing | why it is wrong |
+|---|---|---|
+| merge the trailing segment into the head region | **25** | includes `fast_counter_corrected` — the module D1's OWN REMEDY produces. "Move the register update after the `clk.tick().await`" puts it in the trailing segment; merging then flags the fix as the bug. Also `sync_2ff` (the CDC anchor) and `dual_port_ram`. |
+| apply the two clauses to the trailing segment as a SEPARATE region | **10** | all memory modules. `rom_from_fn`'s trailing segment is `if ready { q = data() } data.write(q)` — assigns a register and drives a plain `Out` from it, structurally identical to the divergent DUT — and it AGREES. |
+
+> **The open question is the discriminator between that DUT and `rom_from_fn`, and
+> a leading `In` read is NOT it** — the same DUT plus one was measured and still
+> diverges (which also refutes the natural hypothesis that the loop-top barrier
+> pins the whole iteration). Until some condition has a flipping witness (R3),
+> widening rejects correct designs (R1). The second widening is the closer of the
+> two and is where a third attempt should start.
+
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
 
 Measured by hand-writing the lowering Prost uses (combinational next-value in

@@ -517,6 +517,57 @@ TRANSPILATION:
     own update. Causes M, N and O all meet in it, which is why it found two bugs
     that none of their own purpose-built tests did.
 
+  ── AUDIT: WHAT CONTROL EXTRACTION HIDES (2026-08-25) ────────────────────────
+  Prompted by two checks in a row turning out to be invisible to extracted
+  modules (the trailing-statement rule and `MultiplyDrivenOutput`). Method:
+  enumerate every check keyed on tick or phase COUNT, then probe each with a
+  linear/extracted pair. Extraction rewrites any module whose ticks live inside
+  branches or loops into a SINGLE-tick `match pc` FSM, so anything counting ticks
+  sees one phase where there are several.
+
+  ✔ `MultiplyDrivenOutput` (vlir_lower) — hidden, and FIXED this session by
+    `copper_analysis::multi_phase_out_write`, which checks the source instead.
+
+  ◐ TRAILING COMBINATIONAL STATEMENTS (shir_lower) — hidden, but the check is NOT
+    the semantic rule it looks like. Measured, linear vs extracted:
+      - `loop { for _ in 0..2 { tick } o.write(CONST); }` — extraction ACCEPTS
+        (the linear path refuses) and it AGREES with its SV. This is `uart/rx`'s
+        `rx_dv.write(Zero)`, which is verified correct. So the linear path's
+        refusal is a limitation of ITS lowering ("an output written there would be
+        silently dropped"), not a property of the language.
+      - `loop { for _ in 0..2 { tick } n = n + 1; o.write(n); }` — DIVERGES. That
+        is D1's canonical shape in the trailing segment, and it is a real gap in
+        the D1 RULE rather than in this check. Pinned and written up under §5.4 of
+        design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md, with both attempted widenings
+        and their corpus costs (25 and 10 false positives) so neither is re-tried.
+    So: nothing to hoist here. The finding is that the linear path is over-strict
+    and D1 is under-strict, which are different bugs from the one being looked for.
+
+  ☐ `MemoryResultDrivesPlainOutput` (vlir_lower) — hidden by
+    `if phases.len() < 2 { return Ok(()) }`, and UNREACHABLE under extraction
+    anyway, because an earlier memory check rejects the module first. That earlier
+    check is itself wrong: `chir_lower`'s read-before-tick staging check reasons
+    about SEGMENTS, and extraction collapses them, so a legal design is refused.
+    Measured — this transpiles:
+        loop { rom.read(addr); tick; data.write(rom.data()); }
+    and appending `for _ in 0..2 { tick }` (which changes nothing about the
+    staging) makes it fail with "`rom...data()` is read before the `clk.tick().await`
+    that produces it". A FALSE POSITIVE, so any memory design that also needs
+    control extraction is currently unwritable.
+    THE FIX IS THE SAME SHAPE AS THE OTHERS — the staging/observation ordering is
+    a CFG reachability question ("is every `data()` separated from its `read()` by
+    a tick on all paths?") and belongs in `copper-analysis`, on the source, where
+    the ticks are still visible. Not small: the analysis crate would have to
+    recognise the memory method calls. Doing it in codegen instead would mean a
+    second implementation of the ordering rule, which is the drift bug this file
+    keeps recording.
+
+  RECORD THE CLASS, since it is now four for four: **a check that counts a
+  syntactic feature (`clk.tick().await`) rather than the thing it means (a clock
+  phase), placed downstream of a pass that legitimately removes that feature.**
+  Every check in CODEGEN that reasons about phases is suspect by construction;
+  the ones in `copper-analysis` are not, because they run on the source.
+
   ── RE-MEASUREMENT OF EVERY REMAINING CAUSE, 2026-08-24 ─────────────────────
   Prompted by four causes in a row turning out to be masking (D, J, C, and
   det_010_awaits). Method: remove the REPORTED blocker in a scratch copy and see

@@ -618,3 +618,87 @@ fn the_rule_flags_the_plain_form_and_not_the_registered_one() {
         "`RegOut` must be exempt — it is excluded by construction, like multi_write_collapse"
     );
 }
+
+// ── D1 in the TRAILING segment — a measured gap, NOT yet guarded ──────────────
+//
+// `unprotected_pretick_out_write` examines head → first tick. The statements
+// AFTER the loop's last tick run in the same cycle as the head segment (falling
+// off the end and re-entering costs no clock), so they are exposed to the same
+// phase question — and D1's canonical shape, moved there, diverges:
+//
+//     loop { for _ in 0..2 { tick } n = n + 1; o.write(n); }
+//
+// The rule does not flag it. Two widenings were measured and REJECTED:
+//
+//   * merging the trailing segment into the head region flags **25** further
+//     corpus modules, all passing — including `sync_2ff`, `dual_port_ram`, and
+//     `fast_counter_corrected`, which is the module D1's OWN REMEDY produces
+//     ("move the register update after the `clk.tick().await`"). The hazard needs
+//     the output write and the register assignment in the SAME segment; split
+//     across the two, it is the fix, not the bug.
+//   * applying the two clauses to the trailing segment as a separate region cuts
+//     that to **10**, all memory modules — e.g. `rom_from_fn`, whose trailing
+//     segment is `if ready { q = data() } data.write(q)`: structurally identical
+//     to the DUT below, and it AGREES.
+//
+// So the discriminator between this DUT and `rom_from_fn` is unidentified, and a
+// leading `In` read is not it — the same DUT plus one was measured and still
+// diverges. Until a condition has a flipping witness (requirement R3 of
+// design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md), widening the rule would reject
+// correct designs, which is requirement R1.
+
+const TRAILING_D1_SRC: &str = r#"
+#[hardware(sequential)]
+async fn trailing_update(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        for _ in 0..2 { clk.tick().await; }
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+"#;
+#[hardware(sequential)]
+async fn trailing_update(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        for _ in 0..2 { clk.tick().await; }
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+
+#[test]
+fn d1_in_the_trailing_segment_is_an_unguarded_gap() {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = o.dirty_handle();
+    exec.spawn_wired(trailing_update(clk.clone(), o), vec![dh], vec![]);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+
+    // The rule does NOT flag it — that is the gap, asserted so it flips loudly if
+    // the rule is ever widened to cover it.
+    let f: syn::ItemFn = syn::parse_str(TRAILING_D1_SRC).expect("parses");
+    assert!(
+        copper_analysis::unprotected_pretick_out_write(&f).is_empty(),
+        "the trailing-segment gap is now GUARDED — good. Delete this test, add the \
+         DUT to EXPECTED_FLAGGED in pretick_alignment_corpus.rs, and record the \
+         discriminator that made it separable from `rom_from_fn`."
+    );
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(TRAILING_D1_SRC, "trailing_update", "clk", "o", "");
+    assert_ne!(
+        sim, sv,
+        "sim and SV now AGREE for a trailing-segment register update — the gap is \
+         FIXED. Promote this to a real equivalence test."
+    );
+}
