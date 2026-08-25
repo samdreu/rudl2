@@ -56,3 +56,57 @@ fn branch_merge_extracts_to_explicit_fsm() {
 fn match_tick_extracts_to_explicit_fsm() {
     assert_extracts_to("match_tick", "match_tick_explicit");
 }
+
+// ── State-count budget ────────────────────────────────────────────────────────
+
+/// The FSM must be the size of the DESIGN, not of the lowering's bookkeeping.
+///
+/// Leaving a loop is not a clock boundary, so a `break` INLINES the enclosing
+/// loop's continuation — and that continuation used to be lowered afresh at every
+/// `break` site, allocating a fresh set of states for every tick in it. The
+/// desugared counted `for` has two `break`s, each lowered again by the rotation's
+/// entry copy, so each nesting level roughly doubled. `examples/uart/rx.rs` came
+/// out at 788 states and 16k lines of SystemVerilog — enough to overflow the `pc`
+/// register, which is how it was noticed at all.
+///
+/// The count did not depend on `CLKS_PER_BIT` (434 and 8 both gave 788), which is
+/// what identified it as duplication rather than unrolling. `LoopCtx::lowered_break`
+/// caches the lowered continuation, so it costs one set of states however many
+/// `break`s reach it.
+///
+/// A budget rather than an exact number: this pins the ORDER OF MAGNITUDE so an
+/// exponential blow-up fails loudly, without freezing a state count that a
+/// legitimate lowering change may legitimately shift by one or two.
+#[test]
+fn a_deeply_nested_design_does_not_blow_up_the_state_count() {
+    let src = include_str!("fixtures/uart_rx_dut.rs");
+    let sv = transpile_source(src, Some("uart_rx_dut"), &EmitConfig::default())
+        .expect("the UART receiver must transpile");
+
+    // `<width>'d<n>:` at the head of a line — a `case` arm label, and nothing else
+    // (an expression mentioning `32'd1` must not be counted as a state).
+    fn case_label(line: &str) -> Option<&str> {
+        let t = line.trim();
+        let (head, _) = t.split_once(':')?;
+        let (w, v) = head.split_once("'d")?;
+        let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+        (digits(w) && digits(v)).then_some(head)
+    }
+    let mut states: Vec<&str> = sv.lines().filter_map(case_label).collect();
+    states.sort_unstable();
+    states.dedup();
+
+    assert!(
+        states.len() <= 24,
+        "the receiver flattened to {} states — it has about ten segments, so this \
+         is duplication, not design. Was the break continuation re-lowered per \
+         `break` again?\n{sv}",
+        states.len()
+    );
+    // …and it must still be a real FSM, not one collapsed by an unrelated bug.
+    assert!(
+        states.len() >= 6,
+        "only {} states: the receiver's segments cannot all be there",
+        states.len()
+    );
+}

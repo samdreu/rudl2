@@ -26,9 +26,10 @@ TRANSPILATION:
   BEFORE each delay — same instants, same behaviour, all five self-check sections
   unchanged — is what finally moved the counter. See the write-up below.
   AND IT DID NOT TRANSPILE CORRECTLY AT FIRST: acceptance is not correctness, and
-  the `for`/`continue` work had two real bugs behind it that only a design this
-  dense could reach (a `pc` too narrow for its own state count, and a back edge
-  that cost a cycle). Both fixed and pinned; read the uart/rx entry. L / L-1 / L-2 / N and the hoisted-default bug were
+  the `for`/`continue` work had three real defects behind it that only a design
+  this dense could reach — a `pc` too narrow for its own state count, a back edge
+  that cost a cycle, and a state count of 788 where 11 was right. All three fixed
+  and pinned; read the uart/rx entry. L / L-1 / L-2 / N and the hoisted-default bug were
   wrong-CODE bugs, not rejections, so they move no counter either — which is the
   point: coverage was never going to show them, and two of them were silent.
   The 6 still failing, by ROOT CAUSE, as measured on 2026-08-25:
@@ -455,15 +456,37 @@ TRANSPILATION:
      design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md before widening it, since three
      candidate fixes are already recorded there as rejected with evidence.
 
-  ☐ 788 STATES FOR A UART RECEIVER — correct now, but absurd, and the number does
-     not depend on CLKS_PER_BIT (434 and 8 both give 788), so it is structural
-     duplication and not unrolling. `lower_into` RE-LOWERS a nested loop's break
-     continuation at every `break` site, and the desugared counted `for` has two
-     of them, so each nesting level roughly doubles. The `None` branch already
-     solves this for its own case by cloning the LOWERED body so the copies share
-     the sub-states their ticks allocated; the break path should do the same.
-     Not a correctness bug (sim ≡ Verilator passes), but 16k lines of SystemVerilog
-     and a 788-way `case` is real area, and it is what makes `pc` need 16 bits.
+  ✔ FIXED (2026-08-25) — **788 STATES FOR A UART RECEIVER, NOW 11.** 16,479 lines
+     of SystemVerilog became 260, and `pc` went back to 8 bits.
+     The diagnosis came from the number not moving: 434 and 8 cycles per bit both
+     gave 788, so it was duplication and not unrolling. `lower_into` RE-LOWERED a
+     nested loop's break continuation at every `break` site, allocating a fresh set
+     of states for every tick in it. The desugared counted `for` has two `break`s,
+     each lowered again by the rotation's entry copy, so each nesting level roughly
+     doubled — and uart/rx is the first design nested deeply enough for that to
+     matter.
+     FIX: `LoopCtx::lowered_break`, a lazily-filled cache of the LOWERED
+     continuation, cloned at each `break`. Exactly the trick the tick-in-branches
+     path already used on the body ("cloning the lowered form rather than
+     re-lowering the source matters: the two copies then share the sub-states their
+     ticks allocated") — the break path simply never got it. Sharing is not an
+     approximation: every `break` out of one loop continues with the same
+     statements in the same context, and where control came from is already
+     recorded by which state it came from. Lazy so a loop whose body never breaks
+     allocates nothing.
+     WHY IT WAS INVISIBLE UNTIL NOW: the corpus had no design with a nested
+     tick-bearing loop inside another one. Cause K's entry predicted exactly this
+     ("no well-formed hand-written instance exists" until the counted `for` landed),
+     and every purpose-built test for M, N and O is one or two levels deep.
+     → tests/control_extraction_structural.rs::
+       a_deeply_nested_design_does_not_blow_up_the_state_count — a BUDGET (≤ 24)
+       rather than an exact count, so an exponential blow-up fails loudly while a
+       legitimate lowering change can still shift the number by one or two. It also
+       asserts a FLOOR, so a collapse to a handful of states cannot pass either.
+       Measured: 11 with the cache, 788 without.
+     RECORD THE CLASS: an optimisation applied on one path of a pass and not its
+     sibling, where the two do the same thing for the same reason. The comment
+     explaining WHY it mattered was sitting ten lines above the code that lacked it.
 
   → tests/uart_rx_equivalence.rs — the receiver at an 8-cycle bit period (434 is
     trace, not coverage), decoding three frames. It is the densest module in the

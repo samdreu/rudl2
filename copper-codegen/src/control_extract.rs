@@ -965,6 +965,26 @@ struct LoopCtx<'a> {
     head: usize,
     break_stmts: Vec<RawStmt>,
     outer: Option<&'a LoopCtx<'a>>,
+    /// `break_stmts` after lowering, computed once and cloned at every `break`.
+    ///
+    /// Leaving a loop is not a clock boundary, so a `break` INLINES the enclosing
+    /// loop's continuation rather than transitioning to it. Lowering that
+    /// continuation afresh per `break` allocated a fresh set of states for every
+    /// tick in it — and the desugared counted `for` has two `break`s, each lowered
+    /// twice more by the rotation's entry copy. `examples/uart/rx.rs` came out at
+    /// 788 states, a count that did not depend on `CLKS_PER_BIT` (434 and 8 both
+    /// gave 788), which is what identified it as duplication rather than unrolling.
+    ///
+    /// Caching the LOWERED form is the same trick the tick-in-branches path
+    /// already uses on the body: the copies then share the sub-states their ticks
+    /// allocated, so the continuation costs one set of states however many
+    /// `break`s reach it. Every `break` from one loop continues with the same
+    /// statements in the same context, so sharing is not an approximation — where
+    /// control came from is already recorded by which state it came from.
+    ///
+    /// Lazily filled: a loop whose body never breaks must not allocate states for
+    /// a continuation nothing reaches.
+    lowered_break: std::cell::RefCell<Option<Vec<RawStmt>>>,
     /// What it MEANS to run off the end of this loop's body without ticking.
     fallthrough: FallThrough,
 }
@@ -1007,6 +1027,7 @@ impl LoopCtx<'_> {
             break_stmts: Vec::new(),
             outer: None,
             fallthrough: FallThrough::ZeroTime,
+            lowered_break: std::cell::RefCell::new(None),
         }
     }
 }
@@ -1051,8 +1072,20 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
             // Leave the nested loop and carry straight on with what followed it,
             // in the same cycle. Anything after the `break` is unreachable.
             let outer = ctx.outer.expect("break outside a nested loop is refused by the gate");
-            let cont = ctx.break_stmts.clone();
-            lower_into(&cont, target, sm, outer);
+            // Lower it once per loop, not once per `break` — see `lowered_break`.
+            // The borrow is released before recursing, so a continuation that
+            // itself breaks out of something cannot deadlock on this cell.
+            let cached = ctx.lowered_break.borrow().clone();
+            let lowered = match cached {
+                Some(l) => l,
+                None => {
+                    let mut v = Vec::new();
+                    lower_into(&ctx.break_stmts, &mut v, sm, outer);
+                    *ctx.lowered_break.borrow_mut() = Some(v.clone());
+                    v
+                }
+            };
+            target.extend(lowered);
             return;
         }
 
@@ -1066,6 +1099,7 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
                 // A nested loop's body is lowered with its trailing tick removed
                 // (rotated, below), so running off its end stands for that tick.
                 fallthrough: FallThrough::AfterTick,
+                lowered_break: std::cell::RefCell::new(None),
             };
             let body = &loop_expr.body;
             // A state is "the code between two ticks", so for a body `W ; tick ; C`
