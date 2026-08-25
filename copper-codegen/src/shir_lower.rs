@@ -254,18 +254,27 @@ fn lower_stmt_list(
                 // against the forwarding as it stands here. Each branch then gets
                 // its own copy — an assignment in one arm must not leak into the
                 // other. Merging the two back afterwards is `advance`'s job.
+                //
+                // Both forms travel on, exactly as a `PortDrive`'s value does: the
+                // drives inside may be split between `always_comb` and `always_ff`,
+                // and only `vlir_lower::split_output_reg` knows which. Emitting the
+                // unforwarded test in the `always_ff` copy is `TODO` cause N — it
+                // made `c = c + 1; if c == 3 { … }` fire a cycle late.
                 let condition = rename_vars(lower_expr(condition)?, renames);
+                let edge_condition = fwd.at_edge(&condition);
                 let then_stmts =
                     lower_stmt_list(then_body, promoted_names, renames, wire_types, &mut fwd.clone())?;
                 let else_stmts = else_body.as_ref()
                     .map(|eb| lower_stmt_list(eb, promoted_names, renames, wire_types, &mut fwd.clone()))
                     .transpose()?;
                 if !then_stmts.is_empty() || else_stmts.as_ref().map_or(false, |e| !e.is_empty()) {
-                    out.push(SHIRStmt::If { condition, then_stmts, else_stmts });
+                    out.push(SHIRStmt::If { condition, edge_condition, then_stmts, else_stmts });
                 }
             }
             CHIRStmt::Match { scrutinee, arms, .. } => {
+                // Both forms, for the reason given on the `If` arm above.
                 let scrutinee = rename_vars(lower_expr(scrutinee)?, renames);
+                let edge_scrutinee = fwd.at_edge(&scrutinee);
                 let shir_arms = arms.iter()
                     .map(|arm| {
                         let stmts = lower_stmt_list(
@@ -283,7 +292,7 @@ fn lower_stmt_list(
                     })
                     .collect::<Result<Vec<_>, SHIRLowerError>>()?;
                 if shir_arms.iter().any(|a| !a.stmts.is_empty()) {
-                    out.push(SHIRStmt::Match { scrutinee, arms: shir_arms });
+                    out.push(SHIRStmt::Match { scrutinee, edge_scrutinee, arms: shir_arms });
                 }
             }
             CHIRStmt::ForLoop { var, start, end, body, .. } => {

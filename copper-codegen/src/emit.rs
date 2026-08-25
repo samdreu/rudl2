@@ -507,7 +507,9 @@ impl Emitter<'_> {
                     expr_str(value)
                 ));
             }
-            VLIRStmt::If { condition, then_stmts, else_stmts } => {
+            // `always_comb`: the post-edge form. The `edge_condition` copy was
+            // already taken by `split_output_reg` for the `always_ff` half.
+            VLIRStmt::If { condition, then_stmts, else_stmts, .. } => {
                 self.out
                     .push_str(&format!("{}if ({}) begin\n", self.indent(level), expr_str(condition)));
                 for st in then_stmts {
@@ -524,7 +526,7 @@ impl Emitter<'_> {
                     self.out.push('\n');
                 }
             }
-            VLIRStmt::Case { selector, arms, default } => {
+            VLIRStmt::Case { selector, arms, default, .. } => {
                 self.out.push_str(&format!("{}case ({})\n", self.indent(level), expr_str(selector)));
                 for arm in arms {
                     self.out.push_str(&format!(

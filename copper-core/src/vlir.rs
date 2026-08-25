@@ -236,13 +236,21 @@ pub enum VLIRStmt {
         value: VLIRExpr,
         edge_value: VLIRExpr,
     },
+    /// `edge_condition` is `condition` in PRE-edge terms, carried for the same
+    /// reason `PortAssign` carries `edge_value`: `split_output_reg` may move the
+    /// drives inside this branch into `always_ff`, and that copy of the test is
+    /// sampled before the edge rather than read after it. Equal to `condition`
+    /// unless the segment assigns a register the test reads. See `SHIRStmt::If`.
     If {
         condition: VLIRExpr,
+        edge_condition: VLIRExpr,
         then_stmts: Vec<VLIRStmt>,
         else_stmts: Option<Vec<VLIRStmt>>,
     },
+    /// See [`VLIRStmt::If`] for why the selector is carried twice.
     Case {
         selector: VLIRExpr,
+        edge_selector: VLIRExpr,
         arms: Vec<VLIRCaseArm>,
         default: Option<Vec<VLIRStmt>>,
     },

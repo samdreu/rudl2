@@ -565,16 +565,18 @@ fn lower_comb_stmt(
             value: lower_expr(value, leg, mb)?,
             edge_value: lower_expr(edge_value, leg, mb)?,
         }),
-        SHIRStmt::If { condition, then_stmts, else_stmts } => Ok(VLIRStmt::If {
+        SHIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => Ok(VLIRStmt::If {
             condition: lower_expr(condition, leg, mb)?,
+            edge_condition: lower_expr(edge_condition, leg, mb)?,
             then_stmts: lower_comb_stmts(then_stmts, leg, mems, mb)?,
             else_stmts: match else_stmts {
                 Some(e) => Some(lower_comb_stmts(e, leg, mems, mb)?),
                 None => None,
             },
         }),
-        SHIRStmt::Match { scrutinee, arms } => {
+        SHIRStmt::Match { scrutinee, edge_scrutinee, arms } => {
             let selector = lower_expr(scrutinee, leg, mb)?;
+            let edge_selector = lower_expr(edge_scrutinee, leg, mb)?;
             let mut case_arms = Vec::new();
             let mut default = None;
             for arm in arms {
@@ -597,7 +599,7 @@ fn lower_comb_stmt(
                     }
                 }
             }
-            Ok(VLIRStmt::Case { selector, arms: case_arms, default })
+            Ok(VLIRStmt::Case { selector, edge_selector, arms: case_arms, default })
         }
         SHIRStmt::ForLoop { var, start, end, body } => Ok(VLIRStmt::ForLoop {
             var: var.clone(),
@@ -630,15 +632,17 @@ fn clone_comb_stmt(s: &VLIRStmt) -> VLIRStmt {
             value: value.clone(),
             edge_value: edge_value.clone(),
         },
-        VLIRStmt::If { condition, then_stmts, else_stmts } => VLIRStmt::If {
+        VLIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => VLIRStmt::If {
             condition: condition.clone(),
+            edge_condition: edge_condition.clone(),
             then_stmts: then_stmts.iter().map(clone_comb_stmt).collect(),
             else_stmts: else_stmts
                 .as_ref()
                 .map(|e| e.iter().map(clone_comb_stmt).collect()),
         },
-        VLIRStmt::Case { selector, arms, default } => VLIRStmt::Case {
+        VLIRStmt::Case { selector, edge_selector, arms, default } => VLIRStmt::Case {
             selector: selector.clone(),
+            edge_selector: edge_selector.clone(),
             arms: arms
                 .iter()
                 .map(|a| VLIRCaseArm {
@@ -1422,8 +1426,13 @@ fn collect_vlir_reads_stmt(stmt: &VLIRStmt, out: &mut HashSet<String>) {
             collect_vlir_reads(value, out);
             collect_vlir_reads(edge_value, out);
         }
-        VLIRStmt::If { condition, then_stmts, else_stmts } => {
+        // BOTH forms of the test count as reads, for the same reason `PortAssign`
+        // collects both: which one survives is decided later, at
+        // `split_output_reg`, and a wire read only by the surviving form must not
+        // have been deleted by then.
+        VLIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => {
             collect_vlir_reads(condition, out);
+            collect_vlir_reads(edge_condition, out);
             for s in then_stmts {
                 collect_vlir_reads_stmt(s, out);
             }
@@ -1433,8 +1442,9 @@ fn collect_vlir_reads_stmt(stmt: &VLIRStmt, out: &mut HashSet<String>) {
                 }
             }
         }
-        VLIRStmt::Case { selector, arms, default } => {
+        VLIRStmt::Case { selector, edge_selector, arms, default } => {
             collect_vlir_reads(selector, out);
+            collect_vlir_reads(edge_selector, out);
             for a in arms {
                 collect_vlir_reads(&a.selector_value, out);
                 for s in &a.stmts {
@@ -1555,7 +1565,11 @@ fn split_output_reg(s: &VLIRStmt, targets: &HashSet<String>) -> (Option<VLIRStmt
                 value: edge_value.clone(),
             }])
         }
-        VLIRStmt::If { condition, then_stmts, else_stmts } => {
+        // A branch is split the same way its drives are, and each half takes the
+        // matching form of the test: the `always_comb` copy reads the registers
+        // AFTER the edge (`condition`), the `always_ff` copy is sampled BEFORE it
+        // (`edge_condition`). Using `condition` for both is `TODO` cause N.
+        VLIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => {
             let (tc, tf) = split_output_regs(then_stmts, targets);
             let (ec, ef) = match else_stmts {
                 Some(e) => { let (c, f) = split_output_regs(e, targets); (Some(c), f) }
@@ -1564,20 +1578,26 @@ fn split_output_reg(s: &VLIRStmt, targets: &HashSet<String>) -> (Option<VLIRStmt
             let comb = if tc.is_empty() && ec.as_ref().map_or(true, |c| c.is_empty()) {
                 None
             } else {
-                Some(VLIRStmt::If { condition: condition.clone(), then_stmts: tc, else_stmts: ec })
+                Some(VLIRStmt::If {
+                    condition: condition.clone(),
+                    edge_condition: edge_condition.clone(),
+                    then_stmts: tc,
+                    else_stmts: ec,
+                })
             };
             let ff = if tf.is_empty() && ef.is_empty() {
                 Vec::new()
             } else {
                 vec![VLIRFFStmt::If {
-                    condition: condition.clone(),
+                    condition: edge_condition.clone(),
                     then_stmts: tf,
                     else_stmts: if ef.is_empty() { None } else { Some(ef) },
                 }]
             };
             (comb, ff)
         }
-        VLIRStmt::Case { selector, arms, default } => {
+        // Same split, same choice of form — see the `If` arm.
+        VLIRStmt::Case { selector, edge_selector, arms, default } => {
             let mut comb_arms = Vec::new();
             let mut ff_arms = Vec::new();
             for a in arms {
@@ -1595,7 +1615,12 @@ fn split_output_reg(s: &VLIRStmt, targets: &HashSet<String>) -> (Option<VLIRStmt
             let comb = if comb_arms.is_empty() && comb_default.is_none() {
                 None
             } else {
-                Some(VLIRStmt::Case { selector: selector.clone(), arms: comb_arms, default: comb_default })
+                Some(VLIRStmt::Case {
+                    selector: selector.clone(),
+                    edge_selector: edge_selector.clone(),
+                    arms: comb_arms,
+                    default: comb_default,
+                })
             };
             let ff = if ff_arms.is_empty() && ff_default.is_none() {
                 Vec::new()
@@ -1604,7 +1629,7 @@ fn split_output_reg(s: &VLIRStmt, targets: &HashSet<String>) -> (Option<VLIRStmt
                 // "no assignment → the output register holds" (and avoids a
                 // Verilator CASEINCOMPLETE warning).
                 vec![VLIRFFStmt::Case {
-                    selector: selector.clone(),
+                    selector: edge_selector.clone(),
                     arms: ff_arms,
                     default: ff_default.or_else(|| Some(Vec::new())),
                 }]
@@ -2086,15 +2111,19 @@ fn collect_read_uses(
                 collect_read_uses_expr(addr, data, valid);
                 collect_read_uses_expr(value, data, valid);
             }
-            SHIRStmt::If { condition, then_stmts, else_stmts } => {
+            // Both forms of the test, since either may be the one emitted — the
+            // same reason `collect_vlir_reads_stmt` walks both.
+            SHIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => {
                 collect_read_uses_expr(condition, data, valid);
+                collect_read_uses_expr(edge_condition, data, valid);
                 collect_read_uses(then_stmts, data, valid);
                 if let Some(e) = else_stmts {
                     collect_read_uses(e, data, valid);
                 }
             }
-            SHIRStmt::Match { scrutinee, arms } => {
+            SHIRStmt::Match { scrutinee, edge_scrutinee, arms } => {
                 collect_read_uses_expr(scrutinee, data, valid);
+                collect_read_uses_expr(edge_scrutinee, data, valid);
                 for a in arms {
                     if let Some(g) = &a.guard {
                         collect_read_uses_expr(g, data, valid);

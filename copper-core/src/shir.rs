@@ -186,13 +186,30 @@ pub enum SHIRStmt {
         value: SHIRExpr,
         edge_value: SHIRExpr,
     },
+    /// A branch carries its test in BOTH forms, for exactly the reason
+    /// [`SHIRStmt::PortDrive`] carries its value in both: the drives inside it may
+    /// be split between a continuous `assign` and an `always_ff` non-blocking
+    /// assignment, and the two copies read the segment's registers in different
+    /// windows. `vlir_lower::split_output_reg` already makes that split; it now
+    /// picks the matching test for each half.
+    ///
+    /// A test that reads a register this segment has ALREADY assigned is the case
+    /// that separates them — `c = c + 1; if c == 3 { … }` means the incremented
+    /// `c` in the simulator, and an `always_ff` copy testing the unforwarded `c`
+    /// silently fires a cycle late (or, with `c` reset inside the branch, never at
+    /// all). See `TODO` cause N.
     If {
         condition: SHIRExpr,
+        /// `condition` in pre-edge terms — see the note above.
+        edge_condition: SHIRExpr,
         then_stmts: Vec<SHIRStmt>,
         else_stmts: Option<Vec<SHIRStmt>>,
     },
+    /// See [`SHIRStmt::If`] for why the scrutinee is carried twice.
     Match {
         scrutinee: SHIRExpr,
+        /// `scrutinee` in pre-edge terms — see [`SHIRStmt::If`].
+        edge_scrutinee: SHIRExpr,
         arms: Vec<SHIRMatchArm>,
     },
     /// `for <var> in <start>..<end>` (exclusive), emitted as an SV `for`.
