@@ -43,10 +43,28 @@ pub fn transpile_fir(
     // `while <cond> { … tick; }` is sugar for the repeating wait extraction
     // already handles; rewrite it before the gate looks at the body.
     control_extract::desugar_tick_waits(&mut fir);
+    // …and `for <var> in <a>..<b> { … tick; }` is sugar for a counted one. It runs
+    // AFTER the `while` rewrite so a `for` nested inside a tick-bearing `while`
+    // is reached: that rewrite moves the body into a fresh `loop`, which this pass
+    // then walks.
+    control_extract::desugar_counted_loops_in(&mut fir);
+    // Why extraction is about to decline, if the reason is a construct the linear
+    // path downstream cannot name. Computed BEFORE the pass runs, since a declined
+    // module is left untouched and there is nothing to inspect afterwards.
+    let declined = control_extract::unflattenable_reason(&fir);
     control_extract::extract_control(&mut fir);
     let fir = &fir;
 
-    let chir = lower_to_chir(fir, hardware_fns, registry).map_err(|e| format!("{e}"))?;
+    // A declined module cannot be flattened, so whatever the linear lowering
+    // reports is downstream of that decline — and it blames the first unsupported
+    // thing it REACHES, which is routinely not the thing at fault. `uart/rx`
+    // reported its well-formed repeating wait (line 55) for a `continue` further
+    // down the body. Prefer the construct that actually stopped the flattening,
+    // with its own span.
+    let chir = lower_to_chir(fir, hardware_fns, registry).map_err(|e| match &declined {
+        Some(reason) => format!("{reason}"),
+        None => format!("{e}"),
+    })?;
     let shir = lower_to_shir(&chir).map_err(|e| format!("{e}"))?;
     let vlir = lower_to_vlir(&shir).map_err(|e| format!("{e}"))?;
     Ok(emit_verilog(&vlir, config))

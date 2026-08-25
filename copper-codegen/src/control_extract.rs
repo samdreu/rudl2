@@ -45,8 +45,8 @@
 //! rather than mis-lowered.
 
 use copper_core::frontend_ir::{
-    ExprAssign, ExprBlock, ExprBreak, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprPath,
-    ExprStmt, ExprUnary,
+    ExprAssign, ExprBinary, ExprBlock, ExprBreak, ExprIf, ExprLit, ExprLoop, ExprMatch,
+    ExprMatchArm, ExprPath, ExprStmt, ExprUnary,
     ExprType, FrontendModuleIR, LocalStmt, RawStmt, RawStmtKind, RawTypeRef, SourceSpan,
 };
 
@@ -140,6 +140,286 @@ fn desugar_expr(e: &mut ExprType) {
     }
 }
 
+// ── Counted repetition ────────────────────────────────────────────────────────
+
+/// The synthesized counter for a `for _ in …` whose variable is `_`.
+const ANON_COUNTER: &str = "__copper_ctr";
+
+/// The counter's Rust type. 32 bits, matching what a `for`-loop variable already
+/// lowers to (`chir_lower` seeds one as `u32`) and what a `const` bound emits as
+/// (`localparam int`), so the comparison against `<end>` needs no widening.
+const COUNTER_TY: &str = "u32";
+
+/// Rewrite the counted `for`s **inside the module's top-level `loop`**, and only
+/// those.
+///
+/// The restriction is not cosmetic. The rewrite replaces a `for` statement with a
+/// `let` and a `loop`, and `extract_control` finds the module's own loop by taking
+/// the FIRST top-level `loop` statement — so a `for` rewritten OUTSIDE that loop
+/// would put a synthesized bounded loop ahead of it and the wrong one would be
+/// extracted. A tick outside the top-level loop is not something the phase FSM
+/// supports in any case, and `chir_lower` already says so; leaving it untouched
+/// keeps that message.
+pub fn desugar_counted_loops_in(fir: &mut FrontendModuleIR) {
+    let Some(idx) = fir.raw_statements.iter().position(is_loop_stmt) else {
+        return;
+    };
+    let RawStmtKind::Expr(es) = &mut fir.raw_statements[idx].kind else {
+        return;
+    };
+    let ExprType::Loop(l) = &mut es.expr else {
+        return;
+    };
+    let mut next_counter = 0usize;
+    desugar_counted_loops(&mut l.body, &mut next_counter);
+}
+
+/// Rewrite `for <var> in <start>..<end> { <B>; clk.tick().await; }` into the
+/// counted `loop` this pass already flattens:
+///
+/// ```text
+/// let mut <var>: u32 = <start>;
+/// loop {
+///     if <var> >= <end> { break; }      // empty range, and the loop's own test
+///     <B>
+///     <var> = <var> + 1;
+///     if <var> >= <end> { break; }      // leave BEFORE the last iteration's tick
+///     clk.tick().await;
+/// }
+/// clk.tick().await;                     // …which is this one
+/// ```
+///
+/// **A tick inside a `for` is counted REPETITION, not unrolling.** A UART bit
+/// period is 434 cycles; unrolling it would be 434 states. The counter is a
+/// register and the loop is one state, exactly as a hand-written wait is — which
+/// is why this is a desugar and not a new state shape: afterwards the loop lands
+/// on `lower_into`'s nested-loop path, already verified end to end.
+///
+/// # Why the last tick is moved OUT of the loop
+///
+/// This is the part that is not obvious, and the naive shape — one test at the
+/// top, tick last, nothing after the loop — is measurably wrong by a cycle.
+///
+/// Breaking out of a nested loop is not a clock boundary: `lower_into` inlines the
+/// enclosing loop's continuation into the breaking path and carries on in the same
+/// cycle. But when that continuation contains no boundary of its own, the lowering
+/// falls off the end and emits `pc = <enclosing head>` — a state transition, and
+/// the FSM spends a cycle on it. With the tick left inside, a counted delay's
+/// continuation IS empty, so every pass through the loop cost one cycle more than
+/// the source asks for (measured on `for _ in 0..3`: the simulator rewrote the
+/// output every 3rd cycle, the transpiled module every 4th).
+///
+/// That is `TODO` cause K's back edge, which its own entry records as unverified
+/// because no well-formed hand-written program could reach it. Leaving the final
+/// tick in the ENCLOSING statement list means the break always continues into a
+/// real clock boundary, so the shape is never produced — the same disposition as
+/// the tick-ordering rule: make the divergent form unwritable rather than teach
+/// the flattener to special-case it.
+///
+/// The second test is what pays for that: the loop leaves before the final tick,
+/// and the hoisted one supplies it. `B` is not duplicated.
+///
+/// # `>=` rather than `==`, and the empty range
+///
+/// `for i in 5..3` yields nothing in Rust; `i == 3` would never fire and the loop
+/// would spin forever, while `i >= 3` breaks at once. A statically empty range is
+/// dropped outright, since the hoisted tick would otherwise cost a cycle the
+/// source does not have. When the bounds are not literals — `0..CLKS_PER_BIT` —
+/// emptiness is not decidable here, and an empty one would produce that spurious
+/// cycle. `copper_analysis::may_exit_without_tick` has the same hole for the same
+/// reason (it treats a `for` as a guaranteed clock boundary, which an empty range
+/// is not) and both need const evaluation to close.
+fn desugar_counted_loops(stmts: &mut Vec<RawStmt>, next_counter: &mut usize) {
+    let mut out: Vec<RawStmt> = Vec::with_capacity(stmts.len());
+    for mut s in std::mem::take(stmts) {
+        // Descend first: an inner `for` must already be a `loop` with its tick
+        // hoisted before the outer one looks at where its own body ends.
+        descend_counted(&mut s, next_counter);
+
+        let expanded = match &s.kind {
+            RawStmtKind::Expr(es) => match &es.expr {
+                ExprType::ForLoop(f) if stmts_contain_tick(&f.body) => {
+                    expand_counted_for(f, s.order, next_counter)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match expanded {
+            Some(rewritten) => out.extend(rewritten),
+            None => out.push(s),
+        }
+    }
+    *stmts = out;
+}
+
+/// Recurse into every statement form that can contain a `for`.
+fn descend_counted(s: &mut RawStmt, next_counter: &mut usize) {
+    match &mut s.kind {
+        RawStmtKind::Expr(es) => descend_counted_expr(&mut es.expr, next_counter),
+        RawStmtKind::Local(l) => {
+            if let Some(init) = l.init.as_mut() {
+                descend_counted_expr(init, next_counter);
+            }
+        }
+        RawStmtKind::Item(_) => {}
+    }
+}
+
+fn descend_counted_expr(e: &mut ExprType, next_counter: &mut usize) {
+    match e {
+        ExprType::Loop(l) => desugar_counted_loops(&mut l.body, next_counter),
+        ExprType::While(w) => desugar_counted_loops(&mut w.body, next_counter),
+        ExprType::ForLoop(f) => desugar_counted_loops(&mut f.body, next_counter),
+        ExprType::Block(b) => desugar_counted_loops(&mut b.stmts, next_counter),
+        ExprType::If(f) => {
+            desugar_counted_loops(&mut f.then_block, next_counter);
+            if let Some(eb) = f.else_branch.as_mut() {
+                descend_counted_expr(eb, next_counter);
+            }
+        }
+        ExprType::Match(m) => {
+            for a in m.arms.iter_mut() {
+                descend_counted_expr(&mut a.body, next_counter);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The statements a tick-bearing counted `for` becomes, or `None` when this pass
+/// declines it — in which case the `for` is left exactly as written and
+/// `chir_lower` reports it with its own span and message.
+///
+/// Declined shapes:
+/// * a header that is not an exclusive `start..end` range;
+/// * a body whose last statement is not `clk.tick().await`. The tick has to be
+///   last for the same reason it does in a `loop` (see
+///   `body_ends_at_a_clock_boundary`), and after the recursive descent above an
+///   inner counted `for` already ends in one — so what is left here is a body
+///   ending in a hand-written nested loop, whose own boundary this rewrite has no
+///   tick to hoist.
+fn expand_counted_for(
+    f: &copper_core::frontend_ir::ExprForLoop,
+    order: usize,
+    next_counter: &mut usize,
+) -> Option<Vec<RawStmt>> {
+    let span = f.span;
+    let (start, end) = match &*f.iter {
+        ExprType::Range(r) if !r.inclusive => {
+            let start = match &r.start {
+                Some(s) => (**s).clone(),
+                None => ExprType::Lit(ExprLit { text: "0".to_string(), span }),
+            };
+            (start, (*r.end.as_ref()?).as_ref().clone())
+        }
+        _ => return None,
+    };
+
+    // The boundary has to be the body's last statement, so that hoisting it out
+    // leaves a well-formed loop behind.
+    let boundary = f.body.last().filter(|s| is_tick_stmt(s))?.clone();
+    let work = &f.body[..f.body.len() - 1];
+
+    // A statically empty range is zero cycles and zero work: drop it, rather than
+    // emit a loop that breaks at once and then takes the hoisted tick anyway.
+    if let (Some(a), Some(b)) = (int_literal(&start), int_literal(&end)) {
+        if a >= b {
+            return Some(Vec::new());
+        }
+    }
+
+    let pat = f.pat_text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    // `for _ in …` still needs a counter, it just has no name to reuse. Numbering
+    // is per module, so two anonymous delays never share a register.
+    let var = if pat == "_" || pat.is_empty() {
+        let n = *next_counter;
+        *next_counter += 1;
+        format!("{ANON_COUNTER}{n}")
+    } else {
+        pat
+    };
+
+    let exit_test = || {
+        expr_stmt(
+            ExprType::If(ExprIf {
+                condition: Box::new(ExprType::Binary(ExprBinary {
+                    left: Box::new(path_expr(&var, span)),
+                    op: ">=".to_string(),
+                    right: Box::new(end.clone()),
+                    span,
+                })),
+                then_block: vec![expr_stmt(
+                    ExprType::Break(ExprBreak { label: None, expr: None, span }),
+                    span,
+                )],
+                else_branch: None,
+                span,
+            }),
+            span,
+        )
+    };
+    let incr = expr_stmt(
+        ExprType::Assign(ExprAssign {
+            left: Box::new(path_expr(&var, span)),
+            right: Box::new(ExprType::Binary(ExprBinary {
+                left: Box::new(path_expr(&var, span)),
+                op: "+".to_string(),
+                right: Box::new(ExprType::Lit(ExprLit { text: "1".to_string(), span })),
+                span,
+            })),
+            span,
+        }),
+        span,
+    );
+
+    let mut loop_body = vec![exit_test()];
+    loop_body.extend(work.iter().cloned());
+    loop_body.push(incr);
+    loop_body.push(exit_test());
+    loop_body.push(boundary.clone());
+
+    let decl = RawStmt {
+        order,
+        kind: RawStmtKind::Local(LocalStmt {
+            is_mut: true,
+            ty: Some(RawTypeRef { ty_text: COUNTER_TY.to_string(), span }),
+            name: var,
+            init: Some(start),
+            attrs: Vec::new(),
+            span,
+        }),
+        text: String::new(),
+        span,
+    };
+    let loop_stmt = RawStmt {
+        order,
+        kind: RawStmtKind::Expr(ExprStmt {
+            expr: ExprType::Loop(ExprLoop { body: loop_body, span }),
+            has_semi: false,
+            span,
+        }),
+        text: String::new(),
+        span,
+    };
+    Some(vec![decl, loop_stmt, boundary])
+}
+
+/// A range bound that is a plain integer literal, for the empty-range check. A
+/// named `const` deliberately does NOT resolve here: this pass has no constant
+/// environment, and inventing a partial one is how two halves of a lowering start
+/// disagreeing.
+fn int_literal(e: &ExprType) -> Option<i128> {
+    match e {
+        ExprType::Lit(l) => l
+            .text
+            .trim_end_matches(|c: char| c.is_alphabetic() || c == '_')
+            .parse::<i128>()
+            .ok(),
+        _ => None,
+    }
+}
+
 /// If the module's top-level `loop` has a tick nested inside a branch, flatten
 /// it in place to a single-tick `match pc` FSM. No-op otherwise.
 pub fn extract_control(fir: &mut FrontendModuleIR) {
@@ -170,7 +450,7 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
     // `expr_contains_tick` descends into every loop form, and anything it finds
     // that the flattener cannot handle used to reach an `.expect` — a raw panic on
     // user input, with no span and no name for the construct at fault.
-    if contains_unflattenable_control(&loop_body) {
+    if contains_unflattenable_control(&loop_body).is_some() {
         return;
     }
 
@@ -827,6 +1107,70 @@ fn loop_needs_extraction(body: &[RawStmt]) -> bool {
         .any(|s| stmt_contains_tick(s) && !is_tick_stmt(s))
 }
 
+/// Why this pass declined a module, when the construct at fault is one the linear
+/// path downstream cannot name.
+///
+/// Declining is deliberate — the linear lowering usually produces a better message
+/// than this pass could. But it only sees what it *reaches*, so a construct that
+/// stopped the flattening somewhere else in the body leaves it blaming whatever it
+/// meets first. Measured on `examples/uart/rx.rs`: a `continue` on line 62 declined
+/// the module, and the linear path then reported the perfectly well-formed
+/// repeating wait on line 55 for having its tick in the wrong place — advice that
+/// cannot be followed, about a loop the author wrote correctly.
+pub struct UnflattenableConstruct {
+    pub construct: String,
+    pub span: SourceSpan,
+    pub hint: Option<String>,
+}
+
+impl std::fmt::Display for UnflattenableConstruct {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}: unsupported construct: {}", self.span.start_line, self.span.start_col, self.construct)?;
+        if let Some(h) = &self.hint {
+            write!(f, "\n  help: {h}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The named construct that stopped this module from being flattened, if there is
+/// one. `None` both when the module flattens and when it was declined for a
+/// malformed nested loop — `chir_lower::nested_loop_error` diagnoses that case
+/// better than anything here could, so it is left to speak.
+pub fn unflattenable_reason(fir: &FrontendModuleIR) -> Option<UnflattenableConstruct> {
+    let loop_idx = fir.raw_statements.iter().position(is_loop_stmt)?;
+    let body = match &fir.raw_statements[loop_idx].kind {
+        RawStmtKind::Expr(es) => match &es.expr {
+            ExprType::Loop(l) => &l.body,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match contains_unflattenable_control(body) {
+        Some(Unflattenable::Named(c)) => Some(c),
+        _ => None,
+    }
+}
+
+/// What `contains_unflattenable_control` found.
+enum Unflattenable {
+    /// A construct the linear path downstream cannot name — report THIS instead.
+    Named(UnflattenableConstruct),
+    /// A nested loop whose body is not one segment between two ticks.
+    /// `chir_lower::nested_loop_error` splits this three ways and points at the
+    /// innermost loop at fault; duplicating that reasoning here is exactly the
+    /// two-halves-drift bug this file keeps recording, so it is not duplicated.
+    MalformedNestedLoop,
+}
+
+fn named(construct: &str, span: SourceSpan, hint: &str) -> Option<Unflattenable> {
+    Some(Unflattenable::Named(UnflattenableConstruct {
+        construct: construct.to_string(),
+        span,
+        hint: Some(hint.to_string()),
+    }))
+}
+
 /// Is there control flow in here this pass cannot flatten?
 ///
 /// It handles straight-line code, `if`/`else`, `match`, and nested `loop`s left by
@@ -843,13 +1187,23 @@ fn loop_needs_extraction(body: &[RawStmt]) -> bool {
 ///   does not track, the second carries a value the FSM has nowhere to put;
 /// * a `break` outside any nested loop — meaningless against the module's own
 ///   infinite loop, and `chir_lower` names it.
-fn contains_unflattenable_control(stmts: &[RawStmt]) -> bool {
-    stmts.iter().any(|s| match &s.kind {
-        RawStmtKind::Expr(es) => unflattenable_in_expr(&es.expr, false),
+fn contains_unflattenable_control(stmts: &[RawStmt]) -> Option<Unflattenable> {
+    unflattenable_in_stmts(stmts, false)
+}
+
+fn unflattenable_in_stmts(stmts: &[RawStmt], in_loop: bool) -> Option<Unflattenable> {
+    stmts.iter().find_map(|s| match &s.kind {
+        RawStmtKind::Expr(es) => unflattenable_in_expr(&es.expr, in_loop),
         // A tick inside an initializer expression has no statement position to
         // become a state.
-        RawStmtKind::Local(l) => l.init.as_ref().is_some_and(expr_contains_tick),
-        RawStmtKind::Item(_) => false,
+        RawStmtKind::Local(l) if l.init.as_ref().is_some_and(expr_contains_tick) => named(
+            "a `clk.tick().await` inside a `let` initializer — an initializer is not \
+             a statement position, so there is no FSM state for the code either side \
+             of the tick to become",
+            s.span,
+            "await into a local first: `let v = <expr>; clk.tick().await;`",
+        ),
+        _ => None,
     })
 }
 
@@ -915,39 +1269,61 @@ fn body_ends_at_a_clock_boundary(body: &[RawStmt]) -> bool {
 
 /// `in_loop` tracks whether a nested `loop` encloses this expression, which is
 /// what makes a `break` meaningful.
-fn unflattenable_in_expr(e: &ExprType, in_loop: bool) -> bool {
+fn unflattenable_in_expr(e: &ExprType, in_loop: bool) -> Option<Unflattenable> {
     match e {
-        ExprType::Continue(_) => true,
-        ExprType::Break(b) => !in_loop || b.label.is_some() || b.expr.is_some(),
+        ExprType::Continue(_) => named(
+            "`continue` — jumping to the loop head mid-cycle needs the head's LOWERED \
+             body at a point where it is still being lowered, and taking it as a state \
+             transition instead would spend a clock cycle the source does not have",
+            e.span(),
+            "restructure the loop so the path falls through to its end instead, e.g. \
+             `if ok { <work> }` rather than `if !ok { continue; } <work>`",
+        ),
+        ExprType::Break(b) if !in_loop => named(
+            "a `break` outside any nested loop — there is nothing to leave but the \
+             module's own infinite loop",
+            b.span,
+            "drop the `break`, or put it inside the nested loop it is meant to exit",
+        ),
+        ExprType::Break(b) if b.label.is_some() => named(
+            "a labelled `break` — it targets a loop this pass does not track",
+            b.span,
+            "restructure so the break leaves its own innermost loop",
+        ),
+        ExprType::Break(b) if b.expr.is_some() => named(
+            "`break <value>` — the FSM has nowhere to put the value",
+            b.span,
+            "assign to a local before breaking: `v = <value>; break;`",
+        ),
+        ExprType::Break(_) => None,
         ExprType::Loop(l) => {
-            !body_ends_at_a_clock_boundary(&l.body)
-                || l.body.iter().any(|s| match &s.kind {
-                    RawStmtKind::Expr(es) => unflattenable_in_expr(&es.expr, true),
-                    RawStmtKind::Local(loc) => loc.init.as_ref().is_some_and(expr_contains_tick),
-                    RawStmtKind::Item(_) => false,
-                })
+            if !body_ends_at_a_clock_boundary(&l.body) {
+                Some(Unflattenable::MalformedNestedLoop)
+            } else {
+                unflattenable_in_stmts(&l.body, true)
+            }
         }
-        // A tick under a construct whose repetition is not a state.
-        ExprType::While(w) => stmts_contain_tick(&w.body),
-        ExprType::ForLoop(f) => stmts_contain_tick(&f.body),
+        // A tick under a construct whose repetition is not a state. Both are
+        // desugared before this gate runs, so reaching here means the desugar
+        // declined the header — an inclusive or non-range iterator, or a body whose
+        // last statement is not the tick.
+        ExprType::While(w) if stmts_contain_tick(&w.body) => Some(Unflattenable::MalformedNestedLoop),
+        ExprType::ForLoop(f) if stmts_contain_tick(&f.body) => named(
+            "a `clk.tick().await` inside a `for` whose repetition cannot be counted — \
+             the header must be an exclusive `start..end` range and the tick must be \
+             the LAST statement of the body",
+            f.span,
+            "write it as `for <var> in <start>..<end> { <work>; clk.tick().await; }`",
+        ),
         // Structures the flattener descends into — keep looking, same loop depth.
-        ExprType::If(f) => {
-            f.then_block.iter().any(|s| match &s.kind {
-                RawStmtKind::Expr(es) => unflattenable_in_expr(&es.expr, in_loop),
-                RawStmtKind::Local(l) => l.init.as_ref().is_some_and(expr_contains_tick),
-                RawStmtKind::Item(_) => false,
-            }) || f
-                .else_branch
+        ExprType::If(f) => unflattenable_in_stmts(&f.then_block, in_loop).or_else(|| {
+            f.else_branch
                 .as_deref()
-                .is_some_and(|e| unflattenable_in_expr(e, in_loop))
-        }
-        ExprType::Block(b) => b.stmts.iter().any(|s| match &s.kind {
-            RawStmtKind::Expr(es) => unflattenable_in_expr(&es.expr, in_loop),
-            RawStmtKind::Local(l) => l.init.as_ref().is_some_and(expr_contains_tick),
-            RawStmtKind::Item(_) => false,
+                .and_then(|e| unflattenable_in_expr(e, in_loop))
         }),
-        ExprType::Match(m) => m.arms.iter().any(|a| unflattenable_in_expr(&a.body, in_loop)),
-        _ => false,
+        ExprType::Block(b) => unflattenable_in_stmts(&b.stmts, in_loop),
+        ExprType::Match(m) => m.arms.iter().find_map(|a| unflattenable_in_expr(&a.body, in_loop)),
+        _ => None,
     }
 }
 

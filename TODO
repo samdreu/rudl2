@@ -12,19 +12,25 @@ DOCUMENTATION:
 TRANSPILATION:
   ☐ Figure out TODOs
 
-  ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-25 (after K, L, L-1, L-2) ──────
-  Every #[hardware] module in examples/ probed through the copper-transpile CLI.
+  ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-25 (after N, M) ────────────────
+  STOP RE-MEASURING THIS BY HAND — that is how it went stale before. Run
+  `tools/transpile_coverage.sh`, which probes every #[hardware] module in
+  examples/ through the copper-transpile CLI and prints the tally and the
+  remaining causes. (It measures ACCEPTANCE, not correctness — see "LINT-CLEAN IS
+  NOT THE SAME AS TRANSPILES" below.)
   19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → C 28/34 →
-  **K 28/34 — NO CHANGE, as predicted**. Cause K unblocks no example on its own;
-  see its entry for why (the shapes it admits need the counted `for` to exist).
-  L / L-1 / L-2 were wrong-CODE bugs, not rejections, so they move no counter
-  either — which is the point: coverage was never going to show them.
+  K 28/34 (no change, as predicted) → **M 28/34 — NO CHANGE, also as predicted**.
+  Cause M's own entry said uart/rx sat behind `continue` as well; it does, and
+  that is now what it reports. L / L-1 / L-2 / N and the hoisted-default bug were
+  wrong-CODE bugs, not rejections, so they move no counter either — which is the
+  point: coverage was never going to show them, and two of them were silent.
   The 6 still failing, by ROOT CAUSE, as measured on 2026-08-25:
     F   Vec ports ................. rv32i_cpu (190:13), rv32i_cpu_pipelined (201:13)
     J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
         error — same message, different mechanism; see J)
-    M   a tick inside a counted `for` ......................... uart/rx (55:8,
-        and the message names the WRONG construct — see M)
+    O   `continue` ................................... uart/rx (64:12) — refused
+        by decision, see cause M's write-up for why it is the same problem as the
+        wasted back edge
     H   file-level `spawn_uart` rejection ... uart_tx, uart_rx (examples/uart/system.rs)
   Full history of every cause, live and retired:
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
@@ -112,46 +118,131 @@ TRANSPILATION:
         message). The back edge is checkable once `for` lands.
         The UART shape that still needs `for`:
             for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS { tick } }
-    M ☐ **A TICK INSIDE A COUNTED `for`** ......................... uart/rx, and
-        behind cause H, uart_tx and uart_rx.
-        **THE NEXT PIECE OF WORK.** It is now the only control-flow cause left,
-        and cause K's entry explains why it has to come next rather than after:
-        with `loop` alone every exitable inner loop can exit having ticked zero
-        times, so K's back edge is not writable at all. `for _ in 0..N { tick }`
-        is the construct that breaks the deadlock — it always ticks AND
-        terminates without an exit test — which is what makes K's machinery
-        reachable by a real design.
-        Two shapes, and a fix must cover BOTH (measured 2026-08-24; removing only
-        the first leaves uart/rx rejected). The class is counted REPETITION, not
-        counted delay:
-            for _ in 0..CLKS_PER_BIT { clk.tick().await; }   // bit timing
-            for i in 0..8 { rx_byte[i] = …; for _ in 0..CLKS { tick } }  // data
-        The second is exactly cause K's shape with a `for` inside, so K's
-        `body_ends_at_a_clock_boundary` already admits the outer loop once the
-        inner `for` is supported.
-        WHAT IS ALREADY IN PLACE FOR IT:
-          - `copper_analysis::may_exit_without_tick` treats a `for` as a
-            GUARANTEED clock boundary (it runs its body, so it ticks), which is
-            what keeps the uart shape well-formed while rejecting the `loop`
-            equivalent. Its one recorded gap is an EMPTY constant range, which
-            needs const evaluation that crate deliberately does not do.
-          - `control_extract` already flattens a loop whose body ends in a
-            tick-bearing loop (cause K), so the outer `for i in 0..8` needs the
-            counting, not new control flow.
-        THE DIAGNOSTIC IS WRONG TODAY AND SHOULD BE FIXED WITH IT — measured
-        2026-08-25, uart/rx reports at 55:8:
-            "a repeating wait must be written as `loop { <test>; clk.tick().await; }`
-             — the tick has to be the LAST statement"
-        pointing at the `while` on line 55. THAT LOOP IS WELL-FORMED: it desugars
-        to tick-last and would flatten fine. The module is declined because of the
-        `for` on line 60, and the linear path downstream then reports the first
-        nested loop it meets. `chir_lower::nested_loop_error` splits three cases
-        but does not check whether the tick is LAST, so a well-formed loop that
-        reaches it for someone else's reason gets the ordering message. The fix:
-        when the body IS a valid segment, say that the module was declined for a
-        different construct and name it, rather than casting suspicion on a loop
-        the author wrote correctly. Same error-message-is-not-the-cause pattern
-        this file keeps recording — now visible INSIDE one module.
+    M ✔ FIXED (2026-08-25) — **A TICK INSIDE A COUNTED `for`** is counted
+        REPETITION, and now desugars to a counter-driven `loop`.
+        `control_extract::desugar_counted_loops` rewrites
+
+            for <var> in <start>..<end> { <B>; clk.tick().await; }
+          ⟶ let mut <var>: u32 = <start>;
+            loop {
+                if <var> >= <end> { break; }      // empty range + the loop's test
+                <B>
+                <var> = <var> + 1;
+                if <var> >= <end> { break; }      // leave BEFORE the last tick
+                clk.tick().await;
+            }
+            clk.tick().await;                     // …which is this one
+
+        A desugar rather than a new state shape, for the same reason C-a was: the
+        result lands on `lower_into`'s nested-loop path, already verified end to
+        end. `<var>` becomes a register and the loop is ONE state — a UART bit
+        period is 434 cycles, so unrolling was never an option.
+        Both shapes cause M was filed for are covered, which is why it is
+        REPETITION and not delay:
+            for _ in 0..CLKS_PER_BIT { clk.tick().await; }              // timing
+            for i in 0..8 { tx.write(byte[i]); for _ in 0..CLKS { tick } }  // data
+        The second nests, and `i` is a counter REGISTER, so `byte[i]` lowers to a
+        dynamic bit select (`CHIRExpr::DynBit`) rather than an unrolled slice.
+
+        **WHY THE LAST TICK IS HOISTED OUT OF THE LOOP — the part that is not
+        obvious, and the reason the first attempt was reverted.** The naive shape
+        (one test at the top, tick last, nothing after the loop) transpiles and is
+        WRONG BY A CYCLE. Measured on `for _ in 0..3 { tick }`: the simulator
+        rewrote the output every 3rd cycle, the transpiled module every 4th.
+        Breaking out of a nested loop is not a clock boundary — `lower_into`
+        inlines the enclosing loop's continuation into the breaking path and
+        carries on in the same cycle. But when that continuation contains no
+        boundary of its own, the lowering falls off the end and emits
+        `pc = <enclosing head>`, and the FSM spends a cycle on the transition.
+        With the tick left inside the loop, a counted delay's continuation IS
+        empty, so every pass cost one cycle more than the source asks for.
+        THAT IS CAUSE K'S BACK EDGE. K's own entry records it as unverified —
+        "the back edge is checkable once `for` lands" — because no well-formed
+        hand-written program could reach it. This is the first thing that could,
+        and it was broken. Hoisting the final tick into the ENCLOSING statement
+        list means a break always continues into a real clock boundary, so the
+        shape is never produced: the divergent form is made unwritable rather
+        than the flattener taught to special-case it, the same disposition as the
+        tick-ordering rule. The second exit test is what pays for it — the loop
+        leaves before the final tick and the hoisted one supplies it — and `<B>`
+        is not duplicated.
+        THE ALTERNATIVE, REJECTED WITH ITS REASON: teach `lower_into` to INLINE
+        the enclosing head's body at a zero-time back edge instead. That is the
+        principled fix and would also unblock `continue` (cause O — the same
+        problem: `continue` is a zero-time jump to the head). It needs the head's
+        LOWERED body at a point where it is still being lowered, so it means a
+        second pass that splices marked `pc = H` assignments after every state
+        body exists — surgery on the most timing-sensitive pass in the codebase,
+        for a shape the desugar can simply avoid producing. Left undone
+        deliberately; cause O is where it would be paid for.
+
+        `>=` RATHER THAN `==`: `for i in 5..3` yields nothing in Rust, and `i == 3`
+        would spin forever. A statically empty range is dropped outright, since the
+        hoisted tick would otherwise be a cycle the source does not have.
+        ☐ KNOWN GAP, and it is the same one the analysis already has: when the
+        bounds are not literals (`0..CLKS_PER_BIT`), emptiness is not decidable in
+        the desugar, and an empty one would produce that spurious cycle.
+        `copper_analysis::may_exit_without_tick` has the identical hole for the
+        identical reason (it treats a `for` as a guaranteed boundary, which an
+        empty range is not). Both need const evaluation to close, and they should
+        be closed together.
+
+        THE DIAGNOSTIC HALF, also fixed, and it was not about lowering at all.
+        uart/rx used to report the well-formed repeating wait on line 55 for
+        having its tick in the wrong place. Declining a module is deliberate — the
+        linear path usually diagnoses better than the flattener could — but it only
+        sees what it REACHES, so a construct that stopped the flattening elsewhere
+        left it blaming whatever it met first. `control_extract::unflattenable_reason`
+        now names that construct, `transpile_fir` prefers it over the downstream
+        error, and uart/rx reports `continue` at 64:12 with its own span. A
+        MALFORMED NESTED LOOP is deliberately NOT named this way —
+        `chir_lower::nested_loop_error` splits that three ways and points at the
+        innermost loop at fault, and duplicating that reasoning in the gate is
+        exactly the two-halves-drift bug this file keeps recording.
+
+        WHAT IT UNBLOCKED: nothing in examples/, as cause M's own entry predicted.
+        uart/rx is behind `continue` (cause O) and uart_tx/uart_rx behind the
+        file-level `spawn_uart` rejection (cause H). The anchors are therefore
+        purpose-built DUTs, which is the right shape for this anyway:
+          - tests/counted_delay_equivalence.rs — `for _ in 0..3 { tick }`, sim ≡
+            Verilator, with a distinct byte per cycle so an off-by-one period
+            shows as a different value rather than the same one later. THIS TEST
+            FAILED on the naive desugar and is what measured the wasted cycle.
+          - tests/counted_repetition_equivalence.rs — the nested serialiser shape,
+            plus an INDEPENDENT property (the line must carry the byte LSB-first
+            at two cycles per bit), so the FSM has to be right and not merely
+            self-consistent.
+          - copper-codegen/tests/unsupported_constructs.rs — the counter is a
+            counter and not an unroll, the empty range costs nothing, a tick that
+            is not last is refused with a `for`-specific message, and a module
+            declined for one construct is not reported against another.
+
+        A FRONT-END DISAGREEMENT IT SURFACED, worth recording as its own thing:
+        `register_reconciliation` failed, because codegen now emits a register for
+        `i` that `copper_analysis::infer_registers` did not name. The analysis was
+        right to be asked and wrong in its answer — `DefinedInLoop` collected `let`
+        bindings and assignment targets but not a `for`'s pattern binding, so
+        `for i in 0..8 { …; tick; }` produced no register at all in the shared
+        inference while the language's central rule says it must. Fixed in
+        `copper-analysis` (gated on the body actually ticking; a tick-free `for`
+        unrolls and its variable is an elaboration index, not state). The
+        synthesized `__copper_ctr<N>` is genuinely nameless in the source — `_`
+        binds nothing — so it joins `pc` on the test's synthetic list.
+        THE GUARD EARNED ITS KEEP: it caught the disagreement the same day it was
+        introduced, which is what it exists for.
+
+    O ☐ **`continue`** ..................................... uart/rx (64:12).
+        Refused, with a good message as of 2026-08-25. It is the SAME problem as
+        cause M's hoisted tick, seen from the other side: `continue` is a jump to
+        the loop head that consumes no clock cycle, and the FSM has no way to
+        express that without inlining the head's lowered body at a point where it
+        is still being lowered. Emitting `pc = <head>` instead would spend a cycle
+        the source does not have — the exact divergence cause M measured.
+        So the fix is the rejected alternative in M's entry: a second pass that
+        splices state bodies into marked zero-time transitions. Doing it would
+        close `continue` AND remove M's need to hoist. It is the only remaining
+        control-flow cause, and unlike M it has no desugar that avoids it.
+        Behind it in uart/rx sit `|=` and a bare integer local.
 
     G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
@@ -290,12 +381,25 @@ TRANSPILATION:
   register does not commit until the edge. One of the two copies got the literal
   and the other did not, and the register is uninitialised at that point.
 
-  WHAT A REAL FIX NEEDS: entry specialisation — the first iteration inlined with
-  the loop variable bound to `start` as a literal EVERYWHERE it appears in that
-  copy, not just in the counter update. That is a change to how the desugar and
-  the clone-into-entry trick interact, in the most timing-sensitive pass in the
-  codebase, and it deserves its own session rather than being bolted on.
-  Degenerate `0..0` also needs deciding (the entry-inlined form would run once).
+  ✘ THAT DIAGNOSIS WAS WRONG, and knowing why matters more than the bug did.
+  It reads as "entry specialisation" — a problem with how the desugar and the
+  clone-into-entry trick interact. It is not. The two lines above come from two
+  DIFFERENT code paths in `shir_lower`: the register update from
+  `extract_updates_from_stmts`, which forwards a segment's own assignments, and
+  the `if` condition from `lower_stmt_list`, which did not forward at all. The
+  entry state was not special; NO branch condition anywhere read a register its
+  own segment had just assigned. That is cause N (2026-08-25), it is reachable
+  with no `for` in sight — `c = c + 1; if c == 3 { … }` — and with the counter
+  also reset inside the branch it silently produced a dead output.
+  With N fixed the entry test reads `<start>` with no special casing, and the
+  degenerate `0..0` falls out: the test is at the top, so the loop breaks before
+  ticking. The real remaining problem was somewhere else entirely (the wasted
+  back edge — see cause M).
+  RECORD THE CLASS: a diagnosis inferred from the SHAPE of the emitted code
+  ("one copy got the literal and the other did not") named the pass it was
+  looking at rather than the pass that produced each copy. Both copies were
+  wrong-by-construction from one missing call, and the fix was five lines in a
+  stage the note never mentions.
 
   ✔ RESOLVED (2026-08-25) — this entry said counted delays "AND IT IS NOT
     SUFFICIENT ANYWAY", because each UART loop's body ENDS IN another tick-bearing
@@ -998,6 +1102,71 @@ TRANSPILATION:
     MEASURED: simulator 4, 5, 12, 14, 19, 23 vs Verilator 1, 4, 5, 12, 14, 19.
     `extract_updates_from_stmts` now records `let` wires in the forwarding map, so
     the same fix covers a REGISTER whose next value reads such a wire.
+
+  ── CAUSE N: A BRANCH DID NOT READ ITS OWN SEGMENT'S UPDATE (2026-08-25) ──────
+  ✔ FIXED. `shir_lower::lower_stmt_list` runs every `PortWrite` through
+  `Forwarding::at_edge` — that is the cause-L fix, and it is what makes
+  `n = n + step; acc.write(n)` mean what it says. An `if` CONDITION and a `match`
+  SCRUTINEE did not get the same treatment, despite a comment three lines above
+  the code claiming they did. So a segment that updates a register and then
+  branches on it emitted the pre-edge value:
+
+      c = c + 1;                     if ((c == 8'd3)) begin      // pre-edge c
+      if c == 3 { o.write(n); }  →       o <= n;
+                                     end
+                                     c <= (((c + 8'd1) == 8'd3) ? …)  // forwarded
+
+  Both copies of the same test, one forwarded and one not — which is exactly the
+  evidence the reverted counted-delay attempt recorded and misdiagnosed (see
+  COUNTED DELAYS above; the correction is written up there).
+  SILENT, AND WORSE THAN A CYCLE LATE. The simulator runs the segment with Rust's
+  own sequencing, so the guard fires on the INCREMENTED `c`. The transpiled module
+  fired a cycle late — and with `c` also reset inside the branch, i.e. the mod-N
+  counter idiom, the pre-edge `c` never reaches 3 at all, the arm never fires and
+  the output is DEAD. The emitted module is perfectly well-typed.
+  WHY THE CORPUS WAS GREEN: `two_domain_counter` tests `count` BEFORE its update.
+  Nothing in examples/ reads a register after assigning it in the same segment.
+  THE FIX FOLLOWS L-1 AND FOR ITS REASON — whether a drive is edge-sampled is
+  decided a stage later, by `vlir_lower`, so predicting it in SHIR would be a
+  second implementation to keep in step. `SHIRStmt::If`/`Match` carry BOTH forms
+  through `VLIRStmt`, and `split_output_reg` — which already splits a branch into
+  an `always_comb` copy and an `always_ff` copy — takes the matching one for each.
+  The `always_comb` copy keeps the UNFORWARDED test on purpose: a continuous
+  assign is read after the edge, when the registers already hold their new values.
+  `pattern_detector`'s Moore output depends on that and must not move.
+  Both forms count as reads in `collect_vlir_reads_stmt` and `collect_read_uses`,
+  so `drop_unread_wires` cannot delete a wire only the surviving form uses — the
+  dead-wire consequence L-2 recorded.
+  → tests/branch_on_updated_reg_equivalence.rs (the `if` half) and
+    tests/match_hold_default_arm_equivalence.rs (the `match` half). Both fail
+    against Verilator with the fix reverted.
+  RECORD THE CLASS: a doc comment asserted the invariant, the code did not
+  implement it, and no test asked. The comment made the hole *look* closed to
+  every reader since — including the one who wrote the counted-delay diagnosis.
+
+  ── A WILDCARD ARM THAT DRIVES NOTHING LOST ITS HOLD (2026-08-25) ─────────────
+  ✔ FIXED, found by the `match` half of cause N's test rather than looked for.
+  `vlir_lower::hoist_moore_output_defaults` gives a Moore output decoded from a
+  state `case` a default at the top of the block, so an encoding the state register
+  can never reach does not make the output look conditional and get wrongly
+  registered. It decided "driven on every path" by intersecting the EXPLICIT arms
+  only — and a `default` written in the source is the one fall-through that is
+  actually reachable.
+  So `match s { One => o.write(n), _ => {} }` — the enabled-register idiom, whose
+  whole point is that `o` HOLDS on the cycles the arm does not fire (see "Out holds
+  when unwritten", verified against bsg_dff_en) — got an unconditional `o <= n`
+  hoisted over it and was driven every cycle. Measured sim ≢ Verilator: the
+  simulator wrote on the even cycles, the transpiled module on all of them.
+  The distinction the pass needs is between two kinds of fall-through:
+  `default: None` is the case it EXISTS for (no source wildcard, only unreachable
+  encodings); `default: Some(_)` is a path the author wrote, and the port is only
+  fully driven if that path drives it too. An empty `_ => {}` intersects to
+  nothing. `traffic_light` and `bsg_dff_en` are untouched — the narrowness the
+  pass documents is preserved.
+  RECORD THE CLASS, again: an "all paths" check that enumerates only the paths it
+  finds convenient. Same shape as `last_update_for` keeping the FIRST of several
+  updates — a set operation that quietly omits one member is right until something
+  produces that member.
 
   ── HOW L-1 AND L-2 WERE FIXED, AND WHY THE FIRST ATTEMPT COULD NOT WORK ──────
     The cause-L fix keyed forwarding on `CHIRPort::registered` in `shir_lower`.

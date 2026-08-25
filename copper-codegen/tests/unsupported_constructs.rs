@@ -608,3 +608,115 @@ async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainCl
         "reproduced a *different* error than the read-ordering rule: {err}"
     );
 }
+
+// ── Counted repetition (`TODO` cause M) ───────────────────────────────────────
+
+/// A tick inside a counted `for` is now COUNTED REPETITION: `control_extract`
+/// desugars it into a counter-driven `loop`. These pin the boundary of what the
+/// desugar accepts, and — the half cause M was really about — that a module
+/// declined for one construct is not reported against another.
+#[test]
+fn a_tick_inside_a_counted_for_is_supported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, n: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    loop {
+        o.write(n.read());
+        for _ in 0..3 {
+            clk.tick().await;
+        }
+    }
+}
+"#;
+    let sv = transpile(src).expect("a counted delay must transpile");
+    assert!(
+        sv.contains("__copper_ctr0"),
+        "the delay should become a counter register, not unroll: {sv}"
+    );
+    // 434 states for a UART bit period is the failure mode this must not have.
+    assert!(
+        sv.matches("8'd").count() < 40,
+        "the counted delay looks unrolled rather than counted: {sv}"
+    );
+}
+
+/// A statically empty range is zero cycles and zero work, so the loop disappears
+/// entirely. It cannot merely break at once: the desugar hoists the final tick out
+/// of the loop, and that tick would then be a cycle the source does not have.
+#[test]
+fn a_statically_empty_counted_range_costs_nothing() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, n: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    loop {
+        o.write(n.read());
+        for _ in 0..0 {
+            clk.tick().await;
+        }
+        clk.tick().await;
+    }
+}
+"#;
+    let sv = transpile(src).expect("an empty counted range must transpile");
+    assert!(
+        !sv.contains("__copper_ctr") && !sv.contains("pc"),
+        "an empty range should leave no counter and no FSM behind: {sv}"
+    );
+}
+
+/// The tick has to be the body's LAST statement, for the same reason it does in a
+/// hand-written `loop` — and the message must say so rather than fall through to
+/// the repeating-wait advice, which does not apply to a `for`.
+#[test]
+fn a_counted_for_whose_tick_is_not_last_is_refused() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, n: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    loop {
+        for _ in 0..3 {
+            clk.tick().await;
+            o.write(n.read());
+        }
+    }
+}
+"#;
+    let err = transpile(src).expect_err("a `for` whose tick is not last must be refused");
+    assert!(
+        err.contains("`for`") && err.contains("LAST"),
+        "the diagnostic must name the `for` and its ordering rule: {err}"
+    );
+}
+
+/// The half of cause M that was not about lowering at all. `uart/rx` was declined
+/// for a `continue`, and the linear path downstream then reported the well-formed
+/// repeating wait it happened to reach first — unfollowable advice about a loop
+/// the author wrote correctly. The construct that actually stopped the flattening
+/// is reported now, with its own span.
+#[test]
+fn a_module_declined_for_one_construct_is_not_reported_against_another() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, n: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    loop {
+        while go.read() == Logic::Zero {
+            clk.tick().await;
+        }
+        if go.read() == Logic::One {
+            continue;
+        }
+        o.write(n.read());
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("`continue` must still be refused");
+    assert!(
+        err.contains("`continue`"),
+        "the reported construct must be the `continue`, not the well-formed wait \
+         above it: {err}"
+    );
+    assert!(
+        !err.contains("repeating wait"),
+        "the well-formed `while` must not be blamed for the `continue`: {err}"
+    );
+}

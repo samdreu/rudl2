@@ -63,6 +63,14 @@ fn is_synthetic(name: &str) -> bool {
     if SYNTHETIC.contains(&name) {
         return true;
     }
+    // The counter control extraction synthesizes for `for _ in <range>` — the same
+    // kind of thing as `pc`, and for the same reason the shared inference cannot
+    // name it: `_` binds nothing, so there is no source-level name to infer. A
+    // NAMED `for` binding (`for i in …`) is not synthetic and IS inferred; see
+    // `DefinedInLoop::visit_expr_for_loop`.
+    if name.starts_with("__copper_ctr") {
+        return true;
+    }
     // Read pipeline stage: `<mem>_rd<N>_q<K>` / `_v<K>`.
     let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
     if let Some(rest) = trimmed.strip_suffix("_q").or_else(|| trimmed.strip_suffix("_v")) {

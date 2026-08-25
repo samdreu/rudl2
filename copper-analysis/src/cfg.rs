@@ -1113,6 +1113,24 @@ impl<'ast> Visit<'ast> for DefinedInLoop<'_> {
         pat_bindings(&l.pat, self.set);
         syn::visit::visit_local(self, l);
     }
+    /// A **ticking** `for`'s binding is defined in the loop just as a `let` is, and
+    /// it is read on the far side of the tick its own body contains — so it is a
+    /// register, and the transpiler builds one for it (control extraction desugars
+    /// the counted `for` into a counter-driven `loop`). Without this the shared
+    /// inference reported no register for `for i in 0..8 { …; tick; }` while
+    /// codegen emitted `i`, and the two front-ends disagreed about the language's
+    /// central rule.
+    ///
+    /// A tick-FREE `for` is combinational and unrolls, so its variable is an
+    /// elaboration-time index and not state. `_` binds nothing and contributes
+    /// nothing, which is correct: the counter the transpiler synthesizes for it has
+    /// no source-level name, exactly like `pc`.
+    fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+        if f.body.stmts.iter().any(stmt_contains_tick) {
+            pat_bindings(&f.pat, self.set);
+        }
+        syn::visit::visit_expr_for_loop(self, f);
+    }
     fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
         assign_targets(&a.left, self.set);
         syn::visit::visit_expr_assign(self, a);
@@ -1290,6 +1308,28 @@ fn tick_clock(expr: &Expr) -> Option<String> {
         return None;
     }
     Some(simple_ident(&mc.receiver).unwrap_or_else(|| "<clock>".to_string()))
+}
+
+/// Does this statement issue a `<clock>.tick().await` at any depth? Shares
+/// [`first_tick_clock`]'s walk so the two cannot disagree about where a tick can
+/// live — a drift that has caused real bugs in the transpiler's own gate.
+fn stmt_contains_tick(s: &syn::Stmt) -> bool {
+    struct FindTick(bool);
+    impl<'ast> Visit<'ast> for FindTick {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            if self.0 {
+                return;
+            }
+            if tick_clock(e).is_some() {
+                self.0 = true;
+                return;
+            }
+            syn::visit::visit_expr(self, e);
+        }
+    }
+    let mut f = FindTick(false);
+    f.visit_stmt(s);
+    f.0
 }
 
 /// The clock receiver of the first `<clock>.tick().await` anywhere inside `expr`,
