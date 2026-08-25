@@ -14,11 +14,37 @@ TRANSPILATION:
 
   ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-24 (after D-a) ─────────────────
   Every #[hardware] module in examples/ probed through the copper-transpile CLI.
-  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → **D-b 26/34**. The 8 still
-  failing, by ROOT CAUSE (several share one cause — fix the cause, not the module):
+  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → **C 28/34**.
+  The 6 still failing, by ROOT CAUSE (several share one cause — fix the cause,
+  not the module):
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
-    C ☐ `while` loops unsupported ................ uart/rx
+    C ✔/☐ SPLIT — `while` was TWO features, and the two modules filed here needed
+        different ones. Third cause in this file grouped by error MESSAGE rather
+        than mechanism (after D and J); worth reading as a pattern.
+        C-a ✔ FIXED — `while <cond> { … tick; }` is a data-dependent WAIT, and is
+            exactly `loop { if !<cond> { break; } … }`: test first, tick last,
+            the supported ordering. Desugared before control extraction
+            (`control_extract::desugar_tick_waits`), so it lands on machinery
+            already verified end to end rather than adding control flow.
+            UNBLOCKED det_010_awaits — which was NOT the module filed here, and
+            was recorded under "tick inside a conditional branch". Its `while`
+            made `contains_unflattenable_control` decline the whole body, so the
+            tick-in-branch fell through to the linear path and reported the error
+            there. Another first-error-masking-the-second.
+        C-b ☐ a `while` with NO tick is combinational: it must fully unroll, which
+            needs a trip count known at compile time. `while` only implies that;
+            `for` states it. Left refused, but the diagnostic now names `for`
+            instead of advising "add a tick", which is the wrong fix for a
+            combinational module. bsg_gray_to_binary was the only instance and is
+            now written as a `for` — its own test fixture already used that
+            spelling, so the `while` form had never been transpiled.
+        STILL BLOCKED, on its own causes: uart/rx. Behind the `while` sit a
+        counted delay (`for _ in 0..CLKS_PER_BIT { tick }`, refused with its own
+        diagnostic — it needs a cycle counter + self-loop state, not unrolling),
+        `continue` in a nested loop (pinned as refused), `|=`, and a bare integer
+        local. Its reported error is now the nested-loop ordering one, which is
+        misleading — the real blocker is the counted delay.
     D-a ✔ FIXED — file-scope `const` items now lower to `localparam`s.
         Unblocked bsg_encode_one_hot AND bsg_adder_one_hot. See the write-up below.
     D-b ✔ FIXED — array-typed ports lower as PACKED 2-D. Unblocked mux and

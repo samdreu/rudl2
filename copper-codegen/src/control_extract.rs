@@ -45,7 +45,8 @@
 //! rather than mis-lowered.
 
 use copper_core::frontend_ir::{
-    ExprAssign, ExprBlock, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprPath, ExprStmt,
+    ExprAssign, ExprBlock, ExprBreak, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprPath,
+    ExprStmt, ExprUnary,
     ExprType, FrontendModuleIR, LocalStmt, RawStmt, RawStmtKind, RawTypeRef, SourceSpan,
 };
 
@@ -57,6 +58,87 @@ const PC: &str = "pc";
 /// the `case` items, e.g. `64'd0` vs an 8-bit scrutinee).
 const PC_TY: &str = "u8";
 const PC_SUFFIX: &str = "u8";
+
+/// Rewrite `while <cond> { … clk.tick().await; }` into the repeating-wait shape
+/// this pass already flattens: `loop { if !<cond> { break; } … }`.
+///
+/// The two are the same program. `while` tests before each iteration and the
+/// tick is the last statement of the body, which is exactly the supported
+/// ordering — the one where the test reads outside the window that makes a
+/// simulator and a flip-flop disagree (see `tick_is_last_statement`). So this is
+/// sugar, not a new control-flow construct: after the rewrite the wait lands on
+/// machinery that is already verified end-to-end.
+///
+/// Only a **tick-bearing** `while` is rewritten. A `while` with no tick is a
+/// combinational loop, which has to be fully unrolled to be hardware and so
+/// needs a compile-time trip count; `for` is how that is spelled, and rewriting
+/// it here would bury the point under a generic "nested loop never terminates"
+/// error. It keeps its own diagnostic instead.
+pub fn desugar_tick_waits(fir: &mut FrontendModuleIR) {
+    let mut body = std::mem::take(&mut fir.raw_statements);
+    desugar_stmts(&mut body);
+    fir.raw_statements = body;
+}
+
+fn desugar_stmts(stmts: &mut Vec<RawStmt>) {
+    for s in stmts.iter_mut() {
+        match &mut s.kind {
+            RawStmtKind::Expr(es) => desugar_expr(&mut es.expr),
+            RawStmtKind::Local(l) => {
+                if let Some(init) = l.init.as_mut() {
+                    desugar_expr(init);
+                }
+            }
+            RawStmtKind::Item(_) => {}
+        }
+    }
+}
+
+fn desugar_expr(e: &mut ExprType) {
+    match e {
+        ExprType::While(w) if stmts_contain_tick(&w.body) => {
+            desugar_stmts(&mut w.body);
+            let span = w.span;
+            // `if !<cond> { break; }` — the loop's exit test, hoisted to the top
+            // of the body so the tick stays last.
+            let guard = expr_stmt(
+                ExprType::If(ExprIf {
+                    condition: Box::new(ExprType::Unary(ExprUnary {
+                        op: "!".to_string(),
+                        expr: w.condition.clone(),
+                        span,
+                    })),
+                    then_block: vec![expr_stmt(
+                        ExprType::Break(ExprBreak { label: None, expr: None, span }),
+                        span,
+                    )],
+                    else_branch: None,
+                    span,
+                }),
+                span,
+            );
+            let mut body = vec![guard];
+            body.extend(w.body.iter().cloned());
+            *e = ExprType::Loop(ExprLoop { body, span });
+        }
+        ExprType::While(w) => desugar_stmts(&mut w.body),
+        ExprType::Loop(l) => desugar_stmts(&mut l.body),
+        ExprType::ForLoop(f) => desugar_stmts(&mut f.body),
+        ExprType::Block(b) => desugar_stmts(&mut b.stmts),
+        ExprType::If(f) => {
+            desugar_stmts(&mut f.then_block);
+            if let Some(eb) = f.else_branch.as_mut() {
+                desugar_expr(eb);
+            }
+        }
+        ExprType::Match(m) => {
+            for a in m.arms.iter_mut() {
+                desugar_expr(&mut a.body);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// If the module's top-level `loop` has a tick nested inside a branch, flatten
 /// it in place to a single-tick `match pc` FSM. No-op otherwise.

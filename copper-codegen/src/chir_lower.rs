@@ -2210,11 +2210,21 @@ fn lower_expr_stmt(
             out.push(CHIRStmt::Match { scrutinee, arms, span });
         }
 
+        // A `while` that CONTAINS a tick never reaches here — `desugar_tick_waits`
+        // rewrites it into the repeating-wait `loop { if !cond { break; } … }`
+        // shape before lowering. So this is always the combinational case: a loop
+        // with no clock boundary, which has to be fully unrolled to be hardware
+        // and therefore needs a trip count known at compile time. `while` only
+        // implies that; `for` states it.
         ExprType::While(_) => {
             return Err(CHIRLowerError::UnsupportedConstruct {
-                description: "while loops are not supported in hardware; use `loop { ... clk.tick().await; }`".to_string(),
+                description: "a `while` loop with no `clk.tick().await` is combinational, so it must unroll — which needs a trip count known at compile time. Write it as a `for` over a constant range"
+                    .to_string(),
                 span,
-                suggested_rewrite: Some("replace with a top-level `loop { ... }` with `clk.tick().await` boundaries".to_string()),
+                suggested_rewrite: Some(
+                    "`for i in 0..N { ... }` with a constant `N` (a literal, a const item, or a                      const generic)"
+                        .to_string(),
+                ),
             });
         }
 

@@ -21,10 +21,12 @@ fn bsg_gray_to_binary(gray_i: In<Bits<WIDTH>, ()>, binary_o: Out<Bits<WIDTH>, ()
     let g = gray_i.read();
     let mut b = [Logic::Zero; WIDTH];
     b[WIDTH - 1] = g[WIDTH - 1];
-    let mut k = WIDTH - 1;
-    while k > 0 {
-        k -= 1;
-        b[k] = g[k] ^ b[k + 1];
+    // A descending `for`, not a `while`: a combinational loop has to be fully
+    // unrolled to be hardware, so its trip count must be a compile-time constant.
+    // `for` says that; `while k > 0 { k -= 1; … }` only implies it. Same
+    // recurrence, same order — b[k] = g[k] ^ b[k+1] for k from WIDTH-2 down to 0.
+    for i in 1..WIDTH {
+        b[WIDTH - 1 - i] = g[WIDTH - 1 - i] ^ b[WIDTH - i];
     }
     binary_o.write(Bits::from_slice(&b));
 }

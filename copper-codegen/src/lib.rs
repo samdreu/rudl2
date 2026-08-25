@@ -40,6 +40,9 @@ pub fn transpile_fir(
     // live inside branches into an explicit single-tick `match pc` FSM — the shape
     // the pipeline below already lowers correctly. No-op for linear modules.
     let mut fir = fir.clone();
+    // `while <cond> { … tick; }` is sugar for the repeating wait extraction
+    // already handles; rewrite it before the gate looks at the body.
+    control_extract::desugar_tick_waits(&mut fir);
     control_extract::extract_control(&mut fir);
     let fir = &fir;
 
