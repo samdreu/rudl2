@@ -19,18 +19,19 @@ TRANSPILATION:
   remaining causes. (It measures ACCEPTANCE, not correctness — see "LINT-CLEAN IS
   NOT THE SAME AS TRANSPILES" below.)
   19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → C 28/34 →
-  K 28/34 (no change, as predicted) → **M 28/34 — NO CHANGE, also as predicted**.
-  Cause M's own entry said uart/rx sat behind `continue` as well; it does, and
-  that is now what it reports. L / L-1 / L-2 / N and the hoisted-default bug were
+  K 28/34 (no change, as predicted) → M 28/34 (no change, also as predicted) →
+  **O 28/34 — still no change**. Each of the last three peeled one blocker off
+  uart/rx and found another underneath: M → `continue` → a post-tick `In` read,
+  which is refused BY DECISION and is a rewrite of the example, not a feature. L / L-1 / L-2 / N and the hoisted-default bug were
   wrong-CODE bugs, not rejections, so they move no counter either — which is the
   point: coverage was never going to show them, and two of them were silent.
   The 6 still failing, by ROOT CAUSE, as measured on 2026-08-25:
     F   Vec ports ................. rv32i_cpu (190:13), rv32i_cpu_pipelined (201:13)
     J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
         error — same message, different mechanism; see J)
-    O   `continue` ................................... uart/rx (64:12) — refused
-        by decision, see cause M's write-up for why it is the same problem as the
-        wasted back edge
+    P   a `for` that ticks BEFORE it samples ......... uart/rx (69:8) — a
+        post-tick `In` read, refused by decision on 2026-08-24; see cause O for
+        the measurement and the rewrite that would make uart/rx writable
     H   file-level `spawn_uart` rejection ... uart_tx, uart_rx (examples/uart/system.rs)
   Full history of every cause, live and retired:
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
@@ -231,18 +232,106 @@ TRANSPILATION:
         THE GUARD EARNED ITS KEEP: it caught the disagreement the same day it was
         introduced, which is what it exists for.
 
-    O ☐ **`continue`** ..................................... uart/rx (64:12).
-        Refused, with a good message as of 2026-08-25. It is the SAME problem as
-        cause M's hoisted tick, seen from the other side: `continue` is a jump to
-        the loop head that consumes no clock cycle, and the FSM has no way to
-        express that without inlining the head's lowered body at a point where it
-        is still being lowered. Emitting `pc = <head>` instead would spend a cycle
-        the source does not have — the exact divergence cause M measured.
-        So the fix is the rejected alternative in M's entry: a second pass that
-        splices state bodies into marked zero-time transitions. Doing it would
-        close `continue` AND remove M's need to hoist. It is the only remaining
-        control-flow cause, and unlike M it has no desugar that avoids it.
-        Behind it in uart/rx sit `|=` and a bare integer local.
+    O ✔ FIXED (2026-08-25) — **`continue`** in the module's top-level loop.
+        It is a back edge that costs NO clock cycle, and the extracted FSM has no
+        way to say that: its shape is `loop { match pc { … }; clk.tick().await; }`,
+        so every `pc` transition spends exactly one cycle. The only way to spend
+        none is to be in the same state body — i.e. to INLINE the target. That is
+        the rule `break` already follows (it inlines the enclosing loop's
+        continuation rather than transitioning to it); cause O applies it to the
+        back edge.
+        `lower_into` cannot do the inlining itself — at the point it lowers a
+        `continue`, the head's body is the thing being lowered further up its own
+        call stack. So it emits `__copper_goto = H` and
+        `control_extract::splice_zero_time_gotos` substitutes state H's statements
+        once every body exists. That is the "second pass that splices state bodies
+        into marked zero-time transitions" cause M's entry describes.
+        ORDER MATTERS: the splice runs AFTER `hoist_cross_state_locals`. Splicing
+        first would copy the target's `let`s into another state, and a temporary
+        local to one state would then look cross-state and be promoted to a
+        flip-flop nobody asked for.
+        A GOTO CYCLE — a chain of zero-time transitions returning to its start —
+        makes `extract_control` DECLINE the module rather than emit anything, and
+        the marker name is checked to have vanished before the arms are built. A
+        leaked `__copper_goto` would otherwise become an assignment to an
+        undeclared name downstream, which is the quiet kind of failure this pass
+        must not produce.
+
+        **THE ANALYSIS HOLE THAT HAD TO BE CLOSED FIRST — the serious half.**
+        `copper_analysis` modelled a top-level `continue` as a FALL-THROUGH to the
+        next statement, which is the one thing it does not do. `loop_ctx` is empty
+        in a top-level loop (a hardware loop never `break`s), so `continue` took
+        the fallback target. `loop { if c { continue; } clk.tick().await; }` then
+        appeared to reach the tick on every path and PASSED reachability, while the
+        real program returns to the head having ticked zero times — a zero-time
+        cycle the simulator livelocks on.
+        Nothing exercised it because codegen refused `continue` outright; emitting
+        one without fixing this would have shipped exactly the failure cause K
+        recorded as "REACHABILITY ACCEPTED A PROGRAM THE SIMULATOR LIVELOCKS ON".
+        `Builder::top_head` now routes it to the loop head, in BOTH front-ends
+        (the macro re-runs the same check), and the two analysis tests pin both
+        directions: the tickless `continue` is rejected, and one reached only
+        after a counted `for` has ticked is not.
+        RECORD THE CLASS: a fallback (`map_or(next, …)`) standing in for a case the
+        code had no target for. It is not a wrong answer, it is a MISSING one
+        wearing a default's clothes — and it read as deliberate for as long as
+        nothing could reach it.
+
+        TWO SMALLER THINGS IT NEEDED, both silent:
+          - `expr_diverges` did not count `continue`. `if halt { continue; }`
+            contains no tick and no `break`, so it was pushed through as an
+            ordinary combinational statement and the `continue` inside it was never
+            lowered at all. It belongs there for exactly the reason `break` does.
+          - `loop_needs_extraction` did not fire on a `continue`, so an otherwise
+            linear body (`loop { tick; if c { continue; } … tick; }`) fell through
+            to the phase FSM, which cannot express a mid-body re-entry.
+
+        NESTED `continue` IS STILL REFUSED, and the reason is the rotation, not
+        effort: a nested loop's head state holds `C ; W` — the post-tick tail
+        wrapped onto the pre-tick prefix — so re-entering it would run the
+        statements the source places AFTER the tick this `continue` never reached.
+        The correct target is the start of `W`, which is not a state at all; it is
+        inlined into whatever precedes the loop. Note such a `continue` is also
+        hard to write well-formed: the enclosing loop's own tick must be LAST, so
+        the tick on the `continue`'s path has to come from a loop nested inside it.
+
+        WHAT IT UNBLOCKED, measured: nothing in examples/ — 28/34 unchanged.
+        uart/rx moved to a NEW blocker, and it is one already decided rather than
+        one to build: the `for i in 0..8` at 69:8 delays first and samples
+        `rx_serial` after, so its tick is not the body's last statement. That is a
+        post-tick `In` read — the seam CLOSED AS REFUSED BY DESIGN on 2026-08-24
+        (see THE MID-PHASE READ SEAM). The module is writable in the language, by
+        aligning 1.5 bit periods and then sampling BEFORE each delay, but that is a
+        rewrite of the example's design and not a transpiler change. Behind it sit
+        `|=` and a bare integer local.
+        NOTE THE CONSERVATISM, so it is not mistaken for the rule: the desugar
+        refuses ANY `for` whose tick is not last, including one that only touches
+        REGISTERS afterwards — which the seam measured as correct. It matches the
+        existing nested-`loop` gate rather than being more permissive than it; if
+        that gate is ever relaxed to key on the post-tick READ instead of the
+        position, both should move together.
+
+        CAUSE M'S HOISTED TICK COULD NOW BE REMOVED with this machinery — the
+        wasted back edge M works around is a zero-time fall-through, and the
+        splice handles exactly that. DELIBERATELY NOT DONE: M is verified green
+        against Verilator, and rewriting its desugar to depend on the newer pass
+        is churn with real risk for no behavioural gain. Worth doing only if a
+        third caller needs it.
+
+        → tests/continue_equivalence.rs (sim ≡ Verilator; the reference model is
+          written from the SOURCE and encodes the zero-cycle back edge, so a
+          `continue` lowered as `pc = 0` fails it — verified by reverting),
+          copper-codegen/tests/unsupported_constructs.rs (transpiles, no marker
+          leaks, the tickless form is still rejected, nested is still refused),
+          copper-analysis/tests/analysis_semantics.rs (both reachability
+          directions).
+
+    ☐ MINOR, found in passing: Verilator rejects a port named `abort`
+        (`SYMRSVDWORD` — it matches a C++ common word) and the equivalence harness
+        runs `-Wall`, so the build fails. `vlir_lower`'s legalizer reserves
+        SystemVerilog keywords but not C++ ones, so a legal Copper name can produce
+        SystemVerilog that Verilator will not compile. Worked around in the cause-O
+        test by renaming the port; the legalizer is the real fix.
 
     G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`

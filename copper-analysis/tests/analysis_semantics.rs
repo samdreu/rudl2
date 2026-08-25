@@ -496,3 +496,61 @@ fn multi_write_clean_for_nested_serializer() {
     }";
     assert!(multi_write_collapse(&f(src)).is_empty());
 }
+
+// ── `continue` in the top-level hardware loop ────────────────────────────────
+
+/// A top-level `continue` is a back edge to the loop head, not a fall-through to
+/// the next statement — so a path that reaches it without ticking is a zero-time
+/// cycle and must be rejected.
+///
+/// This was accepted before 2026-08-25: `loop_ctx` is empty in a top-level loop
+/// (a hardware loop never `break`s), and `continue` fell back to the FALL-THROUGH
+/// target, i.e. the statement it explicitly skips. Every path then appeared to
+/// reach the tick. Codegen refused `continue` outright at the time, so nothing
+/// exercised it; it had to be closed before the transpiler could emit one.
+#[test]
+fn a_continue_that_skips_the_only_tick_is_a_zero_time_cycle() {
+    let src = r#"
+        #[hardware(sequential)]
+        async fn m(clk: Clock<C>, go: In<Logic, C>, o: Out<Logic, C>) {
+            loop {
+                if go.read() == Logic::One {
+                    continue;
+                }
+                o.write(Logic::Zero);
+                clk.tick().await;
+            }
+        }
+    "#;
+    let err = check_reachability(&f(src))
+        .expect_err("a `continue` past the only tick returns to the head in zero time");
+    assert!(
+        !format!("{err}").is_empty(),
+        "the rejection must carry a message"
+    );
+}
+
+/// …and the shape that IS well-formed still passes: `uart/rx` ticks in a counted
+/// `for` before its `continue`, so the back edge costs real cycles.
+#[test]
+fn a_continue_after_a_guaranteed_tick_is_well_formed() {
+    let src = r#"
+        #[hardware(sequential)]
+        async fn m(clk: Clock<C>, go: In<Logic, C>, o: Out<Logic, C>) {
+            loop {
+                for _ in 0..4 {
+                    clk.tick().await;
+                }
+                if go.read() == Logic::One {
+                    continue;
+                }
+                o.write(Logic::Zero);
+                clk.tick().await;
+            }
+        }
+    "#;
+    assert!(
+        check_reachability(&f(src)).is_ok(),
+        "a `continue` reached only after a counted `for` has ticked is well-formed"
+    );
+}

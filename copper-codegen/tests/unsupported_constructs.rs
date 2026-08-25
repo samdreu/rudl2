@@ -687,11 +687,16 @@ async fn m(clk: Clock<MainClk>, n: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, Main
     );
 }
 
-/// The half of cause M that was not about lowering at all. `uart/rx` was declined
-/// for a `continue`, and the linear path downstream then reported the well-formed
-/// repeating wait it happened to reach first — unfollowable advice about a loop
-/// the author wrote correctly. The construct that actually stopped the flattening
-/// is reported now, with its own span.
+/// The half of cause M that was not about lowering at all. A module declined for
+/// one construct used to be reported against another: the linear path downstream
+/// blames the first unsupported thing it REACHES, which left `uart/rx`'s
+/// well-formed repeating wait accused of having its tick in the wrong place.
+///
+/// The DUT below is `uart/rx`'s shape as it stands today — a correct `while` wait
+/// followed by a `for` whose tick is not its last statement. The `for` is what
+/// declines the module, and the `for` is what must be named. (The original
+/// instance was a `continue`, which is supported as of cause O; the mechanism
+/// under test is the same.)
 #[test]
 fn a_module_declined_for_one_construct_is_not_reported_against_another() {
     let src = r#"
@@ -701,7 +706,40 @@ async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, n: In<Bits<8>, MainClk>,
         while go.read() == Logic::Zero {
             clk.tick().await;
         }
-        if go.read() == Logic::One {
+        for _ in 0..4 {
+            clk.tick().await;
+            o.write(n.read());
+        }
+    }
+}
+"#;
+    let err = transpile(src).expect_err("a `for` whose tick is not last must be refused");
+    assert!(
+        err.contains("`for`"),
+        "the reported construct must be the `for`, not the well-formed wait above \
+         it: {err}"
+    );
+    assert!(
+        !err.contains("repeating wait"),
+        "the well-formed `while` must not be blamed for the `for`: {err}"
+    );
+}
+
+// ── `continue` (`TODO` cause O) ───────────────────────────────────────────────
+
+/// A `continue` in the module's own loop is a ZERO-TIME back edge, lowered as a
+/// goto marker and spliced with the head state's body once every body exists.
+/// Nothing of the marker may survive into the emitted SystemVerilog.
+#[test]
+fn a_continue_in_the_module_loop_is_supported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, halt: In<Logic, MainClk>, n: In<Bits<8>, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    loop {
+        for _ in 0..2 {
+            clk.tick().await;
+        }
+        if halt.read() == Logic::One {
             continue;
         }
         o.write(n.read());
@@ -709,14 +747,64 @@ async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, n: In<Bits<8>, MainClk>,
     }
 }
 "#;
-    let err = transpile(src).expect_err("`continue` must still be refused");
+    let sv = transpile(src).expect("a top-level `continue` must transpile");
     assert!(
-        err.contains("`continue`"),
-        "the reported construct must be the `continue`, not the well-formed wait \
-         above it: {err}"
+        !sv.contains("__copper_goto"),
+        "a zero-time goto marker leaked into the output — it is not a real signal: {sv}"
     );
+}
+
+/// …and it must still be REJECTED when the path that reaches it never ticks: the
+/// back edge then returns to the head in zero time. Owned by the shared
+/// reachability guarantee, which the transpiler re-runs, so the sim macro rejects
+/// it at `cargo build` too. This is the invariant that had to hold before codegen
+/// could emit a `continue` at all — see `copper-analysis`' own tests.
+#[test]
+fn a_continue_that_skips_every_tick_is_still_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, halt: In<Logic, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    loop {
+        if halt.read() == Logic::One {
+            continue;
+        }
+        o.write(Bits::zero());
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("a tickless `continue` cycle must be rejected");
     assert!(
-        !err.contains("repeating wait"),
-        "the well-formed `while` must not be blamed for the `continue`: {err}"
+        !err.is_empty() && !err.starts_with("0:0:"),
+        "the rejection must carry a span: {err}"
+    );
+}
+
+/// Inside a NESTED loop it is still refused, and the reason is the rotation: that
+/// loop's head state holds `C ; W` — the post-tick tail wrapped onto the pre-tick
+/// prefix — so re-entering it would run statements the source places AFTER the
+/// tick this `continue` never reached. The right target is the start of `W`, which
+/// is inlined into whatever precedes the loop rather than being a state.
+#[test]
+fn continue_inside_a_nested_loop_is_unsupported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, go: In<Logic, MainClk>, o: RegOut<Bits<8>, MainClk>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        o.write(n);
+        loop {
+            if go.read() == Logic::Zero { continue; }
+            break;
+        }
+        n = n + Bits::from_lit::<1>();
+        clk.tick().await;
+    }
+}
+"#;
+    let err = transpile(src).expect_err("`continue` in a nested loop must be refused");
+    assert!(
+        !err.is_empty() && !err.starts_with("0:0:"),
+        "the `continue` diagnostic must carry a span: {err}"
     );
 }

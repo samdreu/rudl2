@@ -156,6 +156,8 @@ impl Cfg {
         // The head is node 0: an empty node whose successor is the first body node.
         // Every back-edge (trailing tick, fall-through) targets it.
         let head = b.new_node(Node::empty(loop_span));
+        // A `continue` written directly in the hardware loop targets this head.
+        b.top_head = Some(head);
         let body_entry = b.build_block(&loop_body, head);
         b.nodes[head].succs.push((body_entry, EdgeKind::Comb));
 
@@ -757,6 +759,17 @@ struct Builder {
     /// loop's exit sink — so a `break` before a tick does not read as a tickless
     /// cycle. Empty while building a top-level (hardware) loop, which never breaks.
     loop_ctx: Vec<(usize, usize)>,
+    /// The top-level hardware loop's head, for a `continue` written directly in it.
+    ///
+    /// `loop_ctx` stays empty there because a hardware loop never `break`s, and a
+    /// top-level `continue` was consequently routed to its FALL-THROUGH — modelling
+    /// it as "carry on with the next statement", which is the one thing it does not
+    /// do. `loop { if c { continue; } clk.tick().await; }` then reached the tick on
+    /// every path and passed, while the real program returns to the head having
+    /// ticked zero times: a zero-time cycle the simulator livelocks on. Same class
+    /// as the nested-loop hole cause K uncovered, and it had to be closed before
+    /// codegen could emit a `continue` at all.
+    top_head: Option<usize>,
 }
 
 impl Builder {
@@ -767,6 +780,7 @@ impl Builder {
             inputs,
             nested: Vec::new(),
             loop_ctx: Vec::new(),
+            top_head: None,
         }
     }
 }
@@ -909,7 +923,12 @@ impl Builder {
                 })
             }
             Expr::Continue(c) => {
-                let target = self.loop_ctx.last().map_or(next, |&(cont, _)| cont);
+                let target = self
+                    .loop_ctx
+                    .last()
+                    .map(|&(cont, _)| cont)
+                    .or(self.top_head)
+                    .unwrap_or(next);
                 self.new_node(Node {
                     succs: vec![(target, EdgeKind::Comb)],
                     ..Node::empty(c.span())

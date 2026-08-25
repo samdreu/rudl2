@@ -59,6 +59,21 @@ const PC: &str = "pc";
 const PC_TY: &str = "u8";
 const PC_SUFFIX: &str = "u8";
 
+/// Marker for a **zero-time** transition to another state — a jump that must not
+/// cost a clock cycle, so it cannot be a `pc` assignment.
+///
+/// `pc = H` is a state transition, and every state transition in the extracted FSM
+/// (`loop { match pc { … }; clk.tick().await; }`) spends exactly one cycle. A
+/// `continue` spends none: it re-enters the loop head in the SAME cycle. So it is
+/// emitted as `__copper_goto = H` and `splice_zero_time_gotos` later replaces it
+/// with state H's own statements — the same "inline the continuation rather than
+/// transition to it" rule `break` already follows, applied to the back edge.
+///
+/// The name is reserved and never reaches CHIR; `extract_control` declines the
+/// module rather than emit one that survived the splice, so a leak cannot become
+/// a stray assignment in the output.
+const GOTO: &str = "__copper_goto";
+
 /// Rewrite `while <cond> { … clk.tick().await; }` into the repeating-wait shape
 /// this pass already flattens: `loop { if !<cond> { break; } … }`.
 ///
@@ -468,6 +483,14 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
     // then handles — the same treatment `pc` itself gets.
     let hoisted = hoist_cross_state_locals(&mut sm);
 
+    // `continue` left a zero-time goto in place of a state transition; every state
+    // body exists now, so the target can be inlined. Declining on failure keeps the
+    // rule this pass is built on: never mis-lower, always fall back to the linear
+    // path's refusal.
+    if !splice_zero_time_gotos(&mut sm) {
+        return;
+    }
+
     // Build `match pc { 0 => {..}, .., _ => {} }`.
     let mut arms = Vec::new();
     for (i, body) in sm.states.iter().enumerate() {
@@ -545,6 +568,145 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
     // in source order.
     for decl in hoisted.into_iter().rev() {
         fir.raw_statements.insert(loop_idx, decl);
+    }
+}
+
+// ── Zero-time transitions ─────────────────────────────────────────────────────
+
+/// Replace every `__copper_goto = H` with state `H`'s own statements.
+///
+/// A `continue` re-enters the loop head **without consuming a clock cycle**, and
+/// the extracted FSM has no way to say that: its shape is
+/// `loop { match pc { … }; clk.tick().await; }`, so reaching another state always
+/// costs exactly one tick. The only way to spend no cycle is to be in the same
+/// state body — i.e. to inline the target. That is the rule `break` already
+/// follows (it inlines the enclosing loop's continuation rather than transitioning
+/// to it); this applies it to the back edge.
+///
+/// **Why it is a separate pass.** `lower_into` cannot do the inlining itself: at
+/// the point it lowers a `continue`, the head's body is the thing currently being
+/// lowered, further up its own call stack. Every state body exists by the time
+/// `lower_into` returns, so the substitution is deferred to here — which is what
+/// `TODO` cause O records as the work, and what cause M's entry means by "a second
+/// pass that splices state bodies into marked zero-time transitions".
+///
+/// Runs AFTER `hoist_cross_state_locals`, and the order matters: splicing first
+/// would copy the target's `let`s into another state, and a temporary that is
+/// local to one state would then look cross-state and be promoted to a
+/// flip-flop nobody asked for. Hoisting first leaves each copy self-contained.
+///
+/// Returns `false` if a goto cycle was found — a chain of zero-time transitions
+/// that returns to where it started, i.e. a loop that runs in no time at all.
+/// `copper_analysis::check_reachability` rejects that program before codegen sees
+/// it, so reaching this is the two analyses disagreeing; the caller DECLINES the
+/// module rather than emit anything, and the linear path downstream refuses it.
+fn splice_zero_time_gotos(sm: &mut StateMachine) -> bool {
+    // Nothing to do for the overwhelmingly common case — no `continue` anywhere.
+    if !sm.states.iter().any(|b| stmts_contain_goto(b)) {
+        return true;
+    }
+    let originals = sm.states.clone();
+    for i in 0..sm.states.len() {
+        let mut body = std::mem::take(&mut sm.states[i]);
+        let mut path = vec![i];
+        if !splice_in_stmts(&mut body, &originals, &mut path) {
+            return false;
+        }
+        sm.states[i] = body;
+    }
+    // Defence in depth: a marker that survived would become an assignment to an
+    // undeclared name downstream, which is exactly the kind of quiet leak this
+    // pass must not produce.
+    !sm.states.iter().any(|b| stmts_contain_goto(b))
+}
+
+/// `path` is the chain of states already inlined at this point, so a goto back
+/// into one of them is a zero-time cycle rather than an infinite expansion.
+fn splice_in_stmts(
+    stmts: &mut Vec<RawStmt>,
+    originals: &[Vec<RawStmt>],
+    path: &mut Vec<usize>,
+) -> bool {
+    let mut out: Vec<RawStmt> = Vec::with_capacity(stmts.len());
+    for mut s in std::mem::take(stmts) {
+        if let Some(target) = goto_target(&s) {
+            if path.contains(&target) || target >= originals.len() {
+                return false;
+            }
+            let mut inlined = originals[target].clone();
+            path.push(target);
+            let ok = splice_in_stmts(&mut inlined, originals, path);
+            path.pop();
+            if !ok {
+                return false;
+            }
+            out.extend(inlined);
+            // A goto ends its statement list — whatever followed is unreachable.
+            *stmts = out;
+            return true;
+        }
+        if !splice_in_stmt_branches(&mut s, originals, path) {
+            return false;
+        }
+        out.push(s);
+    }
+    *stmts = out;
+    true
+}
+
+/// Descend into the branch forms a state body can contain. Nested `loop`/`while`/
+/// `for` are deliberately NOT visited: control extraction has already flattened
+/// every loop it accepted, so a loop surviving in a state body carries no goto.
+fn splice_in_stmt_branches(
+    s: &mut RawStmt,
+    originals: &[Vec<RawStmt>],
+    path: &mut Vec<usize>,
+) -> bool {
+    let RawStmtKind::Expr(es) = &mut s.kind else { return true };
+    splice_in_expr(&mut es.expr, originals, path)
+}
+
+fn splice_in_expr(e: &mut ExprType, originals: &[Vec<RawStmt>], path: &mut Vec<usize>) -> bool {
+    match e {
+        ExprType::If(f) => {
+            if !splice_in_stmts(&mut f.then_block, originals, path) {
+                return false;
+            }
+            match f.else_branch.as_mut() {
+                Some(eb) => splice_in_expr(eb, originals, path),
+                None => true,
+            }
+        }
+        ExprType::Block(b) => splice_in_stmts(&mut b.stmts, originals, path),
+        ExprType::Match(m) => m
+            .arms
+            .iter_mut()
+            .all(|a| splice_in_expr(&mut a.body, originals, path)),
+        _ => true,
+    }
+}
+
+fn stmts_contain_goto(stmts: &[RawStmt]) -> bool {
+    stmts.iter().any(|s| {
+        if goto_target(s).is_some() {
+            return true;
+        }
+        match &s.kind {
+            RawStmtKind::Expr(es) => expr_contains_goto(&es.expr),
+            _ => false,
+        }
+    })
+}
+
+fn expr_contains_goto(e: &ExprType) -> bool {
+    match e {
+        ExprType::If(f) => {
+            stmts_contain_goto(&f.then_block)
+                || f.else_branch.as_deref().is_some_and(expr_contains_goto)
+        }
+        ExprType::Block(b) => stmts_contain_goto(&b.stmts),
+        ExprType::Match(m) => m.arms.iter().any(|a| expr_contains_goto(&a.body)),
+        _ => false,
     }
 }
 
@@ -820,6 +982,16 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
             return; // rest handled after the tick
         }
 
+        if is_continue_stmt(stmt) {
+            // Back to the enclosing loop's head, in the SAME cycle. Anything after
+            // the `continue` is unreachable. Only a `continue` targeting the
+            // MODULE's own loop reaches here — the gate refuses one inside a nested
+            // loop, whose head state holds the ROTATED body (`C ; W`) and would
+            // re-run the post-tick tail. See `unflattenable_in_expr`.
+            target.push(goto_marker(ctx.head, stmt.span));
+            return;
+        }
+
         if is_break_stmt(stmt) {
             // Leave the nested loop and carry straight on with what followed it,
             // in the same cycle. Anything after the `break` is unreachable.
@@ -950,6 +1122,30 @@ fn expr_stmt(expr: ExprType, span: SourceSpan) -> RawStmt {
     }
 }
 
+/// `__copper_goto = <n>;` — a zero-time transition. See [`GOTO`].
+fn goto_marker(n: usize, span: SourceSpan) -> RawStmt {
+    expr_stmt(
+        ExprType::Assign(ExprAssign {
+            left: Box::new(path_expr(GOTO, span)),
+            right: Box::new(ExprType::Lit(ExprLit { text: n.to_string(), span })),
+            span,
+        }),
+        span,
+    )
+}
+
+/// The state a zero-time goto targets, if `s` is one.
+fn goto_target(s: &RawStmt) -> Option<usize> {
+    let RawStmtKind::Expr(es) = &s.kind else { return None };
+    let ExprType::Assign(a) = &es.expr else { return None };
+    let ExprType::Path(p) = &*a.left else { return None };
+    if p.path_text != GOTO {
+        return None;
+    }
+    let ExprType::Lit(l) = &*a.right else { return None };
+    l.text.parse::<usize>().ok()
+}
+
 /// `pc = <n>;`
 fn pc_assign(n: usize, span: SourceSpan) -> RawStmt {
     expr_stmt(
@@ -1027,6 +1223,10 @@ fn is_tick_stmt(s: &RawStmt) -> bool {
         if matches!(&es.expr, ExprType::Await(a) if is_tick_await(&a.base)))
 }
 
+fn is_continue_stmt(s: &RawStmt) -> bool {
+    matches!(&s.kind, RawStmtKind::Expr(es) if matches!(es.expr, ExprType::Continue(_)))
+}
+
 fn is_break_stmt(s: &RawStmt) -> bool {
     matches!(&s.kind, RawStmtKind::Expr(es) if matches!(es.expr, ExprType::Break(_)))
 }
@@ -1044,13 +1244,18 @@ fn as_nested_loop(s: &RawStmt) -> Option<&ExprLoop> {
 
 /// Can control leave this expression other than by falling off its end?
 ///
-/// Either by a tick (the next cycle starts elsewhere) or by breaking the enclosing
-/// loop (the continuation is somewhere else entirely). Both mean the branches must
-/// be lowered separately with the continuation inlined into each — which is what
-/// makes `if ready { break; }` split into two `pc` futures rather than staying a
-/// plain combinational statement.
+/// Three ways: a tick (the next cycle starts elsewhere), a `break` (the
+/// continuation is somewhere else entirely), or a `continue` (the loop head is,
+/// in the same cycle). Each means the branches must be lowered separately with the
+/// continuation inlined into each — which is what makes `if ready { break; }`
+/// split into two `pc` futures rather than staying a plain combinational statement.
+///
+/// `continue` belongs here for exactly the same reason `break` does, and leaving
+/// it out was silent: `if abort { continue; }` contains no tick and no break, so it
+/// was pushed through as an ordinary statement and the `continue` inside it was
+/// never lowered at all.
 fn expr_diverges(e: &ExprType) -> bool {
-    expr_contains_tick(e) || expr_breaks_enclosing_loop(e)
+    expr_contains_tick(e) || expr_breaks_enclosing_loop(e) || expr_continues_enclosing_loop(e)
 }
 
 fn stmts_break_enclosing_loop(stmts: &[RawStmt]) -> bool {
@@ -1100,11 +1305,41 @@ fn as_match_that_diverges(s: &RawStmt) -> Option<&ExprMatch> {
     None
 }
 
-/// Fire extraction only when a tick is nested inside a branch — i.e. some
-/// top-level statement contains a tick but is not itself the tick.
+/// Fire extraction when a tick is nested inside a branch — i.e. some top-level
+/// statement contains a tick but is not itself the tick — or when the body
+/// `continue`s.
+///
+/// A `continue` needs a `pc` even in an otherwise linear body: it re-enters the
+/// loop head from the middle, which the phase FSM has no way to express. Without
+/// this clause `loop { tick; if c { continue; } … tick; }` fell through to the
+/// linear path and was refused for a construct extraction can now handle.
 fn loop_needs_extraction(body: &[RawStmt]) -> bool {
     body.iter()
         .any(|s| stmt_contains_tick(s) && !is_tick_stmt(s))
+        || stmts_continue_enclosing_loop(body)
+}
+
+/// Is there a `continue` bound to THIS loop? A `continue` under a nested loop of
+/// its own belongs to that loop — mirrors `stmts_break_enclosing_loop`.
+fn stmts_continue_enclosing_loop(stmts: &[RawStmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        RawStmtKind::Expr(es) => expr_continues_enclosing_loop(&es.expr),
+        RawStmtKind::Local(_) | RawStmtKind::Item(_) => false,
+    })
+}
+
+fn expr_continues_enclosing_loop(e: &ExprType) -> bool {
+    match e {
+        ExprType::Continue(_) => true,
+        ExprType::If(f) => {
+            stmts_continue_enclosing_loop(&f.then_block)
+                || f.else_branch.as_deref().is_some_and(expr_continues_enclosing_loop)
+        }
+        ExprType::Block(b) => stmts_continue_enclosing_loop(&b.stmts),
+        ExprType::Match(m) => m.arms.iter().any(|a| expr_continues_enclosing_loop(&a.body)),
+        ExprType::Loop(_) | ExprType::While(_) | ExprType::ForLoop(_) => false,
+        _ => false,
+    }
 }
 
 /// Why this pass declined a module, when the construct at fault is one the linear
@@ -1271,14 +1506,22 @@ fn body_ends_at_a_clock_boundary(body: &[RawStmt]) -> bool {
 /// what makes a `break` meaningful.
 fn unflattenable_in_expr(e: &ExprType, in_loop: bool) -> Option<Unflattenable> {
     match e {
-        ExprType::Continue(_) => named(
-            "`continue` — jumping to the loop head mid-cycle needs the head's LOWERED \
-             body at a point where it is still being lowered, and taking it as a state \
-             transition instead would spend a clock cycle the source does not have",
+        // A `continue` targeting the MODULE's own loop is supported: it becomes a
+        // zero-time goto to state 0, spliced after every state body exists. Inside
+        // a NESTED loop it is not, and the reason is the rotation: that loop's head
+        // state holds `C ; W` (the post-tick tail wrapped onto the pre-tick prefix),
+        // so re-entering it would run `C` — code the source places AFTER the tick
+        // this `continue` never reaches. The right target is the start of `W`, which
+        // is not a state; it is inlined into whatever precedes the loop.
+        ExprType::Continue(_) if in_loop => named(
+            "`continue` inside a NESTED loop — the loop's head state holds its body \
+             ROTATED around the tick, so re-entering it would re-run the statements \
+             that follow the tick, which this `continue` never reached",
             e.span(),
-            "restructure the loop so the path falls through to its end instead, e.g. \
+            "restructure so the path falls through to the loop's end instead, e.g. \
              `if ok { <work> }` rather than `if !ok { continue; } <work>`",
         ),
+        ExprType::Continue(_) => None,
         ExprType::Break(b) if !in_loop => named(
             "a `break` outside any nested loop — there is nothing to leave but the \
              module's own infinite loop",
