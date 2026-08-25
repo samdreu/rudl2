@@ -87,6 +87,77 @@ TRANSPILATION:
     det_010_awaits → tick inside a conditional branch (65:8). Previously filed
       under C (`while` loops); measured, that is not the error it reports.
 
+  ── RE-MEASUREMENT OF EVERY REMAINING CAUSE, 2026-08-24 ─────────────────────
+  Prompted by four causes in a row turning out to be masking (D, J, C, and
+  det_010_awaits). Method: remove the REPORTED blocker in a scratch copy and see
+  what is actually behind it. Three of the four rows were wrong.
+
+  ✔ REAL — ripple_carry_adder / tuple-returning helper. Inlining the tuple
+    (`let ab = a[i]^b[i]; sum_bits[i] = ab^carry; carry = …`) makes the module
+    transpile outright. The recorded cause is the only cause.
+
+  ✘ MASKING — uart_tx, uart_rx were filed under "no structural parent module".
+    That row conflates two different things:
+      - transpiling the two LEAF modules, which the parent has nothing to do
+        with. They failed only because `spawn_uart` has a hardware-looking
+        signature with no `#[hardware]`, which `prepare_source` rejects at FILE
+        level before any module is looked at. With `spawn_uart` removed from the
+        file they get further, and fail on their OWN content (below).
+      - transpiling the SYSTEM as a hierarchy, which is a genuine separate
+        feature and is what the row was presumably about.
+    Keep them separate; the leaf modules are not blocked on hierarchy.
+
+  ◐ UNDERSTATED — the UART family (uart_tx, uart_rx, uart/rx) is blocked on
+    "a tick inside a `for` loop", which is BROADER than the recorded "counted
+    delay". Both `for _ in 0..CLKS_PER_BIT { tick }` (bit timing) AND
+    `for i in 0..8 { … tick … }` (the data-bit loop) are instances — removing
+    only the former leaves the module rejected. The class is counted REPETITION,
+    not just delay, so a fix has to cover a loop whose body does work as well as
+    one that only waits.
+    NOTE the reported error names the wrong construct: control extraction
+    declines because of the `for`, and the linear path downstream then reports
+    the desugared `while` as a nested-loop ordering problem. Same
+    error-message-is-not-the-cause pattern, now visible INSIDE one module.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — CONTROL EXTRACTION DROPPED A LOCAL
+    THAT LIVES ACROSS A TICK. Found while re-measuring uart_tx, minimal repro:
+        loop {
+            while go.read() == Zero { clk.tick().await; }   // forces extraction
+            let captured = d.read();
+            clk.tick().await;
+            o.write(captured);                              // undefined variable
+            clk.tick().await;
+        }
+    → "undefined variable 'captured' referenced in hardware expression".
+    The SAME body without the wait — so without extraction — transpiles fine and
+    `captured` becomes a register, which is the core of the whole timing model
+    ("every value live across an await becomes a register"). So the two paths
+    disagree about the defining rule of the language.
+    Not silent: it is a clean error, and the emitted-vs-dropped question never
+    arises. But the diagnostic is poor (the variable is plainly defined two lines
+    up), and this is a hard blocker for any extracted body that captures a value
+    — which is most real sequential designs, not just the UART.
+    FIX: `hoist_cross_state_locals` moves a local DEFINED in one state and READ in
+    another out to a pre-loop `let mut`, leaving a plain assignment where the
+    `let` was — the same treatment `pc` itself gets, so it lands on the existing
+    register path rather than a new one. A local read only within its own state
+    stays put; hoisting every local would turn state-local temporaries into
+    flip-flops nobody asked for.
+    Verified: tests/cross_state_local_equivalence.rs (sim ≡ transpiled SV under
+    Verilator, with `d` changing BETWEEN the capture and the read so a value that
+    tracked instead of holding would diverge, plus an independent assertion that
+    every value the output takes is one that was actually captured).
+    CONFIRMS THE RE-MEASUREMENT: with this fixed, uart_tx transpiles in full once
+    its counted delays are removed by hand — so the counted delay really is its
+    last remaining blocker, which could not be established before.
+
+  ◐ STALE — rv32i_cpu / rv32i_cpu_pipelined. The first blocker is still the
+    `Vec<Bits<32>>` port, confirmed. The four-item chain recorded behind it was
+    measured 2026-08-24 BEFORE D-a, I, D-b, J-a and C-a landed, so items 2-4 are
+    hypotheses now, not measurements. Re-measure before acting on them. The
+    conclusion that a synthesizable CPU is a REWRITE rather than a flip does not
+    depend on those items and still stands.
+
   ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
   A module can pass the CLI and still fail the equivalence harness, which runs
   Verilator under `-Wall`. TWO modules unblocked above are in exactly that state,

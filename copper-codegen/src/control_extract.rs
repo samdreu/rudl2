@@ -182,6 +182,12 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
     lower_into(&loop_body, &mut state0, &mut sm, &LoopCtx::module());
     sm.set_body(0, state0);
 
+    // A `let` in one state that is read in another cannot stay where it is: a
+    // match arm scopes its locals, so the reader sees an undefined name. Hoist
+    // those to pre-loop `let mut` declarations, which the existing register path
+    // then handles — the same treatment `pc` itself gets.
+    let hoisted = hoist_cross_state_locals(&mut sm);
+
     // Build `match pc { 0 => {..}, .., _ => {} }`.
     let mut arms = Vec::new();
     for (i, body) in sm.states.iter().enumerate() {
@@ -255,6 +261,210 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
 
     fir.raw_statements[loop_idx] = new_loop;
     fir.raw_statements.insert(loop_idx, pc_decl);
+    // Ahead of `pc`, so an init that mentions another hoisted local still reads
+    // in source order.
+    for decl in hoisted.into_iter().rev() {
+        fir.raw_statements.insert(loop_idx, decl);
+    }
+}
+
+// ── Cross-state locals ────────────────────────────────────────────────────────
+
+/// Move a local that is DEFINED in one state and READ in another out to a
+/// pre-loop `let mut`, leaving a plain assignment where the `let` was.
+///
+/// Flattening turns straight-line code into `match pc` arms, and an arm scopes
+/// its own locals — so `let captured = d.read();` in one arm and
+/// `o.write(captured)` in another became "undefined variable 'captured'". The
+/// unflattened form of the same source transpiles and makes `captured` a
+/// register, which is the language's central rule ("every value live across an
+/// await becomes a register"), so the two paths disagreed about the one thing
+/// they must not.
+///
+/// The rewrite produces exactly what a user would write by hand:
+///
+/// ```text
+/// let mut captured = d.read();        // hoisted: gives the type; no init literal
+/// loop { match pc { 0 => { captured = d.read(); … } 1 => { … } } }
+/// ```
+///
+/// which lands on the pre-loop register path rather than inventing a new one.
+/// A local read only within its own state stays put — hoisting every local would
+/// turn state-local temporaries into flip-flops nobody asked for.
+fn hoist_cross_state_locals(sm: &mut StateMachine) -> Vec<RawStmt> {
+    // (state index, name, init) for every local declared anywhere in a state.
+    let mut declared: Vec<(usize, String, ExprType, SourceSpan)> = Vec::new();
+    for (i, body) in sm.states.iter().enumerate() {
+        collect_locals(body, i, &mut declared);
+    }
+
+    let mut hoisted = Vec::new();
+    let mut to_convert: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (state, name, init, span) in declared {
+        let read_elsewhere = sm
+            .states
+            .iter()
+            .enumerate()
+            .any(|(j, body)| j != state && stmts_mention(body, &name));
+        if !read_elsewhere || !to_convert.insert(name.clone()) {
+            continue;
+        }
+        hoisted.push(RawStmt {
+            order: 0,
+            kind: RawStmtKind::Local(LocalStmt {
+                is_mut: true,
+                ty: None,
+                name,
+                init: Some(init),
+                attrs: Vec::new(),
+                span,
+            }),
+            text: String::new(),
+            span,
+        });
+    }
+
+    if !to_convert.is_empty() {
+        for body in sm.states.iter_mut() {
+            convert_locals_to_assignments(body, &to_convert);
+        }
+    }
+    hoisted
+}
+
+fn collect_locals(
+    stmts: &[RawStmt],
+    state: usize,
+    out: &mut Vec<(usize, String, ExprType, SourceSpan)>,
+) {
+    for s in stmts {
+        match &s.kind {
+            RawStmtKind::Local(l) => {
+                if let Some(init) = &l.init {
+                    out.push((state, l.name.clone(), init.clone(), l.span));
+                }
+            }
+            RawStmtKind::Expr(es) => collect_locals_in_expr(&es.expr, state, out),
+            RawStmtKind::Item(_) => {}
+        }
+    }
+}
+
+fn collect_locals_in_expr(
+    e: &ExprType,
+    state: usize,
+    out: &mut Vec<(usize, String, ExprType, SourceSpan)>,
+) {
+    match e {
+        ExprType::If(f) => {
+            collect_locals(&f.then_block, state, out);
+            if let Some(eb) = &f.else_branch {
+                collect_locals_in_expr(eb, state, out);
+            }
+        }
+        ExprType::Block(b) => collect_locals(&b.stmts, state, out),
+        ExprType::Match(m) => {
+            for a in &m.arms {
+                collect_locals_in_expr(&a.body, state, out);
+            }
+        }
+        ExprType::Loop(l) => collect_locals(&l.body, state, out),
+        ExprType::While(w) => collect_locals(&w.body, state, out),
+        ExprType::ForLoop(f) => collect_locals(&f.body, state, out),
+        _ => {}
+    }
+}
+
+/// Replace `let <name> = <init>;` with `<name> = <init>;` for each hoisted name.
+fn convert_locals_to_assignments(
+    stmts: &mut Vec<RawStmt>,
+    names: &std::collections::HashSet<String>,
+) {
+    for s in stmts.iter_mut() {
+        let replacement = match &s.kind {
+            RawStmtKind::Local(l) if names.contains(&l.name) => l.init.as_ref().map(|init| {
+                expr_stmt(
+                    ExprType::Assign(ExprAssign {
+                        left: Box::new(path_expr(&l.name, l.span)),
+                        right: Box::new(init.clone()),
+                        span: l.span,
+                    }),
+                    l.span,
+                )
+            }),
+            _ => None,
+        };
+        if let Some(r) = replacement {
+            *s = r;
+            continue;
+        }
+        if let RawStmtKind::Expr(es) = &mut s.kind {
+            convert_locals_in_expr(&mut es.expr, names);
+        }
+    }
+}
+
+fn convert_locals_in_expr(e: &mut ExprType, names: &std::collections::HashSet<String>) {
+    match e {
+        ExprType::If(f) => {
+            convert_locals_to_assignments(&mut f.then_block, names);
+            if let Some(eb) = f.else_branch.as_mut() {
+                convert_locals_in_expr(eb, names);
+            }
+        }
+        ExprType::Block(b) => convert_locals_to_assignments(&mut b.stmts, names),
+        ExprType::Match(m) => {
+            for a in m.arms.iter_mut() {
+                convert_locals_in_expr(&mut a.body, names);
+            }
+        }
+        ExprType::Loop(l) => convert_locals_to_assignments(&mut l.body, names),
+        ExprType::While(w) => convert_locals_to_assignments(&mut w.body, names),
+        ExprType::ForLoop(f) => convert_locals_to_assignments(&mut f.body, names),
+        _ => {}
+    }
+}
+
+/// Whether `name` appears as an identifier anywhere in `stmts`.
+fn stmts_mention(stmts: &[RawStmt], name: &str) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        RawStmtKind::Local(l) => l.init.as_ref().is_some_and(|i| expr_mentions(i, name)),
+        RawStmtKind::Expr(es) => expr_mentions(&es.expr, name),
+        RawStmtKind::Item(_) => false,
+    })
+}
+
+fn expr_mentions(e: &ExprType, name: &str) -> bool {
+    match e {
+        ExprType::Path(p) => p.path_text.trim() == name,
+        ExprType::Lit(_) => false,
+        ExprType::Unary(u) => expr_mentions(&u.expr, name),
+        ExprType::Binary(b) => expr_mentions(&b.left, name) || expr_mentions(&b.right, name),
+        ExprType::Assign(a) => expr_mentions(&a.left, name) || expr_mentions(&a.right, name),
+        ExprType::MethodCall(mc) => {
+            expr_mentions(&mc.receiver, name) || mc.args.iter().any(|a| expr_mentions(a, name))
+        }
+        ExprType::Call(c) => c.args.iter().any(|a| expr_mentions(a, name)),
+        ExprType::Index(i) => expr_mentions(&i.base, name) || expr_mentions(&i.index, name),
+        ExprType::Cast(c) => expr_mentions(&c.expr, name),
+        ExprType::Reference(r) => expr_mentions(&r.expr, name),
+        ExprType::If(f) => {
+            expr_mentions(&f.condition, name)
+                || stmts_mention(&f.then_block, name)
+                || f.else_branch.as_deref().is_some_and(|e| expr_mentions(e, name))
+        }
+        ExprType::Block(b) => stmts_mention(&b.stmts, name),
+        ExprType::Match(m) => {
+            expr_mentions(&m.scrutinee, name)
+                || m.arms.iter().any(|a| expr_mentions(&a.body, name))
+        }
+        ExprType::Loop(l) => stmts_mention(&l.body, name),
+        ExprType::While(w) => expr_mentions(&w.condition, name) || stmts_mention(&w.body, name),
+        ExprType::ForLoop(f) => expr_mentions(&f.iter, name) || stmts_mention(&f.body, name),
+        ExprType::Tuple(t) => t.elements.iter().any(|e| expr_mentions(e, name)),
+        ExprType::Await(a) => expr_mentions(&a.base, name),
+        _ => false,
+    }
 }
 
 // ── State machine accumulator ─────────────────────────────────────────────────
