@@ -43,8 +43,8 @@ async fn bsg_counter_up_down(
         if reset_i.read() == Logic::One {
             count = Bits::zero();
         } else {
-            // NOTE `Bits::one()` is ALL ONES (7 here), not the value 1 — use a
-            // literal for the step.
+            // The step is the VALUE 1, so it is a literal. (`Bits::all_ones()`
+            // is the all-ones mask — 7 at this width — not 1.)
             let step: Bits<PTR_W> = Bits::from_lit::<1>();
             let up: Bits<PTR_W> = if up_i.read() == Logic::One { step } else { Bits::zero() };
             let down: Bits<PTR_W> = if down_i.read() == Logic::One { step } else { Bits::zero() };

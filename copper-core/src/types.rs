@@ -147,13 +147,30 @@ pub struct Bits<const N: usize> {
 }
 
 impl<const N: usize> Bits<N> {
-    /// Create a bit vector with all zeros
+    /// A bit vector of all zeros — which is also the *value* zero.
+    ///
+    /// Its counterpart is [`Bits::all_ones`], deliberately not named `one`:
+    /// all-ones is `2^N - 1`, not 1. For the value 1, use
+    /// `Bits::from_lit::<1>()`.
     pub fn zero() -> Self {
         Self { bits: [Logic::Zero; N] }
     }
-    
-    /// Create a bit vector with all ones
-    pub fn one() -> Self {
+
+    /// A bit vector with every bit set — the value `2^N - 1`, **not** 1.
+    ///
+    /// `Bits::<3>::all_ones()` is 7. This was called `one()`, which read as the
+    /// value 1 next to [`Bits::zero`] (where the all-zeros/value-zero reading
+    /// happens to coincide) and silently produced an all-ones mask instead — it
+    /// cost a BaseJump counter 49 wrong cycles before the reference caught it.
+    ///
+    /// For the value 1, use `Bits::from_lit::<1>()`.
+    ///
+    /// ```
+    /// use copper_core::Bits;
+    /// assert_eq!(Bits::<3>::all_ones().as_u128(), 7);
+    /// assert_eq!(Bits::<3>::from_lit::<1>().as_u128(), 1);
+    /// ```
+    pub fn all_ones() -> Self {
         Self { bits: [Logic::One; N] }
     }
     
@@ -1168,8 +1185,8 @@ mod tests {
     }
 
     #[test]
-    fn test_one_bits() {
-        let bits: Bits<8> = Bits::one();
+    fn test_all_ones_bits() {
+        let bits: Bits<8> = Bits::all_ones();
 
         assert_eq!(bits.as_u128(), 255);
         assert_eq!(format!("{}", bits), "11111111");
@@ -1493,7 +1510,7 @@ mod tests {
 
     #[test]
     fn test_and_reduce() {
-        assert_eq!(Bits::<4>::one().and_reduce(), Logic::One);
+        assert_eq!(Bits::<4>::all_ones().and_reduce(), Logic::One);
         assert_eq!(Bits::<4>::from_lit::<0b1110>().and_reduce(), Logic::Zero);
         // X & 1 & 1 & 1 = X
         let x1 = Bits::from_array([Logic::X, Logic::One, Logic::One, Logic::One]);
@@ -1525,7 +1542,7 @@ mod tests {
 
     #[test]
     fn test_nand_nor_xnor_reduce() {
-        assert_eq!(Bits::<4>::one().nand_reduce(), Logic::Zero);
+        assert_eq!(Bits::<4>::all_ones().nand_reduce(), Logic::Zero);
         assert_eq!(Bits::<4>::zero().nor_reduce(), Logic::One);
         assert_eq!(Bits::<4>::from_lit::<0b0110>().xnor_reduce(), Logic::One); // even parity → xnor = 1
     }
@@ -1665,7 +1682,7 @@ mod tests {
 
     #[test]
     fn test_mux_x_all_differ() {
-        let a: Bits<4> = Bits::one();
+        let a: Bits<4> = Bits::all_ones();
         let b: Bits<4> = Bits::zero();
         let r = Bits::mux(Logic::X, &a, &b);
         assert_eq!(r, Bits::x());

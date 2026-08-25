@@ -92,10 +92,11 @@ TRANSPILATION:
   ☐ STILL OPEN, and now the standing question rather than a blocker: should a bare
   integer local get its width from its TYPE (today: `usize` → 32) or from its USES?
   Nothing in the corpus needs the answer any more, so this is a language-design
-  call, not a bug. Note the related footgun found while narrowing: `Bits::one()`
-  is ALL ONES, not the value 1 — `Bits::<3>::one()` is 7. `Bits::zero()` reads as
-  the value 0 and IS 0, so the pair invites exactly the wrong guess (use
-  `Bits::from_lit::<1>()` for the value). Worth renaming or documenting.
+  call, not a bug. (The related footgun found while narrowing — `Bits::one()`
+  returning ALL ONES rather than the value 1 — is ✔ FIXED: renamed `all_ones()`,
+  2026-08-24. `Bits::zero()` reads as the value 0 and IS 0, so the pair invited
+  exactly the wrong guess; `Bits::from_lit::<1>()` is the value. Hard rename, no
+  deprecated alias — leaving `one()` reachable would leave the trap reachable.)
   The transpile count above is "the CLI emits SystemVerilog", not "it lints".
 
   ✔ FIXED (2026-08-24, with user sign-off) — I: a branch-local `let` with a

@@ -293,7 +293,7 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **767 tests pass, 0 fail, 4 ignored** across 94 test binaries
+- **768 tests pass, 0 fail, 4 ignored** across 94 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
 - all three wiring guards (G-A / G-B / G-C) clean
 
