@@ -19,19 +19,23 @@ TRANSPILATION:
   remaining causes. (It measures ACCEPTANCE, not correctness — see "LINT-CLEAN IS
   NOT THE SAME AS TRANSPILES" below.)
   19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → C 28/34 →
-  K 28/34 (no change, as predicted) → M 28/34 (no change, also as predicted) →
-  **O 28/34 — still no change**. Each of the last three peeled one blocker off
-  uart/rx and found another underneath: M → `continue` → a post-tick `In` read,
-  which is refused BY DECISION and is a rewrite of the example, not a feature. L / L-1 / L-2 / N and the hoisted-default bug were
+  K 28/34 → M 28/34 → O 28/34 (each no change, each predicted) → **uart/rx
+  REWRITTEN 29/34**. Three causes in a row peeled one blocker off uart/rx and
+  found another underneath; the last one was not a missing feature at all but a
+  post-tick `In` read, refused BY DECISION. Rewriting the example to sample
+  BEFORE each delay — same instants, same behaviour, all five self-check sections
+  unchanged — is what finally moved the counter. See the write-up below.
+  AND IT DID NOT TRANSPILE CORRECTLY AT FIRST: acceptance is not correctness, and
+  the `for`/`continue` work had two real bugs behind it that only a design this
+  dense could reach (a `pc` too narrow for its own state count, and a back edge
+  that cost a cycle). Both fixed and pinned; read the uart/rx entry. L / L-1 / L-2 / N and the hoisted-default bug were
   wrong-CODE bugs, not rejections, so they move no counter either — which is the
   point: coverage was never going to show them, and two of them were silent.
   The 6 still failing, by ROOT CAUSE, as measured on 2026-08-25:
     F   Vec ports ................. rv32i_cpu (190:13), rv32i_cpu_pipelined (201:13)
     J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
         error — same message, different mechanism; see J)
-    P   a `for` that ticks BEFORE it samples ......... uart/rx (69:8) — a
-        post-tick `In` read, refused by decision on 2026-08-24; see cause O for
-        the measurement and the rewrite that would make uart/rx writable
+    (uart/rx is no longer here — see UART/RX, REWRITTEN below)
     H   file-level `spawn_uart` rejection ... uart_tx, uart_rx (examples/uart/system.rs)
   Full history of every cause, live and retired:
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
@@ -366,6 +370,108 @@ TRANSPILATION:
   re-filed as "tick inside a conditional branch (65:8)" — and neither was its own
   cause. Its `while` made `contains_unflattenable_control` decline the whole body,
   so the tick-in-branch fell through to the linear path and was reported there.
+
+  ── UART/RX, REWRITTEN TO SAMPLE BEFORE THE DELAY (2026-08-25) ───────────────
+  ✔ 28/34 → 29/34, and the first coverage gain that came from the EXAMPLE rather
+  than the transpiler. Worth reading for that reason: three causes in a row (M,
+  `continue`, then this) each unblocked uart/rx and each revealed another blocker,
+  and the last one was not a missing feature. Its data loop read `rx_serial`
+  AFTER a bit-period delay — a post-tick `In` read, the seam CLOSED AS REFUSED BY
+  DESIGN on 2026-08-24.
+  THE REWRITE, and why it is not a behaviour change: pre-load ONE bit period after
+  the start-bit check, then have each iteration SAMPLE FIRST and DELAY LAST. The
+  instants sampled are identical (centre of data bit i, for i in 0..8), the eighth
+  iteration's trailing delay lands on the centre of the stop bit where the
+  separate stop-bit wait used to leave it, and all five self-check sections in the
+  example's own `main()` pass with the same bytes. Two smaller changes came with
+  it, each removing a recorded blocker:
+    - a SHIFT REGISTER instead of `byte_val |= 1 << i` over a bare integer. The
+      byte is assembled across eight clock boundaries, so it is a register, and a
+      `[Logic; 8]` filled one element per iteration is assigned on some paths and
+      not others — measured: "would infer a latch". Shifting right and inserting
+      at the top is what a real receiver builds anyway. This is also the corpus's
+      first register READ AFTER ITS OWN UPDATE in one segment
+      (`byte_val = byte_val >> 1;` then `byte_val = byte_val | 0x80`), i.e. the
+      first real exercise of cause N.
+    - `CLKS_PER_HALF_BIT` as a named `const` rather than `CLKS_PER_BIT / 2` at the
+      use site. `/` is a real divider in a HARDWARE expression and is refused
+      there; a file-scope const is elaboration-time arithmetic and already lowers
+      to `localparam int … = CLKS_PER_BIT / 2`. The two paths are right to differ.
+
+  IT TRANSPILED AND WAS WRONG — the part worth keeping. Acceptance is not
+  correctness (this file's own "LINT-CLEAN IS NOT THE SAME AS TRANSPILES", one
+  step further along), and the module reached Verilator only because an
+  equivalence test was written for it. `examples/uart/rx.rs` runs the SIMULATOR
+  only; nothing had ever checked its SystemVerilog.
+
+  ✔ FIXED — **`pc` WAS ALWAYS `u8`, AND NOTHING CHECKED THE STATE COUNT.**
+     uart/rx flattens to 788 states, so `pc = 256` wrapped onto `0` and the emitted
+     `case` had overlapping arms — well-formed SystemVerilog that runs the wrong
+     state. Verilator's CASEOVERLAP caught it; with that lint off it would simply
+     have executed the wrong arm. `pc_ty(states)` now picks `u8`/`u16`/`u32`, at
+     the one point where the count is final. The type and the `match`-arm literal
+     suffix are ONE decision (a mismatch is a WIDTHEXPAND on the case items), which
+     is why they were a pair of constants and are now a pair of returns.
+     RECORD THE CLASS: a fixed-width encoding with no bound check on what it
+     encodes. It held for as long as nothing generated 256 states, and the first
+     design that did was silently miscompiled rather than refused.
+
+  ✔ FIXED — **A ZERO-TIME BACK EDGE STILL COST A CYCLE**, and this is the case
+     cause M's entry recorded as deliberately not fixed ("cause M's hoisted tick
+     could now be removed with this machinery"). It was not merely cosmetic.
+     `lower_into` ends a body that ran off its end with `pc = <head>`, and that is
+     right for a NESTED loop — the rotation removed the body's trailing tick, so
+     the fall-through stands for it — but wrong for the module's own loop, whose
+     body genuinely ends with statements after its last tick. Minimal repro:
+         loop { for _ in 0..3 { tick } dv.write(One); tick; dv.write(Zero); }
+     The simulator repeats every 4 cycles, the FSM every 5: `dv.write(Zero)`
+     belongs to the next iteration's first cycle (an `Out` HOLDS until rewritten)
+     and was given a state of its own. Note the LINEAR path REJECTS trailing
+     statements after the last tick (`trailing_combinational_statements_in_a_
+     multi_tick_loop_are_rejected`) while control extraction accepted them and
+     mis-timed them — the two paths disagreeing again, and silently.
+     FIX: `FallThrough` on `LoopCtx`. `ZeroTime` emits cause O's goto marker and
+     the splice inlines the head; `AfterTick` keeps `pc = head`. It is a property
+     of the CONTEXT, not the call site, which is what makes a `break` come out
+     right: its continuation is lowered in the ENCLOSING context, and whether that
+     continuation's end stands for a removed tick depends on which loop it belongs
+     to rather than on where the `break` was written.
+     So cause O's machinery paid for itself twice, and the deferral in cause M's
+     entry was the wrong call — the shape was reachable, not hypothetical.
+
+  ◐ D1 FALSE NEGATIVE, found here and NOT fixed. With the above corrected, the
+     same repro with a plain `Out` still diverges by exactly one cycle, uniformly:
+     the simulator observes a write issued after a tick in that tick's POST-EDGE
+     SETTLE, while the FSM puts it in the state that runs the next cycle. That is
+     the pre-tick alignment family and `RegOut` is immune by construction
+     (measured: the `RegOut` spelling of the same repro passes). But
+     `unprotected_pretick_out_write` did NOT flag it, because its condition
+     requires the segment to also ASSIGN A REGISTER, and this segment assigns
+     none — it only writes outputs. So the guardrail has a hole for exactly the
+     shape a pulse generator has.
+     uart/rx's `rx_dv`/`rx_byte` are `RegOut` now, which is independently the
+     right call (a one-cycle pulse written before the tick that publishes it IS
+     write-before-tick Moore). The guard's condition is the open question; see
+     design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md before widening it, since three
+     candidate fixes are already recorded there as rejected with evidence.
+
+  ☐ 788 STATES FOR A UART RECEIVER — correct now, but absurd, and the number does
+     not depend on CLKS_PER_BIT (434 and 8 both give 788), so it is structural
+     duplication and not unrolling. `lower_into` RE-LOWERS a nested loop's break
+     continuation at every `break` site, and the desugared counted `for` has two
+     of them, so each nesting level roughly doubles. The `None` branch already
+     solves this for its own case by cloning the LOWERED body so the copies share
+     the sub-states their ticks allocated; the break path should do the same.
+     Not a correctness bug (sim ≡ Verilator passes), but 16k lines of SystemVerilog
+     and a 788-way `case` is real area, and it is what makes `pc` need 16 bits.
+
+  → tests/uart_rx_equivalence.rs — the receiver at an 8-cycle bit period (434 is
+    trace, not coverage), decoding three frames. It is the densest module in the
+    corpus: a data-dependent `while` wait, a `continue` that must cost no cycle,
+    four counted `for` delays (one nested inside a `for` whose body does work), a
+    shift register across eight clock boundaries, and a register read after its
+    own update. Causes M, N and O all meet in it, which is why it found two bugs
+    that none of their own purpose-built tests did.
 
   ── RE-MEASUREMENT OF EVERY REMAINING CAUSE, 2026-08-24 ─────────────────────
   Prompted by four causes in a row turning out to be masking (D, J, C, and

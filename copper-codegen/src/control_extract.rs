@@ -56,8 +56,25 @@ const PC: &str = "pc";
 /// The `pc` register's Rust type. `match`-arm literals carry the matching suffix
 /// so they lower to the same width as `pc` (else Verilator flags `WIDTHEXPAND` on
 /// the `case` items, e.g. `64'd0` vs an 8-bit scrutinee).
-const PC_TY: &str = "u8";
-const PC_SUFFIX: &str = "u8";
+/// The `pc` register's Rust type, chosen to hold `states` distinct values.
+///
+/// It was a fixed `u8`, and nothing checked the state count against it. The UART
+/// receiver flattens to 788 states, so `pc = 256` wrapped onto `0` and the emitted
+/// `case` had overlapping arms — a module that reads as well-formed SystemVerilog
+/// and runs the wrong state. Verilator's `CASEOVERLAP` caught it here; with that
+/// lint off it would simply have executed the wrong arm.
+///
+/// `match`-arm literals carry the matching suffix so they lower to the same width
+/// as `pc` (else Verilator flags `WIDTHEXPAND` on the `case` items, e.g. `64'd0`
+/// against an 8-bit scrutinee) — which is why the type and the suffix are one
+/// decision and not two.
+fn pc_ty(states: usize) -> &'static str {
+    match states {
+        0..=256 => "u8",
+        257..=65536 => "u16",
+        _ => "u32",
+    }
+}
 
 /// Marker for a **zero-time** transition to another state — a jump that must not
 /// cost a clock cycle, so it cannot be a `pc` assignment.
@@ -491,11 +508,13 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
         return;
     }
 
-    // Build `match pc { 0 => {..}, .., _ => {} }`.
+    // Build `match pc { 0 => {..}, .., _ => {} }`. The state count is final here,
+    // so this is the first point `pc`'s width can be chosen correctly.
+    let pc_suffix = pc_ty(sm.states.len());
     let mut arms = Vec::new();
     for (i, body) in sm.states.iter().enumerate() {
         arms.push(ExprMatchArm {
-            pattern_text: format!("{i}{PC_SUFFIX}"),
+            pattern_text: format!("{i}{pc_suffix}"),
             guard: None,
             body: Box::new(block_expr(body.clone(), span)),
             span,
@@ -547,7 +566,7 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
         kind: RawStmtKind::Local(LocalStmt {
             is_mut: true,
             ty: Some(RawTypeRef {
-                ty_text: PC_TY.to_string(),
+                ty_text: pc_suffix.to_string(),
                 span,
             }),
             name: PC.to_string(),
@@ -946,13 +965,49 @@ struct LoopCtx<'a> {
     head: usize,
     break_stmts: Vec<RawStmt>,
     outer: Option<&'a LoopCtx<'a>>,
+    /// What it MEANS to run off the end of this loop's body without ticking.
+    fallthrough: FallThrough,
+}
+
+/// Why control reached the end of a body without a tick — and therefore whether
+/// returning to the head costs a cycle.
+///
+/// The two cases look identical in `lower_into` and are a clock cycle apart:
+///
+/// * `AfterTick` — the body's own trailing tick was REMOVED by the rotation that
+///   builds a nested loop's head state (`W ; tick ; C` is lowered as `C ; W`). The
+///   fall-through stands for that tick, so `pc = head` is exactly right: the FSM's
+///   own trailing tick supplies it.
+/// * `ZeroTime` — nothing was removed; the body genuinely ended with statements
+///   after its last tick, and the source returns to the head in the SAME cycle.
+///   `pc = head` would spend a cycle the program does not have.
+///
+/// Measured on `loop { for _ in 0..3 { tick } dv.write(One); tick; dv.write(Zero); }`:
+/// the simulator repeats every 4 cycles, the FSM every 5, because
+/// `dv.write(Zero)` — which belongs to the next iteration's first cycle, since an
+/// `Out` holds until rewritten — was given a state of its own.
+///
+/// It is a property of the CONTEXT rather than the call site, which matters for a
+/// `break`: its continuation is lowered in the ENCLOSING context, and whether that
+/// continuation's end stands for a removed tick depends on which loop it belongs
+/// to, not on where the `break` was written.
+#[derive(Clone, Copy, PartialEq)]
+enum FallThrough {
+    AfterTick,
+    ZeroTime,
 }
 
 impl LoopCtx<'_> {
     /// The module's own loop: the back edge goes to state 0, and there is nothing
-    /// to break out of (a `break` here is refused before extraction runs).
+    /// to break out of (a `break` here is refused before extraction runs). Nothing
+    /// was rotated away, so running off the end costs no cycle.
     fn module() -> Self {
-        LoopCtx { head: 0, break_stmts: Vec::new(), outer: None }
+        LoopCtx {
+            head: 0,
+            break_stmts: Vec::new(),
+            outer: None,
+            fallthrough: FallThrough::ZeroTime,
+        }
     }
 }
 
@@ -1008,6 +1063,9 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
                 head,
                 break_stmts: rest.to_vec(),
                 outer: Some(ctx),
+                // A nested loop's body is lowered with its trailing tick removed
+                // (rotated, below), so running off its end stands for that tick.
+                fallthrough: FallThrough::AfterTick,
             };
             let body = &loop_expr.body;
             // A state is "the code between two ticks", so for a body `W ; tick ; C`
@@ -1091,9 +1149,13 @@ fn lower_into(stmts: &[RawStmt], target: &mut Vec<RawStmt>, sm: &mut StateMachin
         target.push(stmt.clone());
     }
 
-    // Fell through without ticking → take the back edge next cycle.
+    // Fell through without ticking. Whether that costs a cycle depends on why —
+    // see `FallThrough`.
     let span = stmts.last().map(|s| s.span).unwrap_or_default();
-    target.push(pc_assign(ctx.head, span));
+    target.push(match ctx.fallthrough {
+        FallThrough::AfterTick => pc_assign(ctx.head, span),
+        FallThrough::ZeroTime => goto_marker(ctx.head, span),
+    });
 }
 
 // ── Node constructors ─────────────────────────────────────────────────────────
