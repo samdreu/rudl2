@@ -123,7 +123,10 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
   `check_memory_staging`, `memory_result_drives_plain_out` — because a check
   downstream of `control_extract` cannot see the phases it is counting (that pass
   rewrites branch- or loop-nested ticks into a single-tick `match pc` FSM). Any new
-  phase-sensitive rule belongs here, on the source, not in codegen. Consumed by both
+  phase-sensitive rule belongs here, on the source, not in codegen. That policy is
+  enforced, not just documented: `copper-codegen/tests/phase_sensitive_checks.rs`
+  pins every transpiler function that reasons about phases and can fail, so a new one
+  has to be justified as a lowering limitation or moved. Consumed by both
   `copper-macros` and `copper-codegen`.
 - **`copper-macros`** — the `#[hardware(sequential|combinational|synchronizer)]`
   proc macro. Validates the signature, enforces CDC rules at compile time,

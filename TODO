@@ -1358,6 +1358,20 @@ TRANSPILATION:
      block records the resolution; this entry had not been updated, and was cited as
      an open item as late as this session's planning.
 
+  ✔ DONE (2026-08-25) — THE STRUCTURAL GUARD FOR THE FIVE-TIMES CLASS.
+     `copper-codegen/tests/phase_sensitive_checks.rs` pins every function in the
+     transpiler that BOTH reasons about clock phases AND can produce an error, each
+     with the reason it is allowed to: a LIMITATION of this lowering path (a statement
+     about the code generator — legitimate) or a RULE about the language (which
+     belongs in copper-analysis, on the source, where extraction has not yet collapsed
+     the phases). A new site fails the test with exactly that question, and the three
+     checks that already had to move are named as precedent.
+     It found two sites a hand-written scan missed: one in an `impl` block, and one
+     `Display` impl whose MESSAGE names phases (excluded — text, not logic).
+     It also names the one OPEN instance: shir_lower's trailing-statement refusal,
+     filed as a limitation and audited as a rule. Negative-controlled (adding a
+     phase-counting check to shir_lower fails it by name).
+
   ✔ FIXED (2026-08-25) — D1's TRAILING-SEGMENT GAP. D1's shape past the last tick
      (`loop { for _ in 0..2 { tick } n = n + 1; o.write(n); }`) diverges by a cycle
      and the head rule cannot see it (it examines head → first tick). 5.4 records two

@@ -62,10 +62,12 @@ What remains:
   refuses a shape that the extracted path accepts and that agrees with its SV. Moving
   it to the source means first deciding what it should say, which is the open
   semantics question in `TODO` ("DECIDING where those statements belong").
-* **A structural guard**, so the next phase-sensitive check written in codegen is
-  caught by review rather than by a bug. `tests/timing_model_derivations.rs` pins the
-  disagreement set; a lint-style test that flags new tick-counting in `shir_lower` /
-  `vlir_lower` would close the loop.
+* ~~**A structural guard**~~ — DONE 2026-08-25,
+  `copper-codegen/tests/phase_sensitive_checks.rs`. It found two sites a hand-written
+  scan had missed (one in an `impl` block, one a `Display` impl whose *message* names
+  phases — excluded as text, not logic), and it names the one open instance of the
+  class: `shir_lower`'s trailing-statement refusal, filed as a limitation and audited
+  as a rule.
 
 An IR phase tag — `control_extract` recording which source phase each `pc` state came
 from — is the alternative, and would let checks stay in codegen. It is **not
@@ -130,7 +132,12 @@ old path, no silent regressions.
   the head's phase, multi-tick ones do not. Corpus cost: one real module.
 * **The trailing-statement rule's semantics** (1a): what a combinational statement
   after the last tick should mean. Still the open decision it has been.
-* **A structural guard** against new tick-counting checks appearing in codegen.
+* ~~**A structural guard** against new tick-counting checks appearing in codegen.~~
+  DONE 2026-08-25: `copper-codegen/tests/phase_sensitive_checks.rs` pins every
+  function in the transpiler that both reasons about phases and can fail, each with
+  the reason it is allowed to — a LIMITATION of this lowering path (legitimate) or a
+  RULE about the language (which belongs on the source). A new one fails the test with
+  that question. Negative-controlled.
 
 None of these needs the refactor this document was opened to scope. That is the
 finding.
