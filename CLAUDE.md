@@ -30,10 +30,16 @@ It lives in `tools/` **because it must be in version control**: `.gitignore` exc
 lost on a fresh clone. `.claude/skills/run-copper/smoke.sh` is now a thin wrapper
 that `exec`s this script, so the skill keeps working.
 
-It also enforces three wiring guards, because "the check silently didn't run" has
+It also enforces four wiring guards, because "the check silently didn't run" has
 been a recurring bug class here: **G-A** every `examples/**.rs` is registered as a
 `[[example]]`, **G-B** every registered example actually ran, **G-C** every
-`tests/*.rs` (root and per-crate) produced a test binary that ran. It prints the
+`tests/*.rs` (root and per-crate) produced a test binary that ran, and **G-D** the
+corpus differential sweep covered every `#[hardware]` module and ran. That sweep
+(`build.rs` → `tests/corpus_generated.rs`, see
+`design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`) generates one case per module — seeded
+random stimulus, simulator vs the SystemVerilog it transpiles to under Verilator —
+so **a new module is covered the moment it exists**, with no harness to write. A
+module it cannot run gets an `#[ignore]` with a reason, never an omission. It prints the
 `#[ignore]`d tests on every run so a deliberately-skipped check stays visible.
 
 Subsets — all of these print `PARTIAL OK` and skip some guards, so they are **not**

@@ -782,9 +782,18 @@ TRANSPILATION:
     re-scans the directory at test time and compares against the generated manifest,
     so a generator that quietly stops covering something FAILS rather than shrinking
     the sweep. Negative-controlled (drop one module → it fails naming it).
-  ☐ Phase 3 — extend the generator to examples/ (needs the rust→SV port-name
-    mapping: the testbench addresses the Verilated model by the EMITTED name, and a
-    reserved name is legalized), plus G-D in tools/regression.sh.
+  ✔ Phase 3 — the generator now covers examples/ too: 83 cases running, 21
+    ignored-with-reason, 81s. Nothing new found (the corpus agrees with its emitted
+    SV under stimulus nobody chose), and phase 1's hand-written file is deleted
+    because the generator emits the same wiring. `copper_codegen::legalized_port_name`
+    is public so the sweep and the transpiler share ONE naming rule; the wrapper
+    supplies imports/domains only for files that declare none (fixtures) and never
+    for standalone examples; generated bodies use `__`-aliased imports so nothing can
+    collide with the included file.
+    G-D IN tools/regression.sh: the coverage guard must have run, and at least one
+    differential case must have. The sweep is the only check that says the emitted
+    SystemVerilog agrees with the simulator, so it silently covering nothing is the
+    expensive failure — the same reason G-A/G-B/G-C exist.
   ☐ Phase 4 — generic modules via `with_params` monomorphization; multi-domain.
 
   ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────

@@ -1,8 +1,10 @@
 # Corpus differential sweep — scope
 
-**Status:** phases 1 and 2 BUILT and green — `tests/corpus_equivalence.rs` (6 example
-modules, hand-written) and `tests/corpus_generated.rs` (70 fixture modules, written by
-`build.rs`). Phases 3–4 proposed. Written 2026-08-25, at the point where the memory staging fix
+**Status:** phases 1–3 BUILT and green. `build.rs` generates a case for every
+`#[hardware]` module in `tests/fixtures/` **and** `examples/` — 83 running, 21
+ignored-with-reason — and `tools/regression.sh`'s **G-D** asserts the sweep covered
+the corpus and ran. The hand-written phase-1 file is gone: the generator emits the
+same wiring. Phase 4 (generic modules, multi-clock, array ports) proposed. Written 2026-08-25, at the point where the memory staging fix
 needed a hand-written equivalence test to discover that it had opened a one-cycle
 divergence somewhere else.
 
@@ -56,6 +58,35 @@ written. The generator emits the same wiring, which is what phase 1 was for.
 **One sentence.** Every `#[hardware]` module the transpiler accepts should be run in
 the simulator against its own emitted SystemVerilog under seeded random stimulus,
 automatically, without anybody writing a harness or a reference model for it.
+
+## 0.2 What phase 3 found
+
+**Nothing new, again** — every example module the generator reaches agrees with its
+emitted SystemVerilog under 200 random cycles, including `dual_port_ram`, `sipo_block`,
+`uart/rx`, both `fast_counter`s, and the BaseJump family. The two defects phase 1
+found by hand were the corpus's whole harvest.
+
+Three things the extension needed, all of them consequences of examples being
+standalone programs rather than fixtures:
+
+* **Per-file import and domain rules, keyed on content rather than directory.** A
+  fixture declares no `use` and no `ClockDomain`, so the wrapper supplies both; an
+  example brings its own and the wrapper must supply neither. `impl ClockDomain for X`
+  appears in three spellings in the corpus (with and without a space before `{}`, and
+  fully qualified), which cost a build failure to discover.
+* **Everything the generated body uses is imported under `__` aliases**, so it cannot
+  collide with whatever the included file already imported.
+* **`copper_codegen::legalized_port_name`, called at run time**, rather than the
+  generator reimplementing the rule. Two copies of a naming rule that must agree is
+  the drift bug this repo keeps recording, and it is why the function is now public.
+
+One skip was too strict and was relaxed: the BaseJump modules write their widths as
+file-scope `const`s (`Bits<WIDTH>`), which is *concrete* — the const comes with the
+included file — so four more modules sweep. Array ports (`bsg_mux_one_hot`) stay
+skipped: `RandStim` has no array impl and the bit layout the testbench would assume is
+the array-port ABI, a decision to make deliberately rather than let a generator guess.
+
+**Wall clock: 81s** for 83 Verilator builds and runs.
 
 ---
 
@@ -218,7 +249,7 @@ its most-repeated bug class. A sweep without G-D would be one more instance of i
 |---|---|---|
 | **1** ✔ | `differential_only` + a hand-written `tests/corpus_equivalence.rs` covering the 11-module backlog with random stimulus | DONE 2026-08-25 — found two defects on the first run (§0) |
 | **2** ✔ | `build.rs` generator over `tests/fixtures/` (70 modules, uniform and already `include!`-friendly) | DONE 2026-08-25 — 59 generated + 11 ignored-with-reason, all green in 53s (§0.1) |
-| **3** | extend to `examples/`, add the constraint table and G-D | completeness, and it stops regrowing |
+| **3** ✔ | extend to `examples/`, add the constraint table and G-D | DONE 2026-08-25 — 83 cases, G-D in the driver, phase 1's hand-written file deleted (§0.2) |
 | **4** *(optional)* | generic modules via `with_params` monomorphization; multi-domain modules with an explicit tick ratio | the last 14 |
 
 Rough cost: phase 1 half a day, phase 2 a day, phase 3 a day plus constraint triage,

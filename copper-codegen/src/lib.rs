@@ -12,6 +12,7 @@ pub use parser::capture_frontend_ir;
 pub use chir_lower::{lower_to_chir, ModuleRegistry};
 pub use shir_lower::lower_to_shir;
 pub use vlir_lower::lower_to_vlir;
+pub use vlir_lower::legalized_port_name;
 pub use emit::{emit_verilog, EmitConfig};
 
 /// End-to-end transpile of a single `#[hardware]` module given as a parsed

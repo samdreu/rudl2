@@ -36,6 +36,7 @@
 #   G-A  every examples/**.rs is registered as a [[example]] in Cargo.toml
 #   G-B  every registered example actually ran
 #   G-C  every tests/*.rs (root and per-crate) produced a test binary that ran
+#   G-D  the corpus differential sweep covered every #[hardware] module and ran
 #
 # and it prints the `#[ignore]`d tests every run, because a skipped check that prints
 # nothing is indistinguishable from a passing one.
@@ -154,6 +155,19 @@ if [ "$RUN_TEST" -eq 1 ]; then
   done
   [ -z "$MISSING" ] || { echo "  never ran:$MISSING" >&2; fail "G-C: orphaned test file(s)"; }
   echo "  G-C ok: all $(grep -c 'Running tests/' "$TMP/test.log") test files ran"
+
+  # G-D — the corpus differential sweep actually covered the corpus. Every
+  # `#[hardware]` module in tests/fixtures/ and examples/ must have a generated case
+  # that ran, or an `#[ignore]` with a reason; `every_corpus_module_has_a_generated_case`
+  # asserts that against a fresh scan. The sweep is the only check that says the
+  # SystemVerilog a module transpiles to agrees with the simulator, so it silently
+  # covering nothing is the expensive failure — the same reason G-A/G-B/G-C exist.
+  grep -q "^test every_corpus_module_has_a_generated_case \.\.\. ok" "$TMP/test.log" \
+    || fail "G-D: the corpus sweep's coverage guard did not run"
+  SWEPT=$(grep -cE "^test (fx|ex)_[a-z0-9_]+::[a-z0-9_]+_differential \.\.\. ok" "$TMP/test.log")
+  SWEPT_SKIP=$(grep -cE "^test (fx|ex)_[a-z0-9_]+::[a-z0-9_]+_differential \.\.\. ignored" "$TMP/test.log")
+  [ "$SWEPT" -gt 0 ] || fail "G-D: no differential cases ran"
+  echo "  G-D ok: corpus sweep ran $SWEPT differential cases ($SWEPT_SKIP ignored-with-reason)"
 
   # Ignored tests stay VISIBLE. These are deliberate, but an ignore whose stated
   # reason has gone stale is invisible otherwise — exactly what happened to accum_2,

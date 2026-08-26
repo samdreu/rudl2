@@ -2612,6 +2612,29 @@ fn sanitize(name: &str) -> String {
     out
 }
 
+/// The emitted SystemVerilog name for a **port**, as `Legalizer::legalize` would
+/// produce it: sanitized, with `_sig` appended when the name is reserved.
+///
+/// Exposed because a testbench addresses the Verilated model by the EMITTED name,
+/// not the one in the Rust signature — `examples/cdc/flag_crossing.rs`'s `event`
+/// port is `event_sig` in the SystemVerilog. The corpus differential sweep
+/// (`build.rs`) generates that wiring and must agree with the transpiler about it,
+/// so it calls THIS rather than reimplementing the rule; two copies of a naming
+/// rule that must agree is the drift bug this repo keeps recording.
+///
+/// Collision disambiguation (`_0`, `_1`) is deliberately not modelled: it depends on
+/// what else has been registered, which a caller outside a lowering run cannot know.
+/// Ports are legalized first and from a small set, so a collision would have to be
+/// between two ports of one module — and it fails loudly (an unknown member in the
+/// generated C++) rather than silently.
+pub fn legalized_port_name(name: &str) -> String {
+    let mut base = sanitize(name);
+    if is_reserved(&base) {
+        base.push_str("_sig");
+    }
+    base
+}
+
 fn collect_and_legalize_body_names(body: &SHIRBody, leg: &mut Legalizer) {
     match body {
         SHIRBody::Combinational(c) => {

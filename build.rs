@@ -1,5 +1,6 @@
 //! Generates one differential equivalence test per `#[hardware]` module in
-//! `tests/fixtures/` — phase 2 of `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`.
+//! `tests/fixtures/` **and** `examples/` — phases 2 and 3 of
+//! `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`.
 //!
 //! Each generated case runs the module in the simulator under seeded random
 //! stimulus and Verilates the SystemVerilog it transpiles to against that trace,
@@ -20,13 +21,24 @@
 //! its generated test silently stays stale. `cargo:rerun-if-changed` below is the
 //! whole reason this is a build script.
 //!
-//! # Known limitation
+//! # Two kinds of file
 //!
-//! Port names are used verbatim. The generated testbench addresses the Verilated
-//! model by the **emitted** name, and a name that collides with a SystemVerilog or
-//! C++ keyword is legalized (`event` → `event_sig`), so such a fixture would fail
-//! loudly with a C++ compile error rather than being handled. No fixture has one
-//! today; wiring the rust→SV mapping through is phase 3's job.
+//! A **fixture** declares no imports and no clock domains — deliberately, so the
+//! including test picks them — so the wrapper supplies both. An **example** is a
+//! standalone program and brings its own, so the wrapper supplies neither and would
+//! collide if it did. The predicate is the file's own content (`use` items,
+//! `impl ClockDomain for`), not which directory it came from.
+//!
+//! Everything the generated *body* needs is imported under `__`-prefixed aliases, so
+//! it cannot collide with whatever the included file already imports.
+//!
+//! # Port names
+//!
+//! The generated testbench addresses the Verilated model by the **emitted** name, and
+//! a name colliding with a SystemVerilog or C++ keyword is legalized (`event` →
+//! `event_sig`). The generated code calls `copper_codegen::legalized_port_name` at
+//! run time rather than reimplementing that rule — two copies of a naming rule that
+//! must agree is the drift bug this repo keeps recording.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -60,6 +72,29 @@ const SKIP: &[(&str, &str)] = &[
          cross-tick read still disagrees with the transpiler",
     ),
     (
+        "rv32i_cpu",
+        "does not transpile: cause F, a `Vec<Bits<32>>` port (TODO, TRANSPILER COVERAGE)",
+    ),
+    (
+        "rv32i_cpu_pipelined",
+        "does not transpile: cause F, a `Vec<Bits<32>>` port (TODO, TRANSPILER COVERAGE)",
+    ),
+    (
+        "uart_tx",
+        "does not transpile: cause H — `spawn_uart` in the same file has a hardware-looking \
+         signature with no `#[hardware]`, which `prepare_source` refuses at FILE level before \
+         either module is looked at",
+    ),
+    (
+        "uart_rx",
+        "does not transpile: cause H, the same file-level `spawn_uart` rejection as `uart_tx`",
+    ),
+    (
+        "two_domain_top",
+        "a `#[hardware(structural)]` parent: transpile-only by design, with no simulatable body \
+         to drive (item 4 — the sim wires the hierarchy by hand)",
+    ),
+    (
         "branch_merge_explicit",
         "MEASURED DIVERGENCE, pinned as sequential_forwarding_divergence.rs::\
          a_write_in_a_state_arm_leads_the_hardware_by_one_cycle and written up in \
@@ -75,18 +110,15 @@ const COMB_VECTORS: usize = 64;
 
 fn main() {
     println!("cargo:rerun-if-changed=tests/fixtures");
+    println!("cargo:rerun-if-changed=examples");
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let fixtures = manifest.join("tests/fixtures");
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&fixtures)
-        .expect("tests/fixtures is readable")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_rs(&manifest.join("tests/fixtures"), &mut files);
+    collect_rs(&manifest.join("examples"), &mut files);
     files.sort();
 
     let mut code = String::from(
@@ -108,10 +140,11 @@ fn main() {
         if modules.is_empty() {
             continue;
         }
-        let (m, i) = emit_file(&mut code, path, &modules);
+        let key = wrapper_name(&manifest, path);
+        let (m, i) = emit_file(&mut code, path, &src, &modules, &key);
         emitted += m;
         ignored += i;
-        covered.extend(modules.iter().map(|m| m.name.clone()));
+        covered.extend(modules.iter().map(|m| format!("{key}::{}", m.name)));
     }
 
     // The manifest the coverage guard checks against: every module this script
@@ -128,6 +161,39 @@ fn main() {
     // Surfaced in the build log too, so the counts are visible without running.
     println!("cargo:warning=corpus sweep: {emitted} generated, {ignored} ignored-with-reason");
     std::fs::write(out_dir.join("corpus_generated.rs"), code).expect("write generated tests");
+}
+
+/// Every `.rs` under `dir`, recursively (`examples/` has subdirectories).
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// A unique Rust identifier for one source file's wrapper module, from its path
+/// relative to the manifest — `examples/cdc/flag_crossing.rs` → `ex_cdc_flag_crossing`.
+/// Path-derived rather than stem-derived because two files legitimately share a stem,
+/// and because two different modules can share a NAME (`fast_counter` exists in both
+/// `two_domain_counter.rs` and `two_domain_hierarchy.rs`).
+fn wrapper_name(manifest: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(manifest).unwrap_or(path).with_extension("");
+    let mut s: String = rel
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    s = s
+        .trim_start_matches("tests_fixtures_")
+        .trim_start_matches("examples_")
+        .to_string();
+    let prefix = if path.components().any(|c| c.as_os_str() == "examples") { "ex_" } else { "fx_" };
+    format!("{prefix}{s}")
 }
 
 /// One `#[hardware]` module, as much of it as generation needs.
@@ -195,6 +261,14 @@ impl Module {
                     .to_string(),
             );
         }
+        if self.ports.iter().filter(|p| p.kind == Kind::Clock).count() > 1 {
+            return Some(
+                "more than one clock port: the generated harness drives a single clock, and the \
+                 ratio between two domains is a design decision the sweep must not invent — \
+                 phase 4"
+                    .to_string(),
+            );
+        }
         if self.ports.iter().any(|p| p.kind != Kind::Clock && !is_stimulable(&p.ty)) {
             return Some(format!(
                 "unsupported port payload: the generator can only randomise `Logic` and \
@@ -235,20 +309,27 @@ fn classify(ty: &syn::Type) -> Option<(Kind, String, String)> {
 }
 
 /// Can seeded random stimulus be generated for this payload? `RandStim` covers
-/// `Logic` and any concrete `Bits<N>`; a const-generic width or an array port is
-/// left to a later phase rather than guessed at.
+/// `Logic` and `Bits<N>` for any `N` — including a width written as a file-scope
+/// `const` (`Bits<WIDTH>`, which the BaseJump examples use), since the const comes
+/// with the included file and is in scope in the generated body. A *generic* module
+/// is excluded earlier, by its own signature.
+///
+/// Array ports (`[Bits<W>; N]`) are not covered: `RandStim` has no array impl, and
+/// the bit layout the testbench would have to assume is the array-port ABI
+/// (`design_docs/ARRAY_PORT_ABI.md`) — a decision to make deliberately, not by
+/// letting a generator guess. One module in the corpus, `bsg_mux_one_hot`.
 fn is_stimulable(ty: &str) -> bool {
     if ty == "Logic" {
         return true;
     }
     ty.strip_prefix("Bits<")
         .and_then(|r| r.strip_suffix('>'))
-        .is_some_and(|w| w.chars().all(|c| c.is_ascii_digit()) && !w.is_empty())
+        .is_some_and(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// A zero of the payload type, for the wire's initial value.
 fn zero_of(ty: &str) -> &'static str {
-    if ty == "Logic" { "Logic::Zero" } else { "Bits::zero()" }
+    if ty == "Logic" { "__Logic::Zero" } else { "__Bits::zero()" }
 }
 
 /// A stable per-module seed, so two modules do not walk the same bit pattern and a
@@ -262,42 +343,100 @@ fn seed_of(name: &str) -> u64 {
     h | 1
 }
 
-/// Emit the wrapper module for one fixture file plus a test per hardware module.
+/// Emit the wrapper module for one source file plus a test per hardware module.
 /// Returns `(generated, ignored)`.
-fn emit_file(code: &mut String, path: &Path, modules: &[Module]) -> (usize, usize) {
-    let stem = path.file_stem().expect("fixture has a stem").to_string_lossy().to_string();
+fn emit_file(
+    code: &mut String,
+    path: &Path,
+    src: &str,
+    modules: &[Module],
+    wrapper: &str,
+) -> (usize, usize) {
     let file_path = path.to_string_lossy();
 
-    // Every clock domain the file's modules mention. Fixtures declare none of their
-    // own — by design, so the including test picks them — so the wrapper declares
-    // them all. `()` is already a `ClockDomain` and must not be redeclared.
-    let domains: BTreeSet<&str> = modules
+    // An `include!` cannot produce inner doc comments (`//!` may not follow an item,
+    // and a macro expansion cannot emit one at all), so such a file will not compile
+    // included. Every fixture and every example uses `//` headers today; if one
+    // regresses, say so in the ignore reason rather than emitting a case that breaks
+    // the build.
+    let inner_doc = src.trim_start().starts_with("//!");
+
+    // A file that brings its own imports and clock domains is an EXAMPLE — a
+    // standalone program. Supplying them again would collide. A fixture brings
+    // neither, deliberately, so the wrapper supplies both. The predicate is content,
+    // not directory.
+    let has_own_imports = src.lines().any(|l| l.trim_start().starts_with("use "));
+    // Spelled three ways in the corpus — `impl ClockDomain for X {}`, the same with
+    // no space before the braces, and `impl copper_core::ClockDomain for X {}` — so
+    // match on the phrase and take the identifier that follows, rather than on a
+    // prefix.
+    let declared_domains: BTreeSet<String> = src
+        .lines()
+        .filter_map(|l| l.split_once("ClockDomain for "))
+        .map(|(_, rest)| {
+            rest.trim()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|d| !d.is_empty())
+        .collect();
+
+    let needed_domains: BTreeSet<&str> = modules
         .iter()
         .flat_map(|m| m.ports.iter())
         .map(|p| p.domain.as_str())
-        .filter(|d| *d != "()")
+        .filter(|d| *d != "()" && !declared_domains.contains(*d))
         .collect();
 
     let _ = writeln!(code, "#[allow(unused_imports, dead_code)]");
-    let _ = writeln!(code, "mod fx_{stem} {{");
+    let _ = writeln!(code, "mod {wrapper} {{");
+    // Aliased, so nothing here can clash with what the included file imports.
     let _ = writeln!(
         code,
-        "    use copper_core::port::{{registered_wire, wire, In, Out, RegOut}};\n    \
-         use copper_core::types::Bits;\n    \
-         use copper_core::{{Clock, ClockDomain, Logic, Memory}};\n    \
-         use copper_macros::hardware;\n    \
-         use copper_sim::HardwareExecutor;\n    \
-         use crate::common::{{EquivalenceTest, RandStim, Rng}};"
+        "    use copper_core::port::{{registered_wire as __rw, wire as __w}};\n    \
+         use copper_core::types::Bits as __Bits;\n    \
+         use copper_core::{{Clock as __Clock, Logic as __Logic}};\n    \
+         use copper_sim::HardwareExecutor as __Exec;\n    \
+         use crate::common::{{EquivalenceTest as __Eq, RandStim as __RandStim, Rng as __Rng}};"
     );
-    for d in &domains {
-        let _ = writeln!(code, "    struct {d};\n    impl ClockDomain for {d} {{}}");
+    if !has_own_imports {
+        // A fixture: it needs the hardware vocabulary to compile at all.
+        let _ = writeln!(
+            code,
+            "    use copper_core::port::{{registered_wire, wire, In, Out, RegOut}};\n    \
+             use copper_core::types::Bits;\n    \
+             use copper_core::{{Clock, ClockDomain, Logic, Memory}};\n    \
+             use copper_macros::hardware;\n    \
+             use copper_sim::HardwareExecutor;"
+        );
     }
-    let _ = writeln!(code, "    include!(\"{file_path}\");");
+    for d in &needed_domains {
+        // Fully qualified: a file that needs a domain declared is one that did not
+        // import `ClockDomain` either.
+        let _ = writeln!(
+            code,
+            "    struct {d};\n    impl copper_core::ClockDomain for {d} {{}}"
+        );
+    }
+    if !inner_doc {
+        let _ = writeln!(code, "    include!(\"{file_path}\");");
+    }
     let _ = writeln!(code, "    const SRC: &str = include_str!(\"{file_path}\");\n");
 
     let (mut emitted, mut ignored) = (0, 0);
     for m in modules {
-        match m.skip_reason() {
+        let reason = if inner_doc {
+            Some(
+                "the file opens with `//!` module docs, which `include!` cannot carry — an inner \
+                 doc comment may not follow an item. Give it a `//` header, as every other \
+                 fixture and example has"
+                    .to_string(),
+            )
+        } else {
+            m.skip_reason()
+        };
+        match reason {
             Some(reason) => {
                 let _ = writeln!(code, "    #[ignore = \"{}\"]", escape(&reason));
                 emit_test(code, m, /*body=*/ false);
@@ -332,48 +471,50 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     let clk = m.clock();
     let _ = writeln!(
         code,
-        "        let mut eq = EquivalenceTest::differential_only(\"{name}\", SRC, Some(\"{name}\"));"
+        "        let mut eq = __Eq::differential_only(\"{name}\", SRC, Some(\"{name}\"));"
     );
-    let _ = writeln!(code, "        let mut rng = Rng::new({});", seed_of(name));
+    let _ = writeln!(code, "        let mut rng = __Rng::new({});", seed_of(name));
     if let Some(c) = clk {
-        let _ = writeln!(code, "        let mut clk = Clock::<{}>::new();", c.domain);
+        let _ = writeln!(code, "        let mut clk = __Clock::<{}>::new();", c.domain);
     }
-    let _ = writeln!(code, "        let mut exec = HardwareExecutor::new();");
+    let _ = writeln!(code, "        let mut exec = __Exec::new();");
 
     for p in &m.ports {
+        let (ty, z, d) = (alias_ty(&p.ty), zero_of(&p.ty), &p.domain);
         match p.kind {
             Kind::Clock => {}
             Kind::In => {
                 let _ = writeln!(
                     code,
-                    "        let ({n}_drv, {n}_in) = wire::<{ty}, {d}>({z});",
-                    n = p.name,
-                    ty = p.ty,
-                    d = p.domain,
-                    z = zero_of(&p.ty)
+                    "        let ({n}_drv, {n}_in) = __w::<{ty}, {d}>({z});",
+                    n = p.name
                 );
             }
             Kind::Out => {
                 let _ = writeln!(
                     code,
-                    "        let ({n}_out, {n}_obs) = wire::<{ty}, {d}>({z});",
-                    n = p.name,
-                    ty = p.ty,
-                    d = p.domain,
-                    z = zero_of(&p.ty)
+                    "        let ({n}_out, {n}_obs) = __w::<{ty}, {d}>({z});",
+                    n = p.name
                 );
             }
             Kind::RegOut => {
                 let _ = writeln!(
                     code,
-                    "        let ({n}_out, {n}_obs) = registered_wire::<{ty}, {d}>(&clk, {z});",
-                    n = p.name,
-                    ty = p.ty,
-                    d = p.domain,
-                    z = zero_of(&p.ty)
+                    "        let ({n}_out, {n}_obs) = __rw::<{ty}, {d}>(&clk, {z});",
+                    n = p.name
                 );
             }
         }
+    }
+
+    // The names the testbench will address the Verilated model by — the EMITTED
+    // ones. Resolved by the transpiler's own rule at run time, not guessed here.
+    for p in m.ports.iter().filter(|p| p.kind != Kind::Clock) {
+        let _ = writeln!(
+            code,
+            "        let {n}_sv = copper_codegen::legalized_port_name(\"{n}\");",
+            n = p.name
+        );
     }
 
     let handles: Vec<String> = m
@@ -392,7 +533,7 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     let _ = writeln!(code, "        let reads = vec![{}];", reads.join(", "));
 
     // Arguments in SIGNATURE order — not inputs-then-outputs, which is merely the
-    // usual convention and not a rule any fixture is obliged to follow.
+    // usual convention and not a rule any module is obliged to follow.
     let args: Vec<String> = m
         .ports
         .iter()
@@ -413,10 +554,10 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     for p in m.ports.iter().filter(|p| p.kind == Kind::In) {
         let _ = writeln!(
             code,
-            "            let {n}_v = <{ty} as RandStim>::rand(&mut rng);\n            \
+            "            let {n}_v = <{ty} as __RandStim>::rand(&mut rng);\n            \
              {n}_drv.write({n}_v);",
             n = p.name,
-            ty = p.ty
+            ty = alias_ty(&p.ty)
         );
     }
     let _ = writeln!(
@@ -431,13 +572,13 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
         .ports
         .iter()
         .filter(|p| p.kind == Kind::In)
-        .map(|p| format!("(\"{n}\", &{n}_v.as_bits()[..])", n = p.name))
+        .map(|p| format!("(&{n}_sv[..], &{n}_v.as_bits()[..])", n = p.name))
         .collect();
     let outs: Vec<String> = m
         .ports
         .iter()
         .filter(|p| matches!(p.kind, Kind::Out | Kind::RegOut))
-        .map(|p| format!("(\"{n}\", &{n}_v.as_bits()[..])", n = p.name))
+        .map(|p| format!("(&{n}_sv[..], &{n}_v.as_bits()[..])", n = p.name))
         .collect();
     let _ = writeln!(
         code,
@@ -448,6 +589,16 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     let _ = writeln!(code, "        }}");
     let _ = writeln!(code, "        eq.finish();");
     let _ = writeln!(code, "    }}\n");
+}
+
+/// The payload type spelled with the wrapper's aliases, so the generated body does
+/// not depend on what the included file imported: `Bits<8>` → `__Bits<8>`.
+fn alias_ty(ty: &str) -> String {
+    if ty == "Logic" {
+        "__Logic".to_string()
+    } else {
+        ty.replacen("Bits", "__Bits", 1)
+    }
 }
 
 /// Escape a reason string for a `#[ignore = "…"]` attribute.

@@ -22,35 +22,64 @@ mod common;
 
 include!(concat!(env!("OUT_DIR"), "/corpus_generated.rs"));
 
-/// **The guard.** Every `#[hardware]` module in `tests/fixtures/` must have a case —
-/// running, or `#[ignore]`d with a reason. Asserted against a fresh scan rather than
-/// against the generator's own bookkeeping, so a `build.rs` that silently stops
-/// covering something (a parse it declines, a filter that grows too wide) fails here
-/// instead of quietly shrinking the sweep.
+/// **The guard.** Every `#[hardware]` module in `tests/fixtures/` and `examples/`
+/// must have a case — running, or `#[ignore]`d with a reason. Asserted against a
+/// fresh scan rather than against the generator's own bookkeeping, so a `build.rs`
+/// that silently stops covering something (a parse it declines, a filter that grows
+/// too wide, a directory it no longer walks) fails here instead of quietly shrinking
+/// the sweep.
 ///
 /// Same idea as `tools/regression.sh`'s G-A/G-B/G-C: in this repo "the check did not
 /// run" has been a more expensive bug than "the check failed".
+///
+/// Keys are `<wrapper>::<module>`, not bare module names: two different modules
+/// legitimately share a name (`fast_counter` exists in both `two_domain_counter.rs`
+/// and `two_domain_hierarchy.rs`), and a set of bare names would silently merge them.
 #[test]
-fn every_fixture_module_has_a_generated_case() {
+fn every_corpus_module_has_a_generated_case() {
     use std::collections::BTreeSet;
 
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-    let mut found: BTreeSet<String> = BTreeSet::new();
-    for entry in std::fs::read_dir(dir).expect("tests/fixtures is readable") {
-        let path = entry.expect("readable entry").path();
-        if path.extension().is_none_or(|e| e != "rs") {
-            continue;
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.filter_map(Result::ok) {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
         }
-        let src = std::fs::read_to_string(&path).expect("fixture is readable");
-        let file = syn::parse_file(&src).unwrap_or_else(|e| {
-            panic!("{} does not parse standalone: {e}", path.display())
-        });
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&root.join("tests/fixtures"), &mut files);
+    walk(&root.join("examples"), &mut files);
+
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for path in files {
+        let src = std::fs::read_to_string(&path).expect("source is readable");
+        let file = syn::parse_file(&src)
+            .unwrap_or_else(|e| panic!("{} does not parse standalone: {e}", path.display()));
         for item in &file.items {
             if let syn::Item::Fn(f) = item {
                 if f.attrs.iter().any(|a| {
                     a.path().segments.last().is_some_and(|s| s.ident == "hardware")
                 }) {
-                    found.insert(f.sig.ident.to_string());
+                    // Mirror build.rs's wrapper naming, so the two sets are comparable.
+                    let rel = path.strip_prefix(root).unwrap_or(&path).with_extension("");
+                    let mut w: String = rel
+                        .to_string_lossy()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect();
+                    let is_example = path.components().any(|c| c.as_os_str() == "examples");
+                    w = w
+                        .trim_start_matches("tests_fixtures_")
+                        .trim_start_matches("examples_")
+                        .to_string();
+                    let prefix = if is_example { "ex_" } else { "fx_" };
+                    found.insert(format!("{prefix}{w}::{}", f.sig.ident));
                 }
             }
         }
@@ -61,7 +90,7 @@ fn every_fixture_module_has_a_generated_case() {
     let extra: Vec<&String> = covered.difference(&found).collect();
     assert!(
         missing.is_empty(),
-        "fixture modules with no generated case — the sweep silently stopped covering \
+        "corpus modules with no generated case — the sweep silently stopped covering \
          them: {missing:?}"
     );
     assert!(
