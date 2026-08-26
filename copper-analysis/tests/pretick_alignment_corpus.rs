@@ -102,6 +102,14 @@ const EXPECTED_FLAGGED: &[&str] = &[
     "tests/mem_latency_probe.rs::ram_prewrite",
     "tests/sequential_forwarding_divergence.rs::add_then_write",
     "tests/sequential_forwarding_divergence.rs::fast_counter",
+    // Added 2026-08-25 when the CONSTANT-WRITE exemption was narrowed to
+    // unconditional writes (guardrail 5.5). All three are measured divergences, not
+    // rule regressions: each leads its own emitted SystemVerilog by exactly one
+    // cycle, with both traces pinned in sequential_forwarding_divergence.rs. The
+    // narrowing's total corpus cost was these three and nothing else.
+    "tests/fixtures/control_extraction_dut.rs::branch_merge_explicit",
+    "tests/sequential_forwarding_divergence.rs::pc_arm_toggle",
+    "tests/sequential_forwarding_divergence.rs::pc_arm_write",
 ];
 
 #[test]

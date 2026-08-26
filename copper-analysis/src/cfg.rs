@@ -508,19 +508,35 @@ impl Cfg {
 
         let regs: BTreeSet<String> = self.registers().into_iter().collect();
 
-        // (ii) plain combinational `Out` ports driven in this segment **from a
-        // register**. A write of a constant is idempotent across the phase shift —
-        // the misalignment changes *when* the write happens, so it is only
-        // observable if the value written differs between phases. A `folded` node
-        // carries the conservative all-outputs over-approximation for a nested loop,
-        // not a real `port.write`, so it must not count as evidence.
+        // (ii) plain combinational `Out` ports whose VALUE differs between the two
+        // phases, which is the only way the misalignment becomes observable. Two ways
+        // that happens, and the second was missing until 2026-08-25:
+        //
+        //   * the port is driven **from a register**, so the value depends on when
+        //     the write runs relative to the update; or
+        //   * the port is driven **conditionally** — some path through the segment
+        //     leaves it unwritten, so it HOLDS there. A write of a constant is
+        //     idempotent across the phase shift only if it happens on every path;
+        //     where the alternative is the held value, *when* the write lands is
+        //     observable even though the value written never changes.
+        //
+        // The second clause is `pc_arm_write` in sequential_forwarding_divergence.rs
+        // (5.5 of the guardrail): a `match pc` whose arms write a constant or nothing
+        // at all, measured leading its own emitted SystemVerilog by one cycle.
+        //
+        // A `folded` node carries the conservative all-outputs over-approximation for
+        // a nested loop, not a real `port.write`, so it is not evidence either way.
         let mut driven: BTreeSet<String> = BTreeSet::new();
         for &n in &region {
             let node = &self.nodes[n];
-            if node.folded || node.writes.is_empty() || node.uses.is_disjoint(&regs) {
+            if node.folded || node.writes.is_empty() {
                 continue;
             }
-            driven.extend(node.writes.iter().cloned());
+            for w in &node.writes {
+                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w) {
+                    driven.insert(w.clone());
+                }
+            }
         }
         if driven.is_empty() {
             return Vec::new();
@@ -532,6 +548,55 @@ impl Cfg {
         });
 
         if unprotected { driven.into_iter().collect() } else { Vec::new() }
+    }
+
+    /// Does every path from the loop head to a clock edge drive `port`?
+    ///
+    /// A port left unwritten on some path HOLDS its previous value there — the
+    /// enabled-register idiom, which is legitimate — and that is exactly what makes
+    /// the pre-tick phase shift observable for a constant write: the port's value
+    /// then depends on WHEN the write ran, not only on what it wrote.
+    ///
+    /// The region is acyclic (a tickless cycle is rejected by `check_reachability`),
+    /// so the memoized recursion terminates. A path that reaches a tick, or returns
+    /// to the head, without writing counts as not-written.
+    fn written_on_all_paths(&self, port: &str) -> bool {
+        fn go(
+            cfg: &Cfg,
+            n: usize,
+            port: &str,
+            memo: &mut std::collections::HashMap<usize, bool>,
+        ) -> bool {
+            if let Some(v) = memo.get(&n) {
+                return *v;
+            }
+            let node = &cfg.nodes[n];
+            if !node.folded && node.writes.contains(port) {
+                memo.insert(n, true);
+                return true;
+            }
+            // Guard against a cycle the reachability check would have rejected
+            // anyway: assume not-written while this node is in progress.
+            memo.insert(n, false);
+            let comb: Vec<usize> = node
+                .succs
+                .iter()
+                .filter(|(s, k)| *k == EdgeKind::Comb && *s != cfg.head)
+                .map(|&(s, _)| s)
+                .collect();
+            let all = !comb.is_empty() && comb.iter().all(|&s| go(cfg, s, port, memo));
+            memo.insert(n, all);
+            all
+        }
+
+        let mut memo = std::collections::HashMap::new();
+        let entries: Vec<usize> = self.nodes[self.head]
+            .succs
+            .iter()
+            .filter(|(_, k)| *k == EdgeKind::Comb)
+            .map(|&(s, _)| s)
+            .collect();
+        !entries.is_empty() && entries.iter().all(|&e| go(self, e, port, &mut memo))
     }
 
     /// Plain combinational `Out` ports driven in **more than one clock phase**.
@@ -868,6 +933,43 @@ impl Cfg {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// How many **clock phases** the source has: the number of Comb-connected
+    /// components reachable in the loop, i.e. the number of distinct cycles one
+    /// iteration of the body occupies.
+    ///
+    /// This is the same notion `shir_lower` re-derives downstream by splitting the
+    /// LOWERED body at `clk.tick().await` — and the two disagree whenever a pass
+    /// between them changes the tick structure, which `control_extract` does by
+    /// design. Exposed so that disagreement can be measured rather than argued
+    /// about; see `design_docs/TIMING_MODEL_UNIFICATION.md`.
+    pub fn clock_phase_count(&self) -> usize {
+        let phases = self.comb_phases();
+        let reachable: BTreeSet<usize> = (0..self.nodes.len())
+            .filter(|&i| self.reaches_from_head(i))
+            .map(|i| phases[i])
+            .collect();
+        reachable.len()
+    }
+
+    /// Is `n` reachable from the loop head at all? An unreachable node's phase must
+    /// not be counted — `break` sinks in a nested sub-CFG, for instance.
+    fn reaches_from_head(&self, n: usize) -> bool {
+        let mut stack = vec![self.head];
+        let mut seen = vec![false; self.nodes.len()];
+        while let Some(x) = stack.pop() {
+            if x == n {
+                return true;
+            }
+            if std::mem::replace(&mut seen[x], true) {
+                continue;
+            }
+            for &(s, _) in &self.nodes[x].succs {
+                stack.push(s);
+            }
+        }
+        false
     }
 
     /// Union-find over `Comb` edges: `phases[n]` is the representative of the clock
@@ -2626,7 +2728,17 @@ mod tests {
     /// changes *when* the write happens, which is unobservable when the value does
     /// not depend on a register. Witness for the "write must read a register" clause.
     #[test]
-    fn hazard_constant_writes_not_flagged() {
+    fn a_conditional_constant_write_is_flagged() {
+        // This is `branch_merge_explicit`, and it was pinned here as a module the rule
+        // must NOT flag — "a constant write is idempotent across the phase shift".
+        //
+        // MEASURED FALSE, 2026-08-25, by the corpus differential sweep: it leads its
+        // own emitted SystemVerilog by exactly one cycle. The premise holds only when
+        // the write happens on EVERY path; here the `pc == 1` arm writes `tail_o` and
+        // the `pc == 0` arm may not, so the alternative is the port's HELD value and
+        // *when* the write lands is observable. Both traces are pinned in
+        // sequential_forwarding_divergence.rs (`pc_arm_write`, `pc_arm_toggle`) and
+        // written up as 5.5 of the guardrail.
         let src = r#"
             #[hardware(sequential)]
             async fn m(clk: Clock<C>, sel: In<Logic, C>, head_o: Out<Logic, C>, mid_o: Out<Logic, C>, tail_o: Out<Logic, C>) {
@@ -2646,9 +2758,31 @@ mod tests {
             }
         "#;
         assert!(
+            !hazard(src).is_empty(),
+            "the conditionally-written constant is the measured divergence — not \
+             flagging it lets a design through that disagrees with its own hardware"
+        );
+    }
+
+    /// An UNCONDITIONAL constant write stays exempt, which is what keeps the rule off
+    /// the corpus: the value is the same in either phase, so the shift is unobservable.
+    #[test]
+    fn an_unconditional_constant_write_is_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
+                let mut pc: u8 = 0;
+                loop {
+                    o.write(Logic::One);
+                    if sel.read() == Logic::One { pc = 1; } else { pc = 0; }
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert!(
             hazard(src).is_empty(),
-            "a constant write is idempotent across the phase shift — flagging it \
-             rejects a correct design"
+            "an unconditional constant write is idempotent across the phase shift — \
+             flagging it would reject a correct design"
         );
     }
 

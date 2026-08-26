@@ -730,7 +730,7 @@ fn d1_in_the_trailing_segment_is_an_unguarded_gap() {
 // today's behaviour and flip loudly when it changes.
 
 const PC_ARM_SRC: &str = r#"
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn pc_arm_write(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
     let mut pc: u8 = 0;
     loop {
@@ -744,7 +744,7 @@ async fn pc_arm_write(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
 }
 "#;
 
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn pc_arm_write(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
     let mut pc: u8 = 0;
     loop {
@@ -761,7 +761,7 @@ async fn pc_arm_write(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
 /// on every cycle instead of only the first — `pc_arm_write`'s output latches high
 /// and can only show it once.
 const PC_ARM_TOGGLE_SRC: &str = r#"
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn pc_arm_toggle(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
     let mut pc: u8 = 0;
     loop {
@@ -775,7 +775,7 @@ async fn pc_arm_toggle(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
 }
 "#;
 
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn pc_arm_toggle(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
     let mut pc: u8 = 0;
     loop {
@@ -823,14 +823,20 @@ fn a_write_in_a_state_arm_leads_the_hardware_by_one_cycle() {
         "simulator behaviour changed; if it now starts at 0 the divergence is FIXED"
     );
 
-    // The D1 guard exempts this: the value written is a constant. That exemption is
-    // what this witness says is unsound for a conditionally-written `Out`.
+    // The D1 guard now COVERS this shape (2026-08-25): the constant-write exemption
+    // was narrowed to UNCONDITIONAL writes, because a constant is only idempotent
+    // across the phase shift if it is written on every path — where the alternative
+    // is the port's held value, when the write lands is observable. The divergence
+    // below is unchanged; what changed is that the language rejects the shape rather
+    // than emitting it. The DUT keeps `allow_pretick_alignment` because it exists to
+    // demonstrate the hazard, and the flag silences the error, not the detection.
     let f: syn::ItemFn = syn::parse_str(PC_ARM_SRC).expect("parses");
-    assert!(
-        copper_analysis::unprotected_pretick_out_write(&f).is_empty(),
-        "the constant-write exemption is now NARROWER — good. Delete this assertion, \
-         add the DUT to EXPECTED_FLAGGED in pretick_alignment_corpus.rs, and record \
-         the corpus cost of the narrowing in PRETICK_ALIGNMENT_GUARDRAIL.md §5.5."
+    assert_eq!(
+        copper_analysis::unprotected_pretick_out_write(&f),
+        vec!["o".to_string()],
+        "the rule stopped flagging the shape it was narrowed to catch — this DUT is \
+         in EXPECTED_FLAGGED in pretick_alignment_corpus.rs, and the traces below \
+         still diverge, so silently accepting it again would ship the divergence"
     );
 
     if !verilator_available() {

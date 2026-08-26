@@ -1346,9 +1346,17 @@ TRANSPILATION:
      the simulator forwards the update and writes the new one. The D1 compile error
      exempts `RegOut`, so this shape passes the guardrail and diverges anyway.
      The immunity claim holds for the PHASE question it was written about (when the
-     segment runs); it does not extend to forwarding WITHIN the segment. Worth
-     correcting in the doc either way, and deciding whether D1's exemption should
-     be narrowed.
+     segment runs); it does not extend to forwarding WITHIN the segment.
+     THIS ENTRY WAS STALE and is corrected 2026-08-25: the FORWARDING was repaired
+     (causes L / L-1 / L-2) — a drive sampled at the edge is emitted from pre-edge
+     register values, via `SHIRPortDrive`'s `edge_value` and
+     `vlir_lower::split_output_reg` — and the `RegOut` exemption stands, because the
+     rule is the EMISSION CONTEXT, not the port type (a conditionally-written plain
+     `Out` becomes an implicit-hold register and had the identical lag). All four
+     `regout_forwarding_dut` witnesses now agree with their emitted SV under 200
+     cycles of random stimulus in the corpus sweep. The guardrail's §5.2 correction
+     block records the resolution; this entry had not been updated, and was cited as
+     an open item as late as this session's planning.
 
   ☐ D1's CONSTANT-WRITE EXEMPTION IS UNSOUND for a conditionally-written `Out`
      (found 2026-08-25 by the corpus differential sweep, on random stimulus).

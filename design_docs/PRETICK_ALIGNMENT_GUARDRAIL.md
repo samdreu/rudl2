@@ -380,7 +380,7 @@ identical phase question. Two ways of covering it were implemented and measured:
 > widening rejects correct designs (R1). The second widening is the closer of the
 > two and is where a third attempt should start.
 
-### 5.5 The CONSTANT-WRITE exemption is unsound for a conditionally-written `Out` — found 2026-08-25
+### 5.5 The CONSTANT-WRITE exemption was unsound for a conditionally-written `Out` — found AND FIXED 2026-08-25
 
 `unprotected_pretick_out_write` clause (ii) considers only plain `Out` ports driven
 **from a register**, exempting a write of a constant: *"a write of a constant is
@@ -430,12 +430,35 @@ SystemVerilog (asserted by `control_extraction_structural.rs`), the async twin a
 with that SV for all 200 cycles, and the explicit twin leads it by one — so the
 simulator disagrees with *itself* depending on how the same hardware is spelled.
 
-**Not fixed here, deliberately.** Narrowing the exemption — exempt a constant write
-only where the output is written on every path of the segment — is a rule widening,
-and §5.4 records two widenings whose corpus cost (25 and 10 false positives) is why
-they were rejected. The cost of this one has not been measured, and R1 (zero false
-positives corpus-wide) applies to it as much as to those. The witnesses assert
-today's behaviour and flip loudly when it changes.
+**FIXED the same day, and it is the first widening of this rule that passes R1.**
+The exemption now applies only where the output is written on **every path** of the
+segment (`Cfg::written_on_all_paths`). §5.4 records two widenings rejected for corpus
+cost — 25 and 10 modules, most of them correct designs — so this one was measured the
+same way before landing:
+
+> **Corpus cost: three modules, and all three are the measured divergences.**
+> `branch_merge_explicit` (the corpus instance the sweep found), plus the two
+> witnesses `pc_arm_write` and `pc_arm_toggle`. **Zero false positives.** 26/26
+> examples and all 93 differential cases unaffected.
+
+That is the discriminator §5.4 asked for, and it was hiding in plain sight: *a
+constant is idempotent across the phase shift only if it is written on every path.*
+Where some path leaves the port holding, the phase shift is observable even though the
+value written never changes — which is why the rule keys on the write's
+**conditionality**, not on the value.
+
+All three modules carry `allow_pretick_alignment`: each exists to demonstrate the
+hazard, and the flag silences the error, not the detection, so they stay visible to
+every corpus scan. A real design in this shape now gets a compile error pointing at
+`RegOut`.
+
+**Why this direction rather than a simulator change.** The alternative — teaching the
+executor to run the segment's two jobs in different phases (§5.1's "no single global
+phase choice satisfies both") — is a more complex simulation rule, and the standing
+decision (2026-08-25) is to **limit the design expressions instead**: keep "a value
+live across a `clk.tick().await` is a register", keep one value per variable (no
+current/next distinction, as in §10.1's languages), and reject the shapes that
+diverge rather than growing the machinery that reconciles them.
 
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
 

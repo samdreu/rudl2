@@ -102,10 +102,12 @@ const SKIP: &[(&str, &str)] = &[
     ),
     (
         "branch_merge_explicit",
-        "MEASURED DIVERGENCE, pinned as sequential_forwarding_divergence.rs::\
-         a_write_in_a_state_arm_leads_the_hardware_by_one_cycle and written up in \
-         PRETICK_ALIGNMENT_GUARDRAIL.md 5.5 — the simulator leads the identical emitted SV by one \
-         cycle. Un-ignore when the constant-write exemption is narrowed",
+        "a demonstration of the pre-tick hazard since 2026-08-25: its conditionally-written \
+         constant `tail_o` leads the identical emitted SV by one cycle (pinned as \
+         sequential_forwarding_divergence.rs::a_write_in_a_state_arm_leads_the_hardware_by_one_cycle, \
+         guardrail 5.5). The D1 rule now REJECTS this shape; the module keeps \
+         `allow_pretick_alignment` because it exists to demonstrate it, so it still diverges and \
+         cannot be swept",
     ),
 ];
 

@@ -102,6 +102,16 @@ pub fn multi_phase_out_write(f: &ItemFn) -> Vec<String> {
     Cfg::build(f).map(|c| c.multi_phase_out_write()).unwrap_or_default()
 }
 
+/// How many **clock phases** `f`'s top-level loop occupies — the number of distinct
+/// cycles one iteration runs in. `None` for a module with no loop.
+///
+/// The transpiler re-derives this downstream, by splitting the LOWERED body at its
+/// ticks, and the two disagree wherever a pass between them rewrites the tick
+/// structure. Exposed so the disagreement can be measured.
+pub fn clock_phase_count(f: &ItemFn) -> Option<usize> {
+    Cfg::build(f).map(|c| c.clock_phase_count())
+}
+
 pub fn check_reachability(f: &ItemFn) -> Result<(), syn::Error> {
     match Cfg::build(f) {
         Some(cfg) => cfg
