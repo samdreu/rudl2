@@ -158,11 +158,28 @@ tools/regression.sh --no-examples    # build + CLI + tests, no Verilator
 tools/regression.sh --example lfsr   # one named example
 ```
 
-The driver also enforces three wiring guards, because "the check silently didn't
+The driver also enforces four wiring guards, because "the check silently didn't
 run" has been a recurring bug class here: every `examples/**.rs` is registered as
-a `[[example]]` (**G-A**), every registered example actually ran (**G-B**), and
-every `tests/*.rs` produced a test binary that ran (**G-C**). It prints every
+a `[[example]]` (**G-A**), every registered example actually ran (**G-B**), every
+`tests/*.rs` produced a test binary that ran (**G-C**), and the corpus differential
+sweep covered every `#[hardware]` module and ran (**G-D**). It prints every
 `#[ignore]`d test on each run so a deliberately-skipped check stays visible.
+
+### The corpus differential sweep
+
+`build.rs` generates one equivalence case per `#[hardware]` module in `examples/`
+and `tests/fixtures/`: seeded random stimulus into the simulator, and the
+SystemVerilog that module transpiles to Verilated against the same trace, 200
+cycles each. No reference model is needed — the simulator and the emitted SV are
+two independent implementations of one source, so comparing them is already an
+oracle — which is what makes a case cheap enough to have for *every* module
+rather than for whichever ones someone wrote a harness for.
+
+A module the sweep cannot run gets an `#[ignore]` with its reason, never an
+omission, and G-D fails if the generator quietly stops covering something. Widths
+for generic modules, resets for designs whose state starts undefined, and the
+reason for each skip live in three tables in `build.rs`. See
+`design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`.
 
 ### Transpiling from the command line
 
@@ -293,28 +310,37 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **797 tests pass, 0 fail, 4 ignored** across 102 test binaries
+- **943 tests pass, 0 fail, 16 ignored** across 112 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
-- all three wiring guards (G-A / G-B / G-C) clean
+- **95 corpus differential cases pass**, 12 ignored with a recorded reason
+- all four wiring guards (G-A / G-B / G-C / G-D) clean
+
+Every ignored test prints its reason on each run. They are divergence witnesses,
+shapes refused by design, modules blocked on a recorded transpiler cause, and one
+documented startup transient — not silent skips.
 
 ---
 
 ## Limitations
 
-Measured, not guessed — **28 of 34** `#[hardware]` modules in `examples/`
-currently transpile. The 6 that do not, grouped by root cause:
+Measured, not guessed — **29 of 34** `#[hardware]` modules in `examples/`
+currently transpile (`tools/transpile_coverage.sh` prints the current number;
+don't trust this one). The 5 that do not, grouped by root cause:
 
 | Cause | Blocks |
 |---|---|
 | `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
 | tuple-returning helper functions | `ripple_carry_adder` |
-| a tick inside a counted `for` | `uart/rx` |
 | a hardware-typed function without `#[hardware]` in the same file | `uart_tx`, `uart_rx` |
 
 The last row is a whole-file rejection rather than anything about those two
 modules: `examples/uart/system.rs` also defines `spawn_uart`, a plain wiring
 function whose signature takes a `Clock` and ports, which is refused before any
-module is examined. Behind it they hit the counted `for` too.
+module is examined.
+
+Transpiling is not the same as being *checked*: coverage counts acceptance, and
+the corpus sweep above is what says the emitted SystemVerilog agrees with the
+simulator.
 
 Note that transpiling and *linting* are different bars: the equivalence harness
 runs Verilator under `-Wall`, and a module can emit SystemVerilog that the CLI
@@ -354,7 +380,9 @@ The everything-still-open list lives in [`TODO`](TODO).
 |---|---|
 | [`design_docs/SYNCHRONOUS_SEMANTICS.md`](design_docs/SYNCHRONOUS_SEMANTICS.md) | the timing model — start here |
 | [`design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`](design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md) | the executor/analysis architecture and its sequenced items |
-| [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md) | the pre-tick alignment hazard, its compile-time guard, and three rejected fixes with evidence |
+| [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md) | the pre-tick alignment family — its four compile-time rules, and five rejected fixes with measured evidence |
+| [`design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`](design_docs/CORPUS_DIFFERENTIAL_SWEEP.md) | why every module gets a generated sim-vs-emitted-SV case, and how |
+| [`design_docs/TIMING_MODEL_UNIFICATION.md`](design_docs/TIMING_MODEL_UNIFICATION.md) | how far the simulator's and the transpiler's timing derivations actually diverge — measured |
 | [`design_docs/LEVELIZED_SCHEDULING_SCOPE.md`](design_docs/LEVELIZED_SCHEDULING_SCOPE.md) | the levelized scheduler |
 | [`design_docs/TIMING_COVERAGE_MATRIX.md`](design_docs/TIMING_COVERAGE_MATRIX.md) | which timing patterns have an independent hardware anchor |
 | [`CLAUDE.md`](CLAUDE.md) | orientation for contributors (and for Claude Code) |

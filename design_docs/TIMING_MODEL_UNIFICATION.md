@@ -117,21 +117,27 @@ only what actually diverges, verified against the sweep before it lands.
 
 ## 3. Why the sweep had to come first
 
-Any move in 1b changes behaviour corpus-wide. The 93 differential cases in
-`tests/corpus_generated.rs` are what makes that measurable rather than hopeful: a
+Any move in 1b changes behaviour corpus-wide. The differential cases in
+`tests/corpus_generated.rs` — 95 of them at the time of writing — are what makes that
+measurable rather than hopeful: a
 change to forwarding either keeps every module agreeing with its emitted SystemVerilog
 or it does not, and the answer arrives in 90 seconds. That is the ordering the
 standing rule for migrations asks for — build against a differential oracle, keep the
 old path, no silent regressions.
 
-## 4. What is left
+## 4. What was left, and where it went
 
 * ~~**§5.4's trailing-segment gap**~~ — CLOSED 2026-08-25. The discriminator was not
   conditionality (three such hypotheses were measured and discarded) but **how many
   clock edges the body crosses per iteration**: single-tick trailing statements share
   the head's phase, multi-tick ones do not. Corpus cost: one real module.
-* **The trailing-statement rule's semantics** (1a): what a combinational statement
-  after the last tick should mean. Still the open decision it has been.
+* ~~**The trailing-statement rule's semantics**~~ — DECIDED 2026-08-25 and
+  implemented. The answer was already in `SYNCHRONOUS_SEMANTICS.md`: a clock cycle is
+  a maximal tick-free region, so the trailing statements are in the head's cycle and
+  lower into phase 0. Writing the differential fixture for it exposed a pre-existing
+  bug both lowering paths had claimed in a comment and neither had: the trailing
+  register updates must share a forwarding map with the phase they commit alongside.
+  See "Trailing statements" in the semantics doc.
 * ~~**A structural guard** against new tick-counting checks appearing in codegen.~~
   DONE 2026-08-25: `copper-codegen/tests/phase_sensitive_checks.rs` pins every
   function in the transpiler that both reasons about phases and can fail, each with
@@ -139,5 +145,14 @@ old path, no silent regressions.
   RULE about the language (which belongs on the source). A new one fails the test with
   that question. Negative-controlled.
 
-None of these needs the refactor this document was opened to scope. That is the
-finding.
+**All three are closed, and none of them needed the refactor this document was opened
+to scope.** That is the finding: the measurement said the lowering's derivation is
+sound on its own terms and the phase structure is merely invisible downstream, so the
+work was three small, separately-measured changes rather than one rewrite of the
+lowering's spine.
+
+What remains genuinely open in this family is **D1 itself** — §5.1's durable finding
+that the pre-tick segment does two jobs and no single global phase choice satisfies
+both — and the standing decision (§1b) is to keep restricting the design surface
+rather than grow the executor. Every rule added since has followed that: each rejects
+only shapes with a measured divergence, at a corpus cost quoted before landing.

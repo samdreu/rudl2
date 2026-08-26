@@ -20,6 +20,15 @@
 | Sim trace vs **transpiler-generated** Verilog under Verilator + a Rust model | `tests/common::EquivalenceTest` | No (circular for timing) | No — datapath only |
 | Sim trace vs **itself** (recorded run replayed) | `HardwareTest` + `finish_with_expected(self)` | n/a | No (self-consistency) |
 
+**The corpus differential sweep is the second row, not the first.** As of 2026-08-25
+`build.rs` generates a sim-vs-emitted-SystemVerilog case for every `#[hardware]`
+module (95 running; `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`), which is most of the
+suite by count — and none of it anchors a timing claim, for exactly the reason this
+row states: both sides descend from the same source, so a shared misunderstanding is
+invisible to it. It is excellent at catching one side drifting from the other, which
+is what it was built for. The independent goldens below remain the only thing that
+adjudicates *which* side is right, and must not be traded away for sweep coverage.
+
 Only the first row anchors a *timing* claim. The independent goldens live in
 `examples/**/sv/*.sv` (BaseJump-derived and textbook) and
 `examples/basejump/sv/*.sv` (third-party BaseJump STL, Solderpad-licensed). The

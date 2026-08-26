@@ -776,19 +776,9 @@ fn reg_name_set(registers: &[CHIRRegDecl], promoted_names: &HashSet<String>) -> 
 ///
 /// Applies `renames` (promoted wire x→x_r) and sequential forwarding so that
 /// later assigns within the same segment see the updated values of earlier assigns.
-fn extract_reg_updates(
-    stmts: &[CHIRStmt],
-    registers: &[CHIRRegDecl],
-    promoted_names: &HashSet<String>,
-    span: SourceSpan,
-    renames: &HashMap<String, String>,
-) -> Result<Vec<SHIRRegUpdate>, SHIRLowerError> {
-    let mut forwarding: HashMap<String, SHIRExpr> = HashMap::new();
-    extract_reg_updates_shared(stmts, registers, promoted_names, span, renames, &mut forwarding)
-}
-
-/// As [`extract_reg_updates`], but with the forwarding map supplied by the caller so
-/// **two segments that commit at the same clock edge** share it.
+/// The register updates a segment contributes to its phase's clock edge, with the
+/// forwarding map supplied by the caller so **two segments that commit at the same
+/// clock edge** share it.
 ///
 /// The trailing segment and the phase before it are exactly that pair: the trailing
 /// statements execute in the post-edge settle of that edge, so they read the values
@@ -1526,7 +1516,8 @@ mod tests {
         }];
         let promoted = std::collections::HashSet::new();
 
-        let updates = extract_reg_updates(&stmts, &regs, &promoted, span(), &HashMap::new()).unwrap();
+        let updates = extract_reg_updates_shared(&stmts, &regs, &promoted, span(), &HashMap::new(), &mut HashMap::new())
+            .unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].target, "count");
         // next_value should be Mux(cond, 0, count)
@@ -1562,7 +1553,8 @@ mod tests {
         }];
         let promoted = std::collections::HashSet::new();
 
-        let updates = extract_reg_updates(&stmts, &regs, &promoted, span(), &HashMap::new()).unwrap();
+        let updates = extract_reg_updates_shared(&stmts, &regs, &promoted, span(), &HashMap::new(), &mut HashMap::new())
+            .unwrap();
         assert_eq!(updates.len(), 1);
         assert!(matches!(&updates[0].next_value, SHIRExpr::Mux { .. }));
         if let SHIRExpr::Mux { then_val, else_val, .. } = &updates[0].next_value {
@@ -1638,7 +1630,8 @@ mod tests {
             CHIRRegDecl { name: "stage2_r".to_string(), ty: CHIRType::UInt { width: Width::Concrete(8) }, init: None, span: span() },
         ];
         let promoted = std::collections::HashSet::new();
-        let updates = extract_reg_updates(&stmts, &regs, &promoted, span(), &HashMap::new()).unwrap();
+        let updates = extract_reg_updates_shared(&stmts, &regs, &promoted, span(), &HashMap::new(), &mut HashMap::new())
+            .unwrap();
 
         assert_eq!(updates.len(), 2);
         let s1 = updates.iter().find(|u| u.target == "stage1_r").unwrap();
@@ -1724,7 +1717,8 @@ mod tests {
         ];
         let regs = vec![CHIRRegDecl { name: "R".to_string(), ty: CHIRType::UInt { width: Width::Concrete(8) }, init: None, span: span() }];
         let promoted = std::collections::HashSet::new();
-        let updates = extract_reg_updates(&stmts, &regs, &promoted, span(), &HashMap::new()).unwrap();
+        let updates = extract_reg_updates_shared(&stmts, &regs, &promoted, span(), &HashMap::new(), &mut HashMap::new())
+            .unwrap();
 
         // Should produce two updates for R: first the flat assign, then the Mux
         // (or deduplicated to just the Mux — either is acceptable as long as last wins)

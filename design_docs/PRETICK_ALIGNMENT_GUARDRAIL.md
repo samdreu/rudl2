@@ -1,12 +1,25 @@
 # Pre-Tick Segment Alignment — Divergence Analysis and Guardrail Plan
 
-> **Status (2026-08-21): D1 GUARDED, D2 FIXED.** Phases 0–3 complete, gates G0–G3
-> met. D1 is a compile error (the language is restricted); D2 was adjudicated against
-> independent hardware and fixed in the simulator at no corpus cost.** Three candidate fixes were tried and rejected with
-> measured evidence (§5) before the shippable rule was found. This doc is both the
-> plan and the record of what was ruled out and why.
+> **Status (2026-08-25): the family is GUARDED — four rules, D2 fixed outright.**
+> Phases 0–3 complete, gates G0–G3 met. D1 is a compile error (the language is
+> restricted); D2 was adjudicated against independent hardware and fixed in the
+> simulator at no corpus cost. Three candidate fixes were tried and rejected with
+> measured evidence before the first shippable rule was found (§5.1–5.3), and two
+> further widenings of D1 were measured and rejected (§5.4) before the discriminator
+> that works was located. This doc is both the plan and the record of what was ruled
+> out and why.
 >
-> **Pinned by:** `tests/sequential_forwarding_divergence.rs` (4 tests, green; each
+> **The four rules, each with an exact-set corpus pin in
+> `copper-analysis/tests/pretick_alignment_corpus.rs`:**
+>
+> | rule | what it refuses | corpus cost when it landed |
+> |---|---|---|
+> | `unprotected_pretick_out_write` (D1) | a plain `Out` driven from a register in the pre-tick segment, when that segment also assigns a register with no preceding `In` read | — |
+> | …its **constant-write** clause (§5.5) | the same, where the port is written on *some* paths only — a constant is idempotent across the phase shift only if it lands on every path | 3 modules, all measured divergences |
+> | `unprotected_trailing_out_write` (§5.4) | the same hazard past the *last* tick, when the body crosses more than one clock edge per iteration | 1 real module (`rv32i_cpu_pipelined`, → `RegOut`) |
+> | `multi_phase_out_write` | a plain `Out` driven in more than one clock phase | 9 modules, six of them its own witnesses |
+>
+> **Pinned by:** `tests/sequential_forwarding_divergence.rs` (10 tests, green; each
 > flips loudly when the corresponding divergence is fixed).
 >
 > **Read first:** `SYNCHRONOUS_SEMANTICS.md` §Output timing. This is the **third**
@@ -297,7 +310,11 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
 
 ---
 
-## 5. Rejected approaches (do not re-try)
+## 5. Approaches tried — three rejected, two that landed
+
+§5.1–5.3 are **rejected** and must not be re-tried; §5.4 and §5.5 record two more
+rejected widenings *and* the rules that eventually worked, kept together so the
+discriminator is read beside the attempts it replaced.
 
 ### 5.1 "Always-barrier" — REJECTED 2026-08-21
 
@@ -480,7 +497,8 @@ same way before landing:
 > **Corpus cost: three modules, and all three are the measured divergences.**
 > `branch_merge_explicit` (the corpus instance the sweep found), plus the two
 > witnesses `pc_arm_write` and `pc_arm_toggle`. **Zero false positives.** 26/26
-> examples and all 93 differential cases unaffected.
+> examples and all 93 differential cases unaffected (the sweep's size on the day;
+> `G-D` prints the current count).
 
 That is the discriminator §5.4 asked for, and it was hiding in plain sight: *a
 constant is idempotent across the phase shift only if it is written on every path.*

@@ -1,11 +1,14 @@
 # Corpus differential sweep — scope
 
 **Status:** phases 1–4 BUILT and green. `build.rs` generates a case for every
-`#[hardware]` module in `tests/fixtures/` and `examples/` — **93 running, 11
-ignored-with-reason** — and `tools/regression.sh`'s **G-D** asserts the sweep covered
-the corpus and ran. Every remaining skip is a recorded transpiler cause (5), a
-structural module with no simulatable body (1), or a deliberate divergence witness
-(5). **None is "the generator cannot do this."**
+`#[hardware]` module in `tests/fixtures/` and `examples/` — **95 running, 12
+ignored-with-reason** as of 2026-08-25 — and `tools/regression.sh`'s **G-D** asserts
+the sweep covered the corpus and ran. Every skip is a recorded transpiler cause, a
+structural module with no simulatable body, a deliberate divergence witness, or a
+documented startup transient. **None is "the generator cannot do this."**
+
+The counts move as the corpus does; `G-D` prints the current ones on every full run,
+which is the number to trust over any written here.
 
 ## 0. What phase 1 found, on its first run
 
@@ -168,25 +171,26 @@ mechanical, and mechanical is what makes it complete.
 
 ## 2. The corpus, measured
 
-104 `#[hardware]` modules across `examples/` and `tests/fixtures/`:
+107 `#[hardware]` modules across `examples/` and `tests/fixtures/`, as of 2026-08-25:
 
 | | count |
 |---|---|
-| sequential | 82 |
+| sequential | 85 |
 | combinational | 19 |
 | synchronizer / structural | 3 |
-| generic (const-generic params) | 10 |
-| more than one clock domain | 1 (+3 CDC examples wired as separate modules) |
-| uses `RegOut` | 35 |
-| array-typed ports | 2 |
-| **v1-eligible** (concrete, ≤1 domain, sequential or combinational) | **91** |
+| generic (const-generic params) | 10 — all swept, at the widths in `build.rs`'s `PARAMS` |
+| more than one clock PORT | 1 (`two_domain_top`, structural) |
+| uses `RegOut` | 37 |
+| array-typed ports | 2 — one swept, one skipped (`bsg_mux_one_hot`) |
 
 Port payload types are near-uniform, which is what makes generation tractable:
-**175 `Bits<N>`**, **123 `Logic`**, 2 array ports, 2 `Vec<Bits<N>>` (the CPUs, which
-do not transpile), and 11 const-generic widths. Port *heads* are only `In` / `Out` /
-`RegOut` / `Clock` — there is no fifth shape to discover.
+`Bits<N>` and `Logic` account for nearly all of them, with 2 array ports and 2
+`Vec<Bits<N>>` (the CPUs, which do not transpile). Port *heads* are only `In` / `Out`
+/ `RegOut` / `Clock` — there is no fifth shape to discover. A width written as a
+file-scope `const` or a const-generic parameter is still `Bits<N>`; the generator
+handles both.
 
-### The backlog it would close immediately
+### The backlog it closed (historical — phase 1's starting point)
 
 Concrete example modules with **no** sim ≡ transpiled-SV check today: 10 —
 `det_010_awaits`, `event_sink`, `event_source`, `fast_counter`, `flag_sync`,

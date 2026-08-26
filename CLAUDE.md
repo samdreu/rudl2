@@ -94,10 +94,15 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
   `tests/common::verilator_available()` and `verilator_command()` rather than
   spawning `verilator` yourself — a hand-rolled `--version` probe that treats a
   non-zero exit as "not installed" reintroduces the silent skip.
-- **`copper-transpile` only handles concrete (non-generic) modules.** Generic
-  modules (`const WIDTH_P: usize`, `Bits<W>`, `Clock<D>`) are monomorphized at
-  example-run time by the `#[hardware]` macro, not by the standalone CLI — to
-  see their SystemVerilog, run the example. Multi-module files need `--module`.
+- **A generic module transpiles to a PARAMETRIC SystemVerilog module.**
+  `copper-transpile examples/combinational/rotate_right.rs` emits
+  `module rotate_right #(parameter int N = 1, parameter int N_LOG = 1)`, so it needs
+  concrete widths only when you *Verilate* it — `HardwareTest::with_params(&[("N", 8),
+  …])`, which is how the equivalence tests and the corpus sweep run them (the sweep's
+  widths live in `build.rs`'s `PARAMS`). What the CLI cannot do is pick those widths
+  for you: parameters are often constrained (`N_LOG == clog2(N)`, asserted inside the
+  module), so a guess is a compile error rather than a wrong number.
+  Multi-module files need `--module`.
 
 ## Architecture
 
@@ -194,17 +199,25 @@ receive/clone one.
 - Design docs live in `design_docs/`. Most have been moved to
   `design_docs/OUTDATED/`; `SYNCHRONOUS_SEMANTICS.md` is the current one.
   Treat `OUTDATED/` as historical, not authoritative.
-- **`PRETICK_ALIGNMENT_GUARDRAIL.md`** — D1 (pre-tick alignment) is **guarded** as of
-  2026-08-21: a plain `Out` driven from a register in the pre-tick segment is a
-  compile error when that segment also assigns a register with no preceding `In` read.
-  Fix with `RegOut`, or move the register update after the tick. A module that exists
-  to *demonstrate* the hazard opts out with
+- **`PRETICK_ALIGNMENT_GUARDRAIL.md`** — the pre-tick alignment family. **D1** is
+  **guarded** as of 2026-08-21: a plain `Out` driven from a register in the pre-tick
+  segment is a compile error when that segment also assigns a register with no
+  preceding `In` read. Fix with `RegOut`, or move the register update after the tick.
+  A module that exists to *demonstrate* the hazard opts out with
   `#[hardware(sequential, allow_pretick_alignment)]` — this silences the error, not
   the detection, and must never be reached for in a real design.
   **D2 is FIXED** (2026-08-21) — a read feeding a combinational `Out` in a
   register-free segment is now `Immediate`, so a passthrough tracks its producer
-  instead of lagging it. The doc
-  also records **three** rejected fixes with measured evidence so they are not
+  instead of lagging it.
+  Three more rules joined the family on 2026-08-25, each with a measured corpus cost
+  and an exact-set pin in `pretick_alignment_corpus.rs`: **`multi_phase_out_write`**
+  (a plain `Out` driven in more than one clock phase), the **constant-write
+  narrowing** (a constant is exempt only where the port is written on *every* path —
+  otherwise the alternative is its held value and the phase shift is observable), and
+  **`unprotected_trailing_out_write`** (the same hazard past the *last* tick, gated on
+  the body crossing more than one clock edge per iteration — in a single-tick loop the
+  trailing statements share the head's phase, so there is nothing to misalign).
+  The doc also records **five** rejected fixes with measured evidence so they are not
   re-tried, and the prior-art survey in §10.
 - **Verilator work dirs are unique PER INVOCATION** (`obj_dir_<module><params>_<pid>_<n>`),
   not per module. Two tests in one binary can Verilate the *same* top module in
