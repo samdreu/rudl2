@@ -28,8 +28,9 @@
 //!   not about the language. Add it below with that reason.
 //!
 //! The distinction is not cosmetic: `shir_lower`'s trailing-statement refusal was
-//! filed as the first and audited as the second (the extracted path accepts the same
-//! shape and agrees with its SystemVerilog), which is why it is still open.
+//! filed as the first and audited as the second — the extracted path accepted the same
+//! shape and agreed with its SystemVerilog — and was resolved on 2026-08-25 by
+//! deciding the semantics rather than by moving the check.
 
 use std::collections::BTreeSet;
 
@@ -84,11 +85,11 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
     (
         "shir_lower.rs::lower_seq_body",
-        "lowering: the segment→phase construction itself. ALSO carries the \
-         trailing-statement refusal, which is a RULE and is the one open instance of \
-         the class this test guards — audited 2026-08-25 (the extracted path accepts \
-         the same shape and agrees with its SystemVerilog), tracked in TODO as an \
-         undecided semantics question, not a settled limitation.",
+        "lowering: the segment→phase construction itself. It carried the one open \
+         instance of the class — the trailing-statement refusal — until the semantics \
+         were decided on 2026-08-25 (SYNCHRONOUS_SEMANTICS.md, 'Trailing statements'): \
+         those statements are in the head's cycle and now lower into phase 0, so the \
+         refusal is gone and what is left here is construction.",
     ),
     (
         "shir_lower.rs::validate_seq_chir",

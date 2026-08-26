@@ -236,12 +236,18 @@ fn multi_phase_out_write_flags_exactly_the_demonstration_modules() {
 /// The **trailing-segment** rule's exact set — D1's hazard past the last tick
 /// (`unprotected_trailing_out_write`, 2026-08-25).
 ///
-/// Both entries are measured divergences carrying `allow_pretick_alignment`, and the
-/// rule's total corpus cost was one real module: `rv32i_cpu_pipelined`'s
-/// `program_counter`, migrated to `RegOut` — the same remedy its scalar sibling had
-/// already been given for the multi-phase rule.
+/// A measured divergence carrying `allow_pretick_alignment`. The rule's total corpus
+/// cost was one real module: `rv32i_cpu_pipelined`'s `program_counter`, migrated to
+/// `RegOut` — the same remedy its scalar sibling had already been given for the
+/// multi-phase rule.
+///
+/// `pulse_plain` was here until the all-paths query was scoped to the region being
+/// asked about (2026-08-25). Its trailing `dv.write(Zero)` is an UNCONDITIONAL
+/// constant, so it is exempt on the same terms as any other — the rule was reading it
+/// as conditional only because it asked whether the HEAD region wrote it. The module
+/// is a divergence and stays guarded, by `multi_phase_out_write`: it drives `dv` in
+/// two clock phases, which is what is actually wrong with it.
 const EXPECTED_TRAILING: &[&str] = &[
-    "tests/sequential_forwarding_divergence.rs::pulse_plain",
     "tests/sequential_forwarding_divergence.rs::trailing_update",
 ];
 

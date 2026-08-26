@@ -51,6 +51,49 @@ the liveness rule under *The CFG model*). These are the four informal invariants
 FSM-state, register, and *every loop path reaches a tick* (reachability well-formedness, below) — now
 each a checked property rather than an accident of construction.
 
+### Trailing statements — the segment after the last tick
+
+Decided 2026-08-25; it follows from the definition above rather than adding to it. In
+
+```text
+loop { A; clk.tick().await; B; clk.tick().await; C; }
+```
+
+`C` and the *next* iteration's `A` sit in one maximal tick-free region — falling off
+the end of the body and re-entering it costs no clock — so **`C` is in the head's
+cycle**. Three consequences, all now implemented on every lowering path:
+
+* **`C`'s combinational logic lowers into phase 0**, the head's phase. The single-tick
+  path always did this (there the trailing segment *is* the one phase) and
+  `control_extract`'s path accepts it (`uart/rx`'s trailing `rx_dv.write(Zero)`, sim ≡
+  SV); the multi-tick path used to **refuse** it, so the same source was accepted or
+  rejected depending on whether an unrelated part of the module triggered extraction.
+* **`C` is emitted before `A`**, matching execution order: the simulator runs `C` in
+  the post-edge settle of the tick that opens the cycle and `A` in the pre-edge settle
+  of the tick that closes it. Unobservable through ports — `multi_write_collapse`
+  rejects a port written on both sides of a tick — but observable for a plain local
+  flowing from `C` into `A`.
+* **`C`'s register updates commit at the last tick's edge**, which is the edge that
+  *opens* `C`'s cycle. That is the post-edge continuation convention above ("a register
+  clocked at edge N is observable in cycle N"), and it is why moving a register update
+  after the tick is D1's sanctioned remedy. Because those updates and the preceding
+  phase's commit at the same edge, they **share a forwarding map**: `r = a.read(); tick;
+  w = r + 1;` must emit `w` from the *new* `r`, since the simulator computes it after
+  the edge. (Both lowering paths claimed this in a comment and neither did it, until a
+  differential case caught it.)
+
+A value flowing from `C` into `A` is still a **register**, by the liveness rule's
+back-edge clause — verified on `sync_2ff`, where `ff2 = ff1` in the trailing segment
+must be a flop or the two synchronizer stages collapse into one. Same cycle, but the
+trailing statements execute at an instant just after the edge, and a wire would keep
+tracking its inputs for the rest of that cycle.
+
+**Startup.** An `Out` written *only* in `C` reads as its initial value until the
+statement first runs, while the emitted continuous `assign` drives it from time 0 — so
+the two differ for the first cycle or two and agree thereafter. A continuous assign has
+no notion of "not yet written"; this is a property of an output first driven late, not
+of the rule above.
+
 ## Output timing — `Out` vs `RegOut`
 
 Two output-port kinds capture the Mealy/Moore distinction explicitly:
@@ -94,14 +137,58 @@ unobservable) or moving the register update after the `clk.tick().await` so the 
 `#[hardware(sequential, allow_pretick_alignment)]` — the waiver every lint in this space ships
 (Verilator's `lint_off BLKSEQ`, Verible's rule waivers); it silences the error, not the detection.
 
-Detection is `copper_analysis::unprotected_pretick_out_write`. Each clause has a measured witness:
-the read must *precede* the assignment (a trailing read does not protect); mixed alignment does
-**not** protect (a read on one branch leaves another branch exposed); `RegOut` is immune (changing
-*only* the port type flips a diverging module to agreeing); and the write must read a **register** —
-a constant write is idempotent across the phase shift, which is why `branch_merge_explicit`, driving
-three plain `Out`s from an unprotected path, agrees. Scope: only the pre-tick segment is examined, so a hazard in a *middle* segment of a multi-tick loop
-would not be caught — theoretical, with no known instance (the case originally cited, `accum_2`, was
-measured and does not diverge).
+**Detection is three rules, not one.** The obvious consolidation — one rule examining every segment —
+was implemented and measured **three times**, and rejected every time on corpus evidence: writing a
+plain `Out` after a tick is the *ordinary* multi-phase pattern and is correct, so a rule that cannot
+say which segment it is looking at drowns in false positives. What each rule may assume about its
+region is what separates them.
+
+- **`unprotected_pretick_out_write`** — the head segment (loop head → first tick), the shape above.
+  Every clause has a measured witness: the read must *precede* the assignment (a trailing read does
+  not protect); mixed alignment does **not** protect (a read on one branch leaves another branch
+  exposed); and `RegOut` is immune (changing *only* the port type flips a diverging module to
+  agreeing).
+- **`unprotected_trailing_out_write`** — the same hazard past the *last* tick, unguarded until
+  2026-08-25 and measurably divergent (`trailing_update`, one cycle, uniformly). Two widenings were
+  measured and rejected first: merging the trailing segment into the head region flags **25** modules
+  — including `fast_counter_corrected`, the module D1's own remedy produces — and treating every
+  trailing segment as its own region flags **10**, all single-tick memory modules like `rom_from_fn`,
+  which structurally matches the divergent DUT and *agrees*. The discriminator, found by flipping
+  exactly one thing, is **how many clock edges the body crosses per iteration**: with the identical
+  trailing body `n = n + 1; o.write(n);`, `loop { tick; … }` agrees and
+  `loop { for _ in 0..2 { tick } … }` diverges. In a single-tick loop the trailing statements *share
+  the head's phase* — falling off the end and re-entering costs no cycle — so there is no separate
+  region to misalign. Clause (i) does **not** carry over: the same DUT *with* a leading read still
+  diverges, which also refutes the natural hypothesis that the loop-top barrier pins the whole
+  iteration.
+- **`multi_phase_out_write`** — a plain `Out` driven in **more than one clock phase** (a phase being
+  a Comb-connected component of the CFG). This rule was already in the language: the multi-tick
+  lowering refuses the shape — *"driven in more than one phase … hold it in a register"* — but only
+  when it can **see** the phases, and control extraction hides them by rewriting a branch- or
+  loop-nested body into a single-tick `match pc` FSM whose `pc` states *are* the phases it meant to
+  count. Restating it on the source closes that blind spot. The instance that forced it: a one-cycle
+  pulse, `loop { for _ in 0..3 { tick } dv.write(One); tick; dv.write(Zero); }`, found while writing
+  the UART receiver's first sim-vs-Verilator test — one cycle late, uniformly, `RegOut` immune,
+  measured both ways. Widening D1 to cover it instead flags **36 of 120** corpus modules, ~30 with
+  passing equivalence tests (`det_010`, `mac_pipeline`, `dual_port_ram`, `bsg_dff_en`, every memory
+  fixture); this rule flags 9, six of them its own synthetic witnesses.
+
+**The constant-write exemption is narrower than it looks.** The misalignment changes *when* a write
+happens, so it is observable only if the value written differs between the phases — which is why a
+write of a constant was exempt. That premise holds only when the write happens on **every** path.
+Where a port is written on some paths and not others (the enabled-`Out` idiom), or different arms
+write different constants, the alternative is the port's *held* value, so *when* the write lands is
+observable even though the value written never changes. Both D1 rules therefore flag a port that is
+driven from a register **or** not written on all paths through the region. The witnesses are
+`pc_arm_write` and `pc_arm_toggle`, whose traces are each other shifted by exactly one cycle — a
+phase shift, not an initialization artifact — and `branch_merge_explicit`, which this doc previously
+cited as *agreeing*: it does not. It transpiles byte-identically to its twin, its twin agrees with
+it, and it leads its own emitted SystemVerilog by one. Narrowing the exemption cost exactly those
+three modules corpus-wide.
+
+Enforcement is asymmetric, and deliberately so: `multi_phase_out_write` runs in **both** front-ends
+(the transpiler honours the opt-out too, or a module that exists to demonstrate the hazard could not
+be measured against anything), while the two D1 rules run in the **macro** only.
 
 **This is the third member of the blocking/non-blocking family**, after `Out`-hold semantics and the
 multi-write collapse — and the three share a root cause worth stating plainly: **Copper infers the
@@ -170,12 +257,56 @@ testbench-observable difference, which is exactly why it could not be left in: s
 testbench* is this project's bar. Enforced in `control_extract` (which declines to flatten the
 shape) and reported by `chir_lower`; see `TODO` for the rejected alternatives.
 
+## Memory — staging and read latency
+
+`Memory<T, R, W, D, READ_LAT, WRITE_LAT>` (`copper-core/src/memory.rs`) is a first-class multi-port
+synchronous memory: `R` read ports, `W` write ports, latencies in cycles (`≥ 1`), a
+`WriteMode::{ReadFirst, WriteFirst}` same-address collision policy and a `ReadMode::{Sync, Async}`
+read policy. Both port kinds are fully pipelined — a new address or value may be presented every
+cycle regardless of what is in flight.
+
+**A read is *staged*, not returned.** `mem.read_port::<I>().read(addr)` presents an address; the
+result appears **at the clock edge** and is observed after the tick with `is_ready()` / `data()`.
+None of these are `async` — the `clk.tick().await` between them *is* the wait, which is what makes
+memory latency a property of the design's cycle structure rather than of an extra await kind.
+
+Four rules make the divergent shapes unwritable. All four live in `copper-analysis`, on the
+**source**, for the reason given under *One analysis, both front-ends*: control extraction rewrites
+branch- and loop-nested ticks into a single-tick `match pc` FSM, so a check downstream of it counts
+one phase where the `pc` states *are* the phases it meant to count.
+
+- **One access per bus per cycle** (`check_memory_staging`) — a physical port has a single address
+  bus. Two accesses conflict iff one can reach the other **without crossing a clock edge**, not
+  merely iff they share a phase. That distinction is the whole difference between a bus conflict and
+  a multiplexer: `rv32i_cpu`'s seven regfile writebacks sit in exclusive `match` arms, no path joins
+  any two, and each drives the bus in its own state — exactly what the emitted `always_comb` does.
+  Counting them instead reported a design error where there is a mux.
+- **Observe after the edge that produces it** (`check_memory_staging`) — reading `data()`/`is_ready()`
+  with no `read()` staged earlier on that port (the port never becomes ready), or before the
+  `clk.tick().await` that produces it, is a spanned compile error.
+- **No access inside a tick-free nested loop** (`check_memory_staging`) — such a loop is unrolled, so
+  every iteration's access lands in the same cycle on one address bus. Refused rather than counted
+  as one.
+- **No plain `Out` driven from a read result in a multi-phase module**
+  (`memory_result_drives_plain_out`) — the read pipeline re-captures on every clock edge, so a plain
+  `Out` wired to it either tracks the result into phases that do not observe it or latches one edge
+  after the capture the simulator reads. Measured: a full cycle late on every sampled value. The
+  remedies are `RegOut` or a register between the result and the port. A **single-phase** module is
+  unaffected and deliberately so — there the post-tick segment shares the head's phase and a plain
+  `Out` driven from `data()` is correct (`rom_direct`, pinned in
+  `tests/multiphase_memory_equivalence.rs`).
+
 ## Poll-order and cross-domain interleave independence
 
 **Single domain — poll-order independence.** `poll_tasks` order is an implementation detail: a
 well-formed design simulates **bit-identically** under any task order. Enforced by the poll-order
-fuzzer (`tests/poll_order_fuzz.rs`: `Insertion` ≡ `Reversed` ≡ `Seeded`). Item 6 will make the order
-canonical (levelized scheduling), retiring the fuzzer.
+fuzzer (`tests/poll_order_fuzz.rs`: `Insertion` ≡ `Reversed` ≡ `Seeded`). **Levelized scheduling
+(impl-plan item 6, landed 2026-07-30) made the order canonical** and is the compiled default
+(`SchedulerMode::env_default`, `copper-sim/src/executor.rs`; `COPPER_SCHEDULER` overrides it) — it
+polls in a topological order and ignores `PollOrder` entirely. The fuzzer was **not** retired: it is
+retained **pinned to `SchedulerMode::Fixpoint`**, because the fixpoint scheduler stays in-tree
+permanently as the differential oracle levelized is validated against, and an oracle that became
+order-dependent would silently cost that comparison its footing.
 
 **Multiple domains — cross-domain interleave independence.** Independently-ticking clock domains have
 no defined phase relationship. The generalized invariant: **a well-formed multi-clock design behaves
@@ -268,13 +399,20 @@ delta-settle forever. It is a hard, spanned **compile error** (a DFS back-edge c
 
 **Why shape-restriction soundness is not enough (worked example).** Before this analysis, the
 invariant held only as an *accident* of the single-trailing-tick construction. Codegen's control
-extraction still shows the failure mode it masks: `control_extract.rs::lower_into` (the "fell
-through without ticking" case, ~line 232) emits `pc = 0` **unconditionally** when a branch reaches
-the loop tail without
-ticking — silently handing a zero-tick branch a *free phantom cycle* rather than rejecting it. The
-CFG check makes "reaches a tick on every path" a real, checked property instead of a construction
-accident; the reachability guard runs *before* control extraction, so that fall-through is now
-unreachable for malformed input. A real instance was caught in the wild: `det_010_awaits`'s
+extraction is where the masked failure mode was visible: `lower_into`
+(`copper-codegen/src/control_extract.rs`, the "fell through without ticking" case) once emitted
+`pc = head` **unconditionally** when a branch reached the loop tail without ticking — silently
+handing a zero-tick branch a *free phantom cycle* rather than rejecting it. The CFG check makes
+"reaches a tick on every path" a real, checked property instead of a construction accident.
+
+Two independent changes closed that hole. The reachability guard runs *before* control extraction,
+so the fall-through is unreachable for malformed input; and the fall-through itself no longer
+guesses — it discriminates the two cases that look identical at the call site (`FallThrough`) and are
+a clock cycle apart. **`AfterTick`**: the body's own trailing tick was removed by the rotation that
+builds a nested loop's head state, so the fall-through *stands for* that tick and `pc = head` is
+exactly right. **`ZeroTime`**: nothing was removed, the source genuinely returns to the head in the
+same cycle, and a `goto` marker is emitted instead — `pc = head` would spend a cycle the program does
+not have. A real instance was caught in the wild: `det_010_awaits`'s
 `else if` chain had no final `else`, so holding `rstn=1, in_i=1` spins with zero ticks — flagged by
 the check and since fixed. Legitimate designs with *uneven* per-branch tick counts still pass
 (every path still crosses *a* tick), which is the property shape-restriction could not express.
@@ -290,6 +428,28 @@ reachability condition is enforced **recursively** — so a tickless cycle *insi
 (e.g. `loop { loop { if c { tick } } }`) is rejected. A tick-free nested loop is combinational
 (unrolled) and is not subject to the must-tick rule.
 
+### Combinational loops — the other graph
+
+The CFG above is **intra-module control flow**. A combinational loop lives in a different graph, and
+the distinction is not bookkeeping: *within* a module a comb cycle is unexpressible (Rust rejects the
+use-before-def), so every real one is **cross-module** and structurally invisible to the CFG. It is
+found instead in the **inter-module producer→consumer wiring DAG** that the levelized scheduler
+builds.
+
+`HardwareExecutor::comb_cycles()` (`copper-sim/src/executor.rs`) returns each strongly-connected
+component of size ≥ 2 in that combinational dependency graph — mutual plain-`Out` feedback with no
+`RegOut`, memory, or synchronizer to break it (each of those commits at the clock edge and so induces
+no combinational edge). It is **static**: it inspects the wiring without running the simulation, and
+is empty for a well-formed acyclic design.
+
+**Detection is not rejection.** A *convergent* combinational loop — a set-dominant latch, say — is
+legal hardware, and the levelized settle simulates it by iterating that component to a fixpoint
+(`iterate_scc`) while walking the SCCs in topological order, so the acyclic remainder is unaffected.
+Only a *non-convergent* loop fails, and only when the settle actually fails to converge: a component
+still dirty after `OSCILLATION_THRESHOLD` passes panics, naming the whole SCC. This is the one place
+the semantics are enforced at runtime rather than at compile time, because convergence is not a
+property the wiring graph alone can decide.
+
 ### One analysis, both front-ends (the c2 architecture)
 
 The CFG is keyed off `syn::ItemFn` — the representation both front-ends already hold — so it is a
@@ -299,3 +459,31 @@ single authoritative pass, not two that must agree. Its register output is valid
 (`copper-codegen/tests/register_reconciliation.rs`: codegen ≡ this set + only its synthesized
 phase/pc counter, corpus-wide). See `SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` item 2.
 
+## How these semantics are checked
+
+Three mechanisms, deliberately independent of each other:
+
+- **Independent hand-written Verilog.** `examples/basejump/` checks Copper modules against
+  third-party BaseJump STL Verilog, and the hand-written goldens (`pattern_detector_010.sv`,
+  `mac_fsm.sv`) anchor the rest. This is load-bearing: the shared analysis makes the simulator and
+  the transpiler agree on registers and well-formedness *by construction*, so an independent
+  reference is the only thing left that can catch a **timing** bug. Never the transpiler's own
+  output — that is circular.
+- **The corpus differential sweep.** `build.rs` generates one case per `#[hardware]` module in
+  `tests/fixtures/` and `examples/` into `tests/corpus_generated.rs` — seeded random stimulus, the
+  simulator versus the SystemVerilog that module transpiles to, under Verilator. A new module is
+  therefore covered the moment it exists, with no harness to write; what cannot be inferred lives in
+  three reviewed tables (`PARAMS` widths, `RESET`, `SKIP`), and `tools/regression.sh`'s **G-D** guard
+  asserts the sweep covered the corpus and ran. Its first run found two defects that had been in the
+  tree for weeks and were unreachable from the existing tests — a measured sim ≠ synth divergence in
+  `branch_merge_explicit`, and emitted SystemVerilog that would not parse (a port named `event`, a
+  keyword missing from the legalizer). See `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`.
+- **The two schedulers.** `tests/levelized_differential.rs` steps a design under both
+  `SchedulerMode::Levelized` and `SchedulerMode::Fixpoint` in lockstep and asserts **every wire holds
+  an identical value after every phase of every cycle**, so a divergence is localized to the exact
+  design, cycle, and phase. Its designs are chosen to span the topologies the levelized DAG must get
+  right (combinational chain, fan-out/fan-in, plain-`Out` register feeding combinational logic, a
+  `RegOut` pipeline, an independent two-clock design); corpus *breadth* under the levelized scheduler
+  comes from `tests/golden_traces.rs` running the frozen Verilator-matched goldens under it as well.
+  Fixpoint is retained permanently for exactly this reason: a scheduler change must be provably
+  behavior-neutral, not argued to be.

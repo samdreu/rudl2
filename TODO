@@ -1448,7 +1448,34 @@ TRANSPILATION:
      source-level name, so register_reconciliation now treats them like the
      phase/pc counter it already excluded.
 
-  ☐ Multi-tick loops SILENTLY DROP combinational statements after the LAST tick.
+  ✔ DECIDED AND IMPLEMENTED (2026-08-25) — TRAILING STATEMENTS. Was: multi-tick loops
+     silently dropped combinational statements after the last tick, then refused them
+     loudly, with "DECIDING where those statements belong is a real semantics question
+     … it needs sign-off rather than a default".
+     THE ANSWER WAS ALREADY IN design_docs/SYNCHRONOUS_SEMANTICS.md: "a clock cycle is
+     a maximal tick-free region of an execution". The trailing segment and the next
+     iteration's head are one such region — falling off the end of the body costs no
+     clock — so the trailing statements are IN THE HEAD'S CYCLE. Their combinational
+     logic now lowers into phase 0 on every path (the single-tick path always did;
+     `control_extract`'s path accepted them and agreed with its SV; only the multi-tick
+     path refused, so acceptance depended on whether an unrelated part of the module
+     triggered extraction).
+     Written up under "Trailing statements" in the semantics doc, with the two
+     consequences that are not obvious: emission order within the merged cycle is
+     TRAILING-then-HEAD (execution order — observable for a local flowing from one to
+     the other), and the trailing register updates SHARE A FORWARDING MAP with the
+     preceding phase, since both commit at the same edge and the trailing statements
+     run after it. Both lowering paths claimed that sharing in a comment and NEITHER
+     did it; `r = a.read(); tick; w = r + 1;` emitted `w` from the pre-edge `r`, a
+     cycle behind the simulator. Found by a differential fixture written for the
+     decision, not by the change itself.
+     Also recorded: an `Out` written ONLY in the trailing segment differs from its
+     emitted continuous `assign` for the first cycle or two (the simulator holds its
+     initial value until the statement first runs) and agrees thereafter — a property
+     of an output first driven late, pinned as a reasoned skip in the sweep.
+     Fixtures: tests/fixtures/trailing_statements_dut.rs, swept differentially.
+
+  ☐ (superseded, kept for the history) Multi-tick loops SILENTLY DROP combinational statements after the LAST tick.
      `shir_lower::lower_seq_body`'s multi-tick path never passes the trailing
      segment through `lower_pre_edge_stmts` — only the single-tick path does (where
      the trailing segment shares the one phase). Its REGISTER updates do flow, so

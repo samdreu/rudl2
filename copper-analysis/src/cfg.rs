@@ -505,6 +505,12 @@ impl Cfg {
     /// `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`.
     pub fn unprotected_pretick_out_write(&self) -> Vec<String> {
         let region = self.pre_tick_region();
+        let head_entries: Vec<usize> = self.nodes[self.head]
+            .succs
+            .iter()
+            .filter(|(_, k)| *k == EdgeKind::Comb)
+            .map(|&(s, _)| s)
+            .collect();
 
         let regs: BTreeSet<String> = self.registers().into_iter().collect();
 
@@ -533,7 +539,7 @@ impl Cfg {
                 continue;
             }
             for w in &node.writes {
-                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w) {
+                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w, &head_entries) {
                     driven.insert(w.clone());
                 }
             }
@@ -560,7 +566,14 @@ impl Cfg {
     /// The region is acyclic (a tickless cycle is rejected by `check_reachability`),
     /// so the memoized recursion terminates. A path that reaches a tick, or returns
     /// to the head, without writing counts as not-written.
-    fn written_on_all_paths(&self, port: &str) -> bool {
+    ///
+    /// `entries` is the region being asked about — the head's successors for the
+    /// pre-tick rule, the tick-edge targets that reach the head for the trailing one.
+    /// Asking the wrong region is a false positive: a port written unconditionally in
+    /// the TRAILING segment is never written on a path through the HEAD region, and
+    /// reads as conditional if the head's entries are used (measured on a fixture,
+    /// 2026-08-25).
+    fn written_on_all_paths(&self, port: &str, entries: &[usize]) -> bool {
         fn go(
             cfg: &Cfg,
             n: usize,
@@ -590,12 +603,6 @@ impl Cfg {
         }
 
         let mut memo = std::collections::HashMap::new();
-        let entries: Vec<usize> = self.nodes[self.head]
-            .succs
-            .iter()
-            .filter(|(_, k)| *k == EdgeKind::Comb)
-            .map(|&(s, _)| s)
-            .collect();
         !entries.is_empty() && entries.iter().all(|&e| go(self, e, port, &mut memo))
     }
 
@@ -650,6 +657,16 @@ impl Cfg {
             return Vec::new();
         }
 
+        // The trailing region's entries: what a clock edge hands control to, when that
+        // lands in the region running back to the head.
+        let trailing_entries: Vec<usize> = self
+            .nodes
+            .iter()
+            .flat_map(|n| n.succs.iter())
+            .filter(|(s, k)| *k == EdgeKind::Tick && *s != self.head && self.tick_free_reaches(*s, self.head))
+            .map(|&(s, _)| s)
+            .collect();
+
         let regs: BTreeSet<String> = self.registers().into_iter().collect();
         let mut driven: BTreeSet<String> = BTreeSet::new();
         for (n, node) in self.nodes.iter().enumerate() {
@@ -663,7 +680,8 @@ impl Cfg {
                 continue;
             }
             for w in &node.writes {
-                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w) {
+                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w, &trailing_entries)
+                {
                     driven.insert(w.clone());
                 }
             }

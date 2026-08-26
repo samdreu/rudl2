@@ -559,16 +559,28 @@ async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainCl
     );
 }
 
-/// Combinational statements after the LAST tick of a multi-tick loop. They have
-/// no phase to belong to and used to be dropped silently — an output written
-/// there simply vanished, leaving an undriven port. Not memory-specific; the
-/// memory work is just what surfaced it.
+/// Combinational statements after the LAST tick of a multi-tick loop **lower**, into
+/// phase 0 — decided 2026-08-25 from `design_docs/SYNCHRONOUS_SEMANTICS.md`, which
+/// says a clock cycle is *"a maximal tick-free region of an execution"*. The trailing
+/// statements and the head's are one such region, because falling off the end of the
+/// body and re-entering it costs no clock, so they are the same cycle.
+///
+/// They used to be refused here — "an output written there would be silently dropped"
+/// — while the single-tick path hoisted them and `control_extract`'s path accepted
+/// them and agreed with its SystemVerilog (`uart/rx`'s trailing `rx_dv.write(Zero)`).
+/// The same source was therefore accepted or rejected depending on whether an
+/// unrelated part of the module triggered extraction.
+///
+/// The behavioural half is `tests/fixtures/trailing_statements_dut.rs`, swept
+/// differentially. The rules that constrain WHAT may be written there are unchanged
+/// and separate: `unprotected_trailing_out_write` still refuses a plain `Out` driven
+/// from a register in this segment, which is the measured divergence.
 #[test]
-fn trailing_combinational_statements_in_a_multi_tick_loop_are_rejected() {
+fn trailing_combinational_statements_in_a_multi_tick_loop_lower_into_phase_zero() {
     let src = r#"
 #[hardware(sequential)]
 async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk>,
-           t: Out<Bits<8>, MainClk>) {
+           t: RegOut<Bits<8>, MainClk>) {
     let mut r: Bits<8> = Bits::zero();
     loop {
         r = a.read();
@@ -579,13 +591,13 @@ async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk
     }
 }
 "#;
-    let err = transpile(src).expect_err(
-        "NOW SUPPORTED: trailing combinational statements lower. That decides which phase they \
-         belong to — a semantics question; make sure it was decided, not defaulted.",
+    let sv = transpile(src).expect(
+        "trailing combinational statements must lower — they are in the head's cycle, \
+         which is what a maximal tick-free region means",
     );
     assert!(
-        err.contains("after the last `clk.tick().await`"),
-        "reproduced a *different* error than the tracked trailing-segment gap: {err}"
+        sv.contains("t <= r"),
+        "the trailing `RegOut` drive must reach the emitted module, not be dropped:\n{sv}"
     );
 }
 

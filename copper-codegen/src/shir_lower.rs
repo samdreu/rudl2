@@ -437,41 +437,52 @@ fn lower_seq_body(
         // post_edge = reg_assigns from seg_0 (captured at clock edge) +
         //             reg_assigns from seg_1 / trailing (same edge, next iteration wraps here).
         // Both segments share a forwarding map so seg_1 sees seg_0's register assignments.
+        // Execution order within the cycle, which is what the emitted `always_comb`
+        // must reproduce: the TRAILING statements run first (in the post-edge settle
+        // of the tick that opens this cycle) and the head's run after (in the
+        // pre-edge settle of the tick that closes it). Both are one cycle — "a clock
+        // cycle is a maximal tick-free region of an execution"
+        // (design_docs/SYNCHRONOUS_SEMANTICS.md) — and the back edge costs no time.
+        //
+        // Unobservable for ports, since `multi_write_collapse` rejects a port written
+        // on both sides of a tick; observable for a plain local flowing from the
+        // trailing statements into the head, which is why the order is stated rather
+        // than left to whichever segment happened to be lowered first.
         let mut pre_edge = lower_pre_edge_stmts(
-            &segments[0],
+            &segments[1],
             &promoted_names,
             &no_renames,
             &seq.registers,
             module_span,
         )?;
-        // The trailing (post-tick) segment's *combinational* logic — wires and
-        // output-port drives, including inside `if`/`match` — belongs to this
-        // phase's pre-edge: it computes the registered outputs from the state the
-        // edge just latched (e.g. a Moore output written after the tick). Passing
-        // the whole segment through the pre-edge lowering keeps those and drops
-        // the register reassignments (which `extract_reg_updates` below turns into
-        // this edge's post_edge updates). Previously only `Wire`s were hoisted, so
-        // a post-tick `out.write(...)` was silently dropped.
+        // …then the head segment's own combinational logic. Register reassignments
+        // are dropped from both (`extract_reg_updates` below turns them into this
+        // edge's post_edge updates).
         pre_edge.extend(lower_pre_edge_stmts(
-            &segments[1],
+            &segments[0],
             &promoted_names,
             &no_renames,
             &seq.registers,
             module_span,
         )?);
-        let mut all_post_edge = extract_reg_updates(
+        // One forwarding map across both: they commit at the same edge, and the
+        // trailing segment runs after it.
+        let mut fwd: HashMap<String, SHIRExpr> = HashMap::new();
+        let mut all_post_edge = extract_reg_updates_shared(
             &segments[0],
             &seq.registers,
             &promoted_names,
             module_span,
             &no_renames,
+            &mut fwd,
         )?;
-        let trailing_updates = extract_reg_updates(
+        let trailing_updates = extract_reg_updates_shared(
             &segments[1],
             &seq.registers,
             &promoted_names,
             module_span,
             &no_renames,
+            &mut fwd,
         )?;
         all_post_edge.extend(trailing_updates);
 
@@ -489,6 +500,10 @@ fn lower_seq_body(
         //
         // Phase renames: promoted wires declared in earlier phases are renamed
         // from `x` to `x_r` in the phase where they are consumed.
+
+        // The trailing segment's combinational statements, lowered in the last
+        // phase's rename scope and destined for phase 0 (see below).
+        let mut trailing_comb: Vec<SHIRStmt> = Vec::new();
 
         for phase_idx in 0..n_ticks {
             let seg_idx = phase_idx; // seg_k → phase_k
@@ -510,12 +525,16 @@ fn lower_seq_body(
             module_span,
         )?;
 
-            let mut post_edge = extract_reg_updates(
+            // Shared with the trailing segment below when this is the last phase:
+            // both commit at this edge, and the trailing statements run after it.
+            let mut fwd: HashMap<String, SHIRExpr> = HashMap::new();
+            let mut post_edge = extract_reg_updates_shared(
                 &segments[seg_idx],
                 &seq.registers,
                 &promoted_names,
                 module_span,
                 &phase_renames,
+                &mut fwd,
             )?;
 
             if phase_idx == n_ticks - 1 {
@@ -526,28 +545,38 @@ fn lower_seq_body(
                 // an output written after the last tick simply vanished, leaving
                 // an undriven port. Fail loudly instead; deciding which phase they
                 // belong to is a semantics question, not a lowering detail.
-                let trailing_comb =
-                    lower_pre_edge_stmts(
-            &segments[n_ticks],
-            &promoted_names,
-            &phase_renames,
-            &seq.registers,
-            module_span,
-        )?;
-                if !trailing_comb.is_empty() {
-                    return Err(SHIRLowerError::UnsupportedConstruct {
-                        description: "combinational statements after the last `clk.tick().await`                                       of a multi-tick loop are not supported (an output written                                       there would be silently dropped); move them before the last                                       tick"
-                            .to_string(),
-                        span: module_span,
-                    });
-                }
+                // The trailing segment's COMBINATIONAL statements belong to the
+                // cycle that follows this edge — which is PHASE 0's, because "a
+                // clock cycle is a maximal tick-free region of an execution"
+                // (design_docs/SYNCHRONOUS_SEMANTICS.md) and falling off the end of
+                // the body back to its head costs no time. They are collected here,
+                // where the last phase's renames are in scope, and prepended to
+                // phase 0 below — before phase 0's own statements, since the
+                // simulator runs them first (post-edge settle of this edge) and the
+                // head's after (pre-edge settle of the next).
+                //
+                // They used to be REFUSED on this path — "an output written there
+                // would be silently dropped" — while the single-tick path hoisted
+                // them and `control_extract`'s path accepted them and agreed with
+                // its SystemVerilog (`uart/rx`'s trailing `rx_dv.write(Zero)`,
+                // verified). So the same source was accepted or rejected depending
+                // on whether an unrelated part of the module triggered extraction.
+                // Decided 2026-08-25, from the semantics doc rather than by default.
+                trailing_comb = lower_pre_edge_stmts(
+                    &segments[n_ticks],
+                    &promoted_names,
+                    &phase_renames,
+                    &seq.registers,
+                    module_span,
+                )?;
                 // Trailing segment maps to the same phase — same renames apply
-                let trailing_updates = extract_reg_updates(
+                let trailing_updates = extract_reg_updates_shared(
                     &segments[n_ticks],
                     &seq.registers,
                     &promoted_names,
                     module_span,
                     &phase_renames,
+                    &mut fwd,
                 )?;
                 post_edge.extend(trailing_updates);
             }
@@ -575,6 +604,15 @@ fn lower_seq_body(
             });
 
             phases.push(SHIRPhase { phase_idx, pre_edge, post_edge });
+        }
+
+        // Phase 0 opens with the trailing segment: same cycle, and the simulator runs
+        // it first. `pre_edge` is a plain statement list, so "before" is a splice.
+        if !trailing_comb.is_empty() {
+            let head = &mut phases[0].pre_edge;
+            let mut merged = trailing_comb;
+            merged.append(head);
+            *head = merged;
         }
 
         // Add phase_r register
@@ -745,9 +783,31 @@ fn extract_reg_updates(
     span: SourceSpan,
     renames: &HashMap<String, String>,
 ) -> Result<Vec<SHIRRegUpdate>, SHIRLowerError> {
-    let reg_names = reg_name_set(registers, promoted_names);
     let mut forwarding: HashMap<String, SHIRExpr> = HashMap::new();
-    extract_updates_from_stmts(stmts, &reg_names, span, renames, &mut forwarding)
+    extract_reg_updates_shared(stmts, registers, promoted_names, span, renames, &mut forwarding)
+}
+
+/// As [`extract_reg_updates`], but with the forwarding map supplied by the caller so
+/// **two segments that commit at the same clock edge** share it.
+///
+/// The trailing segment and the phase before it are exactly that pair: the trailing
+/// statements execute in the post-edge settle of that edge, so they read the values
+/// the edge has just applied. Without sharing, `r = a.read(); tick; w = r + 1;`
+/// emits `r <= a; w <= r + 1` — `w` from the PRE-edge `r`, a cycle behind what the
+/// simulator computes. The single-tick path's comment has claimed this sharing since
+/// the path was written; the code made a fresh map per call and neither path did it.
+/// Found 2026-08-25 by a corpus differential case for the trailing-statement
+/// semantics.
+fn extract_reg_updates_shared(
+    stmts: &[CHIRStmt],
+    registers: &[CHIRRegDecl],
+    promoted_names: &HashSet<String>,
+    span: SourceSpan,
+    renames: &HashMap<String, String>,
+    forwarding: &mut HashMap<String, SHIRExpr>,
+) -> Result<Vec<SHIRRegUpdate>, SHIRLowerError> {
+    let reg_names = reg_name_set(registers, promoted_names);
+    extract_updates_from_stmts(stmts, &reg_names, span, renames, forwarding)
 }
 
 /// Recursive helper that processes statements in order, threading a forwarding map
