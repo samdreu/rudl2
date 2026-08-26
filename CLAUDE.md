@@ -108,7 +108,12 @@ Flags: `-o <out.sv>`, `--module <name>` (required when a file has >1 module),
   `infer_registers` (backward-liveness register inference — a local is a register
   iff it is defined-in-loop ∧ live-across-a-tick), `check_reachability` (every loop
   path must reach a `clk.tick().await`, enforced as a hard spanned compile error in
-  **both** front-ends), and the G2 structural reg-match helpers. Consumed by both
+  **both** front-ends), and the G2 structural reg-match helpers. It is also where
+  the checks that reason about **clock phases** live — `multi_phase_out_write`,
+  `check_memory_staging`, `memory_result_drives_plain_out` — because a check
+  downstream of `control_extract` cannot see the phases it is counting (that pass
+  rewrites branch- or loop-nested ticks into a single-tick `match pc` FSM). Any new
+  phase-sensitive rule belongs here, on the source, not in codegen. Consumed by both
   `copper-macros` and `copper-codegen`.
 - **`copper-macros`** — the `#[hardware(sequential|combinational|synchronizer)]`
   proc macro. Validates the signature, enforces CDC rules at compile time,

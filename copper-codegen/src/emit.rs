@@ -539,12 +539,27 @@ impl Emitter<'_> {
                     }
                     self.out.push_str(&format!("{}end\n", self.indent(level + 1)));
                 }
-                if let Some(d) = default {
-                    self.out.push_str(&format!("{}default: begin\n", self.indent(level + 1)));
-                    for st in d {
-                        self.comb_stmt(st, level + 2);
+                match default {
+                    Some(d) => {
+                        self.out
+                            .push_str(&format!("{}default: begin\n", self.indent(level + 1)));
+                        for st in d {
+                            self.comb_stmt(st, level + 2);
+                        }
+                        self.out.push_str(&format!("{}end\n", self.indent(level + 1)));
                     }
-                    self.out.push_str(&format!("{}end\n", self.indent(level + 1)));
+                    // An EMPTY default rather than none: Verilator runs with `-Wall`,
+                    // where an incompletely-covered case is CASEINCOMPLETE and fails
+                    // the build. A `match` with no wildcard arm reaches here — an
+                    // extracted `match pc` whose comb work lives in only some states
+                    // is the routine one — and doing nothing on the unlisted values is
+                    // exactly what the missing arm already meant: every net this block
+                    // drives is assigned its default at the top of the `always_comb`.
+                    None => {
+                        self.out
+                            .push_str(&format!("{}default: begin\n", self.indent(level + 1)));
+                        self.out.push_str(&format!("{}end\n", self.indent(level + 1)));
+                    }
                 }
                 self.out.push_str(&format!("{}endcase\n", self.indent(level)));
             }

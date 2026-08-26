@@ -515,6 +515,11 @@ fn preload_reading_a_signal_is_rejected() {
 
 /// Two accesses to one port in a single cycle. The simulator silently keeps the
 /// last one (it overwrites pipeline stage 0); one physical address bus cannot.
+///
+/// "In a single cycle" is a per-PATH question, not a count of sites: accesses on
+/// mutually exclusive branches are a multiplexer and are accepted (anchored by
+/// `tests/extracted_memory_equivalence.rs::exclusive_arm_writes_…`). The extra
+/// write below is unconditional, so whichever cycle runs the guarded one runs it too.
 #[test]
 fn two_accesses_to_one_memory_port_are_rejected() {
     let src = mem_dut(
@@ -606,6 +611,114 @@ async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainCl
     assert!(
         err.contains("is read before the `clk.tick().await` that produces it"),
         "reproduced a *different* error than the read-ordering rule: {err}"
+    );
+}
+
+/// A memory in a module that **control extraction rewrites**. Until 2026-08-25
+/// this was refused: the staging rules were decided over the lowered body's
+/// tick-delimited segments, and extraction folds a branch- or loop-nested tick
+/// into a single-tick `match pc` FSM, so every access landed in one segment and
+/// an ordinary ROM read looked like a same-cycle one. The rules now run on the
+/// source (`copper_analysis::check_memory_staging`). `tests/extracted_memory_equivalence.rs`
+/// carries the behavioural sim ≡ transpiled-SV check for both extraction triggers.
+#[test]
+fn memory_in_an_extracted_module_is_supported() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: RegOut<Bits<16>, MainClk>) {
+    let rom = Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::new(clk.clone(), 256);
+    loop {
+        rom.read_port::<0>().read(a.read().as_usize());
+        clk.tick().await;
+        o.write(rom.read_port::<0>().data());
+        for _ in 0..2 { clk.tick().await; }
+    }
+}
+"#;
+    let sv = transpile(src).expect("a memory design that needs extraction must transpile");
+    assert!(
+        sv.contains("case (pc)") && sv.contains("rom_rd0_q0 <= rom_rd0_data;"),
+        "expected an extracted FSM with a read pipeline stage, got:\n{sv}"
+    );
+}
+
+/// A plain `Out` driven straight from a read result in an EXTRACTED module. The
+/// read pipeline re-captures on every edge, so this has no correct emitted form —
+/// measured on exactly this DUT, one cycle late on every sampled value, before the
+/// rule was moved somewhere that can see it. `vlir_lower`'s copy gives up on
+/// `phases.len() < 2`, and an extracted module always has exactly one lowered
+/// phase; it was unreachable only because the staging rules used to reject every
+/// extracted memory design first.
+#[test]
+fn a_plain_out_driven_from_a_read_result_in_an_extracted_module_is_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: Out<Bits<16>, MainClk>) {
+    let rom = Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::new(clk.clone(), 256);
+    loop {
+        rom.read_port::<0>().read(a.read().as_usize());
+        clk.tick().await;
+        o.write(rom.read_port::<0>().data());
+        for _ in 0..2 { clk.tick().await; }
+    }
+}
+"#;
+    let err = transpile(src).expect_err(
+        "NOW SUPPORTED: a plain `Out` driven from a read result across phases. It was measured          landing a full cycle late; promote it to an equivalence test before believing this.",
+    );
+    assert!(
+        err.contains("multi-phase") && err.contains("RegOut"),
+        "reproduced a *different* error than the tracked plain-Out gap: {err}"
+    );
+}
+
+/// …and the rule still bites there. This is the direction that matters: the check
+/// has to be able to REJECT inside an extracted module, which the segment-based
+/// one could not do at all once the ticks had become `pc` states.
+#[test]
+fn a_same_cycle_read_result_in_an_extracted_module_is_still_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: RegOut<Bits<16>, MainClk>) {
+    let rom = Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::new(clk.clone(), 256);
+    loop {
+        rom.read_port::<0>().read(a.read().as_usize());
+        o.write(rom.read_port::<0>().data());
+        clk.tick().await;
+        for _ in 0..2 { clk.tick().await; }
+    }
+}
+"#;
+    let err = transpile(src).expect_err(
+        "NOW ACCEPTED: an extracted module observing a read result in its staging cycle. That is \
+         a cycle-early read; check what the emitted FSM does with it.",
+    );
+    assert!(
+        err.contains("is read before the `clk.tick().await` that produces it"),
+        "reproduced a *different* error than the read-ordering rule: {err}"
+    );
+}
+
+/// Same, for the one-bus rule.
+#[test]
+fn two_accesses_in_one_cycle_of_an_extracted_module_are_still_rejected() {
+    let src = r#"
+#[hardware(sequential)]
+async fn m(clk: Clock<MainClk>, a: In<Bits<8>, MainClk>, o: RegOut<Bits<16>, MainClk>) {
+    let rom = Memory::<Bits<16>, 1, 0, MainClk, 1, 1>::new(clk.clone(), 256);
+    loop {
+        rom.read_port::<0>().read(a.read().as_usize());
+        rom.read_port::<0>().read(0);
+        clk.tick().await;
+        o.write(rom.read_port::<0>().data());
+        for _ in 0..2 { clk.tick().await; }
+    }
+}
+"#;
+    let err = transpile(src).expect_err("one address bus, two drivers in a cycle");
+    assert!(
+        err.contains("accessed 2 times in one cycle"),
+        "reproduced a *different* error than the double-drive rule: {err}"
     );
 }
 

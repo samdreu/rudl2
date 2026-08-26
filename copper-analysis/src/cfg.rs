@@ -50,6 +50,48 @@ pub enum EdgeKind {
     Tick,
 }
 
+/// One **memory-port access site**, as it is spelled in the source.
+///
+/// The transpiler's memory rules are all about *when* an access happens relative
+/// to a clock edge, so they have to be decided where the edges are still visible:
+/// on the source. Downstream of `control_extract` they are not — a body whose
+/// ticks live inside branches or loops is rewritten into a single-tick `match pc`
+/// FSM, which is exactly the shape a segment-splitting check reads as "everything
+/// happens in one cycle". See [`Cfg::check_memory_staging`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct MemAccess {
+    /// The memory local's name (`mem` in `mem.read_port::<0>()`).
+    mem: String,
+    /// The port index as written in the turbofish, kept as text: an index that is
+    /// not a literal belongs to a generic memory, which the transpiler refuses
+    /// downstream anyway, and text keeps the two spellings distinct meanwhile.
+    port: String,
+    kind: MemAccessKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MemAccessKind {
+    /// `read_port::<K>().read(addr)` — drives the port's address bus this cycle.
+    StageRead,
+    /// `write_port::<K>().write(addr, v)` — drives the write bus this cycle.
+    StageWrite,
+    /// `read_port::<K>().data()` / `.is_ready()` — observes what the *edge*
+    /// produced, so it belongs to a later cycle than the staging that fed it.
+    Observe(&'static str),
+}
+
+impl MemAccessKind {
+    /// The physical bus an access drives, or `None` for an observation (which
+    /// drives nothing and so never conflicts).
+    fn bus(self) -> Option<bool> {
+        match self {
+            MemAccessKind::StageRead => Some(true),
+            MemAccessKind::StageWrite => Some(false),
+            MemAccessKind::Observe(_) => None,
+        }
+    }
+}
+
 /// One CFG node. Kept at single-statement granularity so `defs`/`uses` are clean
 /// for the liveness dataflow (use-before-def within a node is handled by the
 /// `use ∪ (out − def)` transfer, so `let x = f(x)` keeps `x` live-in correctly).
@@ -68,6 +110,12 @@ struct Node {
     /// Combinational output ports (`Out<…>`, not `RegOut`) driven here via
     /// `port.write(…)` — the def/use of *ports* the definite-assignment check keys on.
     writes: BTreeSet<String>,
+    /// Memory-port access sites appearing in this node's own expression —
+    /// `mem.read_port::<K>().read(a)` / `.data()` / `.is_ready()` and
+    /// `mem.write_port::<K>().write(a, v)`. A *folded* nested loop node carries
+    /// every access in its whole body (the region is opaque here; the sub-CFG in
+    /// `nested_ticking_loops` checks its interior precisely).
+    mem: Vec<MemAccess>,
     /// True iff this is a *folded* nested loop node whose `writes` is the
     /// conservative all-outputs over-approximation (not a real single `port.write`).
     /// The multi-write-collapse detector must not read it as an explicit write.
@@ -99,6 +147,7 @@ impl Node {
             tick_clock: None,
             succs: Vec::new(),
             writes: BTreeSet::new(),
+            mem: Vec::new(),
             folded: false,
             may_exit_without_tick: false,
             span,
@@ -152,7 +201,7 @@ impl Cfg {
 
         let comb_outputs = combinational_outputs(f);
 
-        let mut b = Builder::new(comb_outputs.clone(), in_param_names(f));
+        let mut b = Builder::new(comb_outputs.clone(), in_param_names(f), memory_locals(f));
         // The head is node 0: an empty node whose successor is the first body node.
         // Every back-edge (trailing tick, fall-through) targets it.
         let head = b.new_node(Node::empty(loop_span));
@@ -180,7 +229,7 @@ impl Cfg {
     /// rejects. Structure: `head → body → exit` sink, no back-edge.
     pub fn build_combinational(f: &ItemFn) -> Cfg {
         let comb_outputs = combinational_outputs(f);
-        let mut b = Builder::new(comb_outputs.clone(), in_param_names(f));
+        let mut b = Builder::new(comb_outputs.clone(), in_param_names(f), memory_locals(f));
         let span = f.sig.ident.span();
         let exit = b.new_node(Node::empty(span));
         let head = b.build_block(&f.block.stmts, exit);
@@ -570,6 +619,342 @@ impl Cfg {
         phases.into_iter().filter(|(_, p)| p.len() > 1).map(|(port, _)| port).collect()
     }
 
+    /// Enforce the memory-port rules **on the source**, where the clock edges are
+    /// still visible.
+    ///
+    /// Copper's memory model is that `read`/`write` *stage* a bus during a cycle and
+    /// `data`/`is_ready` *observe* what the following clock edge produced. Three
+    /// things follow, and each guards a place where the emitted array would silently
+    /// disagree with the simulator:
+    ///
+    /// * **One access per bus per cycle.** A physical port has one address bus. The
+    ///   simulator silently keeps the last write of a cycle; hardware cannot.
+    /// * **A result is observed after the edge that produces it** — never in the same
+    ///   cycle as the staging that feeds it, which would read it a cycle early.
+    /// * **A result has a staging somewhere.** Observing a port nothing ever stages
+    ///   reads a port that never becomes ready.
+    ///
+    /// # Why this is not in codegen
+    ///
+    /// It was, in `chir_lower::validate_memory_usage`, expressed over the *segments*
+    /// a loop body splits into at `clk.tick().await`. `control_extract` runs first
+    /// and rewrites any body whose ticks live inside branches or loops into a
+    /// **single-tick `match pc` FSM** — so the segments it counted are gone, and
+    /// every access in the module lands in one of them. Measured: this transpiles
+    ///
+    /// ```text
+    /// loop { rom.read(addr); tick; data.write(rom.data()); }
+    /// ```
+    ///
+    /// and appending `for _ in 0..2 { tick }` — which changes nothing about the
+    /// staging — made it fail with *"read before the `clk.tick().await` that produces
+    /// it"*. A false positive that made **any** memory design needing control
+    /// extraction unwritable. Same class as [`multi_phase_out_write`](Self::multi_phase_out_write):
+    /// a check that counts a syntactic feature placed downstream of a pass that
+    /// legitimately removes it.
+    ///
+    /// # What replaces "segment k precedes segment n"
+    ///
+    /// Reachability over **tick-free** paths, which is the thing segment order was
+    /// approximating. An observation is early iff *every* staging of its port can
+    /// reach it without crossing a tick edge, and two accesses share a bus cycle iff
+    /// one reaches the other the same way. Walking through the loop head is
+    /// deliberate: falling off the end of the body and re-entering it costs no
+    /// cycle, so the trailing statements and the head run in the same one — which is
+    /// also why the segment-index form got that pairing wrong in both directions.
+    ///
+    /// A **folded** nested loop is opaque here, so its accesses are attributed to the
+    /// node as a whole (enough for "a staging exists" and for the tick edge that
+    /// separates it from what follows) and its interior is checked precisely in its
+    /// own sub-CFG, which is where the ticks inside it are visible.
+    pub fn check_memory_staging(&self) -> Result<(), (Span, String)> {
+        self.check_memory_staging_inner(true)
+    }
+
+    /// `require_staging` is false inside a nested loop's sub-CFG: the staging that
+    /// feeds an observation there may well live in the enclosing loop, so only the
+    /// *ordering* rules apply. The enclosing CFG sees every access (the folded node
+    /// carries the whole body) and answers the existence question for both.
+    fn check_memory_staging_inner(&self, require_staging: bool) -> Result<(), (Span, String)> {
+        // A tick-free nested loop is unrolled, so an access inside it becomes N
+        // accesses on one bus in one cycle. Refused rather than counted as one.
+        for node in &self.nodes {
+            if node.folded && !node.is_tick && !node.mem.is_empty() {
+                let a = &node.mem[0];
+                return Err((
+                    node.span,
+                    format!(
+                        "memory `{}` is accessed inside a nested loop with no \
+                         `clk.tick().await`; that loop is unrolled, so every iteration's \
+                         access lands in the same cycle on one address bus",
+                        a.mem
+                    ),
+                ));
+            }
+        }
+
+        // One access per bus per cycle. Two accesses conflict iff one can reach the
+        // other WITHOUT crossing a clock edge — not merely iff they share a phase.
+        // The distinction is the whole difference between a bus conflict and a
+        // multiplexer: `rv32i_cpu`'s seven regfile writebacks sit in exclusive
+        // `match` arms, no path joins any two of them, and each drives the bus in
+        // its own state — which is exactly what the emitted `always_comb` does.
+        // Counting them instead reported a design error where there is a mux.
+        //
+        // A folded tick-bearing loop contributes at most ONE site per bus: its
+        // interior may legitimately access the bus once per iteration (separate
+        // cycles), and its own sub-CFG is where that is checked. It does still
+        // contribute, because its first iteration runs in the cycle that reaches it.
+        let mut sites: Vec<(usize, (String, bool, String), Span)> = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            let mut here: BTreeSet<(String, bool, String)> = BTreeSet::new();
+            for a in &node.mem {
+                let Some(is_read) = a.kind.bus() else { continue };
+                let key = (a.mem.clone(), is_read, a.port.clone());
+                if node.folded && !here.insert(key.clone()) {
+                    continue;
+                }
+                sites.push((i, key, node.span));
+            }
+        }
+        for (p, (i, key, span)) in sites.iter().enumerate() {
+            let conflicting: Vec<&(usize, (String, bool, String), Span)> = sites
+                .iter()
+                .enumerate()
+                .filter(|(q, (j, k, _))| {
+                    *q != p
+                        && k == key
+                        && (self.tick_free_reaches(*i, *j) || self.tick_free_reaches(*j, *i))
+                })
+                .map(|(_, s)| s)
+                .collect();
+            if conflicting.is_empty() {
+                continue;
+            }
+            let (mem, is_read, port) = key;
+            let n = conflicting.len() + 1;
+            return Err((
+                *span,
+                format!(
+                    "memory `{mem}` {} port {port} is accessed {n} times in one cycle; a \
+                     physical port has a single address bus. Merge the accesses into one, \
+                     selecting the address and data with a conditional",
+                    if *is_read { "read" } else { "write" }
+                ),
+            ));
+        }
+
+        // Where each read port is staged, so an observation can ask whether any
+        // staging is separated from it by a clock edge. Positions come from THIS
+        // graph; existence (below) looks through the folds as well, since a staging
+        // inside a nested loop is still a staging.
+        let mut staged: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            for a in &node.mem {
+                if a.kind == MemAccessKind::StageRead {
+                    staged.entry((a.mem.clone(), a.port.clone())).or_default().push(i);
+                }
+            }
+        }
+        let anywhere = self.staged_ports();
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            for a in &node.mem {
+                let MemAccessKind::Observe(what) = a.kind else { continue };
+                let (mem, port) = (&a.mem, &a.port);
+                let Some(sites) = staged.get(&(mem.clone(), port.clone())) else {
+                    if !require_staging || anywhere.contains(&(mem.clone(), port.clone())) {
+                        continue;
+                    }
+                    return Err((
+                        node.span,
+                        format!(
+                            "`{mem}.read_port::<{port}>().{what}()` is read, but nothing stages a \
+                             `read()` on that port earlier in the loop — the port never becomes \
+                             ready. Stage the address with `read(addr)` before a \
+                             `clk.tick().await`, and observe the result after it"
+                        ),
+                    ));
+                };
+                // A staging the observation is NOT tick-free-reachable from is one
+                // whose result an edge has already produced — the shape the rule wants.
+                if sites.iter().any(|&s| !self.tick_free_reaches(s, i)) {
+                    continue;
+                }
+                return Err((
+                    node.span,
+                    format!(
+                        "`{mem}.read_port::<{port}>().{what}()` is read before the \
+                         `clk.tick().await` that produces it. The read result appears at the \
+                         clock edge, so it must be observed after the tick — stage the address \
+                         with `read(addr)` before a `clk.tick().await`, and observe the result \
+                         after it"
+                    ),
+                ));
+            }
+        }
+
+        for sub in &self.nested_ticking_loops {
+            sub.check_memory_staging_inner(false)?;
+        }
+        Ok(())
+    }
+
+    /// Plain combinational `Out` ports driven from a **memory read result** in a
+    /// module with more than one clock phase.
+    ///
+    /// The read pipeline re-captures on every clock edge, so a plain `Out` wired to
+    /// it either tracks it into the phases that do not observe it, or — once the
+    /// implicit-hold conversion takes over — latches one edge after the capture the
+    /// simulator reads. Measured: a full cycle late on every sampled value. `RegOut`
+    /// is the form that works, or a register between the result and the port.
+    ///
+    /// `vlir_lower::reject_memory_driven_comb_outputs` states the same rule over the
+    /// lowered phases, and cannot see this case: it gives up on `phases.len() < 2`,
+    /// and an extracted module has exactly one lowered phase no matter how many
+    /// clock phases the source has. That blind spot was harmless only for as long as
+    /// the memory staging rules happened to reject every extracted memory design
+    /// before it could matter — measured the day they stopped:
+    /// `loop { rom.read(a); tick; o.write(rom.data()); for _ in 0..2 { tick } }`
+    /// diverges by exactly one cycle, uniformly. Hence this copy, on the source,
+    /// where the phases are still countable.
+    ///
+    /// A **single-phase** module is unaffected and deliberately so: there the
+    /// post-tick segment shares the head's phase and a plain `Out` driven from
+    /// `data()` is correct (`rom_direct`, pinned in
+    /// `tests/multiphase_memory_equivalence.rs`).
+    ///
+    /// The drive is followed through same-cycle locals: a value that survives a
+    /// clock edge is a register by construction, so excluding registers from the
+    /// taint is what keeps it within one phase.
+    pub fn memory_result_drives_plain_out(&self) -> Vec<String> {
+        let phases = self.comb_phases();
+        if phases.iter().collect::<BTreeSet<_>>().len() < 2 {
+            return Vec::new();
+        }
+        let observes = |n: &Node| n.mem.iter().any(|a| matches!(a.kind, MemAccessKind::Observe(_)));
+        if !self.nodes.iter().any(observes) {
+            return Vec::new();
+        }
+
+        let regs: BTreeSet<String> = self.registers().into_iter().collect();
+        let mut tainted: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for node in &self.nodes {
+                if !(observes(node) || node.uses.iter().any(|u| tainted.contains(u))) {
+                    continue;
+                }
+                for d in &node.defs {
+                    if !regs.contains(d) && tainted.insert(d.clone()) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut out = BTreeSet::new();
+        for node in &self.nodes {
+            // A folded node's `writes` is the conservative all-outputs
+            // over-approximation, not a real `port.write`.
+            if node.folded || node.writes.is_empty() {
+                continue;
+            }
+            if observes(node) || node.uses.iter().any(|u| tainted.contains(u)) {
+                out.extend(node.writes.iter().cloned());
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Union-find over `Comb` edges: `phases[n]` is the representative of the clock
+    /// phase (Comb-connected component) node `n` runs in. A tick edge is the only
+    /// thing that separates two of them, and the trailing statements merge with the
+    /// head — re-entering the body costs no cycle.
+    fn comb_phases(&self) -> Vec<usize> {
+        let n = self.nodes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for i in 0..n {
+            let succs: Vec<usize> = self.nodes[i]
+                .succs
+                .iter()
+                .filter(|(_, k)| *k == EdgeKind::Comb)
+                .map(|&(s, _)| s)
+                .collect();
+            for s in succs {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, s));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+        (0..n).map(|i| find(&mut parent, i)).collect()
+    }
+
+    /// The accesses that run in the cycle this (nested-loop) CFG is *entered* in —
+    /// those reachable from the head without crossing a tick edge. The enclosing
+    /// graph folds this loop into one node and needs exactly these: the rest of the
+    /// body is separated from that node's cycle by the loop's own clock edges.
+    fn entry_cycle_mem(&self) -> Vec<MemAccess> {
+        let mut out = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !node.mem.is_empty() && self.tick_free_reaches(self.head, i) {
+                out.extend(node.mem.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// Every read port staged **anywhere** in this loop, nested loops included.
+    /// Existence does not depend on position, so unlike the ordering rules this one
+    /// looks straight through the folds.
+    fn staged_ports(&self) -> BTreeSet<(String, String)> {
+        let mut out: BTreeSet<(String, String)> = self
+            .nodes
+            .iter()
+            .flat_map(|n| n.mem.iter())
+            .filter(|a| a.kind == MemAccessKind::StageRead)
+            .map(|a| (a.mem.clone(), a.port.clone()))
+            .collect();
+        for sub in &self.nested_ticking_loops {
+            out.extend(sub.staged_ports());
+        }
+        out
+    }
+
+    /// Is there a path from `a` to `b` that crosses no clock edge — i.e. do they run
+    /// in the same cycle, with `a` before `b`? `a == b` counts (one statement, one
+    /// cycle). Unlike [`comb_reaches`](Self::comb_reaches) this walks **through** the
+    /// loop head, because re-entering the body costs no cycle.
+    fn tick_free_reaches(&self, a: usize, b: usize) -> bool {
+        let mut stack = vec![a];
+        let mut seen = vec![false; self.nodes.len()];
+        while let Some(n) = stack.pop() {
+            if n == b {
+                return true;
+            }
+            if std::mem::replace(&mut seen[n], true) {
+                continue;
+            }
+            for &(s, k) in &self.nodes[n].succs {
+                if k == EdgeKind::Comb {
+                    stack.push(s);
+                }
+            }
+        }
+        false
+    }
+
     /// Enforce the reachability invariant: with every tick edge deleted, the graph
     /// reachable from the loop head must be acyclic. A remaining cycle is a path
     /// that returns to the top of the loop without ever awaiting a clock tick — a
@@ -833,6 +1218,10 @@ struct Builder {
     /// The module's `In` ports — propagated into nested-loop sub-CFGs so the
     /// multi-write-collapse detector can spot a leading read inside a nested loop.
     inputs: BTreeSet<String>,
+    /// The locals bound to a `Memory<…>`, so a `read_port`/`write_port` call can be
+    /// told from a same-named method on anything else. Propagated into nested-loop
+    /// sub-CFGs for the same reason the port sets are.
+    mems: BTreeSet<String>,
     /// Sub-CFGs of **tick-containing nested loops** — built alongside the (still
     /// folded) parent node so [`Cfg::check_reachability`] can recurse into each one
     /// and enforce the tickless-cycle invariant *inside* the nested loop. Only
@@ -858,11 +1247,12 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(outputs: BTreeSet<String>, inputs: BTreeSet<String>) -> Builder {
+    fn new(outputs: BTreeSet<String>, inputs: BTreeSet<String>, mems: BTreeSet<String>) -> Builder {
         Builder {
             nodes: Vec::new(),
             outputs,
             inputs,
+            mems,
             nested: Vec::new(),
             loop_ctx: Vec::new(),
             top_head: None,
@@ -882,7 +1272,7 @@ impl Builder {
     /// loop (no register/output analysis), so `defined_in_loop`/`comb_outputs`/
     /// `exit` are empty/`None`.
     fn nested_loop_cfg(&self, body: &[Stmt], span: Span) -> Cfg {
-        let mut b = Builder::new(self.outputs.clone(), self.inputs.clone());
+        let mut b = Builder::new(self.outputs.clone(), self.inputs.clone(), self.mems.clone());
         let head = b.new_node(Node::empty(span));
         let brk = b.new_node(Node::empty(span)); // exit sink for `break`
         b.loop_ctx.push((head, brk));
@@ -919,18 +1309,22 @@ impl Builder {
                 let mut defs = BTreeSet::new();
                 pat_bindings(&local.pat, &mut defs);
                 let mut uses = BTreeSet::new();
+                let mut mem = Vec::new();
                 if let Some(init) = &local.init {
                     collect_reads(&init.expr, &mut uses);
+                    mem = mem_accesses(&init.expr, &self.mems);
                 }
-                self.terminal(defs, uses, local.span(), next)
+                self.terminal(defs, uses, mem, local.span(), next)
             }
             Stmt::Expr(expr, _) => self.build_expr(expr, next),
             Stmt::Macro(m) => {
                 let mut uses = BTreeSet::new();
                 collect_token_idents(&m.mac.tokens, &mut uses);
-                self.terminal(BTreeSet::new(), uses, m.span(), next)
+                self.terminal(BTreeSet::new(), uses, Vec::new(), m.span(), next)
             }
-            Stmt::Item(item) => self.terminal(BTreeSet::new(), BTreeSet::new(), item.span(), next),
+            Stmt::Item(item) => {
+                self.terminal(BTreeSet::new(), BTreeSet::new(), Vec::new(), item.span(), next)
+            }
         }
     }
 
@@ -957,6 +1351,7 @@ impl Builder {
                 collect_reads(&ei.cond, &mut uses);
                 self.new_node(Node {
                     uses,
+                    mem: mem_accesses(&ei.cond, &self.mems),
                     succs: vec![(then_entry, EdgeKind::Comb), (else_entry, EdgeKind::Comb)],
                     ..Node::empty(ei.span())
                 })
@@ -968,18 +1363,22 @@ impl Builder {
                     let mut arm_defs = BTreeSet::new();
                     pat_bindings(&arm.pat, &mut arm_defs);
                     let mut arm_uses = BTreeSet::new();
+                    let mut arm_mem = Vec::new();
                     if let Some((_, guard)) = &arm.guard {
                         collect_reads(guard, &mut arm_uses);
+                        arm_mem = mem_accesses(guard, &self.mems);
                     }
                     // A pattern binding / guard needs its own entry node so its
                     // defs/uses sit on the path into the arm; otherwise route
                     // straight to the arm body.
-                    let entry = if arm_defs.is_empty() && arm_uses.is_empty() {
+                    let entry = if arm_defs.is_empty() && arm_uses.is_empty() && arm_mem.is_empty()
+                    {
                         body_entry
                     } else {
                         self.new_node(Node {
                             defs: arm_defs,
                             uses: arm_uses,
+                            mem: arm_mem,
                             succs: vec![(body_entry, EdgeKind::Comb)],
                             ..Node::empty(arm.pat.span())
                         })
@@ -990,6 +1389,7 @@ impl Builder {
                 collect_reads(&em.expr, &mut uses);
                 self.new_node(Node {
                     uses,
+                    mem: mem_accesses(&em.expr, &self.mems),
                     succs,
                     ..Node::empty(em.span())
                 })
@@ -1047,14 +1447,26 @@ impl Builder {
                     Some(_) => (true, EdgeKind::Tick),
                     None => (false, EdgeKind::Comb),
                 };
+                // Memory accesses inside the loop. For a TICK-FREE loop the whole
+                // body runs in this cycle (and is refused outright by the staging
+                // check, since unrolling puts every iteration's access on one bus).
+                // For a tick-bearing one only the accesses before its FIRST tick run
+                // in the cycle that reaches this node; the rest belong to later
+                // cycles and are checked in the sub-CFG, where those ticks are real
+                // edges. Attributing all of them here read `rv32i_cpu`'s
+                // `read(addr); loop { tick; if is_ready { break } }` — the standard
+                // wait — as a same-cycle observation.
+                let mut mem = mem_accesses(expr, &self.mems);
                 if is_tick {
                     let sub = self.nested_loop_cfg(loop_body_stmts(expr), expr.span());
+                    mem = sub.entry_cycle_mem();
                     self.nested.push(sub);
                 }
                 self.new_node(Node {
                     uses,
                     is_tick,
                     tick_clock: clock,
+                    mem,
                     may_exit_without_tick: is_tick && may_exit_without_tick(expr),
                     succs: vec![(next, kind)],
                     // Opaque region: conservatively assume it drives every output
@@ -1075,6 +1487,7 @@ impl Builder {
                 self.new_node(Node {
                     defs,
                     uses,
+                    mem: mem_accesses(expr, &self.mems),
                     succs: vec![(next, EdgeKind::Comb)],
                     writes,
                     ..Node::empty(expr.span())
@@ -1087,12 +1500,14 @@ impl Builder {
         &mut self,
         defs: BTreeSet<String>,
         uses: BTreeSet<String>,
+        mem: Vec<MemAccess>,
         span: Span,
         next: usize,
     ) -> usize {
         self.new_node(Node {
             defs,
             uses,
+            mem,
             succs: vec![(next, EdgeKind::Comb)],
             ..Node::empty(span)
         })
@@ -1100,6 +1515,111 @@ impl Builder {
 }
 
 // ── def / use extraction ────────────────────────────────────────────────────
+
+/// Every memory-port access site in `expr` (recursively), for the memories in
+/// `mems`. Restricting to *known* memory locals is what keeps an unrelated
+/// `something.read_port::<0>()` out of the analysis; the set comes from
+/// [`memory_locals`].
+fn mem_accesses(expr: &Expr, mems: &BTreeSet<String>) -> Vec<MemAccess> {
+    struct V<'a> {
+        mems: &'a BTreeSet<String>,
+        out: Vec<MemAccess>,
+    }
+    impl<'ast> Visit<'ast> for V<'_> {
+        fn visit_expr_method_call(&mut self, mc: &'ast syn::ExprMethodCall) {
+            if let Some((mem, port, is_read)) = mem_port_receiver(&mc.receiver, self.mems) {
+                let kind = match (is_read, mc.method.to_string().as_str()) {
+                    (true, "read") => Some(MemAccessKind::StageRead),
+                    (false, "write") => Some(MemAccessKind::StageWrite),
+                    (true, "data") => Some(MemAccessKind::Observe("data")),
+                    (true, "is_ready") => Some(MemAccessKind::Observe("is_ready")),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    self.out.push(MemAccess { mem, port, kind });
+                }
+            }
+            syn::visit::visit_expr_method_call(self, mc);
+        }
+    }
+    if mems.is_empty() {
+        return Vec::new();
+    }
+    let mut v = V { mems, out: Vec::new() };
+    v.visit_expr(expr);
+    v.out
+}
+
+/// If `recv` is `<mem>.read_port::<K>()` / `<mem>.write_port::<K>()` for a known
+/// memory, return `(mem, K-as-text, is_read)`.
+fn mem_port_receiver(recv: &Expr, mems: &BTreeSet<String>) -> Option<(String, String, bool)> {
+    let Expr::MethodCall(mc) = recv else { return None };
+    let is_read = match mc.method.to_string().as_str() {
+        "read_port" => true,
+        "write_port" => false,
+        _ => return None,
+    };
+    if !mc.args.is_empty() {
+        return None;
+    }
+    let mem = simple_ident(&mc.receiver)?;
+    if !mems.contains(&mem) {
+        return None;
+    }
+    let arg = mc.turbofish.as_ref()?.args.first()?;
+    let port = match arg {
+        syn::GenericArgument::Const(Expr::Lit(l)) => match &l.lit {
+            syn::Lit::Int(i) => i.base10_digits().to_string(),
+            _ => return None,
+        },
+        syn::GenericArgument::Const(e) => simple_ident(e)?,
+        syn::GenericArgument::Type(syn::Type::Path(tp)) => {
+            tp.path.get_ident().map(|i| i.to_string())?
+        }
+        _ => return None,
+    };
+    Some((mem, port, is_read))
+}
+
+/// The locals bound to a `Memory<…>` in `f` — `let mem = Memory::<…>::new(…)`,
+/// including the `.write_first()` / `.read_first()` builder spellings. Declared
+/// before the hardware loop, so the whole body is scanned.
+fn memory_locals(f: &ItemFn) -> BTreeSet<String> {
+    struct V {
+        out: BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            if let Some(init) = &l.init {
+                if mentions_memory_type(&init.expr) {
+                    pat_bindings(&l.pat, &mut self.out);
+                }
+            }
+            syn::visit::visit_local(self, l);
+        }
+    }
+    let mut v = V { out: BTreeSet::new() };
+    v.visit_block(&f.block);
+    v.out
+}
+
+/// Does `expr` name the `Memory` type anywhere in a path (`Memory::<…>::new`)?
+fn mentions_memory_type(expr: &Expr) -> bool {
+    struct V {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if p.segments.iter().any(|s| s.ident == "Memory") {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, p);
+        }
+    }
+    let mut v = V { found: false };
+    v.visit_expr(expr);
+    v.found
+}
 
 /// The `(defs, uses)` of a terminal (non-branch, non-tick) statement expression.
 fn terminal_defs_uses(expr: &Expr) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -2819,5 +3339,306 @@ mod tests {
             }
         "#;
         assert_eq!(timings(src), Vec::<ReadTiming>::new());
+    }
+
+    // ── memory staging rules ────────────────────────────────────────────────
+
+    fn mem_check(src: &str) -> Result<(), String> {
+        Cfg::build(&parse(src))
+            .expect("has a loop")
+            .check_memory_staging()
+            .map_err(|(_, m)| m)
+    }
+
+    /// A ROM read, wrapped in a body one line away from the linear form: the
+    /// trailing `for` adds two clock boundaries and nothing else, and it is what
+    /// makes `control_extract` rewrite the module. Under the old segment-based
+    /// check that rewrite collapsed the staging and the observation into one
+    /// segment and the module was refused — the false positive this rule exists to
+    /// fix. `tests/extracted_memory_equivalence.rs` carries the behavioural half.
+    #[test]
+    fn a_counted_pause_after_the_observation_is_not_a_same_cycle_read() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                    for _ in 0..2 { clk.tick().await; }
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
+    }
+
+    /// The same shape without the pause — the linear form, which always worked.
+    #[test]
+    fn a_read_observed_after_the_tick_is_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
+    }
+
+    /// The rule itself, in a module control extraction rewrites: the observation
+    /// is in the staging cycle, so it reads the result an edge early. The old
+    /// check could not see this at all once the ticks became `pc` states.
+    #[test]
+    fn a_same_cycle_observation_is_rejected_even_when_extracted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    o.write(rom.read_port::<0>().data());
+                    clk.tick().await;
+                    for _ in 0..2 { clk.tick().await; }
+                }
+            }
+        "#;
+        let err = mem_check(src).expect_err("observing in the staging cycle must be rejected");
+        assert!(err.contains("is read before the `clk.tick().await`"), "{err}");
+    }
+
+    /// Observing a port nothing ever stages.
+    #[test]
+    fn an_unstaged_port_is_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(rom.read_port::<1>().data());
+                }
+            }
+        "#;
+        let err = mem_check(src).expect_err("an unstaged port never becomes ready");
+        assert!(err.contains("nothing stages a `read()`"), "{err}");
+    }
+
+    /// Two stagings of one bus that a single cycle really does reach — one after
+    /// the other, no edge between them. There is one address bus, so the design
+    /// has to say which address; the simulator would silently keep the last.
+    #[test]
+    fn two_stagings_of_one_bus_in_one_cycle_are_rejected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    rom.read_port::<0>().read(0);
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                }
+            }
+        "#;
+        let err = mem_check(src).expect_err("one address bus, two drivers in a cycle");
+        assert!(err.contains("accessed 2 times in one cycle"), "{err}");
+    }
+
+    /// Stagings on **exclusive** branches are a multiplexer, not a conflict: no
+    /// path joins them, so no cycle drives the bus twice, and the emitted
+    /// `always_comb` assigns the address inside the arm that runs. Counting sites
+    /// per phase instead reported a design error on `rv32i_cpu`'s seven regfile
+    /// writebacks, which are exactly this shape.
+    /// `tests/extracted_memory_equivalence.rs::exclusive_arm_writes_…` is the
+    /// behavioural half.
+    #[test]
+    fn stagings_on_exclusive_branches_are_a_mux() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, s: In<Logic, C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    if s.read() == Logic::One {
+                        rom.read_port::<0>().read(a.read().as_usize());
+                    } else {
+                        rom.read_port::<0>().read(0);
+                    }
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
+    }
+
+    /// Stagings in *different* cycles are the ordinary multi-phase pattern — the
+    /// address bus is phase-gated — and must not be read as a conflict.
+    #[test]
+    fn stagings_in_different_cycles_are_not_a_conflict() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, b: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                    rom.read_port::<0>().read(b.read().as_usize());
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
+    }
+
+    /// A read port and a write port are different buses, so one of each in a cycle
+    /// is the baseline RAM shape (`dual_port_ram`, every memory fixture).
+    #[test]
+    fn a_read_and_a_write_in_one_cycle_are_different_buses() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, we: In<Logic, C>, a: In<Bits<8>, C>, d: In<Bits<16>, C>,
+                       o: RegOut<Bits<16>, C>) {
+                let mem = Memory::<Bits<16>, 1, 1, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    if we.read() == Logic::One {
+                        mem.write_port::<0>().write(a.read().as_usize(), d.read());
+                    }
+                    mem.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(mem.read_port::<0>().data());
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
+    }
+
+    /// The trailing statements of a body run in the same cycle as the head — the
+    /// back edge costs nothing — so a staging in one and an observation in the
+    /// other is a same-cycle read. The segment-index form of this rule got the
+    /// pairing wrong here in both directions.
+    #[test]
+    fn a_trailing_staging_and_a_head_observation_share_a_cycle() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    o.write(rom.read_port::<0>().data());
+                    clk.tick().await;
+                    rom.read_port::<0>().read(a.read().as_usize());
+                }
+            }
+        "#;
+        let err = mem_check(src).expect_err("the trailing staging shares the head's cycle");
+        assert!(err.contains("is read before the `clk.tick().await`"), "{err}");
+    }
+
+    fn plain_out_ports(src: &str) -> Vec<String> {
+        Cfg::build(&parse(src))
+            .expect("has a loop")
+            .memory_result_drives_plain_out()
+    }
+
+    /// The measured divergence: an extracted module's plain `Out` wired straight to
+    /// a read result lands a cycle late in SystemVerilog. `vlir_lower`'s copy of
+    /// this rule counts LOWERED phases and an extracted module has one, so it sees
+    /// nothing.
+    #[test]
+    fn a_plain_out_from_a_read_result_across_phases_is_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                    for _ in 0..2 { clk.tick().await; }
+                }
+            }
+        "#;
+        assert_eq!(plain_out_ports(src), ["o"]);
+    }
+
+    /// Through a same-cycle local, which is the same net wearing a name.
+    #[test]
+    fn the_drive_is_followed_through_a_same_cycle_local() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    let w = rom.read_port::<0>().data();
+                    o.write(w);
+                    for _ in 0..2 { clk.tick().await; }
+                }
+            }
+        "#;
+        assert_eq!(plain_out_ports(src), ["o"]);
+    }
+
+    /// A register between the result and the port is the supported form (`mp_reg`),
+    /// and a register is exactly what a value that survives an edge is.
+    #[test]
+    fn a_register_between_the_result_and_the_port_is_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                let mut q: Bits<16> = Bits::zero();
+                loop {
+                    o.write(q);
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    q = rom.read_port::<0>().data();
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(plain_out_ports(src), Vec::<String>::new());
+    }
+
+    /// A single-phase module: the post-tick segment shares the head's phase, so the
+    /// port is driven from the captured word in the cycle it was captured — correct,
+    /// and pinned behaviourally as `rom_direct`.
+    #[test]
+    fn a_single_phase_module_is_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<16>, C>) {
+                let rom = Memory::<Bits<16>, 1, 0, C, 1, 1>::new(clk.clone(), 256);
+                loop {
+                    rom.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(rom.read_port::<0>().data());
+                }
+            }
+        "#;
+        assert_eq!(plain_out_ports(src), Vec::<String>::new());
+    }
+
+    /// A module with no `Memory` local has nothing to check — and a `read_port`
+    /// method on something else is not a memory access.
+    #[test]
+    fn a_module_without_a_memory_is_unaffected() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, a: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                loop {
+                    o.write(a.read());
+                    clk.tick().await;
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
     }
 }

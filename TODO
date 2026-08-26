@@ -543,26 +543,63 @@ TRANSPILATION:
     So: nothing to hoist here. The finding is that the linear path is over-strict
     and D1 is under-strict, which are different bugs from the one being looked for.
 
-  ☐ `MemoryResultDrivesPlainOutput` (vlir_lower) — hidden by
-    `if phases.len() < 2 { return Ok(()) }`, and UNREACHABLE under extraction
-    anyway, because an earlier memory check rejects the module first. That earlier
-    check is itself wrong: `chir_lower`'s read-before-tick staging check reasons
-    about SEGMENTS, and extraction collapses them, so a legal design is refused.
-    Measured — this transpiles:
+  ✔ FIXED (2026-08-25, with user sign-off on the widening) — THE MEMORY FALSE
+    POSITIVE. `chir_lower`'s memory rules reasoned about the SEGMENTS the lowered
+    loop body splits into at `clk.tick().await`; extraction collapses them, so a
+    legal design was refused. Measured — this transpiles:
         loop { rom.read(addr); tick; data.write(rom.data()); }
     and appending `for _ in 0..2 { tick }` (which changes nothing about the
-    staging) makes it fail with "`rom...data()` is read before the `clk.tick().await`
-    that produces it". A FALSE POSITIVE, so any memory design that also needs
-    control extraction is currently unwritable.
-    THE FIX IS THE SAME SHAPE AS THE OTHERS — the staging/observation ordering is
-    a CFG reachability question ("is every `data()` separated from its `read()` by
-    a tick on all paths?") and belongs in `copper-analysis`, on the source, where
-    the ticks are still visible. Not small: the analysis crate would have to
-    recognise the memory method calls. Doing it in codegen instead would mean a
-    second implementation of the ordering rule, which is the drift bug this file
-    keeps recording.
+    staging) made it fail with "`rom...data()` is read before the `clk.tick().await`
+    that produces it". Any memory design that also needed control extraction was
+    unwritable.
+    → `copper_analysis::check_memory_staging`, on the source, called from
+      `transpile_target` beside `check_reachability` / `multi_phase_out_write`.
+      `validate_memory_usage` is DELETED, not duplicated: one rule, one place.
+    WHAT REPLACES SEGMENT ORDER is tick-free REACHABILITY, which is what segment
+    order was approximating. An observation is early iff every staging of its port
+    reaches it without crossing a tick edge; two accesses share a bus cycle iff one
+    reaches the other the same way. The walk goes THROUGH the loop head, because
+    re-entering the body costs no cycle — the segment-index form got the
+    head/trailing pairing wrong in both directions, which is a second bug the
+    rewrite fixes (`a_trailing_staging_and_a_head_observation_share_a_cycle`).
+    THE ONE-BUS RULE WIDENED with it, deliberately and with sign-off. Counting
+    sites per phase says `rv32i_cpu`'s seven regfile writebacks are seven drivers;
+    they sit in exclusive `match` arms, no path joins two of them, and each drives
+    the bus in its own state — which is exactly what the emitted `always_comb`
+    does. Anchored by `exclusive_arm_writes_sim_matches_transpiled_verilog`
+    (sim ≡ model ≡ Verilator), not by argument. Straight-line double-drive is
+    still refused. Keeping the count would have moved rv32i_cpu's reported cause
+    off F for no gain; it now reports F again.
+    TWO FOLDED-LOOP SUBTLETIES, both measured on real modules:
+      - A nested loop is opaque in the parent graph, so only the accesses before
+        its FIRST tick belong to the cycle that reaches it (`Cfg::entry_cycle_mem`).
+        Attributing all of them read `rv32i_cpu`'s `read(addr); loop { tick; if
+        is_ready { break } }` — the standard wait — as a same-cycle observation.
+      - Existence ("something stages this port") looks through the folds instead,
+        since it does not depend on position (`Cfg::staged_ports`).
+    IT OPENED A HOLE, WHICH IS CLOSED. `MemoryResultDrivesPlainOutput` (vlir_lower)
+    gives up on `phases.len() < 2`, and an extracted module has exactly ONE lowered
+    phase however many clock phases its source has — so that rule was
+    unreachable-by-accident, held up only by the false positive above rejecting
+    every extracted memory design first. Removing the false positive would have
+    made it unreachable in fact: measured, the plain-`Out` form diverges by exactly
+    one cycle, uniformly, with Verilator agreeing with the emitted SV and not with
+    the simulator. `copper_analysis::memory_result_drives_plain_out` states it on
+    the source (following the drive through same-cycle locals — a value that
+    survives an edge is a register, so excluding registers keeps the taint inside
+    one phase). `vlir_lower`'s copy stays for the non-extracted path it can see.
+    ALSO FIXED, found by Verilating the first extracted memory module ever built:
+    a comb `case` with no wildcard arm emitted no `default`, which is CASEINCOMPLETE
+    under `-Wall` and fails the build. An extracted `match pc` whose comb work lives
+    in only some states is the routine instance. Now emits an empty `default`, which
+    is what the missing arm already meant (every net is assigned its default at the
+    top of the `always_comb`).
+    STILL OPEN, found the same way: a memory address written as a LITERAL emits a
+    64-bit constant into a narrow bus — `mem.write_port::<0>().write(0, d.read())`
+    gives `mem_wr0_addr = 64'd0`, WIDTHTRUNC under `-Wall`. A width-inference gap,
+    not a memory one; the fixture uses a port for the second address instead.
 
-  RECORD THE CLASS, since it is now four for four: **a check that counts a
+  RECORD THE CLASS, since it is now five for five: **a check that counts a
   syntactic feature (`clk.tick().await`) rather than the thing it means (a clock
   phase), placed downstream of a pass that legitimately removes that feature.**
   Every check in CODEGEN that reasons about phases is suspect by construction;

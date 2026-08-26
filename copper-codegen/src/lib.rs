@@ -295,6 +295,27 @@ fn transpile_target(
         }
     }
 
+    // The memory-port staging rules, for the same reason and from the same place:
+    // they are questions about clock EDGES, and control extraction rewrites the
+    // ticks that delimit them into `pc` states. `chir_lower` used to ask them of
+    // the lowered body's tick-delimited segments, which made an ordinary memory
+    // design fail the moment anything else in the module needed extraction.
+    copper_analysis::check_memory_staging(target).map_err(|e| e.to_string())?;
+    // …and the plain-`Out`-from-a-read-result rule, for the same reason:
+    // `vlir_lower::reject_memory_driven_comb_outputs` gives up on `phases.len() < 2`,
+    // and an extracted module always has exactly one lowered phase. That check was
+    // unreachable-by-accident while the staging rules rejected every extracted
+    // memory design; it must not become unreachable-in-fact now they do not.
+    if let Some(port) = copper_analysis::memory_result_drives_plain_out(target).first() {
+        return Err(format!(
+            "output port '{port}' is driven from a memory read result in a multi-phase \
+             module. The read pipeline re-captures on every clock edge, so a plain `Out` \
+             either tracks it into the phases that do not observe it, or holds one edge \
+             late — neither matches the simulator. Declare the port `RegOut<T, D>`, or \
+             latch the result into a register and drive the output from that"
+        ));
+    }
+
     // c2 (gate G6): the transpiler consumes the SAME shared analysis, on the SAME
     // input (`&syn::ItemFn`), that the sim macro consumes — one authoritative
     // register/CFG analysis, not two that must agree. Read-only for now; item 2

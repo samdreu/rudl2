@@ -111,6 +111,40 @@ pub fn check_reachability(f: &ItemFn) -> Result<(), syn::Error> {
     }
 }
 
+/// Plain combinational `Out` ports driven from a **memory read result** in a
+/// multi-phase module — a shape with no correct emitted form (measured: a full
+/// cycle late). Returns the offending ports, sorted; the remedy is `RegOut`, or a
+/// register between the result and the port.
+///
+/// `vlir_lower` states the same rule over the *lowered* phases and structurally
+/// cannot see an extracted module, which has one lowered phase however many clock
+/// phases its source has. See [`Cfg::memory_result_drives_plain_out`].
+pub fn memory_result_drives_plain_out(f: &ItemFn) -> Vec<String> {
+    Cfg::build(f).map(|c| c.memory_result_drives_plain_out()).unwrap_or_default()
+}
+
+/// Enforce the **memory-port staging rules** — one access per bus per cycle, a read
+/// result observed only after the clock edge that produces it, and never observed on
+/// a port nothing stages. Rejected with a spanned [`syn::Error`].
+///
+/// Lives here, on the source, because all three are questions about clock **edges**,
+/// and the transpiler's own copy asked them of the loop's tick-delimited *segments*
+/// — which `control_extract` legitimately erases by rewriting a branch- or
+/// loop-nested tick into a single-tick `match pc` FSM. That made every memory design
+/// needing extraction unwritable. See [`Cfg::check_memory_staging`] for the measured
+/// false positive and the reachability formulation that replaces segment order.
+///
+/// A module with no top-level loop (combinational) has no clock edge to order
+/// anything against and is `Ok`.
+pub fn check_memory_staging(f: &ItemFn) -> Result<(), syn::Error> {
+    match Cfg::build(f) {
+        Some(cfg) => cfg
+            .check_memory_staging()
+            .map_err(|(span, msg)| syn::Error::new(span, msg)),
+        None => Ok(()),
+    }
+}
+
 /// Enforce **definite assignment** for a **combinational** module (`#[hardware(
 /// combinational)]`): every `Out` port must be driven on all control paths or none
 /// — a some-but-not-all (conditional) assignment infers a **latch**. Rejected with
