@@ -124,10 +124,10 @@ old path, no silent regressions.
 
 ## 4. What is left
 
-* **§5.4's trailing-segment gap** — D1's shape past the last tick. Two widenings were
-  measured and rejected (25 and 10 false positives); the constant-write narrowing
-  suggests the missing ingredient is again a *conditionality* discriminator rather
-  than a broader region.
+* ~~**§5.4's trailing-segment gap**~~ — CLOSED 2026-08-25. The discriminator was not
+  conditionality (three such hypotheses were measured and discarded) but **how many
+  clock edges the body crosses per iteration**: single-tick trailing statements share
+  the head's phase, multi-tick ones do not. Corpus cost: one real module.
 * **The trailing-statement rule's semantics** (1a): what a combinational statement
   after the last tick should mean. Still the open decision it has been.
 * **A structural guard** against new tick-counting checks appearing in codegen.

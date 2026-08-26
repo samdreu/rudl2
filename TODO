@@ -1358,8 +1358,29 @@ TRANSPILATION:
      block records the resolution; this entry had not been updated, and was cited as
      an open item as late as this session's planning.
 
-  ☐ D1's CONSTANT-WRITE EXEMPTION IS UNSOUND for a conditionally-written `Out`
-     (found 2026-08-25 by the corpus differential sweep, on random stimulus).
+  ✔ FIXED (2026-08-25) — D1's TRAILING-SEGMENT GAP. D1's shape past the last tick
+     (`loop { for _ in 0..2 { tick } n = n + 1; o.write(n); }`) diverges by a cycle
+     and the head rule cannot see it (it examines head → first tick). 5.4 records two
+     widenings measured and REJECTED at 25 and 10 false positives; the open question
+     was the discriminator between that DUT and `rom_from_fn`, structurally identical
+     and AGREEING.
+     THE ANSWER IS HOW MANY CLOCK EDGES THE BODY CROSSES PER ITERATION, found with a
+     flipping witness: identical trailing body, single-tick loop AGREES (that is
+     `rom_from_fn`'s shape), multi-tick loop DIVERGES. In a single-tick loop the
+     trailing statements share the head's phase — nothing to be misaligned against —
+     which is why widening #2 cost ten false positives, all single-tick memory modules.
+     NOT the Comb-component count: the divergent DUT has one component too, its extra
+     edges being inside a folded nested loop. `crosses_more_than_one_tick` counts tick
+     nodes and treats a folded tick-bearing loop as more than one.
+     Three other hypotheses were measured and discarded in one run each — the update's
+     conditionality, the write's conditionality, and loading the register from an input
+     (all four variants diverge identically, so none separates anything).
+     CORPUS COST: one real module — rv32i_cpu_pipelined's `program_counter` → `RegOut`,
+     the remedy its scalar sibling already had. Pinned by a third exact-set test in
+     pretick_alignment_corpus.rs.
+
+  ✔ FIXED (2026-08-25) — D1's CONSTANT-WRITE EXEMPTION WAS UNSOUND for a
+     conditionally-written `Out` (found 2026-08-25 by the corpus differential sweep, on random stimulus).
      `unprotected_pretick_out_write` exempts a write of a constant because "a
      constant is idempotent across the phase shift". True only if the write happens
      EVERY cycle. Where an arm of a `match pc` writes the port and another does not,
@@ -1374,9 +1395,13 @@ TRANSPILATION:
      Pinned: sequential_forwarding_divergence.rs::{a_write_in_a_state_arm_leads_the_hardware_by_one_cycle,
      the_state_arm_lead_is_systematic_not_a_first_cycle_artifact}; written up in
      PRETICK_ALIGNMENT_GUARDRAIL.md 5.5; the corpus instance is ignored-with-reason
-     in corpus_equivalence.rs. NOT fixed deliberately: narrowing the exemption is a
-     rule widening and 5.4 records two whose corpus cost (25 and 10 false positives)
-     is why they were rejected. Measure this one's cost before landing it.
+     in the corpus sweep. NARROWED THE SAME DAY, and it is the first widening of this
+     rule to pass R1: a constant write is exempt only where the output is written on
+     EVERY path (`Cfg::written_on_all_paths`). Measured corpus cost — THREE modules,
+     all three the measured divergences, ZERO false positives; 26/26 examples and 93
+     differential cases unaffected. 5.4's two rejected widenings cost 25 and 10.
+     The discriminator was the write's CONDITIONALITY, not the value: a constant is
+     idempotent across the phase shift only if it lands on every path.
 
   ☐ `continue` inside a nested loop. Jumping to the loop head mid-cycle needs the
      head's LOWERED body at a point where it is still being lowered. `break` avoids

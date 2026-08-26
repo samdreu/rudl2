@@ -232,3 +232,58 @@ fn multi_phase_out_write_flags_exactly_the_demonstration_modules() {
         "no longer flagged — the hazard may be fixed, or the module changed: {missing:?}"
     );
 }
+
+/// The **trailing-segment** rule's exact set — D1's hazard past the last tick
+/// (`unprotected_trailing_out_write`, 2026-08-25).
+///
+/// Both entries are measured divergences carrying `allow_pretick_alignment`, and the
+/// rule's total corpus cost was one real module: `rv32i_cpu_pipelined`'s
+/// `program_counter`, migrated to `RegOut` — the same remedy its scalar sibling had
+/// already been given for the multi-phase rule.
+const EXPECTED_TRAILING: &[&str] = &[
+    "tests/sequential_forwarding_divergence.rs::pulse_plain",
+    "tests/sequential_forwarding_divergence.rs::trailing_update",
+];
+
+#[test]
+fn trailing_out_write_flags_exactly_the_demonstration_modules() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in ["examples", "src", "tests"] {
+        rs_files(&root.join(dir), &mut files);
+    }
+    files.sort();
+
+    let mut scanned = 0usize;
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for path in &files {
+        let Ok(src) = fs::read_to_string(path) else { continue };
+        let Ok(file) = syn::parse_file(&src) else { continue };
+        let mut fns = Vec::new();
+        clocked_hardware_fns(&file.items, &mut fns);
+        for f in &fns {
+            scanned += 1;
+            if !copper_analysis::unprotected_trailing_out_write(f).is_empty() {
+                let rel = path.strip_prefix(&root).unwrap_or(path).display();
+                flagged.insert(format!("{rel}::{}", f.sig.ident));
+            }
+        }
+    }
+
+    assert!(scanned >= 40, "expected to scan the corpus, only saw {scanned} clocked modules");
+
+    let expected: BTreeSet<String> = EXPECTED_TRAILING.iter().map(|s| s.to_string()).collect();
+    let unexpected: Vec<_> = flagged.difference(&expected).cloned().collect();
+    let missing: Vec<_> = expected.difference(&flagged).cloned().collect();
+    assert!(
+        unexpected.is_empty(),
+        "newly flagged by the trailing-segment rule. Either the module HAS the \
+         divergence — check it against its transpiled SV, and the remedy is `RegOut` — \
+         or the rule has regressed into a false positive, which is what cost the two \
+         widenings in guardrail 5.4 their place: {unexpected:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "no longer flagged — the hazard may be fixed, or the module changed: {missing:?}"
+    );
+}

@@ -353,7 +353,7 @@ construction.
 > it. Pinned by `tests/regout_forwarding_equivalence.rs`. Every false positive was a `RegOut` module. The corrected rule keys on
 the output write, which is the same structure `multi_write_collapse` already uses.
 
-### 5.4 Widening D1 to the TRAILING segment — REJECTED 2026-08-25 (two shapes)
+### 5.4 D1 in the TRAILING segment — two widenings REJECTED, then GUARDED 2026-08-25
 
 The gap is real and measured: D1's canonical shape moved past the last tick,
 
@@ -379,6 +379,47 @@ identical phase question. Two ways of covering it were implemented and measured:
 > pins the whole iteration). Until some condition has a flipping witness (R3),
 > widening rejects correct designs (R1). The second widening is the closer of the
 > two and is where a third attempt should start.
+
+#### ANSWERED 2026-08-25 — the discriminator is how many clock edges the body crosses
+
+The third attempt started where the note says, and the flipping witness (R3) came
+from varying exactly one thing. With the **identical** trailing body
+`n = n + 1; o.write(n);`:
+
+| loop | result |
+|---|---|
+| `loop { clk.tick().await; … }` — one edge per iteration | **agrees** — and this is `rom_from_fn`'s shape |
+| `loop { for _ in 0..2 { clk.tick().await; } … }` — more than one | **diverges** by one cycle, uniformly |
+
+In a single-tick loop the trailing statements **share the head's phase**: falling off
+the end and re-entering costs no cycle, the CFG puts them in one Comb-component, and
+`shir_lower`'s single-tick path hoists them into one phase. There is no separate
+trailing region, so there is nothing to be misaligned against. That is exactly why
+widening #2 — which treated every trailing segment as its own region — cost ten false
+positives, **all of them single-tick memory modules**.
+
+Three hypotheses were measured and discarded on the way, each in one run: the update's
+conditionality, the write's conditionality, and whether the register is loaded from an
+input rather than itself. All four variants diverge identically, so none of them
+separates anything.
+
+**Not the Comb-component count.** The divergent DUT has *one* component too — its
+extra edges live inside a folded nested loop, which the parent CFG cannot see into.
+Gating on components suppressed precisely the case the rule exists for (measured
+during implementation). `Cfg::crosses_more_than_one_tick` counts tick nodes and treats
+a folded tick-bearing loop as more than one, since it crosses an edge per iteration of
+its own.
+
+**Corpus cost: one real module.** `rv32i_cpu_pipelined`'s `program_counter`, migrated
+to `RegOut` — the same remedy its scalar sibling had already been given for the
+multi-phase rule, and the harness discards that port, so only the type and its wire
+changed. The two remaining flagged modules are the demonstration witnesses
+(`trailing_update`, `pulse_plain`), both already carrying `allow_pretick_alignment`.
+Pinned by `pretick_alignment_corpus.rs::trailing_out_write_flags_exactly_the_demonstration_modules`.
+
+**The head rule is unchanged and still head-segment-only**, deliberately: widening #1
+proved the two regions cannot share a rule, and they are now complementary the way D1
+and `multi_write_collapse` are.
 
 ### 5.5 The CONSTANT-WRITE exemption was unsound for a conditionally-written `Out` — found AND FIXED 2026-08-25
 

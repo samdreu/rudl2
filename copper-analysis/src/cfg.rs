@@ -599,6 +599,91 @@ impl Cfg {
         !entries.is_empty() && entries.iter().all(|&e| go(self, e, port, &mut memo))
     }
 
+    /// Plain combinational `Out` ports driven from a register in the **trailing**
+    /// segment of a **multi-tick** loop — D1's hazard, past the last tick.
+    ///
+    /// # The gap this closes, and the discriminator that took three attempts
+    ///
+    /// `unprotected_pretick_out_write` examines head → first tick only, so D1's shape
+    /// moved past the last tick was unguarded and measurably divergent
+    /// (`trailing_update`, one cycle, uniformly). §5.4 of the guardrail records two
+    /// widenings measured and rejected: merging the trailing segment into the head
+    /// region flags **25** modules — including `fast_counter_corrected`, the module
+    /// D1's OWN remedy produces — and treating every trailing segment as a separate
+    /// region flags **10**, all of them single-tick memory modules like `rom_from_fn`,
+    /// which structurally matches the divergent DUT and AGREES.
+    ///
+    /// The discriminator is **how many clock phases the loop has**, and it was found
+    /// by flipping exactly one thing (2026-08-25). With the identical trailing body
+    /// `n = n + 1; o.write(n);`:
+    ///
+    /// | loop | result |
+    /// |---|---|
+    /// | `loop { tick; … }` — single-tick | **agrees** (this is `rom_from_fn`'s shape) |
+    /// | `loop { for _ in 0..2 { tick } … }` — multi-tick | **diverges** by one cycle |
+    ///
+    /// In a single-tick loop the trailing segment **shares the head's phase** — falling
+    /// off the end and re-entering costs no cycle, the CFG puts them in one
+    /// Comb-component, and `shir_lower`'s single-tick path hoists them into one phase.
+    /// There is no separate trailing region to be misaligned. Only from two phases on
+    /// does the trailing segment become a region of its own, and only then does the
+    /// hazard exist. That is why a rule that ignored the phase count cost ten false
+    /// positives.
+    ///
+    /// # What it does not use
+    ///
+    /// **Clause (i) — a leading `In` read — does not apply here.** Measured: the same
+    /// DUT with a read still diverges (V2/V3/V4 of the probe), which also refutes the
+    /// natural hypothesis that the loop-top barrier pins the whole iteration.
+    ///
+    /// A constant write stays exempt on the same terms as the head rule: `uart/rx`'s
+    /// trailing `rx_dv.write(Zero)` is verified correct, and an unconditional constant
+    /// is idempotent across the shift.
+    pub fn unprotected_trailing_out_write(&self) -> Vec<String> {
+        // One tick per iteration: the trailing statements ARE the head's phase — the
+        // body occupies a single cycle, so there is nothing for the trailing region to
+        // be misaligned against. This gate is the whole discriminator, and it is
+        // deliberately NOT the Comb-component count: the divergent DUT's extra ticks
+        // live inside a folded nested loop, so it has one component too, and gating on
+        // components suppressed exactly the case this rule exists for (measured).
+        if !self.crosses_more_than_one_tick() {
+            return Vec::new();
+        }
+
+        let regs: BTreeSet<String> = self.registers().into_iter().collect();
+        let mut driven: BTreeSet<String> = BTreeSet::new();
+        for (n, node) in self.nodes.iter().enumerate() {
+            // The trailing region: a tick-free path back to the loop head. The
+            // pre-tick region cannot qualify — reaching the head from there means
+            // crossing the loop's own ticks.
+            if n == self.head || !self.tick_free_reaches(n, self.head) {
+                continue;
+            }
+            if node.folded || node.writes.is_empty() {
+                continue;
+            }
+            for w in &node.writes {
+                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w) {
+                    driven.insert(w.clone());
+                }
+            }
+        }
+        driven.into_iter().collect()
+    }
+
+    /// Does one iteration of the loop cross **more than one clock edge**?
+    ///
+    /// Two tick nodes qualify. So does a single *folded tick-bearing nested loop*,
+    /// which crosses one edge per iteration of its own and is therefore at least as
+    /// separating as two plain ticks — `for _ in 0..2 { clk.tick().await; }` is the
+    /// canonical instance, and the shape the trailing-segment divergence was measured
+    /// on. Counting Comb-components instead would call that body single-phase, since
+    /// the fold hides its interior.
+    fn crosses_more_than_one_tick(&self) -> bool {
+        let ticks = self.nodes.iter().filter(|n| n.is_tick).count();
+        ticks >= 2 || self.nodes.iter().any(|n| n.is_tick && n.folded)
+    }
+
     /// Plain combinational `Out` ports driven in **more than one clock phase**.
     ///
     /// The multi-tick lowering already refuses this — *"output port `p` is driven in

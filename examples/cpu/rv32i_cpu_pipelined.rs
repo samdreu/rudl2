@@ -10,7 +10,7 @@
 // to keep pipeline control logic clean.
 
 use copper_core::{Bits, Clock, ClockDomain, Logic};
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, Out, RegOut};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
@@ -199,7 +199,12 @@ fn branch_taken(rv1: Bits<32>, rv2: Bits<32>, f3: usize) -> bool {
 async fn rv32i_cpu_pipelined(
     clk: Clock<MainClk>,
     program: In<Vec<Bits<32>>, MainClk>,
-    program_counter: Out<Bits<32>, MainClk>,
+    // `RegOut` since 2026-08-25: this port is driven from `pc` in the loop's TRAILING
+    // segment, and the body crosses more than one clock edge per iteration — D1's
+    // hazard past the last tick, which `unprotected_trailing_out_write` now rejects.
+    // Its scalar sibling was migrated for the multi-phase rule in the same way; the
+    // port is observed by nothing in the harness, so only the type and its wire change.
+    program_counter: RegOut<Bits<32>, MainClk>,
     halted: Out<Logic, MainClk>,
     a0_out: Out<Bits<32>, MainClk>,
 ) {
@@ -440,7 +445,7 @@ pub fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let mut exec = HardwareExecutor::new();
 
     let (prog_out, prog_in)     = wire::<Vec<Bits<32>>, MainClk>(vec![]);
-    let (pc_out,  _pc_in)       = wire::<Bits<32>, MainClk>(Bits::zero());
+    let (pc_out,  _pc_in)       = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
     let (halt_out, halt_in)     = wire::<Logic, MainClk>(Logic::Zero);
     let (a0_out,  a0_in)        = wire::<Bits<32>, MainClk>(Bits::zero());
 

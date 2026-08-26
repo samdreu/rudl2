@@ -648,7 +648,7 @@ fn the_rule_flags_the_plain_form_and_not_the_registered_one() {
 // correct designs, which is requirement R1.
 
 const TRAILING_D1_SRC: &str = r#"
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn trailing_update(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut n: Bits<8> = Bits::zero();
     loop {
@@ -658,7 +658,7 @@ async fn trailing_update(clk: Clock<C>, o: Out<Bits<8>, C>) {
     }
 }
 "#;
-#[hardware(sequential)]
+#[hardware(sequential, allow_pretick_alignment)]
 async fn trailing_update(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut n: Bits<8> = Bits::zero();
     loop {
@@ -682,14 +682,27 @@ fn d1_in_the_trailing_segment_is_an_unguarded_gap() {
         })
         .collect();
 
-    // The rule does NOT flag it — that is the gap, asserted so it flips loudly if
-    // the rule is ever widened to cover it.
+    // GUARDED since 2026-08-25 by `unprotected_trailing_out_write`. The head-segment
+    // rule still does not see it — it examines head → first tick — which is why the
+    // trailing region needed a rule of its own rather than a wider one.
+    //
+    // The discriminator that made it separable from `rom_from_fn` (§5.4's open
+    // question) is the number of clock edges the body crosses per iteration, found by
+    // flipping exactly that: with the identical trailing body, a SINGLE-tick loop
+    // agrees and a multi-tick one diverges. In a single-tick loop the trailing
+    // statements share the head's phase, so there is nothing to be misaligned against.
     let f: syn::ItemFn = syn::parse_str(TRAILING_D1_SRC).expect("parses");
     assert!(
         copper_analysis::unprotected_pretick_out_write(&f).is_empty(),
-        "the trailing-segment gap is now GUARDED — good. Delete this test, add the \
-         DUT to EXPECTED_FLAGGED in pretick_alignment_corpus.rs, and record the \
-         discriminator that made it separable from `rom_from_fn`."
+        "the HEAD rule now covers the trailing segment too — check that is deliberate; \
+         the two were kept separate because widening the head region cost 25 false \
+         positives (§5.4)"
+    );
+    assert_eq!(
+        copper_analysis::unprotected_trailing_out_write(&f),
+        vec!["o".to_string()],
+        "the trailing rule stopped flagging the shape it exists for — the traces below \
+         still diverge, so accepting it again would ship the divergence"
     );
 
     if !verilator_available() {
