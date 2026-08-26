@@ -759,6 +759,34 @@ TRANSPILATION:
     inferable width of its own (a bare `0`) failed. Latent in the committed hoist;
     fixed independently of the reverted work.
 
+  ── THE CORPUS DIFFERENTIAL SWEEP (phases 1-2 landed, 2026-08-25) ────────────
+  design_docs/CORPUS_DIFFERENTIAL_SWEEP.md. Why it exists: `tools/transpile_coverage.sh`
+  measures ACCEPTANCE, and correctness was measured only where somebody hand-wrote a
+  harness AND a reference model — so the correctness gap grew silently while the
+  coverage number sat still. The observation that fixes it is that the reference
+  model is NOT REQUIRED: simulator vs Verilated emitted-SV is already an oracle (two
+  independent implementations of one source), so a case needs nothing per-module
+  from a person, and can therefore be GENERATED.
+
+  ✔ Phase 1 — tests/corpus_equivalence.rs, hand-written, the `examples/` modules
+    that transpile and had no sim ≡ emitted-SV check. Found TWO defects on its first
+    run: the D1 constant-write divergence (see the entry above) and `event_source`
+    emitting SystemVerilog that would not parse (a port named `event`).
+  ✔ Phase 2 — build.rs generates one case per `#[hardware]` module in
+    tests/fixtures/: 59 generated + 11 ignored-with-reason, 200 random cycles each,
+    53s wall clock, ALL GREEN on the first run. Nothing new found, which is itself
+    the result — the fixture corpus and its emitted SV agree under stimulus nobody
+    chose. Skips live in build.rs's SKIP table with a reason each, and a skipped
+    module still gets an `#[ignore]`d test so it stays visible.
+    THE GUARD IS THE LOAD-BEARING PART: `every_fixture_module_has_a_generated_case`
+    re-scans the directory at test time and compares against the generated manifest,
+    so a generator that quietly stops covering something FAILS rather than shrinking
+    the sweep. Negative-controlled (drop one module → it fails naming it).
+  ☐ Phase 3 — extend the generator to examples/ (needs the rust→SV port-name
+    mapping: the testbench addresses the Verilated model by the EMITTED name, and a
+    reserved name is legalized), plus G-D in tools/regression.sh.
+  ☐ Phase 4 — generic modules via `with_params` monomorphization; multi-domain.
+
   ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
   A module can pass the CLI and still fail the equivalence harness, which runs
   Verilator under `-Wall`. TWO modules unblocked above are in exactly that state,

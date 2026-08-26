@@ -15,6 +15,13 @@ copper-sim = { path = "copper-sim" }
 env_logger = "0.11.8"
 log = "0.4.29"
 
+[build-dependencies]
+# `build.rs` generates one differential equivalence test per `#[hardware]` module in
+# tests/fixtures/ (phase 2 of design_docs/CORPUS_DIFFERENTIAL_SWEEP.md), which means
+# parsing their signatures — the same `syn` the rest of the pipeline reads.
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+
 [dev-dependencies]
 # The shared control/liveness analysis — the equivalence harness uses it to
 # structurally reg-match inferred registers against independent hand-written SV

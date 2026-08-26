@@ -5,8 +5,11 @@
 //! Verilated-emitted-SystemVerilog is already an oracle — two independent
 //! implementations of one source — so a differential case needs no reference model,
 //! and that is what makes it cheap enough to have one for *every* module. This file
-//! is the hand-written proof of that before `build.rs` generates them (phase 2);
-//! the wiring below is exactly what the generator has to emit.
+//! is the hand-written original of that wiring; `build.rs` now generates the same
+//! shape for every module in `tests/fixtures/` (phase 2, `tests/corpus_generated.rs`),
+//! and the fixture cases that started life here moved there — including the
+//! `control_extraction_dut` pair whose divergence this file found. What is left is
+//! the `examples/` modules, which the generator does not reach yet (phase 3).
 //!
 //! Stimulus is seeded random, 200 cycles per module, every `In` port re-randomised
 //! every cycle. Hand vectors walk the paths their author thought of; these walk the
@@ -26,6 +29,10 @@
 //! transpiled designs are the same bytes. Each one goes in its own module because
 //! they declare their own clock-domain types (`MainClk`, `ClkFast`, …), and their
 //! `fn main` demos come along for the ride unused — hence the module-level `allow`.
+//!
+//! The fixture files, by contrast, declare no domains and no imports at all — which
+//! is what let the generator supply them mechanically.  Unlike an example, a fixture
+//! also carries no `//!` header: `include!` cannot produce inner doc comments.
 
 mod common;
 
@@ -206,182 +213,4 @@ mod pattern_detector_2 {
         }
         eq.finish();
     }
-}
-
-// ── tests/fixtures/control_extraction_dut.rs ─────────────────────────────────
-
-/// The branch- and match-nested-tick pairs. Each async module has a hand-written
-/// explicit `match pc` twin, and `tests/control_extraction_structural.rs` asserts
-/// the two transpile to identical SystemVerilog. That is a strong structural claim
-/// and says nothing about whether either one *behaves* like the simulator, which is
-/// what these add — for both halves, so the pair stays apples-to-apples.
-#[allow(unused_imports, dead_code)]
-mod control_extraction {
-    use crate::common::{EquivalenceTest, RandStim, Rng};
-    use crate::CYCLES;
-    use copper_core::port::{registered_wire, wire, In, Out, RegOut};
-    use copper_core::types::Bits;
-    use copper_core::{Clock, ClockDomain, Logic};
-    use copper_macros::hardware;
-    use copper_sim::HardwareExecutor;
-
-    struct MainClk;
-    impl ClockDomain for MainClk {}
-
-    include!("fixtures/control_extraction_dut.rs");
-    const SRC: &str = include_str!("fixtures/control_extraction_dut.rs");
-
-    /// One `In<Logic>` selecting a branch, three `Out<Logic>` marking which segments
-    /// ran. `$dut` is the async coding or its explicit twin.
-    macro_rules! branch_merge_differential {
-        ($(#[$attr:meta])* $fname:ident, $dut:ident, $seed:expr) => {
-            $(#[$attr])*
-            #[test]
-            fn $fname() {
-                let mut eq = EquivalenceTest::differential_only(
-                    stringify!($dut),
-                    SRC,
-                    Some(stringify!($dut)),
-                );
-                let mut rng = Rng::new($seed);
-                let mut clk = Clock::<MainClk>::new();
-                let mut exec = HardwareExecutor::new();
-                let (sel_drv, sel_in) = wire::<Logic, MainClk>(Logic::Zero);
-                let (h_out, h_obs) = wire::<Logic, MainClk>(Logic::Zero);
-                let (m_out, m_obs) = wire::<Logic, MainClk>(Logic::Zero);
-                let (t_out, t_obs) = wire::<Logic, MainClk>(Logic::Zero);
-                let handles = vec![
-                    h_out.dirty_handle(),
-                    m_out.dirty_handle(),
-                    t_out.dirty_handle(),
-                ];
-                let reads = vec![sel_in.wire_id()];
-                exec.spawn_wired(
-                    $dut(clk.clone(), sel_in, h_out, m_out, t_out),
-                    handles,
-                    reads,
-                );
-
-                for _ in 0..CYCLES {
-                    let sel = Logic::rand(&mut rng);
-                    sel_drv.write(sel);
-                    exec.tick_clock(&mut clk);
-                    let (h, m, t) = (h_obs.read(), m_obs.read(), t_obs.read());
-                    eq.record_differential(
-                        &[("sel", &[sel][..])],
-                        &[
-                            ("head_o", &[h][..]),
-                            ("mid_o", &[m][..]),
-                            ("tail_o", &[t][..]),
-                        ],
-                    );
-                }
-                eq.finish();
-            }
-        };
-    }
-
-    branch_merge_differential!(branch_merge_differential_case, branch_merge, 0x5EED_0006);
-    // FOUND BY THIS SWEEP, 2026-08-25 — a MEASURED sim ≠ synth divergence, and the
-    // sharpest statement of it available: this module and `branch_merge` above
-    // transpile to BYTE-IDENTICAL SystemVerilog (asserted by
-    // control_extraction_structural.rs, re-confirmed by hand), the async one agrees
-    // with that SV for 200 random cycles, and this one leads it by a cycle.
-    //
-    // Mechanism, measured both sides at seed 0x5EED_0007, cycle 0 (sel = 1):
-    // the `pc = 1` arm writes `tail_o` and belongs to the NEXT cycle, but the
-    // simulator runs the next iteration's pre-tick segment during the post-edge
-    // settle of this tick, so `tail_o` reads 1 a cycle before the hardware sets it.
-    // sim: head/mid/tail = 1/0/1 · SV: 1/0/0. It shows up exactly once because
-    // these outputs only ever latch high.
-    //
-    // This is the pre-tick alignment family (D1), in a shape the guardrail exempts:
-    // a CONSTANT write, on the grounds that a constant is idempotent across the
-    // phase shift. That holds only if the write happens every cycle. Here it is
-    // conditional — the other path leaves the port HOLDING — so *when* it lands is
-    // observable. `unprotected_pretick_out_write` returns [] for both twins.
-    //
-    // Minimised, pinned and written up: sequential_forwarding_divergence.rs
-    // (`pc_arm_write` / `pc_arm_toggle`, whose traces are each other shifted by
-    // exactly one cycle) and PRETICK_ALIGNMENT_GUARDRAIL.md §5.5.
-    branch_merge_differential!(
-        #[ignore = "MEASURED DIVERGENCE, pinned as sequential_forwarding_divergence.rs::a_write_in_a_state_arm_leads_the_hardware_by_one_cycle and written up in PRETICK_ALIGNMENT_GUARDRAIL.md 5.5 — the simulator leads the identical emitted SV by one cycle. Un-ignore when the constant-write exemption is narrowed"]
-        branch_merge_explicit_differential_case,
-        branch_merge_explicit,
-        0x5EED_0007
-    );
-
-    /// Two `In<Bits<8>>` and a `RegOut<Bits<8>>`, alternating between them under a
-    /// two-state `match`.
-    macro_rules! match_tick_differential {
-        ($fname:ident, $dut:ident, $seed:expr) => {
-            #[test]
-            fn $fname() {
-                let mut eq = EquivalenceTest::differential_only(
-                    stringify!($dut),
-                    SRC,
-                    Some(stringify!($dut)),
-                );
-                let mut rng = Rng::new($seed);
-                let mut clk = Clock::<MainClk>::new();
-                let mut exec = HardwareExecutor::new();
-                let (a_drv, a_in) = wire::<Bits<8>, MainClk>(Bits::zero());
-                let (b_drv, b_in) = wire::<Bits<8>, MainClk>(Bits::zero());
-                let (o_out, o_obs) = registered_wire::<Bits<8>, MainClk>(&clk, Bits::zero());
-                let dh = o_out.dirty_handle();
-                let reads = vec![a_in.wire_id(), b_in.wire_id()];
-                exec.spawn_wired($dut(clk.clone(), a_in, b_in, o_out), vec![dh], reads);
-
-                for _ in 0..CYCLES {
-                    let a = Bits::<8>::rand(&mut rng);
-                    let b = Bits::<8>::rand(&mut rng);
-                    a_drv.write(a);
-                    b_drv.write(b);
-                    exec.tick_clock(&mut clk);
-                    let o = o_obs.read();
-                    eq.record_differential(
-                        &[("a", &a.as_bits()[..]), ("b", &b.as_bits()[..])],
-                        &[("out", &o.as_bits()[..])],
-                    );
-                }
-                eq.finish();
-            }
-        };
-    }
-
-    match_tick_differential!(match_tick_differential_case, match_tick, 0x5EED_0008);
-    match_tick_differential!(
-        match_tick_explicit_differential_case,
-        match_tick_explicit,
-        0x5EED_0009
-    );
-}
-
-// ── tests/fixtures/sync_2ff_dut.rs ───────────────────────────────────────────
-
-/// The concrete specialization of the standard-library synchronizer. It is anchored
-/// in the simulator (`tests/cdc_synchronizer_anchor.rs` proves it behaves identically
-/// to the library generic), and against hand-written CDC Verilog — but nothing until
-/// now compared it to its own emitted SystemVerilog.
-#[allow(unused_imports, dead_code)]
-mod sync_2ff {
-    use crate::common::{EquivalenceTest, RandStim, Rng};
-    use crate::CYCLES;
-    use copper_core::port::{wire, In, Out};
-    use copper_core::{Clock, ClockDomain, Logic};
-    use copper_macros::hardware;
-    use copper_sim::HardwareExecutor;
-
-    struct SrcClk;
-    impl ClockDomain for SrcClk {}
-    struct DstClk;
-    impl ClockDomain for DstClk {}
-
-    include!("fixtures/sync_2ff_dut.rs");
-    const SRC: &str = include_str!("fixtures/sync_2ff_dut.rs");
-
-    logic_passthrough_differential!(
-        sync_2ff_concrete_differential, sync_2ff_concrete, SRC, DstClk,
-        ("d", SrcClk), ("q", DstClk), 0x5EED_000A
-    );
 }

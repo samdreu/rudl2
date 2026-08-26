@@ -1,7 +1,8 @@
 # Corpus differential sweep — scope
 
-**Status:** phase 1 BUILT and green (`tests/corpus_equivalence.rs`, 11 modules).
-Phases 2–4 proposed. Written 2026-08-25, at the point where the memory staging fix
+**Status:** phases 1 and 2 BUILT and green — `tests/corpus_equivalence.rs` (6 example
+modules, hand-written) and `tests/corpus_generated.rs` (70 fixture modules, written by
+`build.rs`). Phases 3–4 proposed. Written 2026-08-25, at the point where the memory staging fix
 needed a hand-written equivalence test to discover that it had opened a one-cycle
 divergence somewhere else.
 
@@ -26,6 +27,31 @@ hand-written Verilog, and nothing had ever Verilated what it transpiles to.
 **A lesson for the generator (phase 2):** the testbench addresses the Verilated
 model by the **emitted** port name, not the Rust one, so the generator needs the
 rust→SV name mapping — a reserved name is renamed (`event` → `event_sig`).
+
+## 0.1 What phase 2 found
+
+**Nothing — and that is the result.** All 59 generated cases passed on the first
+run: every memory fixture, the read-timing and `RegOut`-forwarding families, the
+control-extraction pairs, `uart_rx`, the ROM and RAM variants. Under 200 cycles of
+random stimulus each, the fixture corpus and its emitted SystemVerilog agree.
+
+That is worth having precisely because it was not knowable before. The 11 skips are
+all explained in `build.rs`'s `SKIP` table or by being generic, and each is a
+`#[ignore]` with its reason rather than an omission.
+
+**The guard is the load-bearing part.** `every_fixture_module_has_a_generated_case`
+re-scans `tests/fixtures/` at test time and asserts the generated manifest matches —
+so a generator that quietly stops covering something fails loudly instead of
+shrinking the sweep. Verified by negative control: dropping one module from the
+generator makes it fail naming that module.
+
+Wall clock: **53s** for 59 Verilator builds and runs, inside `cargo test`'s existing
+parallelism. That is the whole budget question answered — it belongs in the default
+regression path.
+
+**What phase 2 cost, in the end:** one build script, `syn` + `quote` as
+build-dependencies, and the deletion of the hand-written fixture cases phase 1 had
+written. The generator emits the same wiring, which is what phase 1 was for.
 
 **One sentence.** Every `#[hardware]` module the transpiler accepts should be run in
 the simulator against its own emitted SystemVerilog under seeded random stimulus,
@@ -191,7 +217,7 @@ its most-repeated bug class. A sweep without G-D would be one more instance of i
 | Phase | Work | Value |
 |---|---|---|
 | **1** ✔ | `differential_only` + a hand-written `tests/corpus_equivalence.rs` covering the 11-module backlog with random stimulus | DONE 2026-08-25 — found two defects on the first run (§0) |
-| **2** | `build.rs` generator over `tests/fixtures/` (70 modules, uniform and already `include!`-friendly) | the mechanism, on the easy corpus |
+| **2** ✔ | `build.rs` generator over `tests/fixtures/` (70 modules, uniform and already `include!`-friendly) | DONE 2026-08-25 — 59 generated + 11 ignored-with-reason, all green in 53s (§0.1) |
 | **3** | extend to `examples/`, add the constraint table and G-D | completeness, and it stops regrowing |
 | **4** *(optional)* | generic modules via `with_params` monomorphization; multi-domain modules with an explicit tick ratio | the last 14 |
 
