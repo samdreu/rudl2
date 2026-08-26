@@ -90,6 +90,12 @@ const SKIP: &[(&str, &str)] = &[
         "does not transpile: cause H, the same file-level `spawn_uart` rejection as `uart_tx`",
     ),
     (
+        "ex_combinational_ripple_carry_adder::ripple_carry_adder",
+        "does not transpile: cause J-b, a tuple-returning helper (`let (s, c) = full_adder(…)`), \
+         reported as a width error. Pinned by transpile_inference_gaps.rs. The fixture copy is \
+         written without the helper and does sweep",
+    ),
+    (
         "two_domain_top",
         "a `#[hardware(structural)]` parent: transpile-only by design, with no simulatable body \
          to drive (item 4 — the sim wires the hierarchy by hand)",
@@ -102,6 +108,38 @@ const SKIP: &[(&str, &str)] = &[
          cycle. Un-ignore when the constant-write exemption is narrowed",
     ),
 ];
+
+/// The monomorphization to sweep a **generic** module at, in signature order.
+///
+/// A generic module transpiles to a *parametric* SystemVerilog module, so it can be
+/// swept — Verilated with `-G` at the same widths the simulator runs, exactly as the
+/// hand-written tests do. What cannot be inferred is *which* widths: the parameters
+/// are often constrained (`N_LOG == clog2(N)`, asserted in the module itself), so a
+/// guess is a compile error at best. The values here are the ones the corresponding
+/// hand-written equivalence tests use, so the sweep and the vector test exercise the
+/// same shape.
+///
+/// A generic module missing from this table is ignored with a reason that says so.
+const PARAMS: &[(&str, &[(&str, i64)])] = &[
+    ("mux", &[("WIDTH_P", 8), ("ELS_P", 4), ("LG_ELS_LP", 2)]),
+    ("priority_encode", &[("N", 8), ("N_LOG", 3)]),
+    ("ripple_carry_adder", &[("N", 8)]),
+    ("rotate_right", &[("N", 8), ("N_LOG", 3)]),
+    ("shift_register", &[("N", 8), ("N_1", 7)]),
+    ("wide_alu", &[("N", 32)]),
+];
+
+/// Modules whose state is **undefined until reset**, and the port that resets them:
+/// `(module, port, active_low)`. Cycle 0 drives the port to its asserted value; every
+/// cycle after that is random, so the reset itself keeps getting exercised.
+///
+/// This is not a workaround. `shift_register` initialises its register to `Bits::x()`
+/// — deliberately, because an unreset flip-flop is X in hardware — and the two
+/// implementations then legitimately DISAGREE about what X reads as (the simulator
+/// carries X, Verilator's 2-state model reads 0). Sweeping the pre-reset window
+/// compares undefined behaviour against undefined behaviour, which is a test of
+/// nothing. A design that needs a reset gets one.
+const RESET: &[(&str, &str, bool)] = &[("shift_register", "rstn", true)];
 
 /// Cycles of random stimulus per sequential module.
 const SEQ_CYCLES: usize = 200;
@@ -199,10 +237,10 @@ fn wrapper_name(manifest: &Path, path: &Path) -> String {
 /// One `#[hardware]` module, as much of it as generation needs.
 struct Module {
     name: String,
-    /// `true` for a const-generic module: `copper-transpile` only handles concrete
-    /// ones (generics are monomorphized by the macro at run time), so it cannot be
-    /// swept as it stands.
-    generic: bool,
+    /// Const-generic parameter names in signature order, empty for a concrete module.
+    /// A generic module emits a PARAMETRIC SystemVerilog module, so it can be swept —
+    /// at the widths `PARAMS` records for it.
+    generics: Vec<String>,
     ports: Vec<Port>,
 }
 
@@ -237,29 +275,61 @@ impl Module {
             let (kind, ty, domain) = classify(&pt.ty)?;
             ports.push(Port { name, ty, domain, kind });
         }
-        Some(Module {
-            name: f.sig.ident.to_string(),
-            generic: !f.sig.generics.params.is_empty(),
-            ports,
-        })
+        let generics = f
+            .sig
+            .generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                syn::GenericParam::Const(c) => Some(c.ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        Some(Module { name: f.sig.ident.to_string(), generics, ports })
     }
 
     fn clock(&self) -> Option<&Port> {
         self.ports.iter().find(|p| p.kind == Kind::Clock)
     }
 
+    /// The recorded monomorphization, if this module needs one and has one. Every
+    /// declared parameter must be covered — a partial entry would monomorphize to
+    /// something the author did not choose.
+    fn params(&self) -> Option<&'static [(&'static str, i64)]> {
+        if self.generics.is_empty() {
+            return None;
+        }
+        let entry = PARAMS.iter().find(|(n, _)| *n == self.name)?.1;
+        self.generics
+            .iter()
+            .all(|g| entry.iter().any(|(n, _)| n == g))
+            .then_some(entry)
+    }
+
     /// The reason this module cannot be swept, if any.
-    fn skip_reason(&self) -> Option<String> {
-        if let Some((_, why)) = SKIP.iter().find(|(n, _)| *n == self.name) {
+    fn skip_reason(&self, qualified: &str) -> Option<String> {
+        // Matched on the bare name, or on `<wrapper>::<name>` when only one COPY of a
+        // module is affected — `ripple_carry_adder` exists twice and only the example
+        // copy uses the construct that refuses.
+        if let Some((_, why)) = SKIP
+            .iter()
+            .find(|(n, _)| *n == self.name || n.rsplit("::").next() == Some(self.name.as_str()) && *n == qualified)
+        {
             return Some((*why).to_string());
         }
-        if self.generic {
-            return Some(
-                "generic module: monomorphized by the macro at run time, so `copper-transpile` \
-                 (concrete modules only) cannot emit it. Sweeping it needs the `with_params` \
-                 monomorphization path — phase 4"
-                    .to_string(),
-            );
+        if !self.generics.is_empty() && self.params().is_none() {
+            return Some(format!(
+                "generic module with no monomorphization recorded: add `(\"{}\", &[{}])` to \
+                 build.rs's PARAMS table. The parameters are usually constrained (a module can \
+                 `const assert!` a relation between them), so the widths are a decision, not \
+                 something to infer",
+                self.name,
+                self.generics
+                    .iter()
+                    .map(|g| format!("(\"{g}\", ?)"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if self.ports.iter().filter(|p| p.kind == Kind::Clock).count() > 1 {
             return Some(
@@ -309,18 +379,17 @@ fn classify(ty: &syn::Type) -> Option<(Kind, String, String)> {
 }
 
 /// Can seeded random stimulus be generated for this payload? `RandStim` covers
-/// `Logic` and `Bits<N>` for any `N` — including a width written as a file-scope
-/// `const` (`Bits<WIDTH>`, which the BaseJump examples use), since the const comes
-/// with the included file and is in scope in the generated body. A *generic* module
-/// is excluded earlier, by its own signature.
-///
-/// Array ports (`[Bits<W>; N]`) are not covered: `RandStim` has no array impl, and
-/// the bit layout the testbench would have to assume is the array-port ABI
-/// (`design_docs/ARRAY_PORT_ABI.md`) — a decision to make deliberately, not by
-/// letting a generator guess. One module in the corpus, `bsg_mux_one_hot`.
+/// `Logic`, `Bits<N>` for any `N` — including a width written as a file-scope `const`
+/// or a const-generic parameter, both of which are in scope in the generated body —
+/// and arrays of either.
 fn is_stimulable(ty: &str) -> bool {
     if ty == "Logic" {
         return true;
+    }
+    if let Some(inner) = ty.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        // `[Bits<W>;N]` — the element must be stimulable; the length is a width-like
+        // identifier or a literal, and is checked by the compiler, not here.
+        return inner.rsplit_once(';').is_some_and(|(elem, _)| is_stimulable(elem.trim()));
     }
     ty.strip_prefix("Bits<")
         .and_then(|r| r.strip_suffix('>'))
@@ -328,8 +397,17 @@ fn is_stimulable(ty: &str) -> bool {
 }
 
 /// A zero of the payload type, for the wire's initial value.
-fn zero_of(ty: &str) -> &'static str {
-    if ty == "Logic" { "__Logic::Zero" } else { "__Bits::zero()" }
+fn zero_of(ty: &str) -> String {
+    if ty == "Logic" {
+        "__Logic::Zero".to_string()
+    } else if ty.starts_with('[') {
+        // `[T; N]`: `from_fn` rather than `[zero; N]`, which would need `Copy` in a
+        // const context the element type does not necessarily satisfy.
+        let elem = ty[1..ty.len() - 1].rsplit_once(';').map(|(e, _)| e.trim()).unwrap_or("Logic");
+        format!("std::array::from_fn(|_| {})", zero_of(elem))
+    } else {
+        "__Bits::zero()".to_string()
+    }
 }
 
 /// A stable per-module seed, so two modules do not walk the same bit pattern and a
@@ -434,7 +512,7 @@ fn emit_file(
                     .to_string(),
             )
         } else {
-            m.skip_reason()
+            m.skip_reason(&format!("{wrapper}::{}", m.name))
         };
         match reason {
             Some(reason) => {
@@ -469,9 +547,23 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     }
 
     let clk = m.clock();
+    let params = m.params();
+
+    // The monomorphization, as local bindings the port types and the call both use.
+    for (n, v) in params.unwrap_or(&[]) {
+        let _ = writeln!(code, "        const P_{n}: usize = {v};");
+    }
+
+    let with_params = match params {
+        Some(ps) => format!(
+            "\n            .with_params(&[{}])",
+            ps.iter().map(|(n, v)| format!("(\"{n}\", {v})")).collect::<Vec<_>>().join(", ")
+        ),
+        None => String::new(),
+    };
     let _ = writeln!(
         code,
-        "        let mut eq = __Eq::differential_only(\"{name}\", SRC, Some(\"{name}\"));"
+        "        let mut eq = __Eq::differential_only(\"{name}\", SRC, Some(\"{name}\")){with_params};"
     );
     let _ = writeln!(code, "        let mut rng = __Rng::new({});", seed_of(name));
     if let Some(c) = clk {
@@ -480,7 +572,7 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     let _ = writeln!(code, "        let mut exec = __Exec::new();");
 
     for p in &m.ports {
-        let (ty, z, d) = (alias_ty(&p.ty), zero_of(&p.ty), &p.domain);
+        let (ty, z, d) = (alias_ty(&p.ty, &m.generics), zero_of(&p.ty), &p.domain);
         match p.kind {
             Kind::Clock => {}
             Kind::In => {
@@ -543,22 +635,52 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
             Kind::Out | Kind::RegOut => format!("{}_out", p.name),
         })
         .collect();
+    let turbofish = match params {
+        Some(ps) if !m.generics.is_empty() => format!(
+            "::<{}>",
+            m.generics
+                .iter()
+                .map(|g| {
+                    let _ = ps;
+                    format!("P_{g}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => String::new(),
+    };
     let _ = writeln!(
         code,
-        "        exec.spawn_wired({name}({}), handles, reads);\n",
+        "        exec.spawn_wired({name}{turbofish}({}), handles, reads);\n",
         args.join(", ")
     );
 
     let cycles = if clk.is_some() { SEQ_CYCLES } else { COMB_VECTORS };
-    let _ = writeln!(code, "        for _ in 0..{cycles} {{");
+    let reset = RESET.iter().find(|(n, _, _)| *n == m.name);
+    let _ = writeln!(code, "        for __cycle in 0..{cycles} {{");
     for p in m.ports.iter().filter(|p| p.kind == Kind::In) {
-        let _ = writeln!(
-            code,
-            "            let {n}_v = <{ty} as __RandStim>::rand(&mut rng);\n            \
-             {n}_drv.write({n}_v);",
-            n = p.name,
-            ty = alias_ty(&p.ty)
-        );
+        let ty = alias_ty(&p.ty, &m.generics);
+        match reset {
+            // Cycle 0 asserts the reset; after that it is random like everything else,
+            // so the reset path keeps being exercised rather than being visited once.
+            Some((_, port, active_low)) if *port == p.name => {
+                let asserted = if *active_low { "__Logic::Zero" } else { "__Logic::One" };
+                let _ = writeln!(
+                    code,
+                    "            let {n}_v = if __cycle == 0 {{ {asserted} }} else {{ \
+                     <{ty} as __RandStim>::rand(&mut rng) }};\n            {n}_drv.write({n}_v);",
+                    n = p.name
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    code,
+                    "            let {n}_v = <{ty} as __RandStim>::rand(&mut rng);\n            \
+                     {n}_drv.write({n}_v);",
+                    n = p.name
+                );
+            }
+        }
     }
     let _ = writeln!(
         code,
@@ -591,14 +713,38 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     let _ = writeln!(code, "    }}\n");
 }
 
-/// The payload type spelled with the wrapper's aliases, so the generated body does
-/// not depend on what the included file imported: `Bits<8>` → `__Bits<8>`.
-fn alias_ty(ty: &str) -> String {
-    if ty == "Logic" {
-        "__Logic".to_string()
-    } else {
-        ty.replacen("Bits", "__Bits", 1)
+/// The payload type spelled for the generated body: `Bits` and `Logic` under the
+/// wrapper's aliases (so nothing depends on what the included file imported), and any
+/// const-generic parameter under its local `P_` binding.
+///
+/// Token-wise, not by string replacement: `Bits<N_LOG>` must not be rewritten by a
+/// rule for `N`, and a substring replace does exactly that.
+fn alias_ty(ty: &str, generics: &[String]) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    let flush = |ident: &mut String, out: &mut String| {
+        if ident.is_empty() {
+            return;
+        }
+        let mapped = match ident.as_str() {
+            "Bits" => "__Bits".to_string(),
+            "Logic" => "__Logic".to_string(),
+            other if generics.iter().any(|g| g == other) => format!("P_{other}"),
+            other => other.to_string(),
+        };
+        out.push_str(&mapped);
+        ident.clear();
+    };
+    for c in ty.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else {
+            flush(&mut ident, &mut out);
+            out.push(c);
+        }
     }
+    flush(&mut ident, &mut out);
+    out
 }
 
 /// Escape a reason string for a `#[ignore = "…"]` attribute.

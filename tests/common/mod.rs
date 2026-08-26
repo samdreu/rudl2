@@ -143,6 +143,19 @@ impl<const N: usize> RandStim for Bits<N> {
     }
 }
 
+impl<T: RandStim, const N: usize> RandStim for [T; N] {
+    fn rand(rng: &mut Rng) -> Self {
+        std::array::from_fn(|_| T::rand(rng))
+    }
+    /// Element-major, each element in its own bit order — the layout the hand-written
+    /// array-port tests already record (`mux_equivalence.rs` flattens
+    /// `data.iter().flat_map(|b| b.as_array())`), which is the array-port ABI in
+    /// `design_docs/ARRAY_PORT_ABI.md`.
+    fn as_bits(&self) -> Vec<Logic> {
+        self.iter().flat_map(|e| e.as_bits()).collect()
+    }
+}
+
 /// Transpile a DUT fixture and write the SystemVerilog to a temp file.
 ///
 /// `module` may be `None` when the fixture declares exactly one hardware module.

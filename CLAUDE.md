@@ -39,7 +39,11 @@ corpus differential sweep covered every `#[hardware]` module and ran. That sweep
 `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`) generates one case per module — seeded
 random stimulus, simulator vs the SystemVerilog it transpiles to under Verilator —
 so **a new module is covered the moment it exists**, with no harness to write. A
-module it cannot run gets an `#[ignore]` with a reason, never an omission. It prints the
+module it cannot run gets an `#[ignore]` with a reason, never an omission. Three
+tables in `build.rs` carry what cannot be inferred — `PARAMS` (widths for a generic
+module), `RESET` (a design whose state is X until reset), `SKIP` (why a module is not
+swept) — so adding one is the way to teach the sweep about a new module, and each
+entry is a reviewed sentence rather than a silent exclusion. It prints the
 `#[ignore]`d tests on every run so a deliberately-skipped check stays visible.
 
 Subsets — all of these print `PARTIAL OK` and skip some guards, so they are **not**

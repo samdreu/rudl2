@@ -794,7 +794,19 @@ TRANSPILATION:
     differential case must have. The sweep is the only check that says the emitted
     SystemVerilog agrees with the simulator, so it silently covering nothing is the
     expensive failure — the same reason G-A/G-B/G-C exist.
-  ☐ Phase 4 — generic modules via `with_params` monomorphization; multi-domain.
+  ✔ Phase 4 — generic modules (they transpile to PARAMETRIC SV, so they only need
+    `-G` widths; `PARAMS` in build.rs records the same monomorphization the
+    hand-written test uses, because the parameters are usually constrained and a
+    guess is a compile error), array ports (a `RandStim` impl for `[T; N]` using the
+    element-major layout the hand-written array tests already record), and reset
+    sequencing. 93 cases running, 11 ignored — and every remaining skip is a recorded
+    transpiler cause, a structural module, or a deliberate divergence. NONE is "the
+    generator cannot do this".
+    WHAT IT FOUND: `shift_register` initialises its register to `Bits::x()`, so its
+    output is undefined until reset — the simulator carries X, Verilator's 2-state
+    model reads 0, and they legitimately disagree. The fix is a RESET table entry
+    (assert on cycle 0, random after), not a skip: comparing undefined behaviour
+    against undefined behaviour is a test of nothing.
 
   ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
   A module can pass the CLI and still fail the equivalence harness, which runs

@@ -1,12 +1,11 @@
 # Corpus differential sweep — scope
 
-**Status:** phases 1–3 BUILT and green. `build.rs` generates a case for every
-`#[hardware]` module in `tests/fixtures/` **and** `examples/` — 83 running, 21
-ignored-with-reason — and `tools/regression.sh`'s **G-D** asserts the sweep covered
-the corpus and ran. The hand-written phase-1 file is gone: the generator emits the
-same wiring. Phase 4 (generic modules, multi-clock, array ports) proposed. Written 2026-08-25, at the point where the memory staging fix
-needed a hand-written equivalence test to discover that it had opened a one-cycle
-divergence somewhere else.
+**Status:** phases 1–4 BUILT and green. `build.rs` generates a case for every
+`#[hardware]` module in `tests/fixtures/` and `examples/` — **93 running, 11
+ignored-with-reason** — and `tools/regression.sh`'s **G-D** asserts the sweep covered
+the corpus and ran. Every remaining skip is a recorded transpiler cause (5), a
+structural module with no simulatable body (1), or a deliberate divergence witness
+(5). **None is "the generator cannot do this."**
 
 ## 0. What phase 1 found, on its first run
 
@@ -87,6 +86,40 @@ skipped: `RandStim` has no array impl and the bit layout the testbench would ass
 the array-port ABI, a decision to make deliberately rather than let a generator guess.
 
 **Wall clock: 81s** for 83 Verilator builds and runs.
+
+## 0.3 What phase 4 found
+
+**A design's undefined region, which is the interesting part.** `shift_register`
+initialises its register to `Bits::x()` — deliberately, because an unreset flip-flop
+is X in hardware — and the sweep drove it before any reset. The simulator carries X;
+Verilator's 2-state model reads 0. They *legitimately* disagree, and comparing
+undefined behaviour against undefined behaviour is a test of nothing.
+
+The honest fix was not to skip it and not to paper over it, but to give the design
+the reset it requires: a `RESET` table entry drives the reset port asserted on cycle 0
+and randomly after that, so the reset path keeps being exercised rather than visited
+once. One entry covers the corpus — `Bits::x()` appears in exactly two files, which
+are the two copies of that module.
+
+The rest of phase 4 was mechanical and worked first time:
+
+* **Generic modules sweep.** A generic module transpiles to a *parametric*
+  SystemVerilog module, so it needs only `-G` widths — the earlier skip reason
+  ("`copper-transpile` cannot emit it") was simply wrong. What cannot be inferred is
+  *which* widths: parameters are often constrained (`N_LOG == clog2(N)`, asserted
+  inside the module), so a guess is a compile error. `PARAMS` records the same
+  monomorphization the hand-written test uses, so the sweep and the vector test
+  exercise the same shape.
+* **Array ports sweep**, via a `RandStim` impl for `[T; N]` whose bit layout is the
+  one the hand-written array tests already record (element-major) — the array-port
+  ABI, taken from an existing test rather than invented.
+* **Type rewriting is token-wise, not textual.** `Bits<N_LOG>` must not be rewritten
+  by a rule for `N`, and a substring replace does exactly that.
+
+One skip was added rather than removed: the *example* copy of `ripple_carry_adder`
+does not transpile (cause J-b, a tuple-returning helper) while the fixture copy,
+written without the helper, does. Same module name, two files, one blocked — which is
+why `SKIP` accepts a `<wrapper>::<module>` key.
 
 ---
 
@@ -250,7 +283,7 @@ its most-repeated bug class. A sweep without G-D would be one more instance of i
 | **1** ✔ | `differential_only` + a hand-written `tests/corpus_equivalence.rs` covering the 11-module backlog with random stimulus | DONE 2026-08-25 — found two defects on the first run (§0) |
 | **2** ✔ | `build.rs` generator over `tests/fixtures/` (70 modules, uniform and already `include!`-friendly) | DONE 2026-08-25 — 59 generated + 11 ignored-with-reason, all green in 53s (§0.1) |
 | **3** ✔ | extend to `examples/`, add the constraint table and G-D | DONE 2026-08-25 — 83 cases, G-D in the driver, phase 1's hand-written file deleted (§0.2) |
-| **4** *(optional)* | generic modules via `with_params` monomorphization; multi-domain modules with an explicit tick ratio | the last 14 |
+| **4** ✔ | generic modules via `with_params` monomorphization; array ports; reset sequencing | DONE 2026-08-25 — 10 more modules, and the last generator-shaped skip is gone (§0.3) |
 
 Rough cost: phase 1 half a day, phase 2 a day, phase 3 a day plus constraint triage,
 G-D a couple of hours. **~3 focused days** to the point where the gap cannot regrow.
