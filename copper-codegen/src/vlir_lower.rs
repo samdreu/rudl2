@@ -2709,7 +2709,25 @@ fn collect_stmt_names(stmts: &[SHIRStmt], leg: &mut Legalizer) {
 #[allow(dead_code)]
 fn _phase_marker(_: &SHIRPhase) {}
 
-/// Verilog / SystemVerilog reserved keywords (VLIR_DESIGN §Pass 1).
+/// Verilog / SystemVerilog reserved keywords (VLIR_DESIGN §Pass 1), plus the C++
+/// words Verilator will not accept in a generated model.
+///
+/// A name that lands here gets `_sig` appended by [`Legalizer::legalize`], so a
+/// legal Copper identifier never becomes an illegal SystemVerilog one.
+///
+/// **Both lists are load-bearing, and both had holes.** `examples/cdc/flag_crossing.rs`
+/// has a port named `event` — a SystemVerilog keyword absent from the list below
+/// until 2026-08-25 — and emitted SystemVerilog that Verilator could not parse
+/// (*"syntax error, unexpected event"*). It went unnoticed because that example is
+/// checked against hand-written Verilog and nothing had ever Verilated what it
+/// transpiles to; `tests/corpus_equivalence.rs` is what found it. The C++ half is
+/// the same class one step further out: Verilator emits a C++ model, so a port named
+/// `abort` or `delete` builds clean SystemVerilog and then fails the C++ compile
+/// (`SYMRSVDWORD`), which is fatal under the harness's `-Wall`.
+///
+/// Adding a word only ever renames an identifier that was already unusable, so the
+/// lists are kept deliberately complete rather than minimal. Measured when they were
+/// filled in: exactly one name in the whole corpus changed (`event`).
 fn is_reserved(name: &str) -> bool {
     const KEYWORDS: &[&str] = &[
         "always", "always_comb", "always_ff", "always_latch", "and", "assign", "automatic",
@@ -2727,8 +2745,43 @@ fn is_reserved(name: &str) -> bool {
         "struct", "super", "table", "task", "this", "time", "timeprecision", "timeunit", "tran",
         "tri", "type", "typedef", "union", "unique", "unsigned", "var", "virtual", "void", "wait",
         "wand", "while", "wire", "with", "wor", "xnor", "xor",
+        // IEEE 1800-2017 additions, and the Verilog-1995/2001 gate and net keywords
+        // the original list skipped.
+        "accept_on", "alias", "assert", "assume", "before", "bind", "bins", "binsof",
+        "break", "bufif0", "bufif1", "chandle", "checker", "class", "cmos", "const",
+        "constraint", "context", "continue", "cover", "covergroup", "coverpoint",
+        "cross", "deassign", "dist", "endchecker", "endclass", "endclocking", "event",
+        "eventually", "expect", "first_match", "forkjoin", "global", "highz0",
+        "highz1", "ifnone", "ignore_bins", "illegal_bins", "implements", "implies",
+        "incdir", "include", "inside", "interconnect", "intersect", "join_any",
+        "join_none", "large", "let", "liblist", "library", "matches", "medium",
+        "nettype", "nexttime", "nmos", "noshowcancelled", "notif0", "notif1", "null",
+        "pmos", "pull0", "pull1", "pulldown", "pullup", "pulsestyle_ondetect",
+        "pulsestyle_onevent", "pure", "rand", "randc", "randcase", "randsequence",
+        "rcmos", "reject_on", "restrict", "rnmos", "rpmos", "rtran", "rtranif0",
+        "rtranif1", "s_always", "s_eventually", "s_nexttime", "s_until",
+        "s_until_with", "scalared", "showcancelled", "small", "soft", "solve",
+        "strong", "strong0", "strong1", "supply0", "supply1", "sync_accept_on",
+        "sync_reject_on", "tagged", "throughout", "tranif0", "tranif1", "tri0",
+        "tri1", "triand", "trior", "trireg", "unique0", "until", "until_with",
+        "untyped", "use", "uwire", "vectored", "wait_order", "weak", "weak0",
+        "weak1", "wildcard", "within",
     ];
-    KEYWORDS.contains(&name)
+    /// C++ keywords and the few common words Verilator refuses (`SYMRSVDWORD`),
+    /// because the model it generates is C++ and the port becomes a member name.
+    /// The SystemVerilog itself is legal — this is about what can be BUILT.
+    const CPP_RESERVED: &[&str] = &[
+        "abort", "alignas", "alignof", "asm", "auto", "bool", "catch", "char",
+        "char8_t", "char16_t", "char32_t", "co_await", "co_return", "co_yield",
+        "compl", "concept", "const_cast", "consteval", "constexpr", "constinit",
+        "decltype", "delete", "double", "dynamic_cast", "explicit", "false", "float",
+        "friend", "goto", "inline", "long", "main", "mutable", "namespace",
+        "noexcept", "nullptr", "operator", "private", "protected", "public",
+        "register", "reinterpret_cast", "requires", "short", "sizeof",
+        "static_assert", "static_cast", "std", "switch", "template", "throw", "true",
+        "try", "typeid", "typename", "using", "volatile", "wchar_t",
+    ];
+    KEYWORDS.contains(&name) || CPP_RESERVED.contains(&name)
 }
 
 #[cfg(test)]
@@ -2741,6 +2794,38 @@ mod e2e_tests {
         let f: syn::ItemFn = syn::parse_str(src).expect("parse");
         transpile_item_fn(&f, &HashSet::new(), &HashMap::new(), &EmitConfig::default())
             .expect("transpile")
+    }
+
+    /// A port whose name is reserved is renamed, not emitted verbatim — otherwise
+    /// the module is syntactically invalid (SystemVerilog keyword) or cannot be
+    /// built (C++ keyword, which Verilator rejects as `SYMRSVDWORD`).
+    ///
+    /// `event` is the real instance: `examples/cdc/flag_crossing.rs` shipped it, and
+    /// the emitted SystemVerilog would not parse — found 2026-08-25 by
+    /// `tests/corpus_equivalence.rs`, the first thing ever to Verilate what that
+    /// example transpiles to.
+    #[test]
+    fn a_reserved_port_name_is_legalized() {
+        let src = r#"
+            async fn m(clk: Clock<MainClk>, trigger: In<Logic, MainClk>,
+                       event: Out<Logic, MainClk>, delete: Out<Logic, MainClk>) {
+                loop {
+                    event.write(trigger.read());
+                    delete.write(trigger.read());
+                    clk.tick().await;
+                }
+            }
+        "#;
+        let sv = transpile(src);
+        assert!(
+            sv.contains("output logic event_sig") && sv.contains("output logic delete_sig"),
+            "a reserved port name must be legalized — `event` is a SystemVerilog \
+             keyword and `delete` a C++ one, and neither can be emitted verbatim:\n{sv}"
+        );
+        assert!(
+            !sv.contains("output logic event;") && !sv.contains("output logic delete;"),
+            "the bare reserved name is still emitted somewhere:\n{sv}"
+        );
     }
 
     #[test]

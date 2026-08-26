@@ -380,6 +380,63 @@ identical phase question. Two ways of covering it were implemented and measured:
 > widening rejects correct designs (R1). The second widening is the closer of the
 > two and is where a third attempt should start.
 
+### 5.5 The CONSTANT-WRITE exemption is unsound for a conditionally-written `Out` — found 2026-08-25
+
+`unprotected_pretick_out_write` clause (ii) considers only plain `Out` ports driven
+**from a register**, exempting a write of a constant: *"a write of a constant is
+idempotent across the phase shift — the misalignment changes when the write happens,
+so it is only observable if the value written differs between phases."*
+
+That premise holds only when the write happens **every** cycle. It does not when the
+port is written on some paths and not others (the enabled-`Out` idiom), or when
+different arms write different constants — then *when* the write lands is observable,
+because the alternative is the port's held value.
+
+**Measured**, `tests/sequential_forwarding_divergence.rs`:
+
+```rust
+loop {
+    match pc {
+        0u8 => { if sel.read() == Logic::One { pc = 1; } }
+        1u8 => { o.write(Logic::One); pc = 0; }   // belongs to the NEXT cycle
+        _ => {}
+    }
+    clk.tick().await;
+}
+```
+
+| | cycle 0 | 1 | 2 | … |
+|---|---|---|---|---|
+| simulator | 1 | 1 | 1 | 1 |
+| transpiled SV | **0** | 1 | 1 | 1 |
+
+and with the other arm driving the port low, so the shift is visible every cycle
+rather than once (`pc_arm_toggle`):
+
+| | 0 | 1 | 2 | 3 | … |
+|---|---|---|---|---|---|
+| simulator | 1 | 0 | 1 | 0 | … |
+| transpiled SV | 0 | 1 | 0 | 1 | … |
+
+The two traces are each other shifted by exactly one cycle: a phase shift, not an
+initialisation artifact. `unprotected_pretick_out_write` returns `[]` for both.
+
+**How it was found, and why it had not been.** `tests/corpus_equivalence.rs` (phase 1
+of `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`) ran 200 cycles of seeded random
+stimulus at `branch_merge_explicit`, a fixture that had lived in the tree with only a
+*structural* check on it. The sharpest statement of the finding is that
+`branch_merge` and `branch_merge_explicit` transpile to **byte-identical**
+SystemVerilog (asserted by `control_extraction_structural.rs`), the async twin agrees
+with that SV for all 200 cycles, and the explicit twin leads it by one — so the
+simulator disagrees with *itself* depending on how the same hardware is spelled.
+
+**Not fixed here, deliberately.** Narrowing the exemption — exempt a constant write
+only where the output is written on every path of the segment — is a rule widening,
+and §5.4 records two widenings whose corpus cost (25 and 10 false positives) is why
+they were rejected. The cost of this one has not been measured, and R1 (zero false
+positives corpus-wide) applies to it as much as to those. The witnesses assert
+today's behaviour and flip loudly when it changes.
+
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
 
 Measured by hand-writing the lowering Prost uses (combinational next-value in

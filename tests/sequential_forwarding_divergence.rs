@@ -702,3 +702,172 @@ fn d1_in_the_trailing_segment_is_an_unguarded_gap() {
          FIXED. Promote this to a real equivalence test."
     );
 }
+
+// ── Divergence 3 — a write in a state-machine arm, and D1's constant exemption ──
+//
+// FOUND 2026-08-25 by tests/corpus_equivalence.rs, on random stimulus, in
+// `branch_merge_explicit` — a fixture that had been in the tree for weeks with only
+// a STRUCTURAL check on it. The sharpest form of the finding: that module and its
+// async twin `branch_merge` transpile to BYTE-IDENTICAL SystemVerilog, the twin
+// agrees with that SV for 200 random cycles, and the explicit one leads it by a
+// cycle. The simulator therefore disagrees with itself depending on how the same
+// hardware is spelled.
+//
+// The DUTs below are that shape, minimised. `o` is written only in the `pc == 1`
+// arm, which belongs to the NEXT cycle — but the simulator runs the next
+// iteration's pre-tick segment during the post-edge settle of this tick, so the
+// write is observable a cycle before the hardware performs it.
+//
+// WHY THE D1 GUARD DOES NOT FIRE: `unprotected_pretick_out_write` exempts a write
+// of a CONSTANT, on the grounds that a constant is idempotent across the phase
+// shift. That premise holds only if the write happens every cycle. Here which arm
+// runs is chosen by a register (`pc`), so the constant is not the whole story — in
+// `pc_arm_write` the other path leaves the port HOLDING, and in `pc_arm_toggle` it
+// writes a DIFFERENT constant. Either way, *when* the write lands is observable.
+//
+// Narrowing the exemption is a rule widening whose corpus cost has to be measured
+// first (see §5.4 for two widenings that were measured and rejected), so these pin
+// today's behaviour and flip loudly when it changes.
+
+const PC_ARM_SRC: &str = r#"
+#[hardware(sequential)]
+async fn pc_arm_write(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
+    let mut pc: u8 = 0;
+    loop {
+        match pc {
+            0u8 => { if sel.read() == Logic::One { pc = 1; } }
+            1u8 => { o.write(Logic::One); pc = 0; }
+            _ => {}
+        }
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential)]
+async fn pc_arm_write(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
+    let mut pc: u8 = 0;
+    loop {
+        match pc {
+            0u8 => { if sel.read() == Logic::One { pc = 1; } }
+            1u8 => { o.write(Logic::One); pc = 0; }
+            _ => {}
+        }
+        clk.tick().await;
+    }
+}
+
+/// The same machine with the other arm driving the port low, so the lead is visible
+/// on every cycle instead of only the first — `pc_arm_write`'s output latches high
+/// and can only show it once.
+const PC_ARM_TOGGLE_SRC: &str = r#"
+#[hardware(sequential)]
+async fn pc_arm_toggle(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
+    let mut pc: u8 = 0;
+    loop {
+        match pc {
+            0u8 => { o.write(Logic::Zero); if sel.read() == Logic::One { pc = 1; } }
+            1u8 => { o.write(Logic::One); pc = 0; }
+            _ => {}
+        }
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential)]
+async fn pc_arm_toggle(clk: Clock<C>, sel: In<Logic, C>, o: Out<Logic, C>) {
+    let mut pc: u8 = 0;
+    loop {
+        match pc {
+            0u8 => { o.write(Logic::Zero); if sel.read() == Logic::One { pc = 1; } }
+            1u8 => { o.write(Logic::One); pc = 0; }
+            _ => {}
+        }
+        clk.tick().await;
+    }
+}
+
+fn sim_pc_arm(toggle: bool) -> Vec<u8> {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (sel_drv, sel_in) = wire::<Logic, C>(Logic::One);
+    let (o, obs) = wire::<Logic, C>(Logic::Zero);
+    let dh = o.dirty_handle();
+    let reads = vec![sel_in.wire_id()];
+    if toggle {
+        exec.spawn_wired(pc_arm_toggle(clk.clone(), sel_in, o), vec![dh], reads);
+    } else {
+        exec.spawn_wired(pc_arm_write(clk.clone(), sel_in, o), vec![dh], reads);
+    }
+    sel_drv.write(Logic::One);
+    (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            u8::from(obs.read() == Logic::One)
+        })
+        .collect()
+}
+
+/// The corpus instance's shape: `o` is written only in the `pc == 1` arm, so the
+/// other path leaves it holding. The simulator shows the write a cycle before the
+/// hardware performs it. It shows up once because the output latches high — which
+/// is exactly why a hand-written vector set never caught it, and why 200 cycles of
+/// random stimulus did.
+#[test]
+fn a_write_in_a_state_arm_leads_the_hardware_by_one_cycle() {
+    let sim = sim_pc_arm(false);
+    assert_eq!(
+        sim,
+        vec![1u8; CYCLES],
+        "simulator behaviour changed; if it now starts at 0 the divergence is FIXED"
+    );
+
+    // The D1 guard exempts this: the value written is a constant. That exemption is
+    // what this witness says is unsound for a conditionally-written `Out`.
+    let f: syn::ItemFn = syn::parse_str(PC_ARM_SRC).expect("parses");
+    assert!(
+        copper_analysis::unprotected_pretick_out_write(&f).is_empty(),
+        "the constant-write exemption is now NARROWER — good. Delete this assertion, \
+         add the DUT to EXPECTED_FLAGGED in pretick_alignment_corpus.rs, and record \
+         the corpus cost of the narrowing in PRETICK_ALIGNMENT_GUARDRAIL.md §5.5."
+    );
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(PC_ARM_SRC, "pc_arm_write", "clk", "o", "t->sel = 1;");
+    let mut expected_sv = vec![1u8; CYCLES];
+    expected_sv[0] = 0;
+    assert_eq!(sv, expected_sv, "transpiled SV behaviour changed");
+    assert_ne!(
+        sim, sv,
+        "sim and SV now AGREE — this divergence is FIXED. Promote it to a real \
+         equivalence test and un-ignore \
+         corpus_equivalence.rs::branch_merge_explicit_differential_case, which is \
+         the same shape in the corpus."
+    );
+}
+
+/// The same machine with the other arm driving the port low. The two traces are
+/// each other shifted by exactly one cycle, for all 13 — so this is a phase shift,
+/// not an initialisation artifact, and it is worth the second DUT to say so.
+#[test]
+fn the_state_arm_lead_is_systematic_not_a_first_cycle_artifact() {
+    let sim = sim_pc_arm(true);
+    let expected_sim: Vec<u8> = (0..CYCLES).map(|i| u8::from(i % 2 == 0)).collect();
+    assert_eq!(sim, expected_sim, "simulator behaviour changed");
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(PC_ARM_TOGGLE_SRC, "pc_arm_toggle", "clk", "o", "t->sel = 1;");
+    let expected_sv: Vec<u8> = (0..CYCLES).map(|i| u8::from(i % 2 == 1)).collect();
+    assert_eq!(sv, expected_sv, "transpiled SV behaviour changed");
+    assert_eq!(
+        sim[1..],
+        sv[..CYCLES - 1],
+        "the divergence is no longer a clean one-cycle shift — it changed shape, \
+         which means something other than the phase alignment moved"
+    );
+}

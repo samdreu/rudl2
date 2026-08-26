@@ -1,18 +1,18 @@
-//! Clock-domain crossing, minimal: a single-bit "event" flag raised in a fast
-//! domain and consumed in a slow domain, brought across safely by the library
-//! synchronizer `copper::sync_2ff`.
-//!
-//! The point of this example is the *safety story*, in three parts:
-//!
-//!   1. The flag wire is tagged `ClkFast`. It physically cannot be wired into a
-//!      `ClkSlow` module — that is a compile error from the phantom domain types.
-//!   2. A regular `#[hardware(sequential)]` module may not even *declare* a
-//!      foreign-domain port, so you cannot hand-roll an ad-hoc crossing.
-//!   3. The only sanctioned path is a synchronizer (`sync_2ff`, or your own
-//!      `#[hardware(synchronizer)]` module). Its output is firmly `ClkSlow`, and
-//!      the slow consumer reads it like any native input.
-//!
-//! Both illegal paths are shown commented-out below with the error they produce.
+// Clock-domain crossing, minimal: a single-bit "event" flag raised in a fast
+// domain and consumed in a slow domain, brought across safely by the library
+// synchronizer `copper::sync_2ff`.
+//
+// The point of this example is the *safety story*, in three parts:
+//
+//   1. The flag wire is tagged `ClkFast`. It physically cannot be wired into a
+//      `ClkSlow` module — that is a compile error from the phantom domain types.
+//   2. A regular `#[hardware(sequential)]` module may not even *declare* a
+//      foreign-domain port, so you cannot hand-roll an ad-hoc crossing.
+//   3. The only sanctioned path is a synchronizer (`sync_2ff`, or your own
+//      `#[hardware(synchronizer)]` module). Its output is firmly `ClkSlow`, and
+//      the slow consumer reads it like any native input.
+//
+// Both illegal paths are shown commented-out below with the error they produce.
 
 use copper::sync_2ff;
 use copper_core::port::{wire, In, Out};

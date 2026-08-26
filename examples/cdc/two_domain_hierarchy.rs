@@ -1,25 +1,25 @@
-//! Item 4 — hierarchical clocked submodule instantiation (the multi-clock enabler).
-//!
-//! The same dual-clock design as `two_domain_counter`, but expressed as **one
-//! coherent hierarchical component**: a `#[hardware(structural)]` parent
-//! (`two_domain_top`) that instantiates the fast producer, the synchronizer, and
-//! the slow consumer, threading each child's own clock through. The parent has no
-//! `always_ff` of its own — it is pure hierarchy.
-//!
-//! Transpiling `two_domain_top` (see `copper-transpile --module two_domain_top
-//! --hierarchy`) emits real SystemVerilog with `.clk(wr_clk)` / `.clk(rd_clk)`
-//! port connections and internal nets — a self-contained dual-clock design
-//! Verilator lints clean. The *simulation* still hand-wires the children in the
-//! testbench (sim-as-unit is a deferred, separate capability), exactly as
-//! `two_domain_counter` does — so this example's `main` is the sim authority and
-//! the structural parent is the transpilation authority for the same design.
-//!
-//! What `main` checks: the 2:1 timeline (matching `two_domain_counter`), and the
-//! **rate-independent CDC invariant** — under *any* fast:slow tick interleaving,
-//! a flag crossing through the 2-FF synchronizer is monotone (never glitches low
-//! once synchronized) and eventually propagates. That is the observable content
-//! of "a well-formed multi-clock design behaves correctly under any relative tick
-//! rate, provided every crossing goes through a synchronizer."
+// Item 4 — hierarchical clocked submodule instantiation (the multi-clock enabler).
+//
+// The same dual-clock design as `two_domain_counter`, but expressed as **one
+// coherent hierarchical component**: a `#[hardware(structural)]` parent
+// (`two_domain_top`) that instantiates the fast producer, the synchronizer, and
+// the slow consumer, threading each child's own clock through. The parent has no
+// `always_ff` of its own — it is pure hierarchy.
+//
+// Transpiling `two_domain_top` (see `copper-transpile --module two_domain_top
+// --hierarchy`) emits real SystemVerilog with `.clk(wr_clk)` / `.clk(rd_clk)`
+// port connections and internal nets — a self-contained dual-clock design
+// Verilator lints clean. The *simulation* still hand-wires the children in the
+// testbench (sim-as-unit is a deferred, separate capability), exactly as
+// `two_domain_counter` does — so this example's `main` is the sim authority and
+// the structural parent is the transpilation authority for the same design.
+//
+// What `main` checks: the 2:1 timeline (matching `two_domain_counter`), and the
+// **rate-independent CDC invariant** — under *any* fast:slow tick interleaving,
+// a flag crossing through the 2-FF synchronizer is monotone (never glitches low
+// once synchronized) and eventually propagates. That is the observable content
+// of "a well-formed multi-clock design behaves correctly under any relative tick
+// rate, provided every crossing goes through a synchronizer."
 
 use copper_core::port::{wire, In, Out};
 use copper_core::{Bits, Clock, ClockDomain, Logic};

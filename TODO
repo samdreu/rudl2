@@ -331,12 +331,21 @@ TRANSPILATION:
           copper-analysis/tests/analysis_semantics.rs (both reachability
           directions).
 
-    ☐ MINOR, found in passing: Verilator rejects a port named `abort`
-        (`SYMRSVDWORD` — it matches a C++ common word) and the equivalence harness
-        runs `-Wall`, so the build fails. `vlir_lower`'s legalizer reserves
-        SystemVerilog keywords but not C++ ones, so a legal Copper name can produce
-        SystemVerilog that Verilator will not compile. Worked around in the cause-O
-        test by renaming the port; the legalizer is the real fix.
+    ✔ FIXED (2026-08-25) — RESERVED PORT NAMES. Was: Verilator rejects a port named
+        `abort` (`SYMRSVDWORD` — a C++ common word) and the harness runs `-Wall`, so
+        the build fails. Both halves of the legalizer's list were incomplete, and the
+        SystemVerilog half was worse: `examples/cdc/flag_crossing.rs` has a port
+        named `event` — a SystemVerilog KEYWORD — and emitted SystemVerilog that
+        will not parse ("syntax error, unexpected event"). It shipped because that
+        example is checked against hand-written Verilog and nothing had ever
+        Verilated what it transpiles to; the corpus differential sweep found it on
+        its first run. `is_reserved` now carries the full IEEE 1800-2017 keyword set
+        plus the C++ reserved words, and a reserved name still gets `_sig` appended.
+        Measured blast radius: exactly ONE name in the whole corpus changed (`event`
+        → `event_sig`), and nothing hand-instantiates that module.
+        Pinned by vlir_lower::e2e_tests::a_reserved_port_name_is_legalized.
+        NOTE for the sweep generator: the testbench addresses the Verilated model by
+        the EMITTED name, so a generated harness needs the rust→SV name mapping.
 
     G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
         reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
@@ -1291,6 +1300,26 @@ TRANSPILATION:
      segment runs); it does not extend to forwarding WITHIN the segment. Worth
      correcting in the doc either way, and deciding whether D1's exemption should
      be narrowed.
+
+  ☐ D1's CONSTANT-WRITE EXEMPTION IS UNSOUND for a conditionally-written `Out`
+     (found 2026-08-25 by the corpus differential sweep, on random stimulus).
+     `unprotected_pretick_out_write` exempts a write of a constant because "a
+     constant is idempotent across the phase shift". True only if the write happens
+     EVERY cycle. Where an arm of a `match pc` writes the port and another does not,
+     the alternative is the port's HELD value, so *when* the write lands is
+     observable — measured, the simulator leads the emitted SV by exactly one cycle,
+     on every cycle when the other arm writes a different constant.
+     Sharpest form: `branch_merge` and `branch_merge_explicit` transpile to
+     BYTE-IDENTICAL SystemVerilog; the async twin agrees with it for 200 random
+     cycles and the explicit twin does not. The simulator disagrees with ITSELF
+     depending on how the same hardware is spelled — which makes this a witness for
+     the timing-model root cause, not just a rule gap.
+     Pinned: sequential_forwarding_divergence.rs::{a_write_in_a_state_arm_leads_the_hardware_by_one_cycle,
+     the_state_arm_lead_is_systematic_not_a_first_cycle_artifact}; written up in
+     PRETICK_ALIGNMENT_GUARDRAIL.md 5.5; the corpus instance is ignored-with-reason
+     in corpus_equivalence.rs. NOT fixed deliberately: narrowing the exemption is a
+     rule widening and 5.4 records two whose corpus cost (25 and 10 false positives)
+     is why they were rejected. Measure this one's cost before landing it.
 
   ☐ `continue` inside a nested loop. Jumping to the loop head mid-cycle needs the
      head's LOWERED body at a point where it is still being lowered. `break` avoids
