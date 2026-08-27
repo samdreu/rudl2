@@ -1,9 +1,17 @@
 # Synchronous semantics
 
-The reference for Copper's execution/timing model. It states the semantics as properties of the
-**design**, independent of any particular construction (codegen's `match pc` FSM is one realization,
-not the semantics). Companion: `SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` (the staged work); every claim
-below is grounded in the code cited inline and exercised by the test suite.
+The reference for Copper's execution/timing model — **rebased 2026-08-27 onto the
+cycle-dataflow denotation** (`CYCLE_DATAFLOW_SEMANTICS.md`), which is *normative*:
+it defines one value per signal per cycle, and the simulator and transpiler are
+both implementations with stated obligations. This document states that
+denotation first and the machinery that realizes it second; the refusal rules
+appear as the **derived residue** — shapes no implementation can realize — rather
+than as the definition. Every claim is grounded in the code cited inline, the
+per-module derivation record (`DERIVATION_TABLE.md`), and the test suite; the
+semantics is independent of any particular construction (codegen's `match pc`
+FSM is one realization, not the semantics). Companions:
+`SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` (the staged work),
+`PAIRED_IMPLEMENTATION_SCOPE.md` (the migration's execution record).
 
 ## Execution model — c2 + "just Rust"
 
@@ -16,6 +24,49 @@ is what makes their same-source equivalence non-circular (`paper/threats_to_vali
 LEAD contribution #1. A CHIR interpreter may exist only as an optional **validation-only backend,
 never the default** (impl-plan item 7). This "b vs c2" decision was settled 2026-07-29 against the
 alternative of making the sim consume an FSM IR.
+
+## The denotation — cycle dataflow (normative)
+
+Fix a clock domain; edges are numbered `1, 2, …` and **cycle N** is `[edge N,
+edge N+1)`. The observation instant of cycle N is just after edge N's post-edge
+settle (the harness convention: drive, tick, observe). Every signal has **one
+value per cycle**, and the whole sim-vs-synthesis question is governed by one
+invariant:
+
+> **The write-window invariant.** A simulator port write executed at instant `t`
+> is observed for the window `[t, next write)`. The emitted hardware for that
+> port is a continuous function of registers and inputs. The two agree iff, at
+> every observation instant inside the write's intended window, the written
+> value equals that function evaluated at the instant's wire values.
+
+A **segment** is a maximal tick-free region (trailing statements merge with the
+head — see below). Within a segment, statements mean what plain Rust means:
+**program order with forwarding** — a local read yields the last value assigned
+in the segment, else the value committed at the opening edge. The segment
+divides into **regions at the read-site barrier**: an *opening prefix*
+(statements before the first leading `In` read) executes at the cycle's opening
+instant on committed state; a *closing suffix* executes at the pre-edge settle
+on closing-edge samples and forwarded values. That the barrier site *is* the
+region boundary is a validated fact, not an accident — a region-entry barrier
+was proposed and falsified by measurement (V8c; `PAIRED_IMPLEMENTATION_SCOPE.md`
+§0).
+
+**Commits** — register locals (the liveness rule), `RegOut` writes, memory
+stagings, and the implicit state register a control-steering read feeds — anchor
+to the segment's **closing edge**; a *trailing* region's commits anchor to the
+edge that **opens** its cycle. **Reads are defined by value, not instant**: an
+`In` read denotes the settled input value of the window its consumer belongs to
+(`Deferred`/`Immediate` below are the implementation). **Emission obligations**
+follow: an opening-prefix plain-`Out` drive's continuous assign is the
+**forwarded** expression (landed 2026-08-26, byte-identical for every live
+module); a closing-suffix drive's is the unforwarded **commit-frontier** form,
+legal exactly when its value is frontier-expressible — a committed or committing
+register, or an every-path constant.
+
+The model was validated before it was trusted: every corpus module carries a
+derived disposition, and every derivation that predicted a measurable outcome
+was measured — including one silent divergence predicted with exact traces
+before its controlled measurement existed (`DERIVATION_TABLE.md`, F2/m1–m4).
 
 ## The clock tick — phases
 
@@ -88,6 +139,18 @@ must be a flop or the two synchronizer stages collapse into one. Same cycle, but
 trailing statements execute at an instant just after the edge, and a wire would keep
 tracking its inputs for the rest of that cycle.
 
+**One lowering path realizes this and one does not — a known, guarded
+limitation.** The **linear** multi-tick path commits trailing updates at the
+opening edge exactly as stated (measured agreeing, `linear_trailing_probe`).
+**Control extraction** places trailing effects one edge late wherever the last
+tick sits — measured divergent for both the folded-loop and branch-nested
+spellings (`trailing_update`, `branch_trailing`) — so
+`unprotected_trailing_out_write` refuses the observable class on precisely the
+extraction-shaped modules (`has_nested_tick`) and exempts the linear class.
+`RegOut` absorbs the placement difference, which is why uart's trailing write
+agrees. The extraction-path fix is the migration's deferred phase C; landing it
+retires the rule.
+
 **Startup.** An `Out` written *only* in `C` reads as its initial value until the
 statement first runs, while the emitted continuous `assign` drives it from time 0 — so
 the two differ for the first cycle or two and agree thereafter. A continuous assign has
@@ -122,26 +185,26 @@ conditions — bare tick, both-sides write, leading read comb-reaching the pre-t
 corpus-clean. A single-write-per-cycle output, a `RegOut`, and a write-straddle *without* a leading
 read (`counter`; `uart_rx`'s `rx_dv`) are all unaffected.
 
-**Pre-tick alignment guardrail.** A plain combinational `Out` **driven from a register** in the
-pre-tick segment is **rejected at compile time** when that same segment also **assigns a register
-with no `In` read preceding it**. A leading read classifies `Deferred` and injects
-`pre_edge_barrier()`, which parks the task at the barrier so the segment runs in the *pre-edge*
-phase; with no such read the task parks at the tick instead, the segment for cycle *N+1* runs during
-cycle *N*'s **post-edge settle**, and the post-edge observation of cycle *N* therefore sees *N+1*'s
-value. Codegen emits a non-blocking `r <= …`, which no flip-flop can reproduce — measured,
-`loop { r = r+1; o.write(r); tick; }` simulates `[2,3,4,…]` against the SV's `[1,2,3,…]`.
+**The pre-tick alignment family — dissolved where the denotation defines it,
+refused where nothing can realize it.** Historically this family's canonical
+divergence was `loop { r = r+1; o.write(r); tick; }` — the simulator's forwarded
+`[2,3,4,…]` against an unforwarded `assign o = r`'s `[1,2,3,…]`. Under the
+denotation that shape simply *means* the forwarded reading, and since the
+2026-08-26 migration (phase B) codegen emits exactly that (`assign o = (r +
+8'd1)`): the shape is **legal and agreeing**, along with its whole measured
+family (V1/V2/V3/V5/V7 and both `fast_counter` ports), at zero byte-level cost
+to any live module. What remains rejected is the derived residue below — each
+rule a shape the write-window invariant shows *no* emission can realize, each
+with flipping witnesses, and each pointing at the same remedies (`RegOut`,
+reorder, or a uniform read). Demonstration fixtures opt out with
+`#[hardware(sequential, allow_pretick_alignment)]` — the waiver every lint in
+this space ships; it silences the error, not the detection.
 
-The remedies are `RegOut` (immune: it commits at the edge, so *when* the write executes is
-unobservable) or moving the register update after the `clk.tick().await` so the pre-tick segment only
-*reads* state. A module that exists to demonstrate the divergence opts out explicitly with
-`#[hardware(sequential, allow_pretick_alignment)]` — the waiver every lint in this space ships
-(Verilator's `lint_off BLKSEQ`, Verible's rule waivers); it silences the error, not the detection.
-
-**Detection is four rules, not one.** The obvious consolidation — one rule examining every segment —
-was implemented and measured **three times**, and rejected every time on corpus evidence: writing a
-plain `Out` after a tick is the *ordinary* multi-phase pattern and is correct, so a rule that cannot
-say which segment it is looking at drowns in false positives. What each rule may assume about its
-region is what separates them.
+**The residue is five rules, not one.** The obvious consolidation — one rule examining every
+segment — was implemented and measured **three times**, and rejected every time on corpus evidence:
+writing a plain `Out` after a tick is the *ordinary* multi-phase pattern and is correct, so a rule
+that cannot say which region it is looking at drowns in false positives. What each rule may assume
+about its region is what separates them.
 
 - **`unprotected_pretick_out_write`** — the head segment (loop head → first tick). **NARROWED
   2026-08-26 (cycle-dataflow phase D)**: phase B's forwarded continuous-assign emission gave the
@@ -152,19 +215,16 @@ region is what separates them.
   assigned unprotected on another (W4, `probe_fsm`: the write executes at the opening on one path
   and the pre-edge on the other, and no single emission matches both) — plus the unchanged
   conditional/constant hold clause below. `RegOut` remains immune.
-- **`unprotected_trailing_out_write`** — the same hazard past the *last* tick, unguarded until
-  2026-08-25 and measurably divergent (`trailing_update`, one cycle, uniformly). Two widenings were
-  measured and rejected first: merging the trailing segment into the head region flags **25** modules
-  — including `fast_counter_corrected`, the module D1's own remedy produces — and treating every
-  trailing segment as its own region flags **10**, all single-tick memory modules like `rom_from_fn`,
-  which structurally matches the divergent DUT and *agrees*. The discriminator, found by flipping
-  exactly one thing, is **how many clock edges the body crosses per iteration**: with the identical
-  trailing body `n = n + 1; o.write(n);`, `loop { tick; … }` agrees and
-  `loop { for _ in 0..2 { tick } … }` diverges. In a single-tick loop the trailing statements *share
-  the head's phase* — falling off the end and re-entering costs no cycle — so there is no separate
-  region to misalign. Clause (i) does **not** carry over: the same DUT *with* a leading read still
-  diverges, which also refutes the natural hypothesis that the loop-top barrier pins the whole
-  iteration.
+- **`unprotected_trailing_out_write`** — the trailing hazard, now precisely classified as an
+  **extraction lowering limitation** rather than a semantics rule. Two gates, each with a measured
+  flipping pair: the body must cross **more than one clock edge** per iteration (in a single-tick
+  loop the trailing statements share the head's phase — two widenings ignoring this were measured
+  and rejected at 25 and 10 false positives), and — narrowed 2026-08-27 — some tick must sit
+  **inside control flow** (`has_nested_tick`, the source-level mirror of control extraction's
+  trigger). The linear multi-tick spelling commits trailing updates at the opening edge and is
+  measured agreeing (`linear_trailing_probe`), so it is exempt and compiles clean; both
+  extraction-shaped spellings are measured one edge late (`trailing_update`, `branch_trailing`).
+  The rule retires wholesale when the migration's phase C corrects the extraction path.
 - **`multi_phase_out_write`** — a plain `Out` driven in **more than one clock phase** (a phase being
   a Comb-connected component of the CFG). This rule was already in the language: the multi-tick
   lowering refuses the shape — *"driven in more than one phase … hold it in a register"* — but only
@@ -204,18 +264,22 @@ three modules corpus-wide.
 
 Enforcement is asymmetric, and deliberately so: `multi_phase_out_write` runs in **both** front-ends
 (the transpiler honours the opt-out too, or a module that exists to demonstrate the hazard could not
-be measured against anything), while the two D1 rules run in the **macro** only.
+be measured against anything), while the other rules run in the **macro** only.
 
-**This is the third member of the blocking/non-blocking family**, after `Out`-hold semantics and the
-multi-write collapse — and the three share a root cause worth stating plainly: **Copper infers the
-register/combinational boundary where every other HDL makes it explicit.** MyHDL (`sig` vs
+**The family's root cause, and what changed about its disposition.** These rules share one origin
+worth stating plainly: **Copper infers the register/combinational boundary where every other HDL
+makes it explicit.** MyHDL (`sig` vs
 `sig.next`), Chisel (`Reg` vs `:=`), Amaranth (`m.d.sync` vs `m.d.comb`), Spade (`reg(clk) … = …`)
 and Bluespec (atomic rules) all separate a register's *current* value from its *next* one
 syntactically, so the hazard is unexpressible. Verilog leaves it expressible and lints it
 (`BLKSEQ`) — but those lints compare an author-written **marker** (`=` vs `<=`) against an
 author-written **block kind** (`always_comb` vs `always_ff`), two declarations checked against each
-other. Copper has neither, which is why its rules must *infer* both sides. See
-`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`.
+other. Copper has neither, which is why its rules must *infer* both sides. What changed with the
+cycle-dataflow rebase is the *disposition*: instead of a lint family growing one measured
+discriminator at a time, the normative denotation now **defines** the boundary (registers by the
+liveness rule, consumed from one authority; drives by region anchor), the main historical hazard is
+legal by construction, and each surviving rule is a derived unrealizability with its evidence
+attached. See `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md` for the full measurement record.
 
 **Passthrough reads are `Immediate` (the D2 fix, 2026-08-21).** A read that feeds a *combinational*
 `Out` in a segment that assigns **no register** is classified `Immediate`, not `Deferred`, even when
@@ -235,8 +299,11 @@ module rather than the read broke exactly those two, one of them a hardware-anch
 
 ## Input read timing — static edge-phase classification
 
-An `In` read is classified **statically** by its position relative to ticks, replacing the retired
-runtime freshness oracle (impl-plan item 3; `copper_analysis::classify_reads`):
+Under the denotation a read is **defined by value, not instant**: it yields the settled input value
+of the window its consumer belongs to — a closing-edge sample where it feeds a commit, the opening
+window where it feeds only combinational logic. The static classification below is the
+*implementation* of that definition (impl-plan item 3; `copper_analysis::classify_reads`), replacing
+the retired runtime freshness oracle. An `In` read is classified by its position relative to ticks:
 
 - **`Deferred`** — a "leading"/pre-tick read (a clock tick follows it within the iteration). Its result
   is registered at that edge, so it samples at the **next pre-edge settle**. The macro emits
@@ -469,7 +536,13 @@ property the wiring graph alone can decide.
 ### One analysis, both front-ends (the c2 architecture)
 
 The CFG is keyed off `syn::ItemFn` — the representation both front-ends already hold — so it is a
-single authoritative pass, not two that must agree. Its register output is validated (a) against
+single authoritative pass, not two that must agree. **As of 2026-08-27 the register half is consumed,
+not merely reconciled**: `capture_frontend_ir` fills `FrontendModuleIR::registers` from
+`infer_registers`, `transpile_fir` appends the names its FIR passes synthesize (`pc`, counters,
+hoisted locals — by diffing the pre-loop `let mut` set), and `chir_lower` consults that authority
+instead of re-deciding syntactically — a change proven byte-identical across the whole corpus, which
+is the measurement that the old syntactic decider had only ever coincided with the inference. The
+inference's output is additionally validated (a) against
 **independent hand-written SystemVerilog** (structural reg-for-reg match, `mac_fsm`/`det_010`/
 `det_110101`/`lfsr`) and (b) against the **transpiler's own emitted flip-flops**
 (`copper-codegen/tests/register_reconciliation.rs`: codegen ≡ this set + only its synthesized
@@ -477,7 +550,7 @@ phase/pc counter, corpus-wide). See `SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md` item 2.
 
 ## How these semantics are checked
 
-Three mechanisms, deliberately independent of each other:
+Five mechanisms, deliberately independent of each other:
 
 - **Independent hand-written Verilog.** `examples/basejump/` checks Copper modules against
   third-party BaseJump STL Verilog, and the hand-written goldens (`pattern_detector_010.sv`,
@@ -494,6 +567,18 @@ Three mechanisms, deliberately independent of each other:
   tree for weeks and were unreachable from the existing tests — a measured sim ≠ synth divergence in
   `branch_merge_explicit`, and emitted SystemVerilog that would not parse (a port named `event`, a
   keyword missing from the legalizer). See `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`.
+- **Denotation anchors.** `tests/cycle_dataflow_memory_derivation.rs` and
+  `tests/cycle_dataflow_uart_derivation.rs` derive a module's exact trace **from the model on
+  paper** (in the test's comment) and assert that the simulator **and** the transpiled SV both
+  reproduce it under deterministic stimulus — the memory windows (ReadFirst collision, one-edge
+  write visibility, hold-when-unstaged) and the uart receiver's per-edge sampling (a stimulus that
+  carries the complement bit at every non-sample edge, so an off-by-one read corrupts the byte
+  loudly). The sweep proves the implementations agree with each other; these prove they agree with
+  the *denotation*.
+- **The emitted-SV baseline.** `cargo run -q -p copper-codegen --bin sv-baseline -- snapshot|diff`
+  byte-diffs every corpus module's emission against a pinned baseline, so a codegen change alters
+  **exactly its declared module set and nothing else** — the migration's phase gates ran on it, and
+  its first snapshot-then-diff on an unchanged tree caught the emitter being nondeterministic.
 - **The two schedulers.** `tests/levelized_differential.rs` steps a design under both
   `SchedulerMode::Levelized` and `SchedulerMode::Fixpoint` in lockstep and asserts **every wire holds
   an identical value after every phase of every cycle**, so a divergence is localized to the exact

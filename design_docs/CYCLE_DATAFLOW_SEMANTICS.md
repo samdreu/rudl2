@@ -38,8 +38,8 @@ simulator is not internally uniform (`PRETICK_ALIGNMENT_GUARDRAIL.md` §5.3's ge
 result), no single lowering can match it, and every silent divergence to date has been
 a patch surface over that non-uniformity.
 
-Companions: `SYNCHRONOUS_SEMANTICS.md` (the current reference; to be rebased on this
-model once the derivation survives measurement), `PRETICK_ALIGNMENT_GUARDRAIL.md`
+Companions: `SYNCHRONOUS_SEMANTICS.md` (the reference — **rebased onto this model
+2026-08-27**: denotation first, rules as derived residue), `PRETICK_ALIGNMENT_GUARDRAIL.md`
 (the measured evidence this document derives from).
 
 > **Phase 1 is COMPLETE: `DERIVATION_TABLE.md`** (mechanical columns regenerate via
