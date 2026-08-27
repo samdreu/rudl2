@@ -229,7 +229,19 @@ impl<const N: usize> Bits<N> {
     /// The required bit width is inferred from the constant value itself,
     /// and the call is rejected at compile time if `N` is too narrow.
     ///
+    /// STAYS A DOCTEST, deliberately — the other `compile_fail` cases moved to
+    /// trybuild in 2026-08-26, this one cannot. The guard is a
+    /// post-monomorphization `const` assert, which `cargo check` does not evaluate
+    /// (measured: `cargo check` passes, `cargo build` fails), and trybuild compiles
+    /// check-style. A doctest builds fully, so it is the only form that observes it.
+    ///
+    /// THE `use` IS LOAD-BEARING. Without it this doctest failed on `E0412: cannot
+    /// find type `Bits`` — it passed for years without ever reaching the width
+    /// guard. That is precisely what a bare `compile_fail` cannot tell you, and it
+    /// was found by trying to migrate it.
+    ///
     /// ```compile_fail
+    /// use copper_core::Bits;
     /// let _: Bits<4> = Bits::from_lit::<31>(); // 31 needs 5 bits — compile error
     /// ```
     pub fn from_lit<const VAL: u128>() -> Self {

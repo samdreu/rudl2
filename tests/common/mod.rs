@@ -181,6 +181,18 @@ pub struct EquivalenceTest {
     /// A G2 reg-match request set by `with_reference_registers`: the path to an
     /// *independent hand-written* reference SV and the match mode.
     reg_check: Option<(String, copper_analysis::RegMatch)>,
+    /// The module name, mirrored because `HardwareTest` keeps its own private and
+    /// the reference leg needs to build a second one with the same Verilator top.
+    name: String,
+    /// A BEHAVIOURAL reference leg set by `with_hand_written_reference`: an
+    /// independent Verilog implementation of the same behaviour, run over the same
+    /// stimulus. `reg_check` above is the STRUCTURAL counterpart — it compares
+    /// register sets, not traces — and the two are deliberately separate: a design
+    /// can have the right flip-flops and the wrong behaviour, or the reverse.
+    reference_sv: Option<String>,
+    /// Mirrored because `with_params` folds them into `self.test` and the reference
+    /// leg has to be Verilated at the same widths.
+    params: Vec<(String, i64)>,
     /// Set by [`EquivalenceTest::differential_only`]: this run has no reference
     /// model, and `record_differential` feeds the simulator's own outputs in as the
     /// expected trace. Kept as a flag rather than left implicit so the two recording
@@ -207,6 +219,9 @@ impl EquivalenceTest {
             src: Some(src.to_string()),
             module: module.map(str::to_string),
             reg_check: None,
+            name: module_name.to_string(),
+            reference_sv: None,
+            params: Vec::new(),
             differential: false,
         }
     }
@@ -231,6 +246,36 @@ impl EquivalenceTest {
     /// simulator ran the parametric DUT at.
     pub fn with_params(mut self, params: &[(&str, i64)]) -> Self {
         self.test = self.test.with_params(params);
+        self.params = params.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        self
+    }
+
+    /// Also run the recorded stimulus against an **independent hand-written Verilog
+    /// implementation of the same behaviour** and require it to agree.
+    ///
+    /// # What this adds over the differential check
+    ///
+    /// The sweep's ordinary check is simulator vs the SystemVerilog the transpiler
+    /// emitted — two implementations of one source, which is an oracle for *"the two
+    /// agree"* and nothing more. Both can be wrong together, and a shared
+    /// misconception between the executor and the lowering is exactly the failure it
+    /// cannot see. A third implementation nobody derived from the other two closes
+    /// that: the reference is what a hardware engineer would have written for this
+    /// behaviour, so agreement means the semantics are right, not merely consistent.
+    ///
+    /// # What it does NOT add
+    ///
+    /// A reference written by whoever wrote the Copper module shares that person's
+    /// model of the design. It catches lowering and transcription errors; it does
+    /// not catch a misconception both files share. Only a genuinely third-party
+    /// source (BaseJump STL and the like) buys that, which is why each reference
+    /// file states its provenance in its header and why third-party is preferred
+    /// wherever one exists.
+    ///
+    /// The reference's SystemVerilog module must be named the same as the Copper
+    /// module — it is Verilated as the top, exactly as the transpiler's output is.
+    pub fn with_hand_written_reference(mut self, reference_sv_path: &str) -> Self {
+        self.reference_sv = Some(reference_sv_path.to_string());
         self
     }
 
@@ -248,6 +293,9 @@ impl EquivalenceTest {
             src: None,
             module: None,
             reg_check: None,
+            name: module_name.to_string(),
+            reference_sv: None,
+            params: Vec::new(),
             differential: false,
         }
     }
@@ -325,7 +373,70 @@ impl EquivalenceTest {
                 *mode,
             );
         }
+        // BOTH LEGS RUN BEFORE EITHER IS ALLOWED TO FAIL. Asserting the transpiled
+        // leg first would hide the reference result whenever both are wrong, which is
+        // exactly the case a new fixture-plus-reference pair is most likely to be in —
+        // two round trips to learn what one run already knew.
+        //
+        // Keep a copy: the transpiled leg consumes the trace, and the reference leg
+        // must be driven with the SAME stimulus and held to the SAME expectations.
+        let replay = self.expected.clone();
         let expected = SimulationTrace::from_cycles(self.expected);
-        self.test.finish_with_expected(&expected).assert_passed();
+        let transpiled = self.test.finish_with_expected(&expected);
+        transpiled.print_summary();
+
+        let reference = self.reference_sv.as_ref().map(|ref_path| {
+            println!("=== {} vs INDEPENDENT reference {ref_path} ===", self.name);
+            let mut ref_test = HardwareTest::new(&self.name).with_verilog(ref_path);
+            if !self.params.is_empty() {
+                let ps: Vec<(&str, i64)> =
+                    self.params.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+                ref_test = ref_test.with_params(&ps);
+            }
+            for c in &replay {
+                let ins: Vec<(&str, &[Logic])> =
+                    c.inputs.iter().map(|(n, v)| (n.as_str(), &v[..])).collect();
+                let outs: Vec<(&str, &[Logic])> =
+                    c.outputs.iter().map(|(n, v)| (n.as_str(), &v[..])).collect();
+                ref_test.record_cycle(c.cycle, &ins, &outs);
+            }
+            let expected_ref = SimulationTrace::from_cycles(replay);
+            let r = ref_test.finish_with_expected(&expected_ref);
+            r.print_summary();
+            r
+        });
+
+        let ref_failed = reference.as_ref().is_some_and(|r| !r.passed());
+        if transpiled.passed() && !ref_failed {
+            return;
+        }
+
+        // WHICH legs failed is the diagnosis, so say it rather than making the reader
+        // infer it from two summaries. The transpiled leg alone means the transpiler
+        // disagrees with the simulator. The REFERENCE leg alone is the finding this
+        // whole mechanism exists for: the simulator and the transpiler agree with each
+        // other and are both wrong, which no amount of differential testing can see.
+        let mut report = String::new();
+        let verdict = match (transpiled.passed(), ref_failed) {
+            (false, false) => "the TRANSPILED SystemVerilog disagrees with the simulator",
+            (true, true) => {
+                "the simulator and the transpiled SystemVerilog AGREE WITH EACH OTHER and \
+                 both disagree with the independent reference — a shared misconception, \
+                 which is the case the differential check alone cannot see"
+            }
+            (false, true) => "both legs failed: the transpiler disagrees with the simulator, \
+                              AND both disagree with the independent reference",
+            (true, false) => unreachable!("early-returned above"),
+        };
+        report.push_str(&format!("equivalence failed for '{}': {verdict}\n", self.name));
+        if !transpiled.passed() {
+            report.push_str("\n-- simulator vs transpiled SystemVerilog --\n");
+            report.push_str(&transpiled.errors.join("\n"));
+        }
+        if let Some(r) = reference.filter(|r| !r.passed()) {
+            report.push_str("\n-- simulator vs independent reference --\n");
+            report.push_str(&r.errors.join("\n"));
+        }
+        panic!("{report}");
     }
 }

@@ -32,7 +32,32 @@ use syn::ItemFn;
 
 mod cfg;
 
-pub use cfg::{classify_reads, Cfg, EdgeKind, ReadTiming};
+pub use cfg::{classify_reads, Cfg, DerivationFacts, EdgeKind, PhaseFacts, ReadTiming};
+
+/// Plain combinational `Out` ports written **between a leading `In` read and the
+/// update of a register the write reads** — the read's pre-edge barrier drags the
+/// write to the pre-edge settle, where it captures the register's *pre-update*
+/// value; the emitted `assign` (the flip-flop's Q) never shows that value at any
+/// observation instant, so the hardware leads the simulator by one cycle,
+/// silently. The fifth member of the pre-tick alignment family, derived from the
+/// cycle-dataflow model before its controlled measurement
+/// (`design_docs/DERIVATION_TABLE.md` F2; the V8 battery in
+/// `tests/sequential_forwarding_divergence.rs`). Returns the offending ports,
+/// sorted; empty for a combinational module or one with no top-level loop. See
+/// [`Cfg::pretick_out_write_before_update`] for the three clauses and their
+/// flipping witnesses.
+pub fn pretick_out_write_before_update(f: &ItemFn) -> Vec<String> {
+    Cfg::build(f).map(|c| c.pretick_out_write_before_update()).unwrap_or_default()
+}
+
+/// Per-phase facts for the cycle-dataflow derivation table
+/// (`design_docs/CYCLE_DATAFLOW_SEMANTICS.md` phase 1). Reporting only — no rule
+/// keys on this. `None` for a module with no top-level loop (nothing sequential to
+/// classify). See [`Cfg::derivation_facts`] for the phase notion and the two
+/// documented first-cut approximations.
+pub fn derivation_facts(f: &ItemFn) -> Option<DerivationFacts> {
+    Cfg::build(f).map(|c| c.derivation_facts())
+}
 
 /// Infer the synthesizable **register set** of a sequential hardware module from
 /// its control flow, via full backward liveness over the module's CFG ([`Cfg`]).
@@ -638,5 +663,168 @@ endmodule
         assert_registers_match_reference_sv(det_010_src, &sv, RegMatch::StorageEquivalent);
         let inferred: BTreeSet<String> = infer_registers(&parse(det_010_src)).into_iter().collect();
         assert_ne!(inferred, reference, "names are expected to differ for an independent reference");
+    }
+}
+
+// ── The admissible surface ───────────────────────────────────────────────────
+//
+// The transpiler says no in 108 places across four stages, through 21 typed
+// variants, 76 of them sharing one `UnsupportedConstruct` carrying free text — so
+// two unrelated blockers are indistinguishable to anything but a human reading the
+// string, and 60 of the sites have never fired. That is the shape of a language
+// defined by SUBTRACTION: everything Rust can say, minus whatever each pass happens
+// to reject when it gets there.
+//
+// This is the other direction — a POSITIVE grammar, stated once, checked early, on
+// the representation both front-ends already hold. What it accepts is the language;
+// anything else is refused at the declaration with a span, rather than after the
+// whole pipeline has run.
+//
+// # It is built one rule at a time, and calibrated
+//
+// The grammar must NEVER reject a module the transpiler lowers today — that would
+// break working designs to tidy up an error message. So it starts permissive and
+// gains rules only with evidence, and the criterion is asymmetric and testable:
+//
+//   admissible(m) == Err  ⟹  transpile(m) == Err     (no false rejection)
+//
+// `copper-codegen/tests/admissible_calibration.rs` asserts that over the whole
+// corpus. The converse is the GOAL, not yet the rule: as rules land, more of what
+// the transpiler refuses late is caught here early, and the corresponding downstream
+// refusal becomes unreachable and deletable. The calibration test prints how far
+// along that is on every run.
+
+/// Types a `#[hardware]` fn may name — rule 1 of the admissible grammar.
+///
+/// Every port payload and every annotated `let` must be one of these. It is the
+/// rule with the most evidence behind it: `Vec<Bits<32>>` as a port and a
+/// `Memory<…>` parameter are two of the nine refusals in the corpus today, and
+/// struct- and tuple-typed locals are what stop `rv32i_cpu_pipelined`. Measured
+/// before writing it: NO module that transpiles names a type outside this set, so
+/// the rule rejects only designs that already fail — just earlier, and with a span
+/// pointing at the declaration instead of a width error three passes downstream.
+fn admissible_type(ty: &syn::Type) -> bool {
+    match ty {
+        // `[T; N]` — an array of an admissible element. The length is not checked
+        // here: it may be a literal, a const generic, or a file-scope `const`, and
+        // deciding which is `chir_lower`'s job, not the grammar's.
+        syn::Type::Array(a) => admissible_type(&a.elem),
+        // A reference is transparent: `&Clock<D>` is a clock. Whether a reference is
+        // itself admissible in a given position is a separate rule.
+        syn::Type::Reference(r) => admissible_type(&r.elem),
+        syn::Type::Paren(p) => admissible_type(&p.elem),
+        syn::Type::Path(tp) => {
+            let Some(seg) = tp.path.segments.last() else { return false };
+            let name = seg.ident.to_string();
+            matches!(
+                name.as_str(),
+                "Logic"
+                    | "Bits"
+                    | "bool"
+                    | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                    | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                    // Port and resource wrappers. Their payloads are checked by the
+                    // caller, which knows which argument position carries one.
+                    | "Clock" | "In" | "Out" | "RegOut" | "Memory"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// The payload type of a port wrapper — the `T` in `In<T, D>` / `Out<T, D>` /
+/// `RegOut<T, D>`. `None` for anything without one (a `Clock<D>` has a domain, not
+/// a payload; a `Memory<…>`'s element type is checked by its own rule).
+fn port_payload(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    if !matches!(seg.ident.to_string().as_str(), "In" | "Out" | "RegOut") {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(ab) = &seg.arguments else { return None };
+    ab.args.iter().find_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    })
+}
+
+/// Check a `#[hardware]` fn against the admissible grammar.
+///
+/// Returns the first violation as a spanned error, so the diagnostic lands on the
+/// declaration that is out of bounds rather than wherever a later pass tripped over
+/// it. See the module note above for why this is a positive grammar and how it is
+/// calibrated against the transpiler.
+pub fn check_admissible(f: &ItemFn) -> Result<(), syn::Error> {
+    use syn::spanned::Spanned;
+
+    // Rule 1a — port payloads.
+    for arg in &f.sig.inputs {
+        let syn::FnArg::Typed(pt) = arg else { continue };
+        if let Some(payload) = port_payload(&pt.ty) {
+            if !admissible_type(payload) {
+                return Err(syn::Error::new(
+                    payload.span(),
+                    format!(
+                        "`{}` is not a hardware type. A port carries `Logic`, `Bits<N>`, \
+                         `bool`, an integer type, or a fixed-size array of those — a value \
+                         with a width the synthesized wire can have. A `Vec`, a struct or a \
+                         tuple has no such width.",
+                        quote_ty(payload)
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Rule 1b — annotated locals. An UNANNOTATED `let` is left alone: its type comes
+    // from inference, and duplicating that here is the second-analysis-that-must-agree
+    // mistake this crate exists to avoid.
+    struct V(Option<syn::Error>);
+    impl<'ast> syn::visit::Visit<'ast> for V {
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            if self.0.is_none() {
+                if let syn::Pat::Type(pt) = &l.pat {
+                    if !admissible_type(&pt.ty) {
+                        self.0 = Some(syn::Error::new(
+                            pt.ty.span(),
+                            format!(
+                                "`{}` is not a hardware type. A local holds `Logic`, \
+                                 `Bits<N>`, `bool`, an integer type, or a fixed-size array \
+                                 of those. A struct or tuple of several values is written as \
+                                 one local per field.",
+                                quote_ty(&pt.ty)
+                            ),
+                        ));
+                    }
+                }
+            }
+            syn::visit::visit_local(self, l);
+        }
+    }
+    let mut v = V(None);
+    syn::visit::Visit::visit_block(&mut v, &f.block);
+    match v.0 {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Render a type for a diagnostic. Deliberately does NOT pull in `quote` — this
+/// crate has no proc-macro dependencies and a message is not a reason to gain one.
+fn quote_ty(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(tp) => tp
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        syn::Type::Array(a) => format!("[{}; _]", quote_ty(&a.elem)),
+        syn::Type::Reference(r) => format!("&{}", quote_ty(&r.elem)),
+        syn::Type::Tuple(t) => format!(
+            "({})",
+            t.elems.iter().map(quote_ty).collect::<Vec<_>>().join(", ")
+        ),
+        _ => "this type".to_string(),
     }
 }

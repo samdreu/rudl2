@@ -85,7 +85,7 @@ const CYCLES: usize = 13;
 // ── Divergence 1: minimal case ────────────────────────────────────────────────
 
 const ADD_SRC: &str = r#"
-#[hardware(sequential, allow_pretick_alignment)]
+#[hardware(sequential)]
 async fn add_then_write(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut r: Bits<8> = Bits::zero();
     loop {
@@ -96,7 +96,7 @@ async fn add_then_write(clk: Clock<C>, o: Out<Bits<8>, C>) {
 }
 "#;
 
-#[hardware(sequential, allow_pretick_alignment)]
+#[hardware(sequential)]
 async fn add_then_write(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut r: Bits<8> = Bits::zero();
     loop {
@@ -170,7 +170,15 @@ fn sim_add_with_leading_read() -> Vec<u8> {
 /// Verilate `sv` (already written to `sv_path`) as `top`, tick `clk_port`, and
 /// collect the whitespace-separated values each `probe` line prints per cycle.
 fn run_sv(sv_path: &Path, top: &str, clk_port: &str, probes: &[&str], extra_init: &str) -> Vec<Vec<u32>> {
-    let work = std::env::temp_dir().join(format!("copper_fwd_{top}_{}", std::process::id()));
+    // Unique PER INVOCATION, not per top module: two tests in this binary
+    // Verilate the same top in parallel (`trailing_update` is built by both the
+    // d1-trailing gap test and the m2 model-lowering test), and a shared
+    // directory lets them clobber each other's build — the false-PASS/false-FAIL
+    // mechanism the repo's obj_dir convention exists to prevent (see CLAUDE.md).
+    static NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work =
+        std::env::temp_dir().join(format!("copper_fwd_{top}_{}_{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).unwrap();
 
@@ -227,22 +235,24 @@ fn transpile_and_run(src: &str, top: &str, clk: &str, probe: &str, init: &str) -
 // ── Divergence 1 ──────────────────────────────────────────────────────────────
 
 #[test]
-fn pre_tick_update_is_forwarded_in_sim_but_not_in_hardware_known_gap() {
+fn pre_tick_update_forwarding_agrees_end_to_end() {
+    // RE-BLESSED 2026-08-26, cycle-dataflow phase B (PAIRED_IMPLEMENTATION_SCOPE.md):
+    // divergence 1 is DISSOLVED. Codegen now emits the FORWARDED continuous assign
+    // (`assign o = (r + 8'd1)`) for an opening-prefix drive — the meaning the
+    // simulator always had — so the shape is a real equivalence check now. The
+    // trace pins stay exact so a regression on either side is loud.
     let sim = sim_add_then_write();
-    let expected_sim: Vec<u8> = (2..).take(CYCLES).collect();
-    assert_eq!(sim, expected_sim, "simulator behaviour changed; if it now starts at 1 the gap is FIXED");
+    let expected: Vec<u8> = (2..).take(CYCLES).collect();
+    assert_eq!(sim, expected, "simulator behaviour changed");
 
     if !verilator_available() {
         return;
     }
     let sv = transpile_and_run(ADD_SRC, "add_then_write", "clk", "o", "");
-    let expected_sv: Vec<u8> = (1..).take(CYCLES).collect();
-    assert_eq!(sv, expected_sv, "transpiled SV behaviour changed");
-    assert_ne!(
+    assert_eq!(
         sim, sv,
-        "sim and SV now AGREE — divergence 1 is FIXED. Delete this test, promote it \
-         to a real equivalence check, and re-bless tests/two_domain_hierarchy_cdc.rs \
-         (see compensation_is_what_makes_the_hierarchy_anchor_pass)."
+        "sim and SV must AGREE on the forwarded reading — phase B's emission \
+         (opening-prefix drives use edge_value) has regressed"
     );
 }
 
@@ -267,7 +277,7 @@ fn a_leading_input_read_removes_the_divergence() {
 // ── The hardware adjudication ─────────────────────────────────────────────────
 
 const FAST_COUNTER_SRC: &str = r#"
-#[hardware(sequential, allow_pretick_alignment)]
+#[hardware(sequential)]
 async fn fast_counter(clk: Clock<ClkFast>, count_out: Out<Bits<8>, ClkFast>, flag_out: Out<Logic, ClkFast>) {
     let mut count: Bits<8> = Bits::zero();
     let mut latched = Logic::Zero;
@@ -281,7 +291,7 @@ async fn fast_counter(clk: Clock<ClkFast>, count_out: Out<Bits<8>, ClkFast>, fla
 }
 "#;
 
-#[hardware(sequential, allow_pretick_alignment)]
+#[hardware(sequential)]
 async fn fast_counter(
     clk: Clock<ClkFast>,
     count_out: Out<Bits<8>, ClkFast>,
@@ -316,7 +326,7 @@ fn sim_fast_counter() -> Vec<(u8, u8)> {
 }
 
 #[test]
-fn independent_hardware_sides_with_codegen_against_the_simulator() {
+fn independent_hardware_anchors_the_corrected_spelling() {
     // The adjudication, run rather than argued. `ref_fast_counter` was committed in
     // `0d67f9e` (2026-07-30) as an outside implementation of this design, long
     // before the divergence was known — so it is a genuine third opinion, not a
@@ -355,17 +365,45 @@ fn independent_hardware_sides_with_codegen_against_the_simulator() {
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
 
+    // RE-POINTED 2026-08-26, cycle-dataflow phase B, with a recorded rationale
+    // (PAIRED_IMPLEMENTATION_SCOPE.md phase B; R7: anchors are re-verified, never
+    // silently re-blessed). What the adjudication established is that the English
+    // description — "a counter with a sticky flag" — maps to the REGISTERED form,
+    // which under the model is the write-then-update SPELLING
+    // (`fast_counter_corrected`). The reference therefore anchors THAT spelling.
+    // The witness spelling (update-then-write) legitimately means the forwarded
+    // trace, and as of phase B both implementations agree on it — one cycle ahead
+    // of the reference, which is the two spellings being two different programs,
+    // not a divergence.
+    let corrected_sv = copper_codegen::transpile_source(
+        FAST_COUNTER_CORRECTED_SRC,
+        Some("fast_counter_corrected"),
+        &copper_codegen::EmitConfig::default(),
+    )
+    .expect("transpile corrected");
+    let dir2 = std::env::temp_dir().join(format!("copper_fwd_corr_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir2);
+    std::fs::create_dir_all(&dir2).unwrap();
+    let pc = dir2.join("fast_counter_corrected.sv");
+    std::fs::write(&pc, &corrected_sv).unwrap();
+    let corrected: Vec<(u8, u8)> =
+        run_sv(&pc, "fast_counter_corrected", "clk", &["count_out", "flag_out"], "")
+            .into_iter()
+            .map(|r| (r[0] as u8, r[1] as u8))
+            .collect();
+    let _ = std::fs::remove_dir_all(&dir2);
     assert_eq!(
-        transpiled, independent,
-        "codegen must keep matching the independent reference"
-    );
-    assert_ne!(
-        sim, independent,
-        "the simulator now MATCHES independent hardware — the gap is FIXED; \
-         delete this test and re-bless tests/two_domain_hierarchy_cdc.rs"
+        corrected, independent,
+        "the independent reference anchors the CORRECTED spelling — codegen for it \
+         has drifted from the outside implementation"
     );
 
-    // Concretely: the flag asserts a cycle early in the simulator.
+    // The witness spelling now agrees END TO END on the forwarded reading…
+    assert_eq!(
+        sim, transpiled,
+        "the witness spelling must agree sim ≡ SV under forwarded emission (phase B)"
+    );
+    // …and leads the reference by exactly one cycle: two spellings, two programs.
     let sim_flag = sim.iter().position(|&(_, f)| f == 1).unwrap();
     let ref_flag = independent.iter().position(|&(_, f)| f == 1).unwrap();
     assert_eq!(sim_flag + 1, ref_flag, "sim = {sim:?}\nref = {independent:?}");
@@ -380,6 +418,27 @@ async fn slow_consumer(clk: Clock<ClkSlow>, flag_in: In<Logic, ClkSlow>, out: Ou
         clk.tick().await;
     }
 }
+
+const FAST_COUNTER_CORRECTED_SRC: &str = r#"
+#[hardware(sequential)]
+async fn fast_counter_corrected(
+    clk: Clock<ClkFast>,
+    count_out: Out<Bits<8>, ClkFast>,
+    flag_out: Out<Logic, ClkFast>,
+) {
+    let mut count: Bits<8> = Bits::zero();
+    let mut latched = Logic::Zero;
+    loop {
+        count_out.write(count);
+        flag_out.write(latched);
+        clk.tick().await;
+        if count[3] == Logic::One {
+            latched = Logic::One;
+        }
+        count = count + Bits::from_lit::<1>();
+    }
+}
+"#;
 
 /// The corrected counter: sticky update moved after the tick, so it reads the
 /// pre-edge `count` exactly as `if (cnt[3]) latch <= 1;` does.
@@ -888,5 +947,457 @@ fn the_state_arm_lead_is_systematic_not_a_first_cycle_artifact() {
         sv[..CYCLES - 1],
         "the divergence is no longer a clean one-cycle shift — it changed shape, \
          which means something other than the phase alignment moved"
+    );
+}
+
+// ── m1 / V8 — a write between a leading read and the register update ──────────
+//
+// `design_docs/DERIVATION_TABLE.md` F2, measured (m1 in its §5). The
+// cycle-dataflow model derives a divergent shape D1 does not guard: in a
+// closing-anchored segment the barrier parks the task AT THE READ SITE, so a
+// plain-`Out` write placed after the read runs in the pre-edge settle — and if it
+// also precedes the update of the register it reads, it writes the PREVIOUS
+// generation's value, which the emitted `assign o = r` (Q) never shows at any
+// observation instant. D1 exempts the segment precisely because the read
+// comb-reaches the update, so nothing flags it.
+//
+// This is the CPU sweep's `program_counter` divergence #1 (TODO cause Q) reduced
+// to its minimal pair. Position of the write is the only variable across the
+// three DUTs:
+//
+//   V8a  read; write; update   → predicted DIVERGE (SV leads by one)
+//   V8b  read; update; write   → predicted agree (lfsr's shape: forwarded value
+//                                 ≡ committing value ≡ Q at the next observation)
+//   V8c  write; read+update    → predicted agree (the write executes BEFORE the
+//                                 barrier point, at the opening, reading
+//                                 committed state)
+
+const V8A_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn v8a_read_write_update(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        let s = step.read();
+        o.write(r);
+        r = r + s;
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn v8a_read_write_update(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        let s = step.read();
+        o.write(r);
+        r = r + s;
+        clk.tick().await;
+    }
+}
+
+const V8B_SRC: &str = r#"
+#[hardware(sequential)]
+async fn v8b_read_update_write(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        let s = step.read();
+        r = r + s;
+        o.write(r);
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential)]
+async fn v8b_read_update_write(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        let s = step.read();
+        r = r + s;
+        o.write(r);
+        clk.tick().await;
+    }
+}
+
+const V8C_SRC: &str = r#"
+#[hardware(sequential)]
+async fn v8c_write_read_update(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        o.write(r);
+        r = r + step.read();
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential)]
+async fn v8c_write_read_update(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        o.write(r);
+        r = r + step.read();
+        clk.tick().await;
+    }
+}
+
+fn sim_v8(which: u8) -> Vec<u8> {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (step_drv, step_in) = wire::<Bits<8>, C>(Bits::zero());
+    let (p, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = p.dirty_handle();
+    let reads = vec![step_in.wire_id()];
+    match which {
+        0 => exec.spawn_wired(v8a_read_write_update(clk.clone(), step_in, p), vec![dh], reads),
+        1 => exec.spawn_wired(v8b_read_update_write(clk.clone(), step_in, p), vec![dh], reads),
+        _ => exec.spawn_wired(v8c_write_read_update(clk.clone(), step_in, p), vec![dh], reads),
+    };
+    step_drv.write(Bits::from_lit::<1>());
+    (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect()
+}
+
+#[test]
+fn v8a_write_between_leading_read_and_update_diverges_known_gap() {
+    let sim = sim_v8(0);
+    let expected_sim: Vec<u8> = (0..).take(CYCLES).collect();
+    assert_eq!(
+        sim, expected_sim,
+        "simulator behaviour changed; if it now starts at 1 the gap is FIXED"
+    );
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(V8A_SRC, "v8a_read_write_update", "clk", "o", "t->step = 1;");
+    let expected_sv: Vec<u8> = (1..).take(CYCLES).collect();
+    assert_eq!(sv, expected_sv, "transpiled SV behaviour changed");
+    assert_ne!(
+        sim, sv,
+        "sim and SV now AGREE — F2's derived shape is FIXED. Update \
+         DERIVATION_TABLE.md F2 and the write-position rule it proposes."
+    );
+}
+
+#[test]
+fn v8b_moving_the_write_after_the_update_removes_the_divergence() {
+    let sim = sim_v8(1);
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(V8B_SRC, "v8b_read_update_write", "clk", "o", "t->step = 1;");
+    assert_eq!(
+        sim, sv,
+        "the write-after-update form must stay sim ≡ SV — this is lfsr's shape \
+         (legal shape 2 in DERIVATION_TABLE.md §1)"
+    );
+    assert_eq!(sim, (1..).take(CYCLES).collect::<Vec<u8>>());
+}
+
+#[test]
+fn v8c_moving_the_write_before_the_read_removes_the_divergence() {
+    let sim = sim_v8(2);
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(V8C_SRC, "v8c_write_read_update", "clk", "o", "t->step = 1;");
+    assert_eq!(
+        sim, sv,
+        "the write-before-the-read form must stay sim ≡ SV — the write executes \
+         before the barrier point, at the opening, reading committed state"
+    );
+    assert_eq!(sim, (1..).take(CYCLES).collect::<Vec<u8>>());
+}
+
+// V8d — V8a with the update routed through a same-cycle temp (`let next = …`).
+// This is the shape of the `single_loop_local_ok.rs` UI fixture, which the new
+// rule flagged on landing: the fixture existed to exercise the single-loop and
+// param-shadowing guardrails and was COMPILE-ONLY — nothing had ever measured its
+// behaviour. The rename changes nothing: the write still captures pre-update
+// `count` at the pre-edge while `assign out = count` shows the committed value.
+
+const V8D_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn v8d_temp_renamed_update(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut count: Bits<8> = Bits::zero();
+    loop {
+        let next = count + step.read();
+        o.write(count);
+        count = next;
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn v8d_temp_renamed_update(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut count: Bits<8> = Bits::zero();
+    loop {
+        let next = count + step.read();
+        o.write(count);
+        count = next;
+        clk.tick().await;
+    }
+}
+
+#[test]
+fn v8d_temp_renamed_update_diverges_like_v8a_known_gap() {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (step_drv, step_in) = wire::<Bits<8>, C>(Bits::zero());
+    let (p, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = p.dirty_handle();
+    let reads = vec![step_in.wire_id()];
+    exec.spawn_wired(v8d_temp_renamed_update(clk.clone(), step_in, p), vec![dh], reads);
+    step_drv.write(Bits::from_lit::<1>());
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    let expected_sim: Vec<u8> = (0..).take(CYCLES).collect();
+    assert_eq!(sim, expected_sim, "simulator behaviour changed");
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(V8D_SRC, "v8d_temp_renamed_update", "clk", "o", "t->step = 1;");
+    let expected_sv: Vec<u8> = (1..).take(CYCLES).collect();
+    assert_eq!(sv, expected_sv, "transpiled SV behaviour changed");
+    assert_ne!(sim, sv, "sim and SV now AGREE — see the V8a test's note");
+}
+
+// ── m2 — the model's lowering for the trailing segment, hand-written ──────────
+//
+// `design_docs/DERIVATION_TABLE.md` §5 m2, the §5.3 technique (hand-write the
+// candidate lowering, run it under Verilator, compare against the simulator).
+//
+// The cycle-dataflow model places `trailing_update`'s divergence in the
+// **dissolved** bucket: the trailing statements belong to the cycle the LAST tick
+// opens, their register update commits AT that edge (the trailing-statements rule
+// in SYNCHRONOUS_SEMANTICS.md), and the port write publishes the forwarded value —
+// which equals the register committed at that same edge. Hand-lowered, that is an
+// FSM whose trailing increment lands at the edge closing the final wait state,
+// with `assign o = n` reading the committed register:
+//
+//   always_ff @(posedge clk) begin
+//     state <= ~state;
+//     if (state == 1) n <= n + 1;   // the edge that OPENS the trailing cycle
+//   end
+//   assign o = n;
+//
+// Prediction: this matches the simulator's existing trace cycle-for-cycle —
+// i.e. the sim was already implementing the model, and today's codegen (which
+// diverges by one, `d1_in_the_trailing_segment_is_an_unguarded_gap`) is the side
+// the paired fix changes.
+
+const TRAILING_MODEL_SV: &str = r#"
+module trailing_update_model(input logic clk, output logic [7:0] o);
+  logic [7:0] n = 8'd0;
+  logic state = 1'b0;
+  always_ff @(posedge clk) begin
+    state <= ~state;
+    if (state == 1'b1) n <= n + 8'd1;
+  end
+  assign o = n;
+endmodule
+"#;
+
+#[test]
+fn m2_model_forwarded_lowering_matches_the_simulator_for_trailing_update() {
+    // The simulator's trace, now pinned exactly: the write lands at the
+    // observation of every even edge, so obs k shows floor(k/2).
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = o.dirty_handle();
+    exec.spawn_wired(trailing_update(clk.clone(), o), vec![dh], vec![]);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    let expected: Vec<u8> = (1..=CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(sim, expected, "simulator behaviour changed");
+
+    if !verilator_available() {
+        return;
+    }
+
+    let dir = std::env::temp_dir()
+        .join(format!("copper_fwd_m2_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("trailing_update_model.sv");
+    std::fs::write(&p, TRAILING_MODEL_SV).unwrap();
+    let model: Vec<u8> = run_sv(&p, "trailing_update_model", "clk", &["o"], "")
+        .into_iter()
+        .map(|r| r[0] as u8)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        sim, model,
+        "the hand-lowered MODEL emission no longer matches the simulator — the m2 \
+         derivation (DERIVATION_TABLE.md, trailing_update row) is wrong or the \
+         executor's trailing-segment behaviour changed"
+    );
+
+    // And today's codegen still disagrees with both — the divergence the paired
+    // fix will close from the codegen side. (The sim≠SV half is also asserted by
+    // d1_in_the_trailing_segment_is_an_unguarded_gap; repeated here so this test
+    // reads as the complete m2 statement: sim ≡ model ≠ today's SV.)
+    let sv = transpile_and_run(TRAILING_D1_SRC, "trailing_update", "clk", "o", "");
+    assert_ne!(
+        model, sv,
+        "today's transpiled SV now matches the model lowering — the trailing gap is \
+         FIXED in codegen. Promote trailing_update to a real equivalence test and \
+         update DERIVATION_TABLE.md's trailing_update row from 'predict' to done."
+    );
+}
+
+// ── The V-battery re-measured under forwarded emission (phase D evidence) ─────
+//
+// Narrowing D1 (`unprotected_pretick_out_write`) after phase B requires knowing
+// which of its measured-divergent shapes the forwarded emission DISSOLVED. The
+// guardrail's §3.1 verdicts predate both the trailing-forwarding fix
+// (2026-08-25) and phase B, so they are re-measured here and pinned. V1 is
+// covered by `pre_tick_update_forwarding_agrees_end_to_end`; these are the
+// discriminating variants for the narrowing's clauses.
+
+const V5_SRC: &str = r#"
+#[hardware(sequential)]
+async fn v5_trailing_read(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        r = r + Bits::from_lit::<1>();
+        o.write(r);
+        let _late = i.read();
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential)]
+async fn v5_trailing_read(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        r = r + Bits::from_lit::<1>();
+        o.write(r);
+        let _late = i.read();
+        clk.tick().await;
+    }
+}
+
+const V7_SRC: &str = r#"
+#[hardware(sequential)]
+async fn v7_escape_across_tick(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    let mut s: Bits<8> = Bits::zero();
+    loop {
+        r = r + Bits::from_lit::<1>();
+        o.write(s);
+        clk.tick().await;
+        s = r;
+    }
+}
+"#;
+
+#[hardware(sequential)]
+async fn v7_escape_across_tick(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut r: Bits<8> = Bits::zero();
+    let mut s: Bits<8> = Bits::zero();
+    loop {
+        r = r + Bits::from_lit::<1>();
+        o.write(s);
+        clk.tick().await;
+        s = r;
+    }
+}
+
+const W4_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn w4_mixed_alignment(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut phase: u8 = 0;
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        if phase == 0 { r = i.read(); phase = 1; }
+        else { r = r + Bits::from_lit::<1>(); phase = 0; }
+        o.write(r);
+        clk.tick().await;
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn w4_mixed_alignment(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut phase: u8 = 0;
+    let mut r: Bits<8> = Bits::zero();
+    loop {
+        if phase == 0 { r = i.read(); phase = 1; }
+        else { r = r + Bits::from_lit::<1>(); phase = 0; }
+        o.write(r);
+        clk.tick().await;
+    }
+}
+
+fn sim_probe(which: u8) -> Vec<u8> {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (i_drv, i_in) = wire::<Bits<8>, C>(Bits::zero());
+    let (p, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = p.dirty_handle();
+    let reads = vec![i_in.wire_id()];
+    match which {
+        0 => exec.spawn_wired(v5_trailing_read(clk.clone(), i_in, p), vec![dh], reads),
+        1 => exec.spawn_wired(v7_escape_across_tick(clk.clone(), i_in, p), vec![dh], reads),
+        _ => exec.spawn_wired(w4_mixed_alignment(clk.clone(), i_in, p), vec![dh], reads),
+    };
+    i_drv.write(Bits::from_lit::<3>());
+    (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect()
+}
+
+/// Measured 2026-08-26 under forwarded emission (phase B), pinning the phase-D
+/// narrowing's discriminator: V5 and V7 AGREE (dissolved — V7's 2026-08-21
+/// verdict was stale even before phase B: the 2026-08-25 shared
+/// trailing-forwarding map already emits `s <= r + 1`), W4 DIVERGES (the
+/// read-preceded / path-dependent-boundary class the narrowed rule retains —
+/// sim holds `i + 1`, the SV alternates).
+#[test]
+fn d_narrowing_battery_verdicts() {
+    if !verilator_available() {
+        return;
+    }
+    let v5_sim = sim_probe(0);
+    let v5_sv = transpile_and_run(V5_SRC, "v5_trailing_read", "clk", "o", "t->i = 3;");
+    assert_eq!(v5_sim, v5_sv, "V5 (trailing read) must stay dissolved: the write is an opening-prefix drive");
+    assert_eq!(v5_sim, (2..).take(CYCLES).collect::<Vec<u8>>());
+
+    let v7_sim = sim_probe(1);
+    let v7_sv = transpile_and_run(V7_SRC, "v7_escape_across_tick", "clk", "o", "t->i = 3;");
+    assert_eq!(v7_sim, v7_sv, "V7 (escape across the tick) must stay dissolved: the shared trailing-forwarding map covers `s = r`");
+    assert_eq!(v7_sim, (1..).take(CYCLES).collect::<Vec<u8>>());
+
+    let w4_sim = sim_probe(2);
+    let w4_sv = transpile_and_run(W4_SRC, "w4_mixed_alignment", "clk", "o", "t->i = 3;");
+    assert_eq!(w4_sim, vec![4u8; CYCLES], "simulator behaviour changed for the mixed-alignment witness");
+    assert_ne!(
+        w4_sim, w4_sv,
+        "sim and SV now AGREE for MIXED alignment — the path-dependent-boundary \
+         class is fixed; re-bless the narrowed D1 rule, EXPECTED_FLAGGED, and the \
+         ui/fail/pretick_alignment case, which all pin this divergence"
     );
 }

@@ -24,7 +24,14 @@ pub fn lower_to_shir(chir: &CHIRModule) -> Result<SHIRModule, SHIRLowerError> {
             SHIRBody::Combinational(lower_comb_body(comb)?)
         }
         CHIRBody::Sequential(seq) => {
-            SHIRBody::Sequential(lower_seq_body(seq, chir.span)?)
+            let in_ports: std::rc::Rc<HashSet<String>> = std::rc::Rc::new(
+                chir.ports
+                    .iter()
+                    .filter(|p| matches!(p.direction, copper_core::chir::CHIRPortDir::Input))
+                    .map(|p| p.name.clone())
+                    .collect(),
+            );
+            SHIRBody::Sequential(lower_seq_body(seq, in_ports, chir.span)?)
         }
         CHIRBody::Structural(st) => {
             SHIRBody::Structural(lower_structural_body(st)?)
@@ -164,19 +171,58 @@ struct Forwarding {
     map: Option<HashMap<String, SHIRExpr>>,
     reg_names: HashSet<String>,
     span: SourceSpan,
+    /// The module's `In`-port names, for the opening-prefix tracking below.
+    in_ports: std::rc::Rc<HashSet<String>>,
+    /// Cycle-dataflow phase B (`design_docs/PAIRED_IMPLEMENTATION_SCOPE.md`):
+    /// true once any `In`-port read has appeared earlier in this segment's walk
+    /// (conservatively: anywhere in an already-walked statement, including inside
+    /// its branches). A plain-`Out` drive BEFORE this point executes at the
+    /// cycle's OPENING instant in the simulator — ahead of any `pre_edge_barrier`
+    /// — so its continuous-assign form must be the FORWARDED expression
+    /// (`edge_value`); a drive after it executes behind the barrier, where the
+    /// unforwarded committed form is correct (V8b/lfsr, measured). The two forms
+    /// are equal unless the segment assigned a register the drive reads, which is
+    /// what confines the emission change to the measured witness set (F1).
+    /// `false` when the selection is disabled (trailing segments, comb path).
+    seen_in_read: bool,
+    /// Whether the opening-drive selection applies at all: true for pre-tick /
+    /// head segments, false for TRAILING segments (their drives publish values
+    /// whose registers commit at the same opening edge, so the committed
+    /// unforwarded form is the model's emission — m2's measured target) and for
+    /// the combinational path.
+    forward_opening_drives: bool,
 }
 
 impl Forwarding {
     /// The combinational path: no substitution, and assignments are not recorded.
     fn disabled() -> Self {
-        Forwarding { map: None, reg_names: HashSet::new(), span: SourceSpan::default() }
+        Forwarding {
+            map: None,
+            reg_names: HashSet::new(),
+            span: SourceSpan::default(),
+            in_ports: std::rc::Rc::new(HashSet::new()),
+            seen_in_read: false,
+            forward_opening_drives: false,
+        }
     }
 
     /// A fresh map for one sequential segment. Segments do not share it: a register
     /// assigned before a tick is *latched* by that tick, so the next segment reads
     /// the register itself, not the expression that fed it.
-    fn for_segment(reg_names: HashSet<String>, span: SourceSpan) -> Self {
-        Forwarding { map: Some(HashMap::new()), reg_names, span }
+    fn for_segment(
+        reg_names: HashSet<String>,
+        in_ports: std::rc::Rc<HashSet<String>>,
+        forward_opening_drives: bool,
+        span: SourceSpan,
+    ) -> Self {
+        Forwarding {
+            map: Some(HashMap::new()),
+            reg_names,
+            span,
+            in_ports,
+            seen_in_read: false,
+            forward_opening_drives,
+        }
     }
 
     /// The pre-edge form of an expression: registers this segment has assigned stand
@@ -222,6 +268,17 @@ fn lower_stmt_list(
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
     let mut out = Vec::new();
     for stmt in stmts {
+        // Opening-prefix tracking: mark BEFORE lowering, so a drive whose own
+        // expression reads an `In` port counts as behind its read's barrier
+        // (`leading_read_reaches` includes the write's own reads). Conservative
+        // for branches — a read anywhere inside this statement marks the walk —
+        // which only ever keeps a drive on today's unforwarded emission.
+        if fwd.forward_opening_drives && !fwd.seen_in_read {
+            let ins = fwd.in_ports.clone();
+            let mut hit = false;
+            collect_expr_vars_in_stmt(stmt, &mut |v: &str| hit |= ins.contains(v));
+            fwd.seen_in_read = hit;
+        }
         match stmt {
             // A reassignment of a known combinational wire → another blocking
             // assign to it (`name = value;`). The single `logic` declaration is
@@ -243,9 +300,20 @@ fn lower_stmt_list(
             CHIRStmt::PortWrite { port_name, value, .. } => {
                 let value = rename_vars(lower_expr(value)?, renames);
                 let edge_value = fwd.at_edge(&value);
+                // Cycle-dataflow phase B: an OPENING-prefix drive (no In-port
+                // read precedes it in this segment) executes at the cycle's
+                // opening in the simulator, publishing the forwarded value — so
+                // its continuous-assign form is `edge_value`. Registered
+                // emission (`split_output_regs`, hold outputs) keeps using
+                // `edge_value` as before either way.
+                let assign_form = if fwd.forward_opening_drives && !fwd.seen_in_read {
+                    edge_value.clone()
+                } else {
+                    value
+                };
                 out.push(SHIRStmt::PortDrive {
                     port_name: port_name.clone(),
-                    value,
+                    value: assign_form,
                     edge_value,
                 });
             }
@@ -372,6 +440,7 @@ fn lower_structural_body(st: &CHIRStructuralBody) -> Result<SHIRStructuralBody, 
 
 fn lower_seq_body(
     seq: &CHIRSeqBody,
+    in_ports: std::rc::Rc<HashSet<String>>,
     module_span: SourceSpan,
 ) -> Result<SHIRSeqBody, SHIRLowerError> {
     // Step 1: Validate CHIR preconditions
@@ -453,6 +522,8 @@ fn lower_seq_body(
             &promoted_names,
             &no_renames,
             &seq.registers,
+            &in_ports,
+            false, // trailing segment: committed unforwarded emission (m2)
             module_span,
         )?;
         // …then the head segment's own combinational logic. Register reassignments
@@ -463,6 +534,8 @@ fn lower_seq_body(
             &promoted_names,
             &no_renames,
             &seq.registers,
+            &in_ports,
+            true, // head segment: opening-prefix drives get forwarded emission
             module_span,
         )?);
         // One forwarding map across both: they commit at the same edge, and the
@@ -522,6 +595,8 @@ fn lower_seq_body(
             &promoted_names,
             &phase_renames,
             &seq.registers,
+            &in_ports,
+            true, // pre-tick segment of its phase: opening-prefix selection on
             module_span,
         )?;
 
@@ -567,6 +642,8 @@ fn lower_seq_body(
                     &promoted_names,
                     &phase_renames,
                     &seq.registers,
+                    &in_ports,
+                    false, // trailing segment: committed unforwarded emission (m2)
                     module_span,
                 )?;
                 // Trailing segment maps to the same phase — same renames apply
@@ -752,13 +829,29 @@ fn lower_pre_edge_stmts(
     promoted_names: &HashSet<String>,
     renames: &HashMap<String, String>,
     registers: &[CHIRRegDecl],
+    in_ports: &std::rc::Rc<HashSet<String>>,
+    // Pre-tick/head segments get the opening-drive selection; TRAILING segments
+    // must not (their committed unforwarded form is the model's emission — m2).
+    forward_opening_drives: bool,
     span: SourceSpan,
 ) -> Result<Vec<SHIRStmt>, SHIRLowerError> {
-    // The sequential pre-edge path has no combinational reassignments (an `Assign`
-    // there is a register update handled by the segment logic), so the wire-type
-    // map is empty and such assigns are left for that path.
-    let mut fwd = Forwarding::for_segment(reg_name_set(registers, promoted_names), span);
-    lower_stmt_list(stmts, promoted_names, renames, &HashMap::new(), &mut fwd)
+    // The wire types this segment declares. This USED to be empty, on the premise
+    // that "an `Assign` in the sequential path is a register update handled by the
+    // segment logic" — which was true only because that logic made a register update
+    // out of EVERY assign, wire or not. It does not any more (see the `Assign` arm in
+    // `extract_updates_from_stmts`), so a reassigned combinational wire has to be
+    // lowered here, as another blocking assign, exactly as the combinational module
+    // path already does. Without both halves of this change a wire reassignment
+    // either gets two drivers (before) or silently disappears (guard alone).
+    let mut wire_types = HashMap::new();
+    collect_wire_types(stmts, &mut wire_types);
+    let mut fwd = Forwarding::for_segment(
+        reg_name_set(registers, promoted_names),
+        in_ports.clone(),
+        forward_opening_drives,
+        span,
+    );
+    lower_stmt_list(stmts, promoted_names, renames, &wire_types, &mut fwd)
 }
 
 /// The names the segment walks treat as registers: declared registers plus the
@@ -838,8 +931,28 @@ fn extract_updates_from_stmts(
             CHIRStmt::Assign { target, value, .. } => {
                 let resolved = resolve(lower_expr(value)?, forwarding);
                 // Update forwarding so later assigns in this segment see the new value.
+                // Done for a WIRE too: within a segment the statements are sequential,
+                // so a register update that reads a wire between two of its assignments
+                // must see the one that has run, not the wire's final value.
                 forwarding.insert(target.clone(), resolved.clone());
-                updates.push(SHIRRegUpdate { target: target.clone(), next_value: resolved });
+
+                // ONLY A REGISTER GETS A REGISTER UPDATE. Reassigning a combinational
+                // WIRE is not a clock-edge event: `lower_stmt_list` already emits it as
+                // another blocking assign in the `always_comb`, so pushing an update
+                // here as well gave the signal TWO DRIVERS — an `always_comb` defining
+                // it and an `always_ff` holding it — which is MULTIDRIVEN, illegal per
+                // IEEE 1800 9.2.2.2, and semantically a held register where the source
+                // has a wire that is re-initialised every iteration.
+                //
+                // `reg_names` was already threaded into this function and simply not
+                // consulted here. That is the whole defect: not a rival register
+                // inference, but a register update emitted without asking whether the
+                // target is a register. `copper_analysis::infer_registers` had the right
+                // answer all along — `tests/fixtures/aggregate_locals_dut.rs` is the
+                // reduced witness, and `register_reconciliation.rs` is what named it.
+                if reg_names.contains(target) {
+                    updates.push(SHIRRegUpdate { target: target.clone(), next_value: resolved });
+                }
             }
 
             // A `let` wire declared in this segment. It is not a register update, so
@@ -1015,7 +1128,15 @@ fn find_promoted_wires(
         }
     }
 
-    promote.into_iter()
+    // Sorted: `promote` is a HashSet, and iterating it directly made the
+    // promoted-register DECLARATION ORDER nondeterministic — two transpiles of
+    // sipo_block differed in `w0_r`/`w1_r` order (found by sv-baseline's
+    // snapshot-then-diff on an unchanged tree, 2026-08-26). Semantically
+    // harmless, but it poisons byte-level reproducibility and the migration's
+    // exact-set emission gate.
+    let mut promoted: Vec<String> = promote.into_iter().collect();
+    promoted.sort();
+    promoted.into_iter()
         .filter_map(|name| {
             let ty = wire_types.get(&name)?.clone();
             Some((name, ty, None))

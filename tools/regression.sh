@@ -37,6 +37,9 @@
 #   G-B  every registered example actually ran
 #   G-C  every tests/*.rs (root and per-crate) produced a test binary that ran
 #   G-D  the corpus differential sweep covered every #[hardware] module and ran
+#   G-E  how much of that sweep is anchored to an INDEPENDENT hand-written Verilog
+#        reference rather than only cross-checked against the transpiler (printed,
+#        not enforced)
 #
 # and it prints the `#[ignore]`d tests every run, because a skipped check that prints
 # nothing is indistinguishable from a passing one.
@@ -169,6 +172,23 @@ if [ "$RUN_TEST" -eq 1 ]; then
   [ "$SWEPT" -gt 0 ] || fail "G-D: no differential cases ran"
   echo "  G-D ok: corpus sweep ran $SWEPT differential cases ($SWEPT_SKIP ignored-with-reason)"
 
+  # G-E — ANCHORING. The sweep checks the simulator against the SystemVerilog the
+  # transpiler emitted: two implementations of one source, which proves CONSISTENCY.
+  # A module additionally checked against an independent hand-written Verilog
+  # reference has its SEMANTICS anchored to something outside Copper, and a
+  # misconception shared between the executor and the lowering is only visible there.
+  # Not a hard failure — most of the corpus is unanchored today and blocking on that
+  # would help nobody. It is printed every run for the reason the ignored-test list
+  # is: a gap nobody prints is a gap somebody rediscovers in an audit.
+  ANCHOR_LINE=$(grep -h "anchoring:" "$TMP"/*.log 2>/dev/null | tail -1 | sed 's/.*anchoring: //')
+  if [ -n "$ANCHOR_LINE" ]; then
+    echo "  G-E: $ANCHOR_LINE"
+    UNANCH=$(grep -h "unanchored:" "$TMP"/*.log 2>/dev/null | tail -1 | sed 's/.*unanchored: //')
+    [ -n "$UNANCH" ] && echo "       unanchored: $UNANCH"
+  else
+    echo "  G-E: anchoring ledger not found in the build log (build.rs emits it)"
+  fi
+
   # Ignored tests stay VISIBLE. These are deliberate, but an ignore whose stated
   # reason has gone stale is invisible otherwise — exactly what happened to accum_2,
   # which sat disabled long after the divergence it described had been fixed.
@@ -197,12 +217,15 @@ else
     while IFS= read -r line; do EXAMPLES+=("$line"); done < <(registered_examples)
 
     # G-A — an examples/**.rs with no [[example]] entry can never be run by anything.
+    # `old/` directories are exempt: examples/cpu/old/ is untracked scratch holding
+    # pre-subset spellings that no longer compile (Vec ports); build.rs's corpus
+    # sweep prunes it the same way, so the two scans stay consistent.
     UNREG=""
-    for f in $(find examples -name '*.rs' | sort); do
+    for f in $(find examples -path '*/old/*' -prune -o -name '*.rs' -print | sort); do
       grep -q "path = \"$f\"" Cargo.toml || UNREG="$UNREG $f"
     done
     [ -z "$UNREG" ] || { echo "  unregistered:$UNREG" >&2; fail "G-A: example(s) that can never run"; }
-    echo "  G-A ok: all $(find examples -name '*.rs' | wc -l | tr -d ' ') example files are registered"
+    echo "  G-A ok: all $(find examples -path '*/old/*' -prune -o -name '*.rs' -print | wc -l | tr -d ' ') example files are registered"
   fi
 
   command -v verilator >/dev/null || fail "verilator not on PATH (brew install verilator)"

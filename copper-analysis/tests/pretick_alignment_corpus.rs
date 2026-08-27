@@ -99,14 +99,29 @@ fn clocked_hardware_fns(items: &[Item], out: &mut Vec<ItemFn>) {
 /// hand-written SV reference.
 const EXPECTED_FLAGGED: &[&str] = &[
     "tests/fixtures/probe_timing_dut.rs::probe_fsm",
-    "tests/mem_latency_probe.rs::ram_prewrite",
-    "tests/sequential_forwarding_divergence.rs::add_then_write",
-    "tests/sequential_forwarding_divergence.rs::fast_counter",
+    // `ram_prewrite` also left the set in the phase-D narrowing: its write is not
+    // read-preceded, so it falls on the dissolved side of the discriminator. It
+    // never had a behavioral verdict (it does not transpile; its only test is
+    // `#[ignore]`d), so nothing measured contradicts the narrowing — if it ever
+    // transpiles, the corpus sweep covers it the moment it does.
+    // REMOVED 2026-08-26 (cycle-dataflow phase D): `add_then_write` and the
+    // `fast_counter` witness were DISSOLVED by phase B's forwarded emission —
+    // measured agreeing (`pre_tick_update_forwarding_agrees_end_to_end`,
+    // `independent_hardware_anchors_the_corrected_spelling`) — and the rule was
+    // narrowed to READ-PRECEDED register-reading writes (the path-dependent
+    // region boundary), so the no-read opening shapes are legal now.
+    //
+    // ADDED the same day: `w4_mixed_alignment` — the retained class's own
+    // demonstration witness (a read reaches the write on one path only),
+    // measured DIVERGENT under forwarded emission (sim holds, SV alternates;
+    // pinned in `d_narrowing_battery_verdicts`).
+    "tests/sequential_forwarding_divergence.rs::w4_mixed_alignment",
     // Added 2026-08-25 when the CONSTANT-WRITE exemption was narrowed to
     // unconditional writes (guardrail 5.5). All three are measured divergences, not
     // rule regressions: each leads its own emitted SystemVerilog by exactly one
     // cycle, with both traces pinned in sequential_forwarding_divergence.rs. The
-    // narrowing's total corpus cost was these three and nothing else.
+    // hold clause is untouched by forwarded emission (they write constants), so
+    // the phase-D narrowing keeps all three.
     "tests/fixtures/control_extraction_dut.rs::branch_merge_explicit",
     "tests/sequential_forwarding_divergence.rs::pc_arm_toggle",
     "tests/sequential_forwarding_divergence.rs::pc_arm_write",
@@ -291,5 +306,82 @@ fn trailing_out_write_flags_exactly_the_demonstration_modules() {
     assert!(
         missing.is_empty(),
         "no longer flagged — the hazard may be fixed, or the module changed: {missing:?}"
+    );
+}
+
+// ── The write-between-read-and-update rule (V8, m1) ──────────────────────────
+
+/// Plain `Out` ports written between a leading `In` read and the update of a
+/// register the write reads (`copper_analysis::pretick_out_write_before_update`;
+/// `design_docs/DERIVATION_TABLE.md` F2).
+///
+/// The fifth member of the family, and the first DERIVED before it was measured:
+/// the cycle-dataflow model predicted the divergence, the exact traces, and both
+/// flipping controls (the V8 battery in `sequential_forwarding_divergence.rs`)
+/// before the controlled measurement existed. The in-vivo instance was
+/// `rv32i_cpu_transpilable`'s `program_counter` (TODO cause Q, divergence #1),
+/// since rewritten to the post-commit form — which is why no real design appears
+/// here. Same exact-set discipline as the rules above: the opt-out silences the
+/// error, not the detection.
+const EXPECTED_WRITE_BEFORE_UPDATE: &[&str] = &[
+    "tests/sequential_forwarding_divergence.rs::v8a_read_write_update",
+    // V8a with the update routed through a same-cycle temp — the shape the rule
+    // caught in ui/pass/single_loop_local_ok.rs THE DAY IT LANDED (a compile-only
+    // fixture nobody had measured; it diverges exactly like V8a and is pinned as
+    // this witness; the fixture itself was reordered to the legal V8c form).
+    "tests/sequential_forwarding_divergence.rs::v8d_temp_renamed_update",
+];
+
+#[test]
+fn write_before_update_flags_exactly_the_demonstration_modules() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in ["examples", "src", "tests"] {
+        rs_files(&root.join(dir), &mut files);
+    }
+    files.sort();
+
+    let mut scanned = 0usize;
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for path in &files {
+        let Ok(src) = fs::read_to_string(path) else { continue };
+        let Ok(file) = syn::parse_file(&src) else { continue };
+        let mut fns = Vec::new();
+        clocked_hardware_fns(&file.items, &mut fns);
+        for f in &fns {
+            scanned += 1;
+            if !copper_analysis::pretick_out_write_before_update(f).is_empty() {
+                let rel = path.strip_prefix(&root).unwrap_or(path).display();
+                flagged.insert(format!("{rel}::{}", f.sig.ident));
+            }
+        }
+    }
+
+    assert!(scanned >= 40, "expected to scan the corpus, only saw {scanned} clocked modules");
+
+    let expected: BTreeSet<String> =
+        EXPECTED_WRITE_BEFORE_UPDATE.iter().map(|s| s.to_string()).collect();
+    let unexpected: Vec<_> = flagged.difference(&expected).cloned().collect();
+    let missing: Vec<_> = expected.difference(&flagged).cloned().collect();
+
+    assert!(
+        unexpected.is_empty(),
+        "NEW module(s) flagged by the write-before-update rule: {unexpected:#?}\n\
+         Either that module has the divergence (check it against its transpiled SV — \
+         the V8a trace pair is the signature: SV leads the sim by exactly one), or \
+         the rule has regressed into a false positive. Do NOT add to \
+         EXPECTED_WRITE_BEFORE_UPDATE without a measured verdict."
+    );
+    assert!(
+        missing.is_empty(),
+        "module(s) no longer flagged: {missing:#?}\n\
+         If the divergence was fixed (the paired cycle-dataflow migration), drop \
+         them here and re-bless the V8 tests in sequential_forwarding_divergence.rs, \
+         which pin today's divergent traces."
+    );
+
+    eprintln!(
+        "write-before-update: {scanned} clocked modules scanned, {} flagged",
+        flagged.len()
     );
 }

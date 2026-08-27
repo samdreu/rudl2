@@ -66,7 +66,11 @@ impl DirtyHandle {
 /// race. This is the executable spec for that invariant (cf. `In`, which *is*
 /// `Clone` because many readers are fine):
 ///
-/// ```compile_fail
+/// Asserted, with its compiler message pinned, in
+/// `copper-core/tests/ui/fail/out_not_clone_single_driver.rs`. Shown here rather
+/// than run: `compile_fail` would pass whatever the reason for failing.
+///
+/// ```ignore
 /// use copper_core::port::wire;
 /// use copper_core::Logic;
 /// let (out, _in) = wire::<Logic, ()>(Logic::Zero);

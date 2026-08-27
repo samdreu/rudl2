@@ -7,6 +7,10 @@ edition = "2024"
 name = "copper-transpile"
 path = "src/main.rs"
 
+[[bin]]
+name = "surface-audit"
+path = "src/bin/surface-audit.rs"
+
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
 copper-analysis = { version = "0.1.0", path = "../copper-analysis" }

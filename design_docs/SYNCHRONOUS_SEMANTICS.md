@@ -137,17 +137,21 @@ unobservable) or moving the register update after the `clk.tick().await` so the 
 `#[hardware(sequential, allow_pretick_alignment)]` — the waiver every lint in this space ships
 (Verilator's `lint_off BLKSEQ`, Verible's rule waivers); it silences the error, not the detection.
 
-**Detection is three rules, not one.** The obvious consolidation — one rule examining every segment —
+**Detection is four rules, not one.** The obvious consolidation — one rule examining every segment —
 was implemented and measured **three times**, and rejected every time on corpus evidence: writing a
 plain `Out` after a tick is the *ordinary* multi-phase pattern and is correct, so a rule that cannot
 say which segment it is looking at drowns in false positives. What each rule may assume about its
 region is what separates them.
 
-- **`unprotected_pretick_out_write`** — the head segment (loop head → first tick), the shape above.
-  Every clause has a measured witness: the read must *precede* the assignment (a trailing read does
-  not protect); mixed alignment does **not** protect (a read on one branch leaves another branch
-  exposed); and `RegOut` is immune (changing *only* the port type flips a diverging module to
-  agreeing).
+- **`unprotected_pretick_out_write`** — the head segment (loop head → first tick). **NARROWED
+  2026-08-26 (cycle-dataflow phase D)**: phase B's forwarded continuous-assign emission gave the
+  no-read opening shapes their defined meaning (`assign o = r + 1` — the meaning the simulator
+  always had; V1/V5/V7 and both `fast_counter` ports re-measured agreeing), so the register-reading
+  clause now also requires the write to be **read-preceded**. What remains refused is the
+  **path-dependent region boundary** — a read reaches the write on one path while a register is
+  assigned unprotected on another (W4, `probe_fsm`: the write executes at the opening on one path
+  and the pre-edge on the other, and no single emission matches both) — plus the unchanged
+  conditional/constant hold clause below. `RegOut` remains immune.
 - **`unprotected_trailing_out_write`** — the same hazard past the *last* tick, unguarded until
   2026-08-25 and measurably divergent (`trailing_update`, one cycle, uniformly). Two widenings were
   measured and rejected first: merging the trailing segment into the head region flags **25** modules
@@ -185,6 +189,18 @@ phase shift, not an initialization artifact — and `branch_merge_explicit`, whi
 cited as *agreeing*: it does not. It transpiles byte-identically to its twin, its twin agrees with
 it, and it leads its own emitted SystemVerilog by one. Narrowing the exemption cost exactly those
 three modules corpus-wide.
+
+- **`pretick_out_write_before_update`** (2026-08-26) — a plain `Out` written **between a leading
+  `In` read and the update of a register the write reads**. The read's barrier parks the task at the
+  read site, so the write executes in the pre-edge settle with the register's *pre-update* value —
+  which the emitted `assign` (Q) never shows at any observation instant; the hardware leads the
+  simulator by one cycle, silently. D1 structurally cannot see it: the leading read is D1's
+  *protection* (its shapes write after the update, so the barrier hands them the committing value),
+  and here it is the *exposure*. The first rule in the family **derived before it was measured** —
+  from the cycle-dataflow model (`design_docs/CYCLE_DATAFLOW_SEMANTICS.md`), with the V8 battery
+  confirming every predicted trace and the CPU sweep's `program_counter` divergence as the in-vivo
+  instance. Zero corpus cost, and it caught a silently-divergent compile-only UI fixture the day it
+  landed. Remedies: move the write after the update, or before the read, or `RegOut`.
 
 Enforcement is asymmetric, and deliberately so: `multi_phase_out_write` runs in **both** front-ends
 (the transpiler honours the opt-out too, or a module that exists to demonstrate the hazard could not

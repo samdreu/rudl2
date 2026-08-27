@@ -1,0 +1,16 @@
+error[E0382]: use of moved value: `out`
+  --> tests/ui/fail/out_is_not_clone.rs:23:36
+   |
+20 |     let (out, _obs) = wire::<Logic, Fast>(Logic::Zero);
+   |          --- move occurs because `out` has type `Out<copper_core::Logic, Fast>`, which does not implement the `Copy` trait
+21 |     driver_a(Clock::<Fast>::new(), out);
+   |                                    --- value moved here
+22 |     // E0382: use of moved value `out` — a wire has one driver, by move semantics
+23 |     driver_b(Clock::<Fast>::new(), out);
+   |                                    ^^^ value used here after move
+   |
+note: consider changing this parameter type in function `driver_a` to borrow instead if owning the value isn't necessary
+  --> tests/ui/fail/out_is_not_clone.rs:16:34
+   |
+16 | fn driver_a(_c: Clock<Fast>, _q: Out<Logic, Fast>) {}
+   |    -------- in this function     ^^^^^^^^^^^^^^^^ this parameter takes ownership of the value

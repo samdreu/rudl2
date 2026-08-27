@@ -77,7 +77,92 @@ const SKIP: &[(&str, &str)] = &[
     ),
     (
         "rv32i_cpu_pipelined",
-        "does not transpile: cause F, a `Vec<Bits<32>>` port (TODO, TRANSPILER COVERAGE)",
+        "receives its unified instruction/data `Memory` as a parameter, so the sweep cannot \
+         supply one (see the Kind::Memory rule below, which would skip it anyway). It also does \
+         not transpile — a received memory has no port ABI, and the struct-typed pipeline latches \
+         and tuple-returning EX stage are their own blockers (TODO, TRANSPILER COVERAGE)",
+    ),
+    // ── The claim ledger: tests/fixtures/{bits_ops,signedness,aggregate_locals,
+    // match_selector,out_phase,mem_address_width}_dut.rs. Each module below is a
+    // KNOWN-WRONG lowering with a working twin in the same file that DOES sweep, so
+    // a fix shows up as an entry that can be deleted. The failure mode named in each
+    // reason is the one actually observed, not the one predicted.
+    (
+        "bit_not_bits",
+        "WRONG LOWERING, AND THE TRANSPILER'S: `!` on a `Bits<N>` emits SystemVerilog `!` \
+         (LOGICAL negation) rather than `~`, so the result collapses to one bit — Verilator \
+         reports WIDTHTRUNC on the LOGNOT. LOCALISED by an independent reference (`assign o = \
+         ~a`, tests/fixtures/reference_sv/bit_not_bits.sv, wired up in REFERENCE above): it \
+         AGREES with the simulator and disagrees with the emitted SV, so the simulator is \
+         right and the lowering is wrong. `bit_not_via_xor` is the working spelling and \
+         sweeps; `bit_not_bool` pins that `!` on a bool is correct, so a fix must not make \
+         `!` bitwise everywhere. Delete this entry when the lowering emits `~`; the anchor \
+         is already in place",
+    ),
+    (
+        "lit_width_in_ternary",
+        "WRONG WIDTH: a `Bits::<32>::from_lit` with no sibling operand to take its width \
+         from emits a 64-bit literal — WIDTHTRUNC into the 32-bit port. \
+         `lit_width_via_locals` is the same value through explicitly-typed `let` bindings \
+         and sweeps",
+    ),
+    (
+        "signed_lt_via_cast",
+        "WRONG ANSWER, AND IT LINTS CLEAN: `ExprType::Cast` is stripped and `signed` is \
+         never emitted, so `(a as i32) < (b as i32)` becomes an UNSIGNED compare. The sweep \
+         disagrees from cycle 0. This is RISC-V's SLT/BLT/BGE. `signed_lt_via_bias` is the \
+         working spelling and sweeps",
+    ),
+    (
+        "sign_extend_via_cast",
+        "WRONG ANSWER, AND IT LINTS CLEAN: `as i32 >> 20` is arithmetic in Rust and logical \
+         in the emitted SV, so sign extension becomes zero extension (measured: expected \
+         4294967170, got 3970). `sign_extend_via_mask` is the working spelling and sweeps",
+    ),
+    (
+        "match_on_usize",
+        "WRONG WIDTH: a `match` emits 64-bit case labels (`s == 64'd1`) — WIDTHEXPAND against \
+         the 32-bit selector. `ifchain_on_usize` is the same mux and demux as an if-chain and \
+         sweeps. See `match_on_literals`: the width comes from the LITERAL, not the scrutinee",
+    ),
+    (
+        "match_on_literals",
+        "WRONG WIDTH, and this one was WRITTEN AS A CONTROL EXPECTED TO PASS: a `match` on a \
+         `u32` with literal patterns also emits `op == 64'd55`. That is what narrowed the \
+         claim from \"a match on a usize\" to \"a match literal\" — a probe that only asked \
+         \"does it transpile\" had already recorded this shape as working",
+    ),
+    (
+        "match_on_const_pattern",
+        "REFUSED: a named `const` in a match PATTERN reads as an enum-variant pattern and is \
+         rejected as `tuple-pattern match lowering is not yet implemented (M2)`, which is not \
+         what it is. Cause D-a made file-scope consts work as EXPRESSIONS only. \
+         `ifchain_on_const_expr` is the working spelling and sweeps",
+    ),
+    (
+        "out_from_reg_before_commit",
+        "ONE-CYCLE DIVERGENCE, and no existing check catches it: a plain `Out` driven from a \
+         register and written BEFORE the register commits leads the simulator by a cycle. \
+         D1's guard exempts the segment because an `In` read precedes the write. Found by the \
+         sweep on rv32i_cpu_transpilable's `program_counter`. \
+         `out_from_reg_after_commit` is the shape that agrees and sweeps",
+    ),
+    (
+        "regout_trailing_single_tick",
+        "ONE-CYCLE DIVERGENCE, and the half worth knowing: reaching for `RegOut` does NOT fix \
+         the entry above. In a SINGLE-TICK loop the trailing statements share the head's \
+         phase, so the transpiler folds a trailing `RegOut` write into this edge while the \
+         simulator commits it on the next. Same lead, opposite cause. Every other member of \
+         the pre-tick alignment family is about a body crossing two or more edges",
+    ),
+    (
+        "wide_index_sole_consumer",
+        "UNUSEDSIGNAL: `usize` is 32 bits and a memory address net is narrower, so `10'(i)` \
+         reads `i[9:0]` and an index local that feeds NOTHING ELSE has a dead upper half. \
+         Not the address cast being wrong — `wide_index_into_narrow_addr` is the same index \
+         with a range check (which reads the whole word, as every address in \
+         rv32i_cpu_transpilable does) and sweeps. The fix is a real choice — emit the index \
+         local at the address width, or accept the lint — and is deliberately not guessed at",
     ),
     (
         "uart_tx",
@@ -151,7 +236,44 @@ const PARAMS: &[(&str, &[(&str, i64)])] = &[
 /// carries X, Verilator's 2-state model reads 0). Sweeping the pre-reset window
 /// compares undefined behaviour against undefined behaviour, which is a test of
 /// nothing. A design that needs a reset gets one.
-const RESET: &[(&str, &str, bool)] = &[("shift_register", "rstn", true)];
+/// An **independent hand-written Verilog reference** for a module, by name.
+///
+/// The sweep's ordinary check is simulator vs the SystemVerilog the transpiler
+/// emitted: two implementations of ONE source. That is an oracle for "the two
+/// agree" and nothing more — a misconception shared between the executor and the
+/// lowering is invisible to it. A reference nobody derived from either closes that
+/// gap, and a module listed here is checked against all three.
+///
+/// **Provenance is part of the claim and belongs in the file's header.** A
+/// reference written by whoever wrote the Copper module catches lowering and
+/// transcription errors but shares that person's model of the design; only a
+/// genuinely third-party source (BaseJump STL and the like) buys independence.
+/// Third-party is preferred wherever one exists — see `examples/basejump/sv/` for
+/// the header format, including what was adapted and why.
+///
+/// The referenced file's SystemVerilog module must be NAMED FOR THE COPPER MODULE:
+/// it is Verilated as the top exactly as the transpiler's output is. Vendored
+/// third-party code is therefore adapted (renamed ports, concrete parameter
+/// defaults), which the vendored BaseJump files already do and record.
+///
+/// A module NOT listed here is unanchored, and `tools/regression.sh` prints how
+/// many there are on every run — the gap is tracked rather than rediscovered.
+const REFERENCE: &[(&str, &str)] = &[
+    ("ram_read_first", "tests/fixtures/reference_sv/ram_read_first.sv"),
+    // Anchored while still SKIPped, deliberately: the row is inert until the SKIP
+    // below is deleted, and it is what proved the `!` bug is the TRANSPILER's and
+    // not the simulator's. Ready the moment the fix lands.
+    ("bit_not_bits", "tests/fixtures/reference_sv/bit_not_bits.sv"),
+];
+
+const RESET: &[(&str, &str, bool)] = &[
+    ("shift_register", "rstn", true),
+    // Held low the core is idle and its boot port owns the memory's write bus, so the
+    // sweep's random stimulus reaches a defined state instead of X. This is the first
+    // CPU-scale design in the sweep; it got here when `vlir_lower` started casting
+    // memory addresses to the address-net width (TODO cause Q).
+    ("rv32i_cpu_transpilable", "rstn", true),
+];
 
 /// Cycles of random stimulus per sequential module.
 const SEQ_CYCLES: usize = 200;
@@ -208,17 +330,117 @@ fn main() {
         covered.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
     );
 
+    // Validate the REFERENCE table before anything uses it. Every failure mode here
+    // is silent otherwise: a mistyped module name anchors NOTHING and the sweep goes
+    // on passing, which is this repo's signature bug in a new place. Checked at build
+    // time so the mistake is reported where it was made rather than as a confusing
+    // Verilator error twenty seconds later.
+    for (module, path) in REFERENCE {
+        let leaves: Vec<&str> =
+            covered.iter().map(|n| n.rsplit("::").next().unwrap_or(n)).collect();
+        if !leaves.contains(module) {
+            // Near-misses only. Printing all ~130 module names buries the one thing
+            // the reader needs, which is "did I typo it".
+            let pre = &module[..module.len().min(4)];
+            let mut near: Vec<&str> =
+                leaves.iter().copied().filter(|l| l.starts_with(pre)).collect();
+            near.sort_unstable();
+            near.dedup();
+            let hint = if near.is_empty() {
+                format!("no module starts with `{pre}`; {} are covered", leaves.len())
+            } else {
+                format!("did you mean: {}", near.join(", "))
+            };
+            panic!(
+                "REFERENCE names `{module}`, which is not a module the sweep covers. \
+                 A typo here anchors nothing and every test still passes. {hint}"
+            );
+        }
+        let full = manifest.join(path);
+        assert!(
+            full.is_file(),
+            "REFERENCE for `{module}` points at `{path}`, which does not exist \
+             (looked in {})",
+            full.display()
+        );
+        let sv = std::fs::read_to_string(&full)
+            .unwrap_or_else(|e| panic!("REFERENCE for `{module}`: cannot read {path}: {e}"));
+        assert!(
+            sv.contains(&format!("module {module}")),
+            "REFERENCE for `{module}` is `{path}`, which does not declare `module {module}`. \
+             Verilator is run with `--top-module {module}`, so the reference's module must be \
+             NAMED FOR THE COPPER MODULE — vendored third-party code is renamed for this, which \
+             the files in examples/basejump/sv/ do and record in their headers"
+        );
+        assert!(
+            !sv.contains("// @generated"),
+            "REFERENCE for `{module}` points at generated output. A reference derived from the \
+             transpiler cannot anchor the transpiler"
+        );
+        println!("cargo:rerun-if-changed={path}");
+    }
+
+    // The anchoring ledger. A module cross-checked only against the transpiler's own
+    // output is verified for CONSISTENCY; one checked against an independent
+    // reference is verified for SEMANTICS. Keeping the two counts apart is the point
+    // — see REFERENCE above — and G-E in tools/regression.sh prints the remainder so
+    // it stays visible instead of being rediscovered by an audit.
+    let anchored = covered
+        .iter()
+        .filter(|n| {
+            let leaf = n.rsplit("::").next().unwrap_or(n);
+            REFERENCE.iter().any(|(m, _)| *m == leaf)
+        })
+        .count();
+    let _ = writeln!(
+        code,
+        "/// Modules checked against an INDEPENDENT hand-written Verilog reference.\n\
+         pub const ANCHORED: usize = {anchored};\n\
+         /// Swept modules with no independent reference — cross-checked against the\n\
+         /// transpiler's own output only, so consistent but not externally anchored.\n\
+         pub const UNANCHORED: usize = {};",
+        covered.len() - anchored
+    );
+
     // Surfaced in the build log too, so the counts are visible without running.
     println!("cargo:warning=corpus sweep: {emitted} generated, {ignored} ignored-with-reason");
+    let unanchored_names: Vec<&str> = covered
+        .iter()
+        .filter(|n| {
+            let leaf = n.rsplit("::").next().unwrap_or(n);
+            !REFERENCE.iter().any(|(m, _)| *m == leaf)
+        })
+        .map(|n| n.as_str())
+        .collect();
+    println!(
+        "cargo:warning=anchoring: {anchored} module(s) checked against an independent reference, \
+         {} cross-checked against the transpiler only",
+        unanchored_names.len()
+    );
+    // Named once the list is short enough to read. While it is the whole corpus the
+    // count is the useful number; the names become the useful thing as the remainder
+    // shrinks, which is the direction this is meant to move.
+    if !unanchored_names.is_empty() && unanchored_names.len() <= 25 {
+        println!("cargo:warning=unanchored: {}", unanchored_names.join(", "));
+    }
     std::fs::write(out_dir.join("corpus_generated.rs"), code).expect("write generated tests");
 }
 
 /// Every `.rs` under `dir`, recursively (`examples/` has subdirectories).
+///
+/// `old/` directories are excluded: `examples/cpu/old/` is untracked scratch
+/// holding pre-subset spellings (`Vec` ports the admissible grammar rejects), and
+/// sweeping it generates corpus cases that cannot compile. The `TODO`'s KNOWN
+/// entry for the admissible grammar verified the tracked corpus is unaffected
+/// with `old/` set aside; this makes that the sweep's actual behaviour.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.filter_map(Result::ok) {
         let p = entry.path();
         if p.is_dir() {
+            if p.file_name().is_some_and(|n| n == "old") {
+                continue;
+            }
             collect_rs(&p, out);
         } else if p.extension().is_some_and(|e| e == "rs") {
             out.push(p);
@@ -270,6 +492,10 @@ enum Kind {
     In,
     Out,
     RegOut,
+    /// A `Memory<T, R, W, D, RL, WL>` the module RECEIVES rather than declares.
+    /// Not a port: no wire is made for it and no stimulus is generated. It exists
+    /// as a variant so `classify` can return `Some` for it — see the note there.
+    Memory,
 }
 
 impl Module {
@@ -343,6 +569,15 @@ impl Module {
                     .join(", ")
             ));
         }
+        if self.ports.iter().any(|p| p.kind == Kind::Memory) {
+            return Some(
+                "receives a `Memory<…>` parameter: the sweep would have to invent its size and \
+                 its contents, and both are design decisions (a ROM's contents ARE the design). \
+                 Same disposition as PARAMS — a memory-taking module is swept by a hand-written \
+                 test that states them, not by generated stimulus"
+                    .to_string(),
+            );
+        }
         if self.ports.iter().filter(|p| p.kind == Kind::Clock).count() > 1 {
             return Some(
                 "more than one clock port: the generated harness drives a single clock, and the \
@@ -368,6 +603,15 @@ impl Module {
 }
 
 /// `In<Bits<8>, MainClk>` → `(Kind::In, "Bits<8>", "MainClk")`; `Clock<D>` → the domain.
+///
+/// **Returning `None` here deletes a module from the sweep.** `Module::from_item`
+/// propagates it with `?`, so an unclassifiable parameter does not make the module
+/// un-sweepable-with-a-reason — it makes the module invisible, which is the one
+/// outcome the SKIP table exists to prevent. That is what happened when `Memory`
+/// first became a legal parameter type: the pipelined CPU dropped out of the
+/// corpus silently and only `every_corpus_module_has_a_generated_case` (which
+/// scans for `#[hardware]` by attribute, NOT through this function) noticed.
+/// So a new parameter kind belongs here first, and in `skip_reason` second.
 fn classify(ty: &syn::Type) -> Option<(Kind, String, String)> {
     let syn::Type::Path(tp) = ty else { return None };
     let seg = tp.path.segments.last()?;
@@ -376,6 +620,7 @@ fn classify(ty: &syn::Type) -> Option<(Kind, String, String)> {
         "In" => Kind::In,
         "Out" => Kind::Out,
         "RegOut" => Kind::RegOut,
+        "Memory" => Kind::Memory,
         _ => return None,
     };
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else { return None };
@@ -386,6 +631,9 @@ fn classify(ty: &syn::Type) -> Option<(Kind, String, String)> {
         .collect();
     match kind {
         Kind::Clock => Some((kind, text.first()?.clone(), text.first()?.clone())),
+        // `Memory<T, R, W, D, RL, WL>` — the domain is the 4th argument, not the
+        // 2nd, because R and W sit between the element type and it.
+        Kind::Memory => Some((kind, text.first()?.clone(), text.get(3)?.clone())),
         _ => Some((kind, text.first()?.clone(), text.get(1)?.clone())),
     }
 }
@@ -566,6 +814,10 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
         let _ = writeln!(code, "        const P_{n}: usize = {v};");
     }
 
+    let with_reference = match REFERENCE.iter().find(|(n, _)| *n == m.name) {
+        Some((_, path)) => format!("\n            .with_hand_written_reference(\"{path}\")"),
+        None => String::new(),
+    };
     let with_params = match params {
         Some(ps) => format!(
             "\n            .with_params(&[{}])",
@@ -575,7 +827,7 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
     };
     let _ = writeln!(
         code,
-        "        let mut eq = __Eq::differential_only(\"{name}\", SRC, Some(\"{name}\")){with_params};"
+        "        let mut eq = __Eq::differential_only(\"{name}\", SRC, Some(\"{name}\")){with_params}{with_reference};"
     );
     let _ = writeln!(code, "        let mut rng = __Rng::new({});", seed_of(name));
     if let Some(c) = clk {
@@ -587,6 +839,11 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
         let (ty, z, d) = (alias_ty(&p.ty, &m.generics), zero_of(&p.ty), &p.domain);
         match p.kind {
             Kind::Clock => {}
+            // `skip_reason` returns early for any module with one, so a memory
+            // never reaches code generation. Spelled out rather than caught by a
+            // wildcard so a future parameter kind fails to compile here instead of
+            // being silently dropped on the floor.
+            Kind::Memory => unreachable!("a module with a Memory parameter is skipped"),
             Kind::In => {
                 let _ = writeln!(
                     code,
@@ -645,6 +902,7 @@ fn emit_test(code: &mut String, m: &Module, body: bool) {
             Kind::Clock => "clk.clone()".to_string(),
             Kind::In => format!("{}_in", p.name),
             Kind::Out | Kind::RegOut => format!("{}_out", p.name),
+            Kind::Memory => unreachable!("a module with a Memory parameter is skipped"),
         })
         .collect();
     let turbofish = match params {

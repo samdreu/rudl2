@@ -53,9 +53,21 @@
 //!
 //! ## GUARANTEED — rejected at compile time
 //!
+//! Each case below is asserted in `copper-core/tests/ui/fail/`, one file per rule,
+//! with the compiler's message pinned in the adjacent `.stderr`. They were
+//! `compile_fail` doctests until 2026-08-26; that form asserts only that the snippet
+//! failed to compile, so a typo or a renamed API satisfied it exactly as well as the
+//! guarantee, and the error CODE — `E0308` for a domain crossing, `E0382` for the
+//! single-driver move, `E0599` for `RegOut` not being `Clone` — was never checked at
+//! all. Run them with `cargo test -p copper-core --test cdc_ui`.
+//!
 //! Connecting a `Fast`-domain input wire to a `Slow`-domain input port:
 //!
-//! ```compile_fail
+//! Asserted, with its compiler message pinned, in
+//! `copper-core/tests/ui/fail/in_port_foreign_domain.rs`. Shown here rather than run:
+//! `compile_fail` would pass whatever the reason for failing.
+//!
+//! ```ignore
 //! use copper_core::port::{wire, In, Out};
 //! use copper_core::{Clock, ClockDomain, Logic};
 //! struct Fast; impl ClockDomain for Fast {}
@@ -70,7 +82,11 @@
 //!
 //! Connecting a `Fast`-domain output wire to a `Slow`-domain output port:
 //!
-//! ```compile_fail
+//! Asserted, with its compiler message pinned, in
+//! `copper-core/tests/ui/fail/out_port_foreign_domain.rs`. Shown here rather than run:
+//! `compile_fail` would pass whatever the reason for failing.
+//!
+//! ```ignore
 //! use copper_core::port::{wire, Out};
 //! use copper_core::{Clock, ClockDomain, Logic};
 //! struct Fast; impl ClockDomain for Fast {}
@@ -91,7 +107,11 @@
 //!
 //! Count 1 — the wire is already moved into its single driver:
 //!
-//! ```compile_fail
+//! Asserted, with its compiler message pinned, in
+//! `copper-core/tests/ui/fail/out_is_not_clone.rs`. Shown here rather than run:
+//! `compile_fail` would pass whatever the reason for failing.
+//!
+//! ```ignore
 //! use copper_core::port::{wire, Out};
 //! use copper_core::{Clock, ClockDomain, Logic};
 //! struct Fast; impl ClockDomain for Fast {}
@@ -107,7 +127,11 @@
 //! Count 2 — and even the *attempt* to reach across a domain is a type error, so
 //! cloning `Out` (if it were possible) would not help:
 //!
-//! ```compile_fail
+//! Asserted, with its compiler message pinned, in
+//! `copper-core/tests/ui/fail/second_driver_foreign_domain.rs`. Shown here rather than run:
+//! `compile_fail` would pass whatever the reason for failing.
+//!
+//! ```ignore
 //! use copper_core::port::{wire, Out};
 //! use copper_core::{Clock, ClockDomain, Logic};
 //! struct Fast; impl ClockDomain for Fast {}
@@ -121,7 +145,11 @@
 //!
 //! `RegOut` carries the same single-driver guarantee as `Out`:
 //!
-//! ```compile_fail
+//! Asserted, with its compiler message pinned, in
+//! `copper-core/tests/ui/fail/regout_is_not_clone.rs`. Shown here rather than run:
+//! `compile_fail` would pass whatever the reason for failing.
+//!
+//! ```ignore
 //! use copper_core::port::registered_wire;
 //! use copper_core::{Clock, ClockDomain, Logic};
 //! struct Fast; impl ClockDomain for Fast {}
@@ -133,7 +161,11 @@
 //!
 //! Passing a `Fast` clock where a `Slow` clock is required:
 //!
-//! ```compile_fail
+//! Asserted, with its compiler message pinned, in
+//! `copper-core/tests/ui/fail/clock_foreign_domain.rs`. Shown here rather than run:
+//! `compile_fail` would pass whatever the reason for failing.
+//!
+//! ```ignore
 //! use copper_core::{Clock, ClockDomain};
 //! struct Fast; impl ClockDomain for Fast {}
 //! struct Slow; impl ClockDomain for Slow {}

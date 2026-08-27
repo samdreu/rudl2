@@ -129,6 +129,15 @@ fn is_clocked(f: &ItemFn) -> bool {
     })
 }
 
+/// Modules that exist to DEMONSTRATE a reconciliation failure, by name.
+///
+/// Not a category filter — the header above records that excluding a *category*
+/// (synchronizers) once hid a real bug, and that filter is lifted permanently. A
+/// named witness is the opposite thing: the divergence is the module's whole
+/// purpose, it is stated here with its mechanism, and the entry disappears when
+/// the mechanism is fixed. Same disposition as `probe` in `build.rs`'s SKIP table.
+const WITNESSES: &[(&str, &str)] = &[];
+
 #[test]
 fn codegen_registers_match_shared_inference() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -183,6 +192,17 @@ fn codegen_registers_match_shared_inference() {
                 .collect();
 
             let where_ = format!("{}::{name}", path.file_name().unwrap().to_string_lossy());
+            if let Some((_, why)) = WITNESSES.iter().find(|(n, _)| *n == name) {
+                // Assert the witness still diverges. A witness that quietly started
+                // agreeing would sit here forever claiming a bug that was fixed —
+                // the stale-`#[ignore]` failure this repo keeps recording.
+                assert!(
+                    !missing.is_empty() || !extra.is_empty(),
+                    "{where_} is listed as a reconciliation witness but now AGREES. \
+                     If that is the fix, delete its WITNESSES entry. Reason on file: {why}"
+                );
+                continue;
+            }
             if !missing.is_empty() {
                 violations.push(format!(
                     "{where_}: inferred registers missing from codegen output: {missing:?} \

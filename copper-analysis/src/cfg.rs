@@ -155,6 +155,63 @@ impl Node {
     }
 }
 
+/// Facts about one clock phase (Comb-connected component), for the
+/// cycle-dataflow derivation table. See [`Cfg::derivation_facts`].
+#[derive(Clone, Debug)]
+pub struct PhaseFacts {
+    /// This is the head phase (which the trailing segment merges into).
+    pub is_head: bool,
+    /// Some node in the phase assigns a register.
+    pub assigns_registers: bool,
+    /// Some node in the phase reads an `In` port.
+    pub has_input_read: bool,
+    /// An `In` read comb-reaches a commit site in this phase — the first-cut
+    /// evidence the phase is **closing-anchored** under the model (path-based
+    /// over-approximation of value dependence). Commit sites are register
+    /// assignments **and memory stagings**: `mem.read_port().read(a)` /
+    /// `write_port().write(a, v)` latch their operands at the closing edge exactly
+    /// as a register does.
+    pub input_reaches_commit: bool,
+    /// Some node in the phase stages a memory access (drives an address/write bus
+    /// that latches at the closing edge).
+    pub stages_memory: bool,
+    /// Some `In`-reading node in the phase branches (≥ 2 comb successors) — the
+    /// read steers control, and in a ticking module which suspension point comes
+    /// next is a commit of the **implicit state register** (`pc`), which the CFG
+    /// does not carry as a `def`. Closing-anchor evidence on the same footing as
+    /// `input_reaches_commit`; it is what keeps `det_010_awaits`-style condition
+    /// reads anchored to their edge (the D2 rule's condition-position exclusion,
+    /// restated).
+    pub control_input_read: bool,
+    /// Plain combinational `Out` ports written in this phase (`RegOut` excluded,
+    /// as everywhere in `Node::writes`).
+    pub plain_out_writes: BTreeSet<String>,
+    /// The subset of `plain_out_writes` whose write reads a register assigned
+    /// earlier in the same phase — the forwarding delta is observable, so an
+    /// opening-anchored phase's emitted SV changes under the model.
+    pub forwarded_observable: BTreeSet<String>,
+    /// The subset of `plain_out_writes` whose operand value flows from a
+    /// same-cycle `In` read **through wires** (registers break the taint — a
+    /// register read is commit-frontier by definition). These are the writes the
+    /// review-row taxonomy cannot clear as frontier-expressible mechanically:
+    /// the dual-anchor read question (table §8 item 1) applies, per-read.
+    pub input_fed_writes: BTreeSet<String>,
+}
+
+/// Per-module facts for the cycle-dataflow derivation table.
+/// See [`Cfg::derivation_facts`].
+#[derive(Clone, Debug)]
+pub struct DerivationFacts {
+    pub registers: Vec<String>,
+    /// Direct `clk.tick().await` nodes in the top-level loop (folded nested loops
+    /// count as one node however many ticks they contain).
+    pub tick_nodes: usize,
+    /// One iteration crosses more than one clock edge (counts folded tick-bearing
+    /// nested loops as more than one, unlike the phase count).
+    pub multi_tick: bool,
+    pub phases: Vec<PhaseFacts>,
+}
+
 /// The control-flow graph of a module's top-level `loop`.
 pub struct Cfg {
     nodes: Vec<Node>,
@@ -539,7 +596,24 @@ impl Cfg {
                 continue;
             }
             for w in &node.writes {
-                if !node.uses.is_disjoint(&regs) || !self.written_on_all_paths(w, &head_entries) {
+                // NARROWED 2026-08-26 (cycle-dataflow phase D, measured — see
+                // `d_narrowing_battery_verdicts` in
+                // tests/sequential_forwarding_divergence.rs): a register-reading
+                // write with NO In read comb-reaching it is an OPENING-PREFIX
+                // drive, and phase B's forwarded continuous-assign emission gives
+                // it the meaning the simulator always had — V1, V5 (trailing
+                // read), V7 (escape across the tick) and both `fast_counter`
+                // ports were re-measured AGREEING. What remains divergent is the
+                // READ-PRECEDED write — the path-dependent region boundary (W4,
+                // `probe_fsm`: a read reaches the write on one path only, so the
+                // write executes at the opening on one path and the pre-edge on
+                // the other, and no single emission matches both). The
+                // hold/conditional clause below stays unconditional: `pc_arm_*`
+                // and `branch_merge_explicit` write constants, are untouched by
+                // forwarded emission, and still diverge (their pins are green).
+                let register_read_hazard =
+                    !node.uses.is_disjoint(&regs) && self.leading_read_reaches(n);
+                if register_read_hazard || !self.written_on_all_paths(w, &head_entries) {
                     driven.insert(w.clone());
                 }
             }
@@ -687,6 +761,94 @@ impl Cfg {
             }
         }
         driven.into_iter().collect()
+    }
+
+    /// Plain combinational `Out` ports written **between a leading `In` read and
+    /// the update of a register the write reads** — the fifth member of the
+    /// pre-tick alignment family, and the first derived from the cycle-dataflow
+    /// model *before* its controlled measurement existed
+    /// (`design_docs/DERIVATION_TABLE.md` F2 / m1, 2026-08-26).
+    ///
+    /// # The hazard
+    ///
+    /// A leading read's `pre_edge_barrier` parks the task **at the read site**, so
+    /// everything after it — including this write — executes in the pre-edge
+    /// settle of the closing tick. A write placed there that reads a register
+    /// updated *later* in the segment captures the register's **pre-update**
+    /// value, one generation behind what the emitted `assign o = r` (the
+    /// flip-flop's Q) shows at every observation instant. Measured (the V8 battery
+    /// in `tests/sequential_forwarding_divergence.rs`, position of the write the
+    /// only variable, every trace predicted before the run):
+    ///
+    /// ```text
+    /// let s = step.read(); o.write(r); r = r + s;   // V8a: sim [0,1,2,…], SV [1,2,3,…]
+    /// let s = step.read(); r = r + s; o.write(r);   // V8b: agree — forwarded ≡ committing ≡ Q
+    /// o.write(r); r = r + step.read();              // V8c: agree — write precedes the barrier
+    /// ```
+    ///
+    /// The in-vivo instance is `rv32i_cpu_transpilable`'s `program_counter`
+    /// (`TODO` cause Q, divergence #1), since rewritten to the post-commit form.
+    ///
+    /// # Why D1 does not catch it
+    ///
+    /// [`unprotected_pretick_out_write`](Self::unprotected_pretick_out_write)'s
+    /// clause (i) requires a register assigned with **no** leading read reaching
+    /// it — the read is the *protection* in D1's shapes, because their writes come
+    /// after the update and the barrier gives them the forwarded (committing)
+    /// value. Here the read is what *creates* the exposure, by dragging a
+    /// write-before-update to the pre-edge. Complementary triggers, like every
+    /// pair in this family.
+    ///
+    /// # Clauses, each with a flipping witness
+    ///
+    /// 1. a leading `In` read comb-reaches the write (V8c flips it: write before
+    ///    the read executes at the cycle's opening on committed state — agrees);
+    /// 2. the write reads a register (a constant is generation-free);
+    /// 3. the write comb-reaches an update of a register it reads (V8b flips it:
+    ///    update first, the write captures the committing value — agrees).
+    ///
+    /// `RegOut` is excluded for free (`Node::writes` holds only combinational
+    /// outputs), as everywhere in the family.
+    ///
+    /// # Honest scope (R6)
+    ///
+    /// Pre-tick region only, like D1 — a middle segment of a multi-tick loop is
+    /// unexamined (no measured instance; measure before widening, per the family's
+    /// standing rule). Conditional writes carry no extra clause here: only the
+    /// value's generation is at issue, not the write's landing instant, and no
+    /// conditional variant has been measured to diverge.
+    pub fn pretick_out_write_before_update(&self) -> Vec<String> {
+        let region = self.pre_tick_region();
+        let regs: BTreeSet<String> = self.registers().into_iter().collect();
+        let mut flagged: BTreeSet<String> = BTreeSet::new();
+        for &w in &region {
+            let wn = &self.nodes[w];
+            if wn.folded || wn.writes.is_empty() {
+                continue;
+            }
+            // (2) the write reads a register — otherwise its value is
+            // generation-free and the phase it executes in is unobservable.
+            let read_regs: BTreeSet<String> =
+                wn.uses.intersection(&regs).cloned().collect();
+            if read_regs.is_empty() {
+                continue;
+            }
+            // (1) barrier-dragged: a leading `In` read comb-reaches the write.
+            if !self.leading_read_reaches(w) {
+                continue;
+            }
+            // (3) the update comes after: some later node in the region assigns a
+            // register this write reads.
+            let updated_after = region.iter().any(|&a| {
+                a != w
+                    && !self.nodes[a].defs.is_disjoint(&read_regs)
+                    && self.comb_reaches(w, a)
+            });
+            if updated_after {
+                flagged.extend(wn.writes.iter().cloned());
+            }
+        }
+        flagged.into_iter().collect()
     }
 
     /// Does one iteration of the loop cross **more than one clock edge**?
@@ -1393,6 +1555,176 @@ impl Cfg {
         live_out
     }
 
+    /// Per-clock-phase facts for the cycle-dataflow derivation table
+    /// (`design_docs/CYCLE_DATAFLOW_SEMANTICS.md` phase 1). **Reporting only** — no
+    /// rule keys on this; it exists so the table's mechanical columns come from the
+    /// same authority the rules read, instead of a hand scan that goes stale.
+    ///
+    /// A *phase* is a Comb-connected component of the CFG, exactly as
+    /// [`multi_phase_out_write`](Self::multi_phase_out_write) counts them (the
+    /// trailing segment merges with the head via the fall-through back-edge). Two
+    /// deliberate first-cut approximations, refined by hand in the table:
+    ///
+    /// * `input_reaches_commit` uses comb-**path** reachability (an `In` read
+    ///   comb-reaches a register assignment), not value dependence — an
+    ///   over-approximation of the model's "some commit *depends on* a same-cycle
+    ///   input read" closing-anchor condition.
+    /// * reach queries are iteration-local ([`comb_reaches`](Self::comb_reaches)
+    ///   stops at the head), so a trailing→head ordering within the merged phase is
+    ///   not followed.
+    /// * **`RegOut` writes are commits the CFG does not carry** (`Node::writes`
+    ///   holds combinational outputs only), so a phase whose only input-dependent
+    ///   commit is a `RegOut` write reads as opening-anchored with a stray input
+    ///   read — the `match_on_updated_reg` false `(read-retime)`, hand-derived in
+    ///   `DERIVATION_TABLE.md` §4b (really closing-anchored; no retiming).
+    pub fn derivation_facts(&self) -> DerivationFacts {
+        let regs: BTreeSet<String> = self.registers().into_iter().collect();
+
+        // Union-find over Comb edges — the same phase notion multi_phase_out_write
+        // uses. A Tick edge is the only separator.
+        let n = self.nodes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for i in 0..n {
+            for &(s, k) in &self.nodes[i].succs {
+                if k == EdgeKind::Comb {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, s));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+
+        let head_root = find(&mut parent, self.head);
+        let mut by_root: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            by_root.entry(r).or_default().push(i);
+        }
+
+        let mut phases = Vec::new();
+        for (root, members) in &by_root {
+            let is_head = *root == head_root;
+            let mut ph = PhaseFacts {
+                is_head,
+                assigns_registers: false,
+                has_input_read: false,
+                input_reaches_commit: false,
+                stages_memory: false,
+                control_input_read: false,
+                plain_out_writes: BTreeSet::new(),
+                forwarded_observable: BTreeSet::new(),
+                input_fed_writes: BTreeSet::new(),
+            };
+            // Wire taint: which same-cycle wire names carry an input's value.
+            // Registers break the chain — reading one yields the committed
+            // (frontier) value however it was computed.
+            let tainted: BTreeSet<String> = {
+                let mut t: BTreeSet<String> = BTreeSet::new();
+                loop {
+                    let mut changed = false;
+                    for &m in members.iter() {
+                        let node = &self.nodes[m];
+                        let src_hit = !node.uses.is_disjoint(&self.inputs)
+                            || !node.uses.is_disjoint(&t);
+                        if src_hit {
+                            for d in node.defs.difference(&regs) {
+                                changed |= t.insert(d.clone());
+                            }
+                        }
+                    }
+                    if !changed {
+                        break t;
+                    }
+                }
+            };
+            // Commit sites: register assignments and memory stagings — both latch
+            // their operands at the closing edge.
+            let commit_nodes: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    !self.nodes[m].defs.is_disjoint(&regs)
+                        || self.nodes[m].mem.iter().any(|a| a.kind.bus().is_some())
+                })
+                .collect();
+            ph.assigns_registers =
+                commit_nodes.iter().any(|&m| !self.nodes[m].defs.is_disjoint(&regs));
+            ph.stages_memory = members
+                .iter()
+                .any(|&m| self.nodes[m].mem.iter().any(|a| a.kind.bus().is_some()));
+            for &m in members {
+                let node = &self.nodes[m];
+                if !node.uses.is_disjoint(&self.inputs) {
+                    ph.has_input_read = true;
+                    if commit_nodes.iter().any(|&c| self.comb_reaches(m, c)) {
+                        ph.input_reaches_commit = true;
+                    }
+                    let comb_succs =
+                        node.succs.iter().filter(|(_, k)| *k == EdgeKind::Comb).count();
+                    if comb_succs >= 2 {
+                        ph.control_input_read = true;
+                    }
+                    // A folded tick-bearing loop hides its interior from the
+                    // parent: it carries interior `uses` but NO `defs`, so a read
+                    // that feeds a commit or steers a branch INSIDE the fold looks
+                    // commit-free out here. The uart mid-bit sample does both
+                    // (m4, DERIVATION_TABLE.md): in the sub-CFG it reaches
+                    // `byte_val`'s update and branches. The precise answer lives in
+                    // `nested_ticking_loops`; the honest first cut at this level is
+                    // closing evidence, never a retime flag.
+                    if node.folded && node.is_tick {
+                        ph.input_reaches_commit = true;
+                    }
+                }
+                if node.folded || node.writes.is_empty() {
+                    continue;
+                }
+                for w in &node.writes {
+                    ph.plain_out_writes.insert(w.clone());
+                    // The write's operand reads a register some comb-preceding node
+                    // in the phase assigns: the sim's forwarded value is observable,
+                    // so under the model an OPENING-anchored phase's emission must
+                    // be the forwarded expression (D1's family).
+                    let observable = commit_nodes.iter().any(|&c| {
+                        self.comb_reaches(c, m)
+                            && !self.nodes[c]
+                                .defs
+                                .intersection(&regs)
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                                .is_disjoint(&node.uses)
+                    });
+                    if observable {
+                        ph.forwarded_observable.insert(w.clone());
+                    }
+                    if !node.uses.is_disjoint(&self.inputs)
+                        || !node.uses.is_disjoint(&tainted)
+                    {
+                        ph.input_fed_writes.insert(w.clone());
+                    }
+                }
+            }
+            // A component with no statements of interest (e.g. a lone tick node) is
+            // still reported: phase COUNT is part of the table.
+            phases.push(ph);
+        }
+
+        DerivationFacts {
+            registers: self.registers(),
+            tick_nodes: self.nodes.iter().filter(|n| n.is_tick).count(),
+            multi_tick: self.crosses_more_than_one_tick(),
+            phases,
+        }
+    }
+
     /// A minimal FSM report that falls out of the CFG for free (the item-2 byproduct
     /// tracked in `TODO`): the tick count (≈ number of cycle boundaries), the clock
     /// receivers seen, and the inferred registers. Kept intentionally small; a
@@ -1786,9 +2118,22 @@ fn mem_port_receiver(recv: &Expr, mems: &BTreeSet<String>) -> Option<(String, St
     Some((mem, port, is_read))
 }
 
-/// The locals bound to a `Memory<…>` in `f` — `let mem = Memory::<…>::new(…)`,
-/// including the `.write_first()` / `.read_first()` builder spellings. Declared
-/// before the hardware loop, so the whole body is scanned.
+/// The names bound to a `Memory<…>` in `f`, in either of its two spellings:
+///
+/// - **declared** — `let mem = Memory::<…>::new(…)`, including the
+///   `.write_first()` / `.read_first()` builder forms. Declared before the
+///   hardware loop, so the whole body is scanned.
+/// - **received** — a `mem: Memory<…>` parameter, the spelling a module uses when
+///   a testbench or a parent owns the storage and hands it over.
+///
+/// **Both, deliberately.** Every rule downstream of this — the one-access-per-bus
+/// -per-cycle rule, the read-is-staged-before-its-tick rule, the unrolled-nested-
+/// loop rule — is keyed on the *names* this returns. A received memory that this
+/// function did not report would not be diagnosed as unsafe; it would simply stop
+/// being examined, and the module would go quiet rather than fail. That is the
+/// failure mode the wiring guards in `tools/regression.sh` exist to prevent, and
+/// it is why the parameter spelling was taught here in the same change that
+/// taught the macro to accept it, rather than afterwards.
 fn memory_locals(f: &ItemFn) -> BTreeSet<String> {
     struct V {
         out: BTreeSet<String>,
@@ -1805,6 +2150,18 @@ fn memory_locals(f: &ItemFn) -> BTreeSet<String> {
     }
     let mut v = V { out: BTreeSet::new() };
     v.visit_block(&f.block);
+
+    // Received memories. The type is matched by its outer name for the same reason
+    // the macro's allowlist does: `Memory` may arrive fully qualified
+    // (`copper_core::Memory<…>`), and the last path segment is the type either way.
+    for arg in &f.sig.inputs {
+        let syn::FnArg::Typed(pt) = arg else { continue };
+        let syn::Type::Path(tp) = &*pt.ty else { continue };
+        if tp.path.segments.last().is_some_and(|s| s.ident == "Memory") {
+            pat_bindings(&pt.pat, &mut v.out);
+        }
+    }
+
     v.out
 }
 
@@ -2658,9 +3015,108 @@ mod tests {
         Cfg::build(&parse(src)).map(|c| c.unprotected_pretick_out_write()).unwrap_or_default()
     }
 
-    /// V1 — no `In` read anywhere; register assigned pre-tick; plain `Out`. DIVERGES.
+    // ── write between a leading read and the update (V8 battery, m1) ────────
+
+    fn v8(src: &str) -> Vec<String> {
+        Cfg::build(&parse(src)).map(|c| c.pretick_out_write_before_update()).unwrap_or_default()
+    }
+
+    /// V8a — read; write; update. Measured to DIVERGE (sim `[0,1,…]`, SV `[1,2,…]`):
+    /// the barrier drags the write to the pre-edge, where it captures the
+    /// register's pre-update value.
     #[test]
-    fn hazard_v1_assign_then_write_flagged() {
+    fn v8a_write_between_read_and_update_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { let s = step.read(); o.write(r); r = r + s; clk.tick().await; }
+            }
+        "#;
+        assert_eq!(v8(src), ["o"]);
+    }
+
+    /// V8b — read; update; write. Measured to AGREE: the write captures the
+    /// forwarded (committing) value, which is Q from the next observation on.
+    /// Flips clause 3 (the write no longer comb-reaches the update).
+    #[test]
+    fn v8b_write_after_update_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { let s = step.read(); r = r + s; o.write(r); clk.tick().await; }
+            }
+        "#;
+        assert!(v8(src).is_empty());
+    }
+
+    /// V8c — write; read; update. Measured to AGREE: the write precedes the
+    /// barrier point, so it executes at the cycle's opening on committed state.
+    /// Flips clause 1 (no leading read comb-reaches the write).
+    #[test]
+    fn v8c_write_before_read_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { o.write(r); r = r + step.read(); clk.tick().await; }
+            }
+        "#;
+        assert!(v8(src).is_empty());
+    }
+
+    /// A constant write in V8a's position is generation-free — clause 2. (No
+    /// measured divergent conditional/constant variant exists; scope note on the
+    /// rule.)
+    #[test]
+    fn v8_constant_write_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { let s = step.read(); o.write(Bits::zero()); r = r + s; clk.tick().await; }
+            }
+        "#;
+        assert!(v8(src).is_empty());
+    }
+
+    /// V8a with the port declared `RegOut` — immune by construction, excluded the
+    /// same way the whole family excludes it (`Node::writes` is comb-only).
+    #[test]
+    fn v8_regout_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, step: In<Bits<8>, C>, o: RegOut<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { let s = step.read(); o.write(r); r = r + s; clk.tick().await; }
+            }
+        "#;
+        assert!(v8(src).is_empty());
+    }
+
+    /// The write reads register `a` but only `b` is updated after it — the value
+    /// the write captures is `a`'s committed one, which the assign shows too.
+    /// Clause 3 keys on a register THE WRITE READS, not any register.
+    #[test]
+    fn v8_unrelated_update_after_write_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, step: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut a: Bits<8> = Bits::zero();
+                let mut b: Bits<8> = Bits::zero();
+                loop { let s = step.read(); o.write(a); b = b + s; clk.tick().await; a = a + b; }
+            }
+        "#;
+        assert!(v8(src).is_empty());
+    }
+
+    /// V1 — no `In` read anywhere; register assigned pre-tick; plain `Out`.
+    /// RE-BLESSED 2026-08-26 (phase D): DISSOLVED by forwarded emission — the
+    /// opening-prefix drive now means `assign o = r + 1`, measured agreeing
+    /// (`pre_tick_update_forwarding_agrees_end_to_end`). Not flagged.
+    #[test]
+    fn hazard_v1_assign_then_write_dissolved() {
         let src = r#"
             #[hardware(sequential)]
             async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
@@ -2668,13 +3124,16 @@ mod tests {
                 loop { r = r + Bits::from_lit::<1>(); o.write(r); clk.tick().await; }
             }
         "#;
-        assert_eq!(hazard(src), ["o"]);
+        assert!(hazard(src).is_empty());
     }
 
-    /// V7 — the assigned register is never read back in the segment, and it still
-    /// diverges. The rule must not require an in-segment read-back.
+    /// V7 — the assigned register escapes across the tick through `s = r`.
+    /// RE-BLESSED 2026-08-26 (phase D): AGREES — its 2026-08-21 verdict was stale
+    /// even before phase B (the 2026-08-25 shared trailing-forwarding map already
+    /// emits `s <= r + 1`), re-measured in `d_narrowing_battery_verdicts`. The
+    /// write is not read-preceded, so the narrowed rule does not flag it.
     #[test]
-    fn hazard_v7_no_readback_still_flagged() {
+    fn hazard_v7_escape_across_tick_dissolved() {
         let src = r#"
             #[hardware(sequential)]
             async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
@@ -2683,7 +3142,7 @@ mod tests {
                 loop { r = r + Bits::from_lit::<1>(); o.write(s); clk.tick().await; s = r; }
             }
         "#;
-        assert_eq!(hazard(src), ["o"]);
+        assert!(hazard(src).is_empty());
     }
 
     /// V4 — an `In` read PRECEDES the assignment, installing the barrier. AGREES.
@@ -2699,11 +3158,12 @@ mod tests {
         assert!(hazard(src).is_empty());
     }
 
-    /// V5 — the read comes AFTER the assignment, so it does not protect it. DIVERGES.
-    /// This is what makes `leading_read_reaches` (a comb-path query) the right test
-    /// rather than "the module reads an input somewhere".
+    /// V5 — the read comes AFTER the write, so the write is an opening-prefix
+    /// drive. RE-BLESSED 2026-08-26 (phase D): DISSOLVED by forwarded emission,
+    /// re-measured agreeing in `d_narrowing_battery_verdicts`. The read-preceded
+    /// clause is per-WRITE comb-reach, so a trailing read does not retain it.
     #[test]
-    fn hazard_v5_trailing_read_still_flagged() {
+    fn hazard_v5_trailing_read_dissolved() {
         let src = r#"
             #[hardware(sequential)]
             async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
@@ -2716,7 +3176,7 @@ mod tests {
                 }
             }
         "#;
-        assert_eq!(hazard(src), ["o"]);
+        assert!(hazard(src).is_empty());
     }
 
     /// V6 — the safe order: the register is assigned POST-tick. AGREES.
@@ -3708,6 +4168,50 @@ mod tests {
                     }
                     clk.tick().await;
                     o.write(rom.read_port::<0>().data());
+                }
+            }
+        "#;
+        assert_eq!(mem_check(src), Ok(()));
+    }
+
+    /// A **received** memory is checked exactly like a declared one.
+    ///
+    /// This is the pin that matters for the parameter spelling. `memory_locals`
+    /// used to find memories only through `let mem = Memory::<…>::new(…)`, so the
+    /// moment `#[hardware]` began accepting a `Memory<…>` parameter, a module that
+    /// received one would not have been diagnosed as safe — it would have stopped
+    /// being examined, and every rule below would have gone quiet on it. The
+    /// violation here is the same one `two_stagings_of_one_bus_in_one_cycle_are_rejected`
+    /// uses, so a regression shows up as this test passing where that one fails.
+    #[test]
+    fn a_received_memory_is_checked_like_a_declared_one() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, mem: Memory<Bits<16>, 1, 0, C, 1, 1>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                loop {
+                    mem.read_port::<0>().read(a.read().as_usize());
+                    mem.read_port::<0>().read(0);
+                    clk.tick().await;
+                    o.write(mem.read_port::<0>().data());
+                }
+            }
+        "#;
+        let err = mem_check(src).expect_err("one address bus, two drivers in a cycle");
+        assert!(err.contains("accessed 2 times in one cycle"), "{err}");
+    }
+
+    /// The well-formed half of the same shape: receiving a memory is not itself a
+    /// finding. Without this, the test above would still pass if the check had
+    /// started rejecting every received memory outright.
+    #[test]
+    fn a_well_formed_received_memory_is_accepted() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, mem: Memory<Bits<16>, 1, 0, C, 1, 1>, a: In<Bits<8>, C>, o: RegOut<Bits<16>, C>) {
+                loop {
+                    mem.read_port::<0>().read(a.read().as_usize());
+                    clk.tick().await;
+                    o.write(mem.read_port::<0>().data());
                 }
             }
         "#;

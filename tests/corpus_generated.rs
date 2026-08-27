@@ -44,6 +44,16 @@ fn every_corpus_module_has_a_generated_case() {
         for e in entries.filter_map(Result::ok) {
             let p = e.path();
             if p.is_dir() {
+                // `old/` is excluded here BECAUSE it is excluded from the sweep
+                // (build.rs `collect_rs`, 2026-08-26): examples/cpu/old/ is
+                // untracked scratch whose pre-subset spellings (`Vec` ports) the
+                // admissible grammar rejects, so its cases could never compile.
+                // The two scans must prune identically or this guard reports the
+                // deliberate exclusion as silent coverage loss — which is exactly
+                // what it did when only build.rs was changed, working as designed.
+                if p.file_name().is_some_and(|n| n == "old") {
+                    continue;
+                }
                 walk(&p, out);
             } else if p.extension().is_some_and(|x| x == "rs") {
                 out.push(p);

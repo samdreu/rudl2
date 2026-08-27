@@ -80,12 +80,16 @@ name = "dual_port_ram"
 path = "examples/memory/dual_port_ram.rs"
 
 [[example]]
-name = "rv32i_cpu"
-path = "examples/cpu/rv32i_cpu.rs"
-
-[[example]]
 name = "rv32i_cpu_pipelined"
 path = "examples/cpu/rv32i_cpu_pipelined.rs"
+
+[[example]]
+name = "rv32i_cpu_transpilable"
+path = "examples/cpu/rv32i_cpu_transpilable.rs"
+# `cargo test` builds an example but does not run it. This compiles the file as a
+# test target too, so its self-check runs under `cargo test` instead of only under
+# `tools/regression.sh`.
+test = true
 
 [[example]]
 name = "uart_rx"

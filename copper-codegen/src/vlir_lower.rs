@@ -516,6 +516,23 @@ fn lower_mem_access(
     // expression truncates here exactly as the simulator's `usize` index would
     // wrap — except the simulator panics on an out-of-range address instead, so
     // a design that reaches this truncation has already failed in simulation.
+    //
+    // That reasoning settles the SEMANTICS, and it always did; what it did not do
+    // is tell Verilator. An address is almost always derived from a `usize`, which
+    // is 32 bits, while the net is `clog2(depth)` — so the narrowing is implicit
+    // and `-Wall` (fatal in `verification.rs`) rejects it as WIDTHTRUNC, however
+    // well the design guards its own index. `rv32i_cpu_transpilable` is where this
+    // stopped being theoretical: four addresses, every one already inside an
+    // `if (idx < MEM_WORDS)`, and no source spelling could avoid the warning
+    // (`truncate` / `part_select` do not lower, and a `Bits<10>` local still takes
+    // a 32-bit right-hand side). So the cast is stated here, where the width is
+    // known, rather than asked of every design that addresses a memory.
+    //
+    // UNCONDITIONAL, both directions. `W'(x)` on an already-`W`-bit expression is
+    // a no-op, and a NARROWER address zero-extends — which is what the implicit
+    // assignment did anyway, and silences the mirror-image WIDTHEXPAND. Making it
+    // conditional would mean re-deriving the expression's width here, which is the
+    // kind of second width calculation that drifts from the first.
     let addr_net = leg.get(&mem_net(mem, is_read, port, "addr"));
     let mut out = Vec::new();
     if !is_read || mems.wants_read_en(mem, port) {
@@ -530,7 +547,10 @@ fn lower_mem_access(
         name: addr_net,
         width: mems.addr(mem),
         outer_dim: None,
-        value: lower_expr(addr, leg, mb)?,
+        value: VLIRExpr::Resize {
+            expr: Box::new(lower_expr(addr, leg, mb)?),
+            width: mems.addr(mem),
+        },
     });
     if let Some(v) = value {
         out.push(VLIRStmt::WireAssign {

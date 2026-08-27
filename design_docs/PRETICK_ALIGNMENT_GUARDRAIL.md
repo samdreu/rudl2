@@ -12,12 +12,21 @@
 > **The four rules, each with an exact-set corpus pin in
 > `copper-analysis/tests/pretick_alignment_corpus.rs`:**
 >
+> **NARROWED 2026-08-26 (cycle-dataflow phase D, §5.7):** phase B's forwarded
+> emission gave the no-read opening shapes their defined meaning (V1, V5, V7 and
+> both `fast_counter` ports re-measured AGREEING — V7's 2026-08-21 verdict was
+> stale even before phase B), so D1's register-reading clause now additionally
+> requires the write to be **read-preceded** — the path-dependent-boundary class
+> (W4, `probe_fsm`). The hold/conditional-constant clause is unchanged
+> (`pc_arm_*` still diverge). The former ui/fail V1 case is a ui/pass case now.
+>
 > | rule | what it refuses | corpus cost when it landed |
 > |---|---|---|
-> | `unprotected_pretick_out_write` (D1) | a plain `Out` driven from a register in the pre-tick segment, when that segment also assigns a register with no preceding `In` read | — |
+> | `unprotected_pretick_out_write` (D1, narrowed §5.7) | a plain `Out` written where an `In` read reaches the write on some path while a register is assigned unprotected on another (path-dependent boundary), or a conditional/constant write in such a segment | — |
 > | …its **constant-write** clause (§5.5) | the same, where the port is written on *some* paths only — a constant is idempotent across the phase shift only if it lands on every path | 3 modules, all measured divergences |
 > | `unprotected_trailing_out_write` (§5.4) | the same hazard past the *last* tick, when the body crosses more than one clock edge per iteration | 1 real module (`rv32i_cpu_pipelined`, → `RegOut`) |
 > | `multi_phase_out_write` | a plain `Out` driven in more than one clock phase | 9 modules, six of them its own witnesses |
+> | `pretick_out_write_before_update` (§5.6, 2026-08-26) | a plain `Out` written between a leading `In` read and the update of a register the write reads | 0 real modules; caught a silently-divergent compile-only UI fixture the day it landed |
 >
 > **Pinned by:** `tests/sequential_forwarding_divergence.rs` (10 tests, green; each
 > flips loudly when the corresponding divergence is fixed).
@@ -518,6 +527,72 @@ decision (2026-08-25) is to **limit the design expressions instead**: keep "a va
 live across a `clk.tick().await` is a register", keep one value per variable (no
 current/next distinction, as in §10.1's languages), and reject the shapes that
 diverge rather than growing the machinery that reconciles them.
+
+### 5.6 The write BETWEEN a leading read and the update — DERIVED, then measured, then GUARDED 2026-08-26
+
+The first rule in this family to arrive in the opposite direction: **derived from
+the cycle-dataflow model before its controlled measurement existed**
+(`design_docs/CYCLE_DATAFLOW_SEMANTICS.md`; the derivation and its record are
+`design_docs/DERIVATION_TABLE.md` F2/m1). The barrier a leading read installs
+parks the task **at the read site**, so a plain-`Out` write placed after the read
+executes in the pre-edge settle — and if it also precedes the update of the
+register it reads, it captures the **pre-update** value, one generation behind
+what `assign o = r` (Q) shows at every observation instant.
+
+**D1 cannot see it, structurally**: D1's clause (i) treats the leading read as the
+*protection*, because in D1's shapes the write comes after the update and the
+barrier hands it the forwarded (committing) value. Here the read is the
+*exposure*. Complementary triggers, like every pair in this family.
+
+The V8 battery (`tests/sequential_forwarding_divergence.rs`), position of the
+write the only variable, **every trace predicted before the run**:
+
+| | shape | verdict |
+|---|---|---|
+| V8a | `read; write; update` | **DIVERGE** — sim `[0,1,…]`, SV `[1,2,…]`, silently |
+| V8b | `read; update; write` | agree (the forwarded value *is* the committing one) |
+| V8c | `write; read; update` | agree (the write precedes the barrier point) |
+| V8d | V8a through a `let next` temp | **DIVERGE** — identically; renaming changes nothing |
+
+The in-vivo instance was `rv32i_cpu_transpilable`'s `program_counter` (`TODO`
+cause Q, divergence #1), rewritten to the post-commit form before this rule
+existed. **Corpus cost: zero real modules** — and the rule earned its keep on
+landing day: it flagged `ui/pass/single_loop_local_ok.rs::accum`, a compile-only
+fixture nobody had ever measured, which V8d then confirmed diverges exactly like
+V8a. The fixture was reordered to V8c's form; the shape is pinned as V8d.
+
+Rule: `Cfg::pretick_out_write_before_update`, three clauses, each with a flipping
+witness (V8c flips the read clause, V8b the update-order clause, a constant write
+the register-read clause). Enforced in the macro with the same
+`allow_pretick_alignment` opt-out; exact-set pinned as the fourth scan in
+`pretick_alignment_corpus.rs`. Honest scope (R6): pre-tick region only, like D1;
+conditional writes carry no extra clause because none has a measured divergence.
+
+### 5.7 The dissolution and the narrowing — cycle-dataflow phases B and D, 2026-08-26
+
+The paired-implementation migration (`PAIRED_IMPLEMENTATION_SCOPE.md`) landed
+**forwarded continuous-assign emission for opening-prefix drives** (a plain-`Out`
+write not preceded by any `In` read in its segment now emits its `edge_value` —
+`assign o = (r + 8'd1)` for V1), which is §5.3's Prost-style lowering applied to
+exactly the sub-class where §5.3's measurement showed it correct, and no wider.
+The sv-baseline byte-diff confirmed the corpus cost as **exactly the two
+demonstration witnesses and zero live modules** (F1). Re-measured under it
+(`d_narrowing_battery_verdicts`):
+
+| | shape | verdict under forwarded emission |
+|---|---|---|
+| V1/V2/V3 | update-then-write, no reads | **agree** — dissolved |
+| V5 | trailing read after the write | **agree** — dissolved (the write is an opening-prefix drive) |
+| V7 | escape across the tick (`s = r`) | **agree** — its 2026-08-21 verdict was stale even before phase B: the 2026-08-25 shared trailing-forwarding map already emits `s <= r + 1` |
+| W4 | mixed alignment | **DIVERGE** — sim holds `i + 1`, SV alternates; the path-dependent boundary no single emission can match |
+
+D1 was then narrowed on that evidence: the register-reading clause requires the
+write to be **read-preceded** (`leading_read_reaches`), retaining exactly the
+W4/`probe_fsm` class; the conditional/constant hold clause is untouched
+(constants are blind to forwarded emission — `pc_arm_*`'s pins stayed green
+throughout). `add_then_write`, `fast_counter` (witness), V5 and V7 dropped their
+opt-outs and compile clean on their own merits; `ram_prewrite` left the flag set
+with a recorded note (it never had a behavioral verdict and does not transpile).
 
 ### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
 

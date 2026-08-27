@@ -1,0 +1,8 @@
+module,status,copper_cells,ref_cells,cell_ratio,copper_ffs,ref_ffs,ff_match,copper_hist,ref_hist,note
+bsg_adder_one_hot,ok,25,25,1.0,0,0,yes,$_AND_x6 $_NAND_x19,$_AND_x6 $_NAND_x19,
+bsg_counter_up_down,ok,16,15,1.067,3,3,yes,$_ANDNOT_x1 $_MUX_x1 $_NAND_x3 $_NOR_x1 $_ORNOT_x2 $_OR_x1 $_SDFF_PP0_x3 $_XNOR_x2 $_XOR_x2,$_AND_x3 $_NAND_x1 $_ORNOT_x1 $_OR_x2 $_SDFF_PP0_x3 $_XNOR_x2 $_XOR_x3,
+bsg_dff_en,ok,8,8,1.0,8,8,yes,$_DFFE_PP_x8,$_DFFE_PP_x8,
+bsg_encode_one_hot,ok,15,11,1.364,0,0,yes,$_ANDNOT_x1 $_NAND_x3 $_NOR_x6 $_OR_x5,$_NAND_x4 $_NOR_x6 $_OR_x1,
+bsg_gray_to_binary,reference synth failed,,,,,,,,,
+bsg_mux_one_hot,ok,20,20,1.0,0,0,yes,$_AND_x4 $_NAND_x16,$_AND_x4 $_NAND_x16,
+sipo_block,ok,32,36,0.889,32,30,NO,$_DFFE_PP_x28 $_DFF_P_x4,$_ANDNOT_x2 $_AND_x1 $_DFFE_PP_x28 $_DFF_P_x2 $_NOR_x1 $_NOT_x1 $_XOR_x1,

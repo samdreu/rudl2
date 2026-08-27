@@ -12,6 +12,177 @@ DOCUMENTATION:
 TRANSPILATION:
   ☐ Figure out TODOs
 
+  ── compile_fail DOCTESTS -> trybuild, TRANCHE 1 DONE 2026-08-26 ────────────
+  `compile_fail` asserts only that a snippet FAILED TO COMPILE — for any reason. A
+  typo, a renamed API or a missing `use` satisfies it exactly as well as the
+  guarantee it names. trybuild pins the compiler's own message in a .stderr, so it
+  asserts WHY. copper-core/tests/ui/fail/ + tests/cdc_ui.rs; 7 cases; the six CDC
+  rules and `Out` is not `Clone`. Codes now pinned: E0308 for a domain crossing,
+  E0382 for the single-driver move, E0599 for RegOut/Out not being Clone — none of
+  which the doctests ever checked. Mutation-verified (swap E0382 for E0499 -> FAIL).
+  The doc prose keeps every example, as ```ignore with a pointer to its case.
+  IT IMMEDIATELY FOUND A DOCTEST THAT NEVER TESTED ITS CLAIM. `Bits::from_lit`'s
+  compile_fail had no `use copper_core::Bits;`, so it failed on
+  `E0412: cannot find type Bits` and never reached the width guard it documents.
+  Fixed in place. This is the argument for the migration, made by the migration.
+  AND A REAL LIMIT ON trybuild, measured: it compiles CHECK-STYLE, and `cargo check`
+  does NOT evaluate a post-monomorphization `const` assert. `Bits::from_lit`'s guard
+  is one — `cargo check` passes, `cargo build` fails — so that case CANNOT move to
+  trybuild and stays a doctest, which builds fully. Do not "finish the migration" by
+  moving it; the comment at the site says so.
+  REMAINING (need trybuild runners in two more crates): src/lib.rs, src/sync.rs,
+  copper-sim/src/executor.rs::HardwareModule.
+
+  ── SHRINKING THE SURFACE: THE ADMISSIBLE GRAMMAR, STARTED 2026-08-26 ───────
+  MEASURE FIRST, and it corrected the plan. `cargo run -q -p copper-codegen --bin
+  surface-audit` walks every #[hardware] module and counts what they contain:
+    - only **6 of 33** FIR expression variants are unused (Array, Async, Let,
+      Return, Yield, Try). The audit's "constructs that can never be hardware"
+      list was wrong about Closure (7 uses, memory `from_fn`), Macro (10, `vec![]`),
+      Range (41, `for` bounds) and Reference (4). Deleting the dead six is worth a
+      few hundred lines, not thousands.
+    - **126 of 135 modules transpile.** The sim/transpiler language gap is NINE
+      modules, not a chasm: 2 Vec ports, 2 uart file-level, 1 Memory param, 1 width
+      inference through a tuple helper, 1 const match pattern, and 2 deliberate
+      semantic refusals (mp_rom, tick_first_waiter).
+  SO THE TAX IS NOT DEAD SURFACE. It is that the language is defined by
+  SUBTRACTION — everything Rust can say, minus whatever each pass rejects when it
+  gets there: 108 sites, 76 sharing one variant, 60 never fired.
+  WHAT LANDED: `copper_analysis::check_admissible`, a POSITIVE grammar, enforced by
+  the macro for all modes. Rule 1 is the TYPE surface — a port payload and an
+  annotated `let` must be Logic / Bits<N> / bool / an integer / a fixed array of
+  those. Measured before writing it: no module that transpiles names a type outside
+  that set.
+  THE DISCIPLINE, and it is the whole reason this is safe to build incrementally:
+      admissible(m) == Err  =>  transpile(m) == Err      ENFORCED
+      transpile(m) == Err   =>  admissible(m) == Err      the GOAL, reported
+  `copper-codegen/tests/admissible_calibration.rs` asserts the first over the whole
+  corpus and PRINTS the second as a progress count. A rule that overreaches breaks
+  a working design, and that failure is silent until someone hits it — so it is a
+  standing test, not a review step.
+  NEXT RULES, in evidence order: the `Memory<…>` parameter (cause P) is admissible
+  to the macro but has no port ABI, so it belongs behind an explicit opt-out rather
+  than in the grammar; then unannotated struct/tuple locals (needs inference, so it
+  is rule 2 not rule 1); then the file-level `spawn_uart` rule, which is about a
+  FILE not a module and may not belong in this grammar at all.
+  KNOWN: enforcing the grammar breaks `examples/cpu/old/` (untracked scratch, two
+  `Vec` ports) because build.rs's sweep include!s it. The tracked corpus is
+  unaffected — verified with old/ moved aside: 113 sweep cases pass, all crate
+  suites green.
+
+  ── A REASSIGNED WIRE IS NOT A REGISTER — FIXED 2026-08-26 ──────────────────
+  `shir_lower::extract_updates_from_stmts` turned EVERY `CHIRStmt::Assign` into a
+  `SHIRRegUpdate`, without asking whether the target was a register. A reassigned
+  combinational wire therefore got TWO DRIVERS — an `always_comb` defining it and
+  an `always_ff` holding it (MULTIDRIVEN, illegal per IEEE 1800 9.2.2.2) — and held
+  last cycle's value where the source re-initialises it every iteration.
+  THE DIAGNOSIS I STARTED WITH WAS WRONG, and the correction is the useful part.
+  It looked like "codegen has a rival register inference" — lib.rs:324 does call
+  `copper_analysis::infer_registers` and only LOG it, and chir_lower.rs:1295 does
+  decide `let mut` → register syntactically. But that declaration rule AGREES with
+  the shared inference on every module in the corpus; `register_reconciliation.rs`
+  passing is the measurement. The defect was one arm that never consulted the
+  register set it had already been handed.
+  TWO HALVES, and either alone is broken:
+    1. `extract_updates_from_stmts` emits an update only when `reg_names` contains
+       the target. Alone, a wire reassignment SILENTLY DISAPPEARS.
+    2. `lower_pre_edge_stmts` now collects its segment's wire types instead of
+       passing an empty map, so the reassignment lowers as another blocking assign.
+       That map was empty on the premise that "an Assign in the sequential path is
+       a register update" — true only because of the bug in (1).
+  RESULT: default-then-override in one `always_comb`, the idiom the transpiler
+  already emitted for its own memory control nets.
+  MEASURED: corpus sweep 112 -> 113 passing, 24 -> 23 ignored, nothing else moved.
+  Both CPU examples 13/13. All crate suites green. held_temp_trap's SKIP entry and
+  the register_reconciliation WITNESS entry are both DELETED — and the staleness
+  assertion on that witness fired on its own first ("listed as a reconciliation
+  witness but now AGREES"), which is the check working as designed.
+  tests/fixtures/aggregate_locals_dut.rs stays as the pin. `held_temp_trap` and
+  `enabled_register` are syntactically identical at the assignment and differ only
+  in liveness across a tick; a regression that made either look like the other
+  breaks that file first.
+
+  ── THREE-WAY ANCHORING, INFRASTRUCTURE LANDED 2026-08-26 ───────────────────
+  The sweep's ordinary check is simulator vs the SV the transpiler emitted — two
+  implementations of ONE source. That proves CONSISTENCY. A misconception shared
+  between the executor and the lowering is invisible to it. A third implementation
+  nobody derived from either closes that gap.
+  WHAT LANDED: `EquivalenceTest::with_hand_written_reference`, a `REFERENCE` table
+  in build.rs next to PARAMS/RESET/SKIP, and guard **G-E** in regression.sh, which
+  prints how many swept modules are anchored and how many are not (printed, not
+  enforced — blocking on it would help nobody while the remainder is the whole
+  corpus). Proven end to end on `ram_read_first`, including a MUTATION check:
+  flipping the reference to write-first makes it fail on the exact semantic.
+  BASELINE: 1 anchored, 133 not.
+  THE GAP IS NOT WHERE YOU WOULD GUESS. Every hand-written reference the repo had
+  is for an ORDINARY design — combinational logic, counters, shift registers, the
+  BaseJump modules. Measured by family:
+      timing/phase (RegOut, pre-tick, trailing) ... 10 fixture files, 0 anchored
+      control-flow lowering (extraction, waits) ...  8 fixture files, 0 anchored
+      memory (latency, write-first, preload) ......  6 fixture files, 0 anchored
+      the data-surface ledger .....................  5 fixture files, 0 anchored
+      ordinary designs ............................ 11 of 24 anchored
+  So the anchoring is strongest exactly where Copper is least novel and absent
+  exactly where its semantics are its own.
+  WHO WRITES THEM: the USER writes the pairs (Copper fixture + Verilog reference).
+  Decided 2026-08-26, and it is the better arrangement on the merits — a reference
+  written independently of the Copper module is worth more than one written
+  alongside it by the same hand. Do NOT write these unasked.
+  WHAT IS THERE TO WRITE AGAINST: design_docs/ANCHORING_A_MODULE.md — the contract
+  (module name = Copper module, clock port literally `clk`, emitted port names,
+  -Wall is FATAL, params mirrored, no `initial` needed because Verilator zero-fills
+  and so does the transpiler), the three-step recipe, provenance guidance, and how
+  to check a reference has teeth. build.rs validates each REFERENCE row at build
+  time: a mistyped module name would otherwise anchor nothing while every test kept
+  passing, so it panics with near-miss suggestions.
+  reference_sv/ram_read_first.sv is the worked example, hand-written and labelled
+  as such. Timing/phase and control extraction have NO third-party counterpart —
+  they are Copper's own abstractions — so those will have to be hand-written with
+  the weaker claim stated; memory has real counterparts in BaseJump STL
+  (`bsg_mem_1r1w_sync` and relatives) if the stronger form is wanted there.
+
+  ── THE CLAIM LEDGER, ADDED 2026-08-26 ──────────────────────────────────────
+  tests/fixtures/{bits_ops,signedness,aggregate_locals,match_selector,out_phase,
+  mem_address_width}_dut.rs — 24 modules, one per claim about what the transpiler
+  supports, each broken one paired with the working twin in the same file. The
+  sweep picks them up automatically, so a fix shows up as a build.rs SKIP entry
+  that can be DELETED rather than as a test nobody wrote.
+  WHY, in one number: of the 15 things this session turned up, a probe that only
+  asks "does it transpile" catches 6. Verilator's -Wall adds 5. Only running both
+  sides adds the last 3 — and one of those (`as i32` dropped) emits SystemVerilog
+  that lints perfectly clean and computes the wrong answer. The gate is the whole
+  value; the size of the test is incidental.
+  IT CORRECTED TWO OF MY OWN CLAIMS ON FIRST RUN, which is the argument for
+  fixtures over scratch probes in one line:
+    - "a `match` on a `usize` emits 64-bit case labels" was too narrow. The width
+      comes from the LITERAL: `match_on_literals` scrutinises a `u32` and still
+      emits `op == 64'd55`. It was written as a control expected to PASS.
+    - the memory-address fixtures first failed for a second, unrelated reason
+      (they had the out_phase bug baked in), and the "narrow index" control failed
+      on UNUSEDSIGNAL — which turned into its own finding, `wide_index_sole_
+      consumer`: a `usize` index local whose ONLY consumer is a memory address has
+      a dead upper half, because `10'(i)` reads `i[9:0]`. rv32i_cpu_transpilable
+      escapes it because its indices are range-checked.
+  NEW, NOT PREVIOUSLY RECORDED ANYWHERE: `!` on a `Bits<N>` emits SystemVerilog
+  `!` (LOGICAL) rather than `~` — silently, and it reached the JALR alignment mask
+  in rv32i_cpu_pipelined, where it turns every jump target into 0. `!` on a bool
+  is correct, and `bit_not_bool` pins that so a fix cannot overshoot.
+  A FOURTH GATE FOUND IT TOO, and diagnosed it better than any of the others:
+  `copper-codegen/tests/register_reconciliation.rs` reported `held_temp_trap` as
+  "codegen has non-synthetic registers the shared inference missed: [u, v]".
+  So `infer_registers` is RIGHT — those are not registers — and CODEGEN REGISTERS
+  THEM ANYWAY. That is a c2 front-end disagreement, which is exactly what
+  copper-analysis exists to prevent, and it names the fix precisely. That test has
+  no exclusion list on purpose (its header records that excluding synchronizers
+  once hid a real bug), so `held_temp_trap` is listed as a NAMED WITNESS with its
+  mechanism, and the check now ASSERTS the witness still diverges — a witness that
+  quietly started agreeing would otherwise sit there claiming a fixed bug.
+  WHAT A LEDGER STILL WILL NOT CATCH: composition. The commit-order bug in
+  rv32i_cpu_transpilable (pipeline latches committed in forward order, so each
+  stage read a source already overwritten) has no atomic form — it exists only
+  once four latches chain. That is what the CPU-scale sweep is for, and it is why
+  both halves are worth having.
+
   ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-25 (after N, M) ────────────────
   STOP RE-MEASURING THIS BY HAND — that is how it went stale before. Run
   `tools/transpile_coverage.sh`, which probes every #[hardware] module in
@@ -32,8 +203,11 @@ TRANSPILATION:
   and pinned; read the uart/rx entry. L / L-1 / L-2 / N and the hoisted-default bug were
   wrong-CODE bugs, not rejections, so they move no counter either — which is the
   point: coverage was never going to show them, and two of them were silent.
-  The 5 still failing, by ROOT CAUSE, as measured on 2026-08-25:
-    F   Vec ports ................. rv32i_cpu (190:13), rv32i_cpu_pipelined (201:13)
+  The 5 still failing, by ROOT CAUSE, as measured on 2026-08-25 (P added 2026-08-26):
+    F   Vec ports ................. rv32i_cpu (190:13)
+    P   a RECEIVED `Memory<…>` parameter ... rv32i_cpu_pipelined (224:12), which
+        moved off F on 2026-08-26 when it stopped taking its program as a `Vec`
+    (Q is FIXED as of 2026-08-26 — see below. rv32i_cpu_transpilable now SWEEPS.)
     J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
         error — same message, different mechanism; see J)
     (uart/rx is no longer here — see UART/RX, REWRITTEN below)
@@ -74,8 +248,89 @@ TRANSPILATION:
     E ✔ FIXED — `Memory` now transpiles ......... dual_port_ram. Both CPUs stay
         blocked, but on their OWN causes (re-measured): rv32i_cpu on G,
         rv32i_cpu_pipelined on F — not on memory.
-    F ☐ `Vec` ports ....................... rv32i_cpu_pipelined, rv32i_cpu
-        (rv32i_cpu joined this cause once the G panic stopped masking it)
+    Q ✔ FIXED (2026-08-26) — **THE MEMORY ADDRESS NET IS NARROWER THAN THE INDEX.**
+        Address nets are `clog2(depth)` (10 bits for 1024 words); an address is
+        almost always derived from a `usize`, which is 32. The narrowing was
+        implicit, so Verilator's `-Wall` — fatal, verification.rs:405 — rejected
+        every such module however well the design guarded its own index.
+        `vlir_lower::lower_mem_stmt` now wraps the address in `VLIRExpr::Resize` at
+        the address-net width, emitting `10'(idx)`.
+        UNCONDITIONAL, both directions: `W'(x)` on an already-W-bit expression is a
+        no-op and a narrower address zero-extends, which is what the implicit
+        assignment did anyway and which silences the mirror-image WIDTHEXPAND.
+        Conditional would mean re-deriving the expression's width at the assignment
+        — a second width calculation to drift from the first.
+        THE SEMANTICS WERE NEVER IN QUESTION and the comment at that site already
+        said so ("a design that reaches this truncation has already failed in
+        simulation", because the simulator panics on an out-of-range address). What
+        was missing was telling Verilator. Measured before changing anything: no
+        source spelling avoids it — `Bits::<10>::from_u32(…)` declares the local at
+        the right width but leaves a 32-bit RHS, `truncate` / `part_select` do not
+        lower, and masking moves the mismatch rather than removing it.
+        WHAT IT UNBLOCKED: `rv32i_cpu_transpilable` lints clean and its SKIP entry
+        is gone, so **a full RV32I 5-stage pipelined CPU is now in the differential
+        sweep** — 200 cycles of seeded random stimulus, sim vs the SV it transpiles
+        to, under Verilator. The first CPU-scale design in the corpus.
+        AND THE SWEEP IMMEDIATELY EARNED ITS KEEP. Two one-cycle divergences on
+        `program_counter`, neither of which any existing check catches, both now
+        written up at the port and at its write site in the example:
+          1. a plain `Out` driven from a register BEFORE the commit leads the
+             simulator by a cycle. D1's guard exempts the segment because an `In`
+             read precedes the write.
+          2. reaching for `RegOut` does not fix it — in a SINGLE-TICK loop the
+             trailing statements share the head's phase, so the transpiler folds a
+             trailing `RegOut` write into this edge while the simulator commits it
+             on the next. Same lead, opposite cause.
+        The shape that agrees is a plain `Out` written AFTER the commit. Worth a
+        rule of its own; filed here rather than guessed at.
+    F ☐ `Vec` ports ....................... rv32i_cpu
+        (rv32i_cpu joined this cause once the G panic stopped masking it;
+        rv32i_cpu_pipelined left it on 2026-08-26 — see P)
+    P ☐ A **RECEIVED `Memory<…>` PARAMETER** has no port ABI. `#[hardware]` accepts
+        one as of 2026-08-26 — a module may be HANDED its storage instead of
+        declaring it, the same disposition `Clock<D>` has always had ("received,
+        never constructed") — and the simulator runs it, but `resolve_type` has no
+        arm for it, so the module stops at `cannot resolve type 'Memory < … >'`.
+        That is a HONEST refusal with a span, not a silent wrong answer, but the
+        message names the type rather than the gap; a diagnostic naming the gap is
+        the cheap half and was deliberately left undone rather than folded into an
+        unrelated change.
+        THE REAL QUESTION IS NOT THE TYPE, IT IS WHAT A RECEIVED MEMORY *IS* in
+        SystemVerilog. A declared memory lowers to an array inside the module. A
+        received one is either (a) a set of address/data/we PORTS on the module,
+        with the array living in the parent — which needs a port ABI decision of
+        the same weight as ARRAY_PORT_ABI.md — or (b) a hierarchy edge, which is
+        item 4's structural-module territory. Do not pick one by accident while
+        fixing something else.
+        WHAT WAS TAUGHT ALONGSIDE THE MACRO, and had to be, because each of the
+        three would have gone QUIET rather than wrong:
+          - `copper_analysis::cfg::memory_locals` — collects Memory-typed
+            PARAMETERS as well as `let`-declared ones. Without it every memory rule
+            (one-access-per-bus-per-cycle, read-staged-before-its-tick, the
+            unrolled-nested-loop rule) simply stops examining a received memory.
+            Pinned both ways by `a_received_memory_is_checked_like_a_declared_one`
+            and `a_well_formed_received_memory_is_accepted`.
+          - `build.rs::classify` — returns `Some` for `Memory`, and `skip_reason`
+            gives a memory-taking module an `#[ignore]` WITH A REASON. `classify`
+            returning `None` is propagated by `Module::from_item`'s `?`, so the
+            first version of this change deleted rv32i_cpu_pipelined from the
+            corpus sweep outright. `every_corpus_module_has_a_generated_case`
+            caught it, because it scans for `#[hardware]` by ATTRIBUTE and never
+            goes through `classify` — the two-independent-scans design earning its
+            keep. Same bug class as the attribute-parser note in CLAUDE.md.
+          - `cdc_check::check_cdc` — a memory carries its clock domain in its 4th
+            generic argument, so a foreign-domain one is a real crossing and is now
+            rejected with a memory-specific remedy (a memory cannot be brought
+            across by a synchronizer). Pinned by ui/fail/cdc_memory_parameter.rs.
+        **`examples/cpu/rv32i_cpu_transpilable.rs` (2026-08-26) is the answer to
+        "can the CPU be written so it transpiles?" — YES.** Same design, same 13
+        programs, IDENTICAL cycle counts, and it emits 33 KB of SystemVerilog. It
+        declares its memory in-module and takes the program through a boot port
+        rather than receiving a `Memory`, which is also what makes it resettable.
+        Everything else it spells differently is a workaround for a transpiler gap,
+        each one named in its header comment; the only one still open is cause Q.
+        Read that header as the standing list of what the subset work has to make
+        unnecessary.
     K ✔ FIXED (2026-08-24) — **A LOOP WHOSE BODY ENDS IN ANOTHER TICK-BEARING
         LOOP** now flattens. It does NOT by itself unblock uart_tx / uart_rx /
         uart/rx: those need the counted `for` as well (see below — the ordering

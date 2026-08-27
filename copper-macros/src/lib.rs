@@ -216,6 +216,14 @@ pub(crate) fn check_cdc(f: &ItemFn) -> Result<(), Error> {
             Some("In") => Some("input"),
             Some("Out") => Some("output"),
             Some("RegOut") => Some("output"),
+            // A received `Memory<T, R, W, D, RL, WL>` is clocked on `D` — its ports
+            // capture and commit on that domain's edge — so a foreign-domain memory
+            // is as real a crossing as a foreign-domain port, and is caught here
+            // rather than becoming a silent two-clock design. `port_domain` reads it
+            // without a special case: the const arguments are not type arguments, so
+            // the last TYPE argument of a `Memory<…>` is `D`, exactly as it is for
+            // `In<T, D>`.
+            Some("Memory") => Some("memory"),
             _ => None,
         }) else {
             continue;
@@ -223,11 +231,24 @@ pub(crate) fn check_cdc(f: &ItemFn) -> Result<(), Error> {
         if let Some(d) = port_domain(&pt.ty) {
             if d != native {
                 let name = param_ident(a).unwrap_or_default();
+                // A memory cannot be brought across with a synchronizer, so the
+                // remedy differs from a port's — say so rather than give advice that
+                // cannot be followed.
+                let remedy = if kind == "memory" {
+                    format!(
+                        "A memory is clocked on its own domain and cannot be synchronized across \
+                         one — give this module a `Clock<{d}>` and receive the memory there, or \
+                         hand it a memory in `{native}`."
+                    )
+                } else {
+                    "A regular module may not cross clock domains — bring the signal across with \
+                     a synchronizer (`copper::sync_2ff`, or your own `#[hardware(synchronizer)]` \
+                     module), then use its output in this domain."
+                        .to_string()
+                };
                 return Err(Error::new_spanned(a, format!(
                     "clock-domain crossing: {kind} `{name}` is in domain `{d}`, but this module is \
-                     clocked on `{native}`. A regular module may not cross clock domains — bring \
-                     the signal across with a synchronizer (`copper::sync_2ff`, or your own \
-                     `#[hardware(synchronizer)]` module), then use its output in this domain.",
+                     clocked on `{native}`. {remedy}",
                 )));
             }
         }
@@ -896,6 +917,21 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
         return err.to_compile_error().into();
     }
 
+    // The ADMISSIBLE GRAMMAR (all modes). A positive statement of what a hardware
+    // module may contain, checked here rather than discovered pass by pass in the
+    // transpiler — where it is spread over 108 sites, 76 of which share one error
+    // variant and 60 of which have never fired.
+    //
+    // It is built one rule at a time and may only reject what the transpiler already
+    // refuses; `copper-codegen/tests/admissible_calibration.rs` asserts that over the
+    // whole corpus and reports how many refusals have moved here. Enforcing it at the
+    // macro is what makes the language SHRINK rather than merely be documented: a
+    // module outside the grammar now fails at `cargo build`, at its own declaration,
+    // instead of simulating happily and refusing to synthesize much later.
+    if let Err(err) = copper_analysis::check_admissible(&input_fn) {
+        return err.to_compile_error().into();
+    }
+
     // A `let` binding may not shadow a hardware port parameter (all modes).
     if let Err(err) = check_no_param_shadowing(&input_fn) {
         return err.to_compile_error().into();
@@ -972,15 +1008,52 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
                 return Error::new(
                     span,
                     format!(
-                        "output port `{port}` is driven from a register in the pre-tick \
-                         segment, but that segment also assigns a register with no preceding \
-                         input read to pin its clock phase — the simulator runs it one phase \
-                         early and silently disagrees with the synthesized hardware. Declare \
-                         `{port}` as `RegOut<…>` (a registered output, immune because it \
-                         commits at the clock edge), or move the register update after the \
-                         `clk.tick().await` so the pre-tick segment only reads state. If this \
-                         module exists to DEMONSTRATE the divergence, opt out explicitly with \
+                        "output port `{port}`'s pre-tick region has a PATH-DEPENDENT boundary: \
+                         an input read reaches the write on some paths but a register is \
+                         assigned with no protecting read on another, so the write executes at \
+                         the cycle's opening on one path and at the pre-edge on the other — no \
+                         single synthesized emission can match both, and the simulator silently \
+                         disagrees with the hardware (or, for a constant written on only some \
+                         paths, the held value makes the phase shift observable). Make the \
+                         boundary uniform (read the input on every path before the register \
+                         update), declare `{port}` as `RegOut<…>` (registered, immune because \
+                         it commits at the clock edge), or move the register update after the \
+                         `clk.tick().await`. If this module exists to DEMONSTRATE the \
+                         divergence, opt out explicitly with \
                          `#[hardware(sequential, {ALLOW_PRETICK})]`."
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            // A plain `Out` written between a leading `In` read and the update of a
+            // register it reads (the V8a shape, DERIVATION_TABLE.md F2). D1 cannot
+            // see it — the leading read is D1's *protection*, and here it is the
+            // exposure: the barrier drags the write to the pre-edge, where it
+            // captures the register's pre-update value.
+            let stale = if allow_pretick_alignment {
+                Vec::new()
+            } else {
+                copper_analysis::pretick_out_write_before_update(&input_fn)
+            };
+            if let Some(port) = stale.first() {
+                let span = port_param_span(&input_fn.sig, port)
+                    .unwrap_or_else(|| input_fn.sig.ident.span());
+                return Error::new(
+                    span,
+                    format!(
+                        "output port `{port}` is written between a leading input read and \
+                         the update of a register the write reads — the read's pre-edge \
+                         barrier makes the write execute just before the clock edge with \
+                         the register's PRE-update value, which the synthesized `assign` \
+                         (the flip-flop's Q) never shows at any observation instant: the \
+                         hardware leads the simulator by one cycle, silently. Move the \
+                         write after the register update (it then publishes the committing \
+                         value), or before the input read (it then runs at the cycle's \
+                         opening and publishes the committed value), or declare `{port}` \
+                         as `RegOut<…>` (registered, immune because it commits at the \
+                         edge). If this module exists to DEMONSTRATE the divergence, opt \
+                         out explicitly with `#[hardware(sequential, {ALLOW_PRETICK})]`."
                     ),
                 )
                 .to_compile_error()
@@ -1119,15 +1192,32 @@ fn validate_hardware_fn(input_fn: &ItemFn, hardware_mode: &HardwareMode) -> Resu
                 // clock edge, so a held/conditional output is a proper register rather
                 // than a latch. It counts as an output. See copper-core RegOut and
                 // design_docs/REGISTERED_OUTPUTS.md.
+                // `Memory<T, R, W, D, RL, WL>` is a *received resource*, not a port:
+                // the same disposition as `Clock<D>` one section above ("a hardware
+                // module receives its clock as a parameter; it may not create a new
+                // one"). A memory is a real array you are handed — by a testbench, or
+                // by a parent that owns it — so receiving one is how a module shares
+                // storage instead of privately conjuring its own. It is neither an
+                // input nor an output, so it satisfies neither `has_clock` nor
+                // `has_out`: a module whose only non-clock parameter is a memory still
+                // needs an `Out` to say anything.
+                //
+                // Constructing a memory in the body stays legal (that is what every
+                // existing single-owner design does); this only adds the second
+                // spelling. `copper_analysis::Cfg` collects BOTH spellings, so
+                // `check_memory_staging` covers a received memory exactly as it covers
+                // a declared one — see `memory_locals`.
                 match outer_type_name(&pat_ty.ty).as_deref() {
                     Some("Clock")  => has_clock = true,
                     Some("In")     => {}
                     Some("Out")    => has_out = true,
                     Some("RegOut") => has_out = true,
+                    Some("Memory") => {}
                     _ => {
                         return Err(Error::new_spanned(
                             &pat_ty.ty,
-                            "hardware function parameters must be Clock<D>, In<T>, Out<T>, or RegOut<T>",
+                            "hardware function parameters must be Clock<D>, In<T>, Out<T>, \
+                             RegOut<T>, or Memory<T, R, W, D, RL, WL>",
                         ));
                     }
                 }

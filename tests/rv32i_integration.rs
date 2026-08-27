@@ -18,7 +18,15 @@
 
 #![allow(dead_code)] // each example brings a full harness; tests use a subset
 
-include!("../examples/cpu/rv32i_cpu.rs");
+// REPOINTED 2026-08-26: this used to include `examples/cpu/rv32i_cpu.rs`, which
+// was moved to untracked `old/` during the subset-restriction refactor (its `Vec`
+// ports are outside the admissible grammar and no longer compile). The scalar
+// role is now played by `rv32i_cpu_transpilable.rs` — same design, same 13
+// programs, identical cycle counts (its header records the equivalence), an
+// identical `run_program(Vec<u32>, usize) -> (u32, usize)` harness, and it is
+// tracked and sweep-covered. The `scalar_and_pipelined_agree` differential below
+// is therefore transpilable-vs-pipelined now.
+include!("../examples/cpu/rv32i_cpu_transpilable.rs");
 
 mod pl {
     include!("../examples/cpu/rv32i_cpu_pipelined.rs");
