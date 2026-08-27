@@ -1,4 +1,4 @@
-//! Bit-width inference: one gap CLOSED, one still open.
+//! Bit-width inference: both gaps CLOSED.
 //! (P0, `TODO` TESTING plan; see `TODO` TRANSPILATION section.)
 //!
 //! `transpile_source` used to reject two constructs the macro-simulator accepts,
@@ -7,17 +7,11 @@
 //!      asserted positively below, and behaviourally verified end-to-end by
 //!      `tests/logic_array_pack_equivalence.rs` (sim ≡ transpiled SV ≡ an
 //!      independent Rust golden, under Verilator).
-//!   2. tuple-returning plain-Rust helper fns called from a hardware body —
-//!      **still open**, still pinned.
-//!
-//! The open one PINS current behavior so the gap stays visible and honest — the
-//! equivalence test for the affected design (ripple_carry_adder) uses a
-//! `Bits`-indexing rewrite to sidestep it, which could otherwise let the
-//! limitation be silently forgotten.
-//!
-//! **When that gap is fixed** its `expect_err` will fail loudly. That is the
-//! signal to delete the workaround and promote the natural form to a positive
-//! equivalence test — do NOT just relax the assertion.
+//!   2. tuple-returning plain-Rust helper fns called from a hardware body
+//!      (cause J-b) — **CLOSED 2026-08-27** by the tuple-destructuring `let`
+//!      lowering: the helper call inlines (#7b) and the tuple projects per
+//!      element. Asserted positively below; `ripple_carry_adder` itself now
+//!      sweeps differentially (its build.rs SKIP entry is deleted).
 
 fn transpile(src: &str) -> Result<String, String> {
     copper_codegen::transpile_source(src, None, &copper_codegen::EmitConfig::default())
@@ -72,14 +66,13 @@ fn logic_array_local_transpiles_as_a_packed_vector() {
 }
 
 #[test]
-fn tuple_returning_helper_is_a_known_transpile_gap() {
-    let err = transpile(TUPLE_HELPER_DUT).expect_err(
-        "KNOWN GAP now closed: tuple-returning helper fns transpile. Promote the \
-         natural full-adder form to a positive equivalence test.",
-    );
+fn tuple_returning_helper_transpiles() {
+    let sv = transpile(TUPLE_HELPER_DUT)
+        .expect("a tuple-returning helper fn must transpile (cause J-b closed)");
+    // The helper inlines: `x` is the projected first element, `_y` is skipped.
     assert!(
-        err.contains("cannot infer bit width"),
-        "reproduced a *different* transpile error than the tracked bit-width gap: {err}"
+        sv.contains("x = (i0 & i1);"),
+        "the projected element should inline to the field expression, got:\n{sv}"
     );
 }
 

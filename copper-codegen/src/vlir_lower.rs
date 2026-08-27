@@ -1105,7 +1105,7 @@ fn ports_driven_any_path(stmts: &[VLIRStmt]) -> HashSet<String> {
 }
 
 /// Names referenced by an SHIR expression.
-fn shir_expr_vars(e: &SHIRExpr, out: &mut HashSet<String>) {
+pub(crate) fn shir_expr_vars(e: &SHIRExpr, out: &mut HashSet<String>) {
     match e {
         SHIRExpr::Var(n) => {
             out.insert(n.clone());

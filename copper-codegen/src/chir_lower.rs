@@ -259,6 +259,17 @@ fn infer_type_from_expr(
             Some(inner) => infer_type_from_expr(inner, span, symbols, enums),
             None => infer_type_from_call(call, span),
         },
+        // A field read of a flattened struct local: `ex_mem.alu_result` is the
+        // `ex_mem_alu_result` net.
+        ExprType::Field(f) => {
+            if let ExprType::Path(pth) = f.base.as_ref() {
+                let name = format!("{}_{}", compact_ident(&pth.path_text), f.member);
+                if let Some(t) = symbols.get(&name) {
+                    return Ok(t.clone());
+                }
+            }
+            Err(CHIRLowerError::AmbiguousWidth { span })
+        }
         // A single-bit index `x[i]` is 1-bit.
         ExprType::Index(_) => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
         // `[Logic::Zero; N]` — a repeated array of hardware elements is a packed
@@ -1425,10 +1436,59 @@ fn lower_seq_body(
     // Forward inference: a register/wire whose width the init can't determine
     // (`let mut out_n = Bits::x()`) takes the type of the output port it drives.
     let write_inferred = build_write_inferred_types(fir, &symbols);
+    // Needed during the scan itself: a struct-valued `let mut` (a pipeline
+    // latch, `let mut if_id = IFIDReg::bubble();`) flattens to one register per
+    // field, which takes seeing through the ctor call before the context exists.
+    let fns_reg = build_fn_registry(fir);
+    let structs_reg = build_struct_registry(fir);
+    let mut pre_struct_locals: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for stmt in &fir.raw_statements {
         match &stmt.kind {
             RawStmtKind::Local(local) if local.is_mut => {
+                // A struct-valued latch flattens to one register per declared
+                // field, named `<local>_<field>` — the same flattening every
+                // struct WIRE binding gets, so a field read (`if_id.pc` →
+                // `if_id_pc`) is one scheme for both. The register authority is
+                // consulted for the WHOLE name: the source-level inference sees
+                // `if_id`, not the fields.
+                if let Some(init) = &local.init {
+                    if let Some(lit) = resolve_struct_literal_in(init, &fns_reg, &structs_reg)? {
+                        let sname = compact_ident(&lit.path_text);
+                        if !fir.registers.iter().any(|r| r == &local.name) {
+                            return Err(CHIRLowerError::UnsupportedConstruct {
+                                description: format!(
+                                    "struct-typed pre-loop `let mut {}` is not a register \
+                                     (never live across a clock edge); bind it with a plain \
+                                     `let` instead",
+                                    local.name
+                                ),
+                                span: local.span,
+                                suggested_rewrite: None,
+                            });
+                        }
+                        for (fname, fty) in
+                            struct_fields_in(&sname, &structs_reg, &enums, local.span)?
+                        {
+                            let finit = lit
+                                .fields
+                                .iter()
+                                .find(|f| f.member == fname)
+                                .and_then(|f| lower_init_to_lit(&f.expr, &enums));
+                            let rname = format!("{}_{fname}", local.name);
+                            symbols.insert(rname.clone(), fty.clone());
+                            registers.push(CHIRRegDecl {
+                                name: rname,
+                                ty: fty,
+                                init: finit,
+                                span: local.span,
+                            });
+                        }
+                        pre_struct_locals.insert(local.name.clone(), sname);
+                        continue;
+                    }
+                }
                 let ty = match (&local.ty, &local.init) {
                     (Some(t), _) => resolve_type(&t.ty_text, t.span)?,
                     (None, Some(init)) => match infer_type_from_expr(init, local.span, &symbols, &enums) {
@@ -1537,6 +1597,7 @@ fn lower_seq_body(
     ctx.fns = build_fn_registry(fir);
     ctx.structs = build_struct_registry(fir);
     ctx.write_inferred = build_write_inferred_types(fir, &ctx.symbols);
+    ctx.struct_locals = pre_struct_locals;
     ctx.memories = mem_infos;
 
     // Preloads, now that expressions can be lowered. Each word is retyped and
@@ -1915,6 +1976,10 @@ pub(crate) struct LowerCtx<'a> {
     /// File-scope free functions available for inlining (#7b), by name. Built
     /// from `FrontendModuleIR::file_fns`.
     fns: std::collections::HashMap<String, FrontendFnIR>,
+    /// Locals (wires AND flattened registers) of struct type: name → struct
+    /// name. What lets a whole-struct copy (`ex_mem = new_ex_mem;`) and a
+    /// struct-typed leaf in a conditional tree expand per-field.
+    struct_locals: std::collections::HashMap<String, String>,
     /// Free-fn names currently being inlined, to detect (and reject) recursion.
     inlining: std::collections::HashSet<String>,
     /// File-scope struct definitions by name, for struct lowering (milestone 2):
@@ -1950,6 +2015,7 @@ impl<'a> LowerCtx<'a> {
             enums: EnumRegistry::new(),
             bindings: std::collections::HashMap::new(),
             fns: std::collections::HashMap::new(),
+            struct_locals: std::collections::HashMap::new(),
             inlining: std::collections::HashSet::new(),
             structs: std::collections::HashMap::new(),
             write_inferred: SymbolTable::new(),
@@ -1994,6 +2060,51 @@ fn lower_local_binding(
         return lower_struct_binding(&local.name, &s, ctx, out);
     }
 
+    // `let (a, b, …) = <tuple tree>` — one binding per element (see
+    // `lower_tuple_binding`). The parser carries the binder list in the name.
+    if local.name.starts_with('(') {
+        return lower_tuple_binding(local, init, ctx, out);
+    }
+
+    // `let x = { …; tail };` — a block-valued binding (the CPU's forwarding
+    // unit). Handled ahead of the conditional paths so inner `let`s get scoped.
+    if let ExprType::Block(b) = init {
+        return lower_block_binding(local, b, ctx, out);
+    }
+
+    // A struct-valued `if`/`match` binding: default-then-override. Declare every
+    // `<name>_<field>` wire with a zero default, then lower the conditional as a
+    // STATEMENT whose leaves assign the fields — which keeps arm-local `let`s
+    // (an expression projection would drop them, `extract_block_expr_value`
+    // takes only the tail).
+    if matches!(init, ExprType::If(_) | ExprType::Match(_)) {
+        if let Some(sname) = conditional_struct_name(init, ctx) {
+            let fields = struct_fields(&sname, ctx, local.span)?;
+            for (fname, fty) in &fields {
+                let wire = format!("{}_{fname}", local.name);
+                ctx.symbols.insert(wire.clone(), fty.clone());
+                out.push(CHIRStmt::Wire {
+                    name: wire,
+                    ty: fty.clone(),
+                    value: CHIRExpr::Lit(CHIRLit { ty: fty.clone(), value: 0 }),
+                    span: local.span,
+                });
+            }
+            ctx.struct_locals.insert(local.name.clone(), sname.clone());
+            let rewritten = {
+                let ctx_ref: &LowerCtx = ctx;
+                let mut mk = |leaf: &ExprType, span: SourceSpan| {
+                    struct_leaf_assigns(&local.name, &sname, &fields, leaf, ctx_ref, span)
+                };
+                rewrite_value_leaves(init, local.span, &mut mk)?
+            };
+            let mut stmts = Vec::new();
+            lower_expr_stmt(&rewritten, local.span, ctx, &mut stmts)?;
+            out.extend(stmts);
+            return Ok(());
+        }
+    }
+
     let ty = match &local.ty {
         Some(t) => resolve_type(&t.ty_text, t.span)?,
         // A memory read result carries the memory's element type, which the
@@ -2006,7 +2117,9 @@ fn lower_local_binding(
         // local is later written to (forward inference).
         None => match infer_type_from_expr(init, local.span, &ctx.symbols, &ctx.enums) {
             Ok(t) => t,
-            Err(e) => ctx.write_inferred.get(&local.name).cloned().ok_or(e)?,
+            Err(e) => fn_return_type(init, ctx)
+                .or_else(|| ctx.write_inferred.get(&local.name).cloned())
+                .ok_or(e)?,
         },
     };
     // Retype context-width default literals (e.g. `Bits::zero()`) to the binding's
@@ -2025,6 +2138,362 @@ fn lower_local_binding(
     Ok(())
 }
 
+/// Retype a port write's default-width literals (`o.write(Bits::zero())`) to
+/// the port's declared width — the same treatment an `Assign`'s RHS gets. Only
+/// AMBIGUOUS default literals are rewritten, so a value with its own width is
+/// untouched.
+fn retype_port_write_value(port: &str, value: CHIRExpr, ctx: &LowerCtx) -> CHIRExpr {
+    match ctx.symbols.get(port) {
+        Some(ty) => retype_default_literals_in_values(value, type_width(ty)),
+        None => value,
+    }
+}
+
+/// The declared return type of a call to a registered file-scope fn
+/// (`branch_taken(…)` → `bool`), for typing a binding the expression walk
+/// cannot: the walk sees a Call, not the inlined body.
+fn fn_return_type(init: &ExprType, ctx: &LowerCtx) -> Option<CHIRType> {
+    let ExprType::Call(call) = init else { return None };
+    let fn_ir = call_path(call).and_then(|n| ctx.fns.get(&n))?;
+    let ret = fn_ir.signature.return_ty.as_ref()?;
+    let text = compact_ident(&ret.ty_text);
+    resolve_type(&text, ret.span).ok().or_else(|| {
+        ctx.enums
+            .get(&text)
+            .map(|e| CHIRType::UInt { width: Width::Concrete(e.width) })
+    })
+}
+
+/// Lower `let (a, b, …) = <tuple tree>` as one binding per element, by the same
+/// default-then-override statement transform as a struct-valued conditional: a
+/// zero-defaulted wire per (non-wildcard) element, then the tree in statement
+/// position with every tuple-literal leaf turned into per-element assignments.
+/// A struct-typed element recursively gets per-FIELD wires (`<elem>_<field>`)
+/// and is registered as a struct local, so later field reads and whole-struct
+/// copies of it work unchanged.
+fn lower_tuple_binding(
+    local: &LocalStmt,
+    init: &ExprType,
+    ctx: &mut LowerCtx,
+    out: &mut Vec<CHIRStmt>,
+) -> Result<(), CHIRLowerError> {
+    let names: Vec<String> = local
+        .name
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(|n| n.trim().to_string())
+        .collect();
+
+    // A call to a tuple-returning helper (`let (s, c) = full_adder(…)`, cause
+    // J-b) inlines first (#7b), its body locals prefixed with the first binder
+    // so they cannot capture a caller name.
+    let inlined_init;
+    let init = if let ExprType::Call(call) = init {
+        match call_path(call).and_then(|n| ctx.fns.get(&n).cloned()) {
+            Some(fn_ir) => {
+                let mut e = build_inlined_expr(&fn_ir, &call.args, call.span)?;
+                if let ExprType::Block(b) = &mut e {
+                    let prefix = names
+                        .iter()
+                        .find(|n| *n != "_")
+                        .cloned()
+                        .unwrap_or_else(|| "tuple".to_string());
+                    rename_block_locals(b, &prefix);
+                }
+                inlined_init = e;
+                &inlined_init
+            }
+            None => init,
+        }
+    } else {
+        init
+    };
+
+    // Sample leaves for per-element typing: the first leaf that yields a
+    // definite answer wins (a `Bits::zero()` element in one arm has no width of
+    // its own; another arm's `pc + imm` does).
+    let mut leaves: Vec<&ExprType> = Vec::new();
+    collect_value_leaves(init, &mut leaves);
+    if leaves.is_empty() {
+        return Err(CHIRLowerError::UnsupportedConstruct {
+            description: "tuple binding needs a tuple literal or an `if`/`match` over tuple \
+                          literals"
+                .to_string(),
+            span: local.span,
+            suggested_rewrite: None,
+        });
+    }
+
+    // element index → Some(struct name) when that element is struct-valued
+    let mut elem_structs: Vec<Option<String>> = vec![None; names.len()];
+    for (idx, name) in names.iter().enumerate() {
+        if name == "_" {
+            continue;
+        }
+        // Struct-valued element?
+        let mut sname = None;
+        for leaf in &leaves {
+            let elem = project_tuple_element(leaf, idx, local.span)?;
+            if let Some(n) = conditional_struct_name(&elem, ctx) {
+                sname = Some(n);
+                break;
+            }
+        }
+        if let Some(sname) = sname {
+            let fields = struct_fields(&sname, ctx, local.span)?;
+            for (fname, fty) in &fields {
+                let wire = format!("{name}_{fname}");
+                ctx.symbols.insert(wire.clone(), fty.clone());
+                out.push(CHIRStmt::Wire {
+                    name: wire,
+                    ty: fty.clone(),
+                    value: CHIRExpr::Lit(CHIRLit { ty: fty.clone(), value: 0 }),
+                    span: local.span,
+                });
+            }
+            ctx.struct_locals.insert(name.clone(), sname.clone());
+            elem_structs[idx] = Some(sname);
+            continue;
+        }
+        // Scalar element: infer its type from the first leaf that knows it,
+        // with arm-local `let`s in scope.
+        let mut tree_symbols = ctx.symbols.clone();
+        collect_tree_local_types(init, &mut tree_symbols, &ctx.enums);
+        let mut ty = None;
+        for leaf in &leaves {
+            let elem = project_tuple_element(leaf, idx, local.span)?;
+            if let Ok(t) = infer_type_from_expr(&elem, local.span, &tree_symbols, &ctx.enums) {
+                ty = Some(t);
+                break;
+            }
+        }
+        let ty = match ty.or_else(|| ctx.write_inferred.get(name).cloned()) {
+            Some(t) => t,
+            None => return Err(CHIRLowerError::AmbiguousWidth { span: local.span }),
+        };
+        ctx.symbols.insert(name.clone(), ty.clone());
+        out.push(CHIRStmt::Wire {
+            name: name.clone(),
+            ty: ty.clone(),
+            value: CHIRExpr::Lit(CHIRLit { ty, value: 0 }),
+            span: local.span,
+        });
+    }
+
+    let rewritten = {
+        let ctx_ref: &LowerCtx = ctx;
+        let names_ref = &names;
+        let elem_structs_ref = &elem_structs;
+        let mut mk = |leaf: &ExprType, span: SourceSpan| -> Result<Vec<RawStmt>, CHIRLowerError> {
+            let mut stmts = Vec::new();
+            for (idx, name) in names_ref.iter().enumerate() {
+                if name == "_" {
+                    continue;
+                }
+                let elem = project_tuple_element(leaf, idx, span)?;
+                match &elem_structs_ref[idx] {
+                    Some(sname) => {
+                        let fields = struct_fields(sname, ctx_ref, span)?;
+                        stmts.extend(struct_leaf_assigns(
+                            name, sname, &fields, &elem, ctx_ref, span,
+                        )?);
+                    }
+                    None => stmts.push(assign_stmt(name, elem, span)),
+                }
+            }
+            Ok(stmts)
+        };
+        rewrite_value_leaves(init, local.span, &mut mk)?
+    };
+    let mut stmts = Vec::new();
+    lower_expr_stmt(&rewritten, local.span, ctx, &mut stmts)?;
+    out.extend(stmts);
+    Ok(())
+}
+
+/// Prefix every top-level `let` in a block with `prefix_`, substituting the
+/// references — the scoping step for a block used as a value: two blocks may
+/// both declare `hit`, and without the rename the second silently reads (or
+/// redrives) the first's wire.
+fn rename_block_locals(b: &mut copper_core::frontend_ir::ExprBlock, prefix: &str) {
+    let mut subst: std::collections::HashMap<String, ExprType> = std::collections::HashMap::new();
+    for stmt in &mut b.stmts {
+        if let RawStmtKind::Local(l) = &mut stmt.kind {
+            let renamed = format!("{prefix}_{}", l.name);
+            subst.insert(
+                l.name.clone(),
+                ExprType::Path(copper_core::frontend_ir::ExprPath {
+                    path_text: renamed.clone(),
+                    span: l.span,
+                }),
+            );
+            l.name = renamed;
+        }
+    }
+    if !subst.is_empty() {
+        subst_in_stmts(&mut b.stmts, &subst);
+    }
+}
+
+/// Lower `let x = { …; tail };` — a block-valued binding. Inner `let`s become
+/// wires prefixed with the binding's name (`x_<inner>` — the CPU's two
+/// forwarding blocks both declare `from_ex_mem`, and without the prefix the
+/// second declaration would silently shadow the first), and the tail is bound
+/// by the same default-then-override transform as a conditional initializer,
+/// so a conditional tail keeps its structure and the inner `let`s lower once.
+fn lower_block_binding(
+    local: &LocalStmt,
+    block: &copper_core::frontend_ir::ExprBlock,
+    ctx: &mut LowerCtx,
+    out: &mut Vec<CHIRStmt>,
+) -> Result<(), CHIRLowerError> {
+    let mut b = block.clone();
+    rename_block_locals(&mut b, &local.name);
+
+    let tail = block_tail_expr(&b.stmts).cloned().ok_or_else(|| {
+        CHIRLowerError::UnsupportedConstruct {
+            description: format!(
+                "block binding `{}` has no tail value expression",
+                local.name
+            ),
+            span: local.span,
+            suggested_rewrite: None,
+        }
+    })?;
+    let init = ExprType::Block(b);
+
+    // Struct-valued tail → per-field wires; otherwise one scalar wire.
+    if let Some(sname) = conditional_struct_name(&tail, ctx) {
+        let fields = struct_fields(&sname, ctx, local.span)?;
+        for (fname, fty) in &fields {
+            let wire = format!("{}_{fname}", local.name);
+            ctx.symbols.insert(wire.clone(), fty.clone());
+            out.push(CHIRStmt::Wire {
+                name: wire,
+                ty: fty.clone(),
+                value: CHIRExpr::Lit(CHIRLit { ty: fty.clone(), value: 0 }),
+                span: local.span,
+            });
+        }
+        ctx.struct_locals.insert(local.name.clone(), sname.clone());
+        let rewritten = {
+            let ctx_ref: &LowerCtx = ctx;
+            let mut mk = |leaf: &ExprType, span: SourceSpan| {
+                struct_leaf_assigns(&local.name, &sname, &fields, leaf, ctx_ref, span)
+            };
+            rewrite_value_leaves(&init, local.span, &mut mk)?
+        };
+        let mut stmts = Vec::new();
+        lower_expr_stmt(&rewritten, local.span, ctx, &mut stmts)?;
+        out.extend(stmts);
+        return Ok(());
+    }
+
+    let ty = match &local.ty {
+        Some(t) => resolve_type(&t.ty_text, t.span)?,
+        None => {
+            let mut tree_symbols = ctx.symbols.clone();
+            collect_tree_local_types(&init, &mut tree_symbols, &ctx.enums);
+            let mut leaves = Vec::new();
+            collect_value_leaves(&tail, &mut leaves);
+            leaves
+                .iter()
+                .find_map(|leaf| {
+                    infer_type_from_expr(leaf, local.span, &tree_symbols, &ctx.enums).ok()
+                })
+                .or_else(|| ctx.write_inferred.get(&local.name).cloned())
+                .ok_or(CHIRLowerError::AmbiguousWidth { span: local.span })?
+        }
+    };
+    ctx.symbols.insert(local.name.clone(), ty.clone());
+    out.push(CHIRStmt::Wire {
+        name: local.name.clone(),
+        ty: ty.clone(),
+        value: CHIRExpr::Lit(CHIRLit { ty, value: 0 }),
+        span: local.span,
+    });
+    let rewritten = {
+        let mut mk = |leaf: &ExprType, span: SourceSpan| {
+            Ok(vec![assign_stmt(&local.name, leaf.clone(), span)])
+        };
+        rewrite_value_leaves(&init, local.span, &mut mk)?
+    };
+    let mut stmts = Vec::new();
+    lower_expr_stmt(&rewritten, local.span, ctx, &mut stmts)?;
+    out.extend(stmts);
+    Ok(())
+}
+
+/// Fold the types of every `let` declared anywhere inside a value tree into
+/// `symbols`, so a leaf that names an arm-local binding (`tgt` in the CPU's
+/// JAL arm) can still be typed. Best-effort: a local whose init cannot be
+/// typed is skipped.
+fn collect_tree_local_types(expr: &ExprType, symbols: &mut SymbolTable, enums: &EnumRegistry) {
+    fn scan_stmts(stmts: &[RawStmt], symbols: &mut SymbolTable, enums: &EnumRegistry) {
+        for stmt in stmts {
+            match &stmt.kind {
+                RawStmtKind::Local(l) => {
+                    let ty = match (&l.ty, &l.init) {
+                        (Some(t), _) => resolve_type(&t.ty_text, t.span).ok(),
+                        (None, Some(init)) => {
+                            collect_tree_local_types(init, symbols, enums);
+                            infer_type_from_expr(init, l.span, symbols, enums).ok()
+                        }
+                        (None, None) => None,
+                    };
+                    if let Some(ty) = ty {
+                        symbols.insert(l.name.clone(), ty);
+                    }
+                }
+                RawStmtKind::Expr(es) => collect_tree_local_types(&es.expr, symbols, enums),
+                RawStmtKind::Item(_) => {}
+            }
+        }
+    }
+    match expr {
+        ExprType::If(f) => {
+            scan_stmts(&f.then_block, symbols, enums);
+            if let Some(else_br) = &f.else_branch {
+                collect_tree_local_types(else_br, symbols, enums);
+            }
+        }
+        ExprType::Match(m) => {
+            for arm in &m.arms {
+                collect_tree_local_types(&arm.body, symbols, enums);
+            }
+        }
+        ExprType::Block(b) => scan_stmts(&b.stmts, symbols, enums),
+        _ => {}
+    }
+}
+
+/// Collect the value LEAVES of a conditional tree (the non-`if`/`match`/block
+/// expressions), in source order.
+fn collect_value_leaves<'e>(expr: &'e ExprType, out: &mut Vec<&'e ExprType>) {
+    match expr {
+        ExprType::If(f) => {
+            if let Some(tail) = block_tail_expr(&f.then_block) {
+                collect_value_leaves(tail, out);
+            }
+            if let Some(else_br) = &f.else_branch {
+                collect_value_leaves(else_br, out);
+            }
+        }
+        ExprType::Match(m) => {
+            for arm in &m.arms {
+                collect_value_leaves(&arm.body, out);
+            }
+        }
+        ExprType::Block(b) => {
+            if let Some(tail) = block_tail_expr(&b.stmts) {
+                collect_value_leaves(tail, out);
+            }
+        }
+        leaf => out.push(leaf),
+    }
+}
+
 /// If `init` denotes a struct value — a struct literal, or a call to a
 /// file-scope fn that inlines to one (`alu_exec_reg(..)` → `AluOutput { .. }`) —
 /// return that literal. Inlines one level to see through a call.
@@ -2032,22 +2501,52 @@ fn resolve_struct_literal(
     init: &ExprType,
     ctx: &LowerCtx,
 ) -> Result<Option<ExprStruct>, CHIRLowerError> {
+    resolve_struct_literal_in(init, &ctx.fns, &ctx.structs)
+}
+
+/// Registry-based form of [`resolve_struct_literal`], usable before a
+/// `LowerCtx` exists (the pre-loop register scan).
+fn resolve_struct_literal_in(
+    init: &ExprType,
+    fns: &std::collections::HashMap<String, FrontendFnIR>,
+    structs: &std::collections::HashMap<String, ItemStruct>,
+) -> Result<Option<ExprStruct>, CHIRLowerError> {
     let inlined;
+    // An associated ctor (`IFIDReg::bubble()`) usually builds `Self { … }`;
+    // the type it means is the call path's prefix.
+    let mut self_ty: Option<String> = None;
     let candidate: &ExprType = match init {
-        ExprType::Call(call) => match call_path(call).and_then(|n| ctx.fns.get(&n).cloned()) {
-            Some(fn_ir) => {
-                inlined = build_inlined_expr(&fn_ir, &call.args, call.span)?;
-                &inlined
+        ExprType::Call(call) => {
+            let path = call_path(call);
+            match path.as_deref().and_then(|n| fns.get(n).cloned()) {
+                Some(fn_ir) => {
+                    self_ty = path
+                        .as_deref()
+                        .and_then(|n| n.rsplit_once("::"))
+                        .map(|(ty, _)| ty.to_string());
+                    inlined = build_inlined_expr(&fn_ir, &call.args, call.span)?;
+                    &inlined
+                }
+                None => init,
             }
-            None => init,
-        },
+        }
         _ => init,
     };
 
     match candidate {
-        ExprType::Struct(s) => {
-            let name: String = s.path_text.chars().filter(|c| !c.is_whitespace()).collect();
-            Ok(ctx.structs.contains_key(&name).then(|| s.clone()))
+        ExprType::Struct(st) => {
+            let mut name = compact_ident(&st.path_text);
+            if name == "Self" {
+                match self_ty {
+                    Some(ty) => name = ty,
+                    None => return Ok(None),
+                }
+            }
+            Ok(structs.contains_key(&name).then(|| {
+                let mut lit = st.clone();
+                lit.path_text = name;
+                lit
+            }))
         }
         _ => Ok(None),
     }
@@ -2067,7 +2566,8 @@ fn lower_struct_binding(
             suggested_rewrite: None,
         });
     }
-    let struct_name: String = s.path_text.chars().filter(|c| !c.is_whitespace()).collect();
+    let struct_name = compact_ident(&s.path_text);
+    ctx.struct_locals.insert(base.to_string(), struct_name.clone());
     for field in &s.fields {
         let wire_name = format!("{base}_{}", field.member);
         let ty = resolve_field_type(&struct_name, &field.member, &field.expr, field.span, ctx)?;
@@ -2105,6 +2605,234 @@ fn resolve_field_type(
         }
     }
     infer_type_from_expr(value, span, &ctx.symbols, &ctx.enums)
+}
+
+/// The one struct name every LEAF of a conditional tree resolves to — a struct
+/// literal, a ctor call that inlines to one, or a local already known to be of
+/// that struct type. `None` if any leaf is something else or the names differ.
+fn conditional_struct_name(expr: &ExprType, ctx: &LowerCtx) -> Option<String> {
+    match expr {
+        ExprType::If(f) => {
+            let then = conditional_struct_name(block_tail_expr(&f.then_block)?, ctx)?;
+            let els = conditional_struct_name(f.else_branch.as_deref()?, ctx)?;
+            (then == els).then_some(then)
+        }
+        ExprType::Match(m) => {
+            let mut name: Option<String> = None;
+            for arm in &m.arms {
+                let n = conditional_struct_name(&arm.body, ctx)?;
+                match &name {
+                    None => name = Some(n),
+                    Some(prev) if *prev == n => {}
+                    _ => return None,
+                }
+            }
+            name
+        }
+        ExprType::Block(b) => conditional_struct_name(block_tail_expr(&b.stmts)?, ctx),
+        ExprType::Path(path) => {
+            let ident = compact_ident(&path.path_text);
+            ctx.struct_locals.get(&ident).cloned()
+        }
+        other => resolve_struct_literal(other, ctx)
+            .ok()
+            .flatten()
+            .map(|s| compact_ident(&s.path_text)),
+    }
+}
+
+fn compact_ident(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The last non-semicolon expression statement of a block — its value.
+fn block_tail_expr(stmts: &[RawStmt]) -> Option<&ExprType> {
+    stmts.iter().rev().find_map(|s| match &s.kind {
+        RawStmtKind::Expr(es) if !es.has_semi => Some(&es.expr),
+        _ => None,
+    })
+}
+
+/// The declared, ordered field list of struct `name`: `(field, resolved type)`.
+fn struct_fields(
+    name: &str,
+    ctx: &LowerCtx,
+    span: SourceSpan,
+) -> Result<Vec<(String, CHIRType)>, CHIRLowerError> {
+    struct_fields_in(name, &ctx.structs, &ctx.enums, span)
+}
+
+fn struct_fields_in(
+    name: &str,
+    structs: &std::collections::HashMap<String, ItemStruct>,
+    enums: &EnumRegistry,
+    span: SourceSpan,
+) -> Result<Vec<(String, CHIRType)>, CHIRLowerError> {
+    let def = structs.get(name).ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+        description: format!("unknown struct `{name}`"),
+        span,
+        suggested_rewrite: None,
+    })?;
+    def.fields
+        .iter()
+        .map(|f| {
+            let text = compact_ident(&f.ty.ty_text);
+            let ty = match resolve_type(&text, f.ty.span) {
+                Ok(t) => t,
+                Err(e) => match enums.get(&text) {
+                    Some(enum_def) => CHIRType::UInt { width: Width::Concrete(enum_def.width) },
+                    None => return Err(e),
+                },
+            };
+            Ok((f.name.clone(), ty))
+        })
+        .collect()
+}
+
+/// Rewrite a struct/tuple-VALUED conditional tree into STATEMENT position:
+/// every value leaf becomes the assignment statements `mk(leaf)` produces,
+/// while `if`/`match`/block structure — including arm-local `let`s, which an
+/// expression projection would drop — survives intact. The result lowers
+/// through the ordinary statement path (`lower_expr_stmt`), so together with
+/// default-initialized wire declarations ahead of it this is the
+/// default-then-override lowering of a conditional aggregate value.
+fn rewrite_value_leaves(
+    expr: &ExprType,
+    span: SourceSpan,
+    mk: &mut dyn FnMut(&ExprType, SourceSpan) -> Result<Vec<RawStmt>, CHIRLowerError>,
+) -> Result<ExprType, CHIRLowerError> {
+    match expr {
+        ExprType::If(f) => {
+            let mut new_if = f.clone();
+            rewrite_block_tail(&mut new_if.then_block, f.span, mk)?;
+            let else_br = f.else_branch.as_deref().ok_or_else(|| {
+                CHIRLowerError::UnsupportedConstruct {
+                    description: "aggregate-valued `if` needs an `else` branch".to_string(),
+                    span: f.span,
+                    suggested_rewrite: None,
+                }
+            })?;
+            new_if.else_branch = Some(Box::new(rewrite_value_leaves(else_br, f.span, mk)?));
+            Ok(ExprType::If(new_if))
+        }
+        ExprType::Match(m) => {
+            let mut new_m = m.clone();
+            for arm in &mut new_m.arms {
+                arm.body = Box::new(rewrite_value_leaves(&arm.body, m.span, mk)?);
+            }
+            Ok(ExprType::Match(new_m))
+        }
+        ExprType::Block(b) => {
+            let mut nb = b.clone();
+            rewrite_block_tail(&mut nb.stmts, b.span, mk)?;
+            Ok(ExprType::Block(nb))
+        }
+        leaf => {
+            let stmts = mk(leaf, span)?;
+            Ok(ExprType::Block(copper_core::frontend_ir::ExprBlock { stmts, span }))
+        }
+    }
+}
+
+/// Replace a block's tail value expression with its leaf rewrite, in place.
+fn rewrite_block_tail(
+    stmts: &mut Vec<RawStmt>,
+    span: SourceSpan,
+    mk: &mut dyn FnMut(&ExprType, SourceSpan) -> Result<Vec<RawStmt>, CHIRLowerError>,
+) -> Result<(), CHIRLowerError> {
+    let tail_idx = stmts
+        .iter()
+        .rposition(|s| matches!(&s.kind, RawStmtKind::Expr(es) if !es.has_semi))
+        .ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+            description: "aggregate-valued branch has no tail value expression".to_string(),
+            span,
+            suggested_rewrite: None,
+        })?;
+    if let RawStmtKind::Expr(es) = &mut stmts[tail_idx].kind {
+        es.expr = rewrite_value_leaves(&es.expr.clone(), es.span, mk)?;
+        es.has_semi = true;
+    }
+    Ok(())
+}
+
+/// A synthesized `target = value;` statement, for the leaf rewrites above.
+fn assign_stmt(target: &str, value: ExprType, span: SourceSpan) -> RawStmt {
+    RawStmt {
+        order: 0,
+        kind: RawStmtKind::Expr(copper_core::frontend_ir::ExprStmt {
+            expr: ExprType::Assign(copper_core::frontend_ir::ExprAssign {
+                left: Box::new(ExprType::Path(copper_core::frontend_ir::ExprPath {
+                    path_text: target.to_string(),
+                    span,
+                })),
+                right: Box::new(value),
+                span,
+            }),
+            has_semi: true,
+            span,
+        }),
+        text: String::new(),
+        span,
+    }
+}
+
+/// The assignments that store one struct-valued LEAF into `base`'s per-field
+/// wires/registers: a literal (or ctor) assigns each field's expression; a
+/// struct-typed local assigns field accesses, which lower to its own
+/// `<local>_<field>` nets.
+fn struct_leaf_assigns(
+    base: &str,
+    struct_name: &str,
+    fields: &[(String, CHIRType)],
+    leaf: &ExprType,
+    ctx: &LowerCtx,
+    span: SourceSpan,
+) -> Result<Vec<RawStmt>, CHIRLowerError> {
+    if let Some(lit) = resolve_struct_literal(leaf, ctx)? {
+        return fields
+            .iter()
+            .map(|(fname, _)| {
+                let value = lit
+                    .fields
+                    .iter()
+                    .find(|f| f.member == *fname)
+                    .map(|f| (*f.expr).clone())
+                    .ok_or_else(|| CHIRLowerError::UnsupportedConstruct {
+                        description: format!(
+                            "struct literal `{}` is missing field `{fname}`",
+                            lit.path_text
+                        ),
+                        span,
+                        suggested_rewrite: None,
+                    })?;
+                Ok(assign_stmt(&format!("{base}_{fname}"), value, span))
+            })
+            .collect();
+    }
+    if let ExprType::Path(pth) = leaf {
+        let ident = compact_ident(&pth.path_text);
+        if ctx.struct_locals.get(&ident).map(String::as_str) == Some(struct_name) {
+            return Ok(fields
+                .iter()
+                .map(|(fname, _)| {
+                    let value = ExprType::Field(copper_core::frontend_ir::ExprField {
+                        base: Box::new(leaf.clone()),
+                        member: fname.clone(),
+                        span,
+                    });
+                    assign_stmt(&format!("{base}_{fname}"), value, span)
+                })
+                .collect());
+        }
+    }
+    Err(CHIRLowerError::UnsupportedConstruct {
+        description: format!(
+            "a `{struct_name}` value here must be a struct literal, a constructor call, \
+             or a `{struct_name}`-typed local"
+        ),
+        span,
+        suggested_rewrite: None,
+    })
 }
 
 fn lower_stmt(
@@ -2244,7 +2972,7 @@ fn lower_expr_stmt(
                     suggested_rewrite: None,
                 }),
             };
-            let value = lower_expr(&mc.args[0], ctx)?;
+            let value = retype_port_write_value(&port_name, lower_expr(&mc.args[0], ctx)?, ctx);
             out.push(CHIRStmt::PortWrite { port_name, value, span });
         }
 
@@ -2285,6 +3013,28 @@ fn lower_expr_stmt(
                     out.push(CHIRStmt::Assign { target, value: CHIRExpr::Var(tmp), span });
                 }
                 return Ok(());
+            }
+            // Whole-struct assignment: `ex_mem = new_ex_mem;` (or a struct
+            // literal / ctor / conditional over them) expands to one assignment
+            // per field. RHS field reads see pre-assignment values only when
+            // they name OTHER locals' wires — a literal whose fields read the
+            // target's own fields would see forwarded values; no such shape
+            // exists in the corpus, and the plain-Var copy (the CPU latches) is
+            // hazard-free by construction.
+            if let ExprType::Path(pth) = assign.left.as_ref() {
+                let target = compact_ident(&pth.path_text);
+                if let Some(sname) = ctx.struct_locals.get(&target).cloned() {
+                    let fields = struct_fields(&sname, ctx, span)?;
+                    let rewritten = {
+                        let ctx_ref: &LowerCtx = ctx;
+                        let mut mk = |leaf: &ExprType, span: SourceSpan| {
+                            struct_leaf_assigns(&target, &sname, &fields, leaf, ctx_ref, span)
+                        };
+                        rewrite_value_leaves(&assign.right, span, &mut mk)?
+                    };
+                    lower_expr_stmt(&rewritten, span, ctx, out)?;
+                    return Ok(());
+                }
             }
             // LHS bit-assign: `base[index] = value` drives a single bit of an
             // already-declared signal.
@@ -2347,7 +3097,11 @@ fn lower_expr_stmt(
                                 suggested_rewrite: None,
                             }),
                         };
-                        let value = lower_expr(&mc.args[0], ctx)?;
+                        let value = retype_port_write_value(
+                            &port_name,
+                            lower_expr(&mc.args[0], ctx)?,
+                            ctx,
+                        );
                         vec![CHIRStmt::PortWrite { port_name, value, span }]
                     }
                     other => {
@@ -2444,7 +3198,7 @@ fn lower_else_branch(
                     suggested_rewrite: None,
                 }),
             };
-            let value = lower_expr(&mc.args[0], ctx)?;
+            let value = retype_port_write_value(&port_name, lower_expr(&mc.args[0], ctx)?, ctx);
             Ok(vec![CHIRStmt::PortWrite { port_name, value, span }])
         }
         other => {
@@ -3423,6 +4177,18 @@ fn lower_method_call(
     mc: &copper_core::frontend_ir::ExprMethodCall,
     ctx: &mut LowerCtx,
 ) -> Result<CHIRExpr, CHIRLowerError> {
+    // `a.arithmetic_shift_right(n)` IS the signed shift: `$signed(a) >>> n`,
+    // the same lowering `(a.as_u32() as i32) >> n` gets via the cast path.
+    if mc.method == "arithmetic_shift_right" && mc.args.len() == 1 {
+        let recv = lower_expr(&mc.receiver, ctx)?;
+        let amt = lower_expr(&mc.args[0], ctx)?;
+        return Ok(signed_binop(
+            CHIRBinOp::Shr,
+            CHIRExpr::SignCast { signed: true, expr: Box::new(recv) },
+            amt,
+        ));
+    }
+
     // `mem.read_port::<I>().data()` / `.is_ready()` — the read port's output
     // and its valid flag. Checked before the passthrough list below, which would
     // otherwise swallow nothing here but keeps the memory forms adjacent.

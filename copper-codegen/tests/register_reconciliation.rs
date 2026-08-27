@@ -19,6 +19,25 @@
 //!     multi-tick / control-extracted FSMs (`codegen − inferred ⊆ {phase, pc}`),
 //!     which the source-level inference has no name for.
 //!
+//! Two REPRESENTATION mappings are applied before comparing (2026-08-27, the
+//! aggregate-surface landing):
+//!
+//!   * a struct-typed register (`let mut latch = Latch::bubble()`) is inferred
+//!     under its own name but FLATTENS to one flop per field
+//!     (`latch_valid`, `latch_data`); the inferred name is satisfied by its
+//!     complete field set, and those field flops are accounted for in reverse;
+//!   * in a SINGLE-TICK module, a plain `let` that crosses the edge (`let xv =
+//!     x.read(); tick; latch = f(xv)`) is inferred as a register but is
+//!     ABSORBED by codegen: it stays a comb wire and every consumer flop
+//!     samples it at the edge — the same machine, with the wire's storage
+//!     living inside the consumer's flop. The allowance is narrow: it applies
+//!     only when the body has exactly one tick (a multi-tick module must still
+//!     PROMOTE such a wire to `{name}_r`, and a promotion regression still
+//!     fails here) and only to names the SV actually declares as comb nets
+//!     (directly, or renamed `{outer}_{name}` by the block-binding scoping).
+//!     Behavioral equivalence of the absorption is the differential sweep's
+//!     job — `tests/fixtures/struct_pipeline_dut.rs` pins these shapes.
+//!
 //! **Memory arrays are not in scope** and are filtered out inside
 //! `reference_sv_registers` rather than here: `mem[addr] <= data` reduces to
 //! `mem <= data` once bit-selects are stripped, so a memory would otherwise read
@@ -138,6 +157,67 @@ fn is_clocked(f: &ItemFn) -> bool {
 /// the mechanism is fixed. Same disposition as `probe` in `build.rs`'s SKIP table.
 const WITNESSES: &[(&str, &str)] = &[];
 
+/// If the module declares `let mut <name> = X::…(…)` or `let mut <name> = X { … }`
+/// at fn top level and the file defines `struct X`, return X's field names — the
+/// flattening a struct-typed register gets.
+fn struct_register_fields(f: &ItemFn, file: &syn::File, name: &str) -> Option<Vec<String>> {
+    let struct_name = f.block.stmts.iter().find_map(|stmt| {
+        let syn::Stmt::Local(l) = stmt else { return None };
+        let syn::Pat::Ident(pi) = &l.pat else { return None };
+        if pi.ident != name || pi.mutability.is_none() {
+            return None;
+        }
+        match &*l.init.as_ref()?.expr {
+            // `X::ctor(…)` — the type is the path prefix.
+            syn::Expr::Call(c) => {
+                let syn::Expr::Path(p) = &*c.func else { return None };
+                let segs: Vec<_> = p.path.segments.iter().collect();
+                (segs.len() >= 2).then(|| segs[segs.len() - 2].ident.to_string())
+            }
+            syn::Expr::Struct(st) => {
+                st.path.segments.last().map(|seg| seg.ident.to_string())
+            }
+            _ => None,
+        }
+    })?;
+    file.items.iter().find_map(|i| {
+        let syn::Item::Struct(st) = i else { return None };
+        if st.ident != struct_name {
+            return None;
+        }
+        Some(
+            st.fields
+                .iter()
+                .filter_map(|fl| fl.ident.as_ref().map(|id| id.to_string()))
+                .collect(),
+        )
+    })
+}
+
+/// Every net the emitted SV declares (`logic … <name>;`), flop or not. Minus the
+/// flop set, this is the comb-wire set the absorption allowance checks against.
+fn sv_declared_nets(sv: &str) -> BTreeSet<String> {
+    sv.lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            let t = t.strip_prefix("logic")?;
+            let t = t.strip_suffix(';')?;
+            // skip the width part, keep the last identifier
+            let name = t.split_whitespace().last()?;
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Exactly one `.tick()` in the body — the single-tick shape whose absorption
+/// allowance the header describes.
+fn is_single_tick(f: &ItemFn) -> bool {
+    let body = quote::quote!(#f).to_string();
+    body.matches(". tick ()").count() + body.matches(".tick()").count() == 1
+}
+
 #[test]
 fn codegen_registers_match_shared_inference() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -184,10 +264,46 @@ fn codegen_registers_match_shared_inference() {
                 .map(|n| strip_r(n))
                 .collect();
 
-            let missing: Vec<_> = inferred.difference(&codegen).cloned().collect();
+            // Struct-typed registers: an inferred name is satisfied by its
+            // complete flattened field set, and those flops are accounted for.
+            let mut struct_fields_of: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for n in &inferred {
+                if let Some(fields) = struct_register_fields(f, &file, n) {
+                    struct_fields_of.insert(n.clone(), fields);
+                }
+            }
+            let accounted: BTreeSet<String> = struct_fields_of
+                .iter()
+                .flat_map(|(n, fields)| fields.iter().map(move |fl| format!("{n}_{fl}")))
+                .collect();
+            // Single-tick absorption — see the header.
+            let comb: BTreeSet<String> = if is_single_tick(f) {
+                sv_declared_nets(&sv).difference(&codegen).cloned().collect()
+            } else {
+                BTreeSet::new()
+            };
+
+            let missing: Vec<_> = inferred
+                .difference(&codegen)
+                .filter(|n| {
+                    if let Some(fields) = struct_fields_of.get(*n) {
+                        if fields.iter().all(|fl| codegen.contains(&format!("{n}_{fl}"))) {
+                            return false;
+                        }
+                    }
+                    if comb.contains(*n)
+                        || comb.iter().any(|c| c.ends_with(&format!("_{n}")))
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
             let extra: Vec<_> = codegen
                 .difference(&inferred)
-                .filter(|r| !is_synthetic(r))
+                .filter(|r| !is_synthetic(r) && !accounted.contains(*r))
                 .cloned()
                 .collect();
 

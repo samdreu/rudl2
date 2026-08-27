@@ -517,7 +517,7 @@ fn lower_seq_body(
         // on both sides of a tick; observable for a plain local flowing from the
         // trailing statements into the head, which is why the order is stated rather
         // than left to whichever segment happened to be lowered first.
-        let mut pre_edge = lower_pre_edge_stmts(
+        let trailing_pre_edge = lower_pre_edge_stmts(
             &segments[1],
             &promoted_names,
             &no_renames,
@@ -528,8 +528,9 @@ fn lower_seq_body(
         )?;
         // …then the head segment's own combinational logic. Register reassignments
         // are dropped from both (`extract_reg_updates` below turns them into this
-        // edge's post_edge updates).
-        pre_edge.extend(lower_pre_edge_stmts(
+        // edge's post_edge updates). Head statements defining names the trailing
+        // ones read are hoisted ahead — see `merge_trailing_before_head`.
+        let head_pre_edge = lower_pre_edge_stmts(
             &segments[0],
             &promoted_names,
             &no_renames,
@@ -537,7 +538,8 @@ fn lower_seq_body(
             &in_ports,
             true, // head segment: opening-prefix drives get forwarded emission
             module_span,
-        )?);
+        )?;
+        let pre_edge = merge_trailing_before_head(trailing_pre_edge, head_pre_edge);
         // One forwarding map across both: they commit at the same edge, and the
         // trailing segment runs after it.
         let mut fwd: HashMap<String, SHIRExpr> = HashMap::new();
@@ -686,10 +688,8 @@ fn lower_seq_body(
         // Phase 0 opens with the trailing segment: same cycle, and the simulator runs
         // it first. `pre_edge` is a plain statement list, so "before" is a splice.
         if !trailing_comb.is_empty() {
-            let head = &mut phases[0].pre_edge;
-            let mut merged = trailing_comb;
-            merged.append(head);
-            *head = merged;
+            let head = std::mem::take(&mut phases[0].pre_edge);
+            phases[0].pre_edge = merge_trailing_before_head(trailing_comb, head);
         }
 
         // Add phase_r register
@@ -825,6 +825,204 @@ fn check_no_tick_in_branch(stmt: &CHIRStmt, span: SourceSpan) -> Result<(), SHIR
 /// assignment produced rather than the register's pre-edge value. Skipping that
 /// step made `n = n + step; acc.write(n);` and `acc.write(n); n = n + step;` emit
 /// identical SystemVerilog — `TODO` cause L.
+/// Names a comb statement DEFINES (wires it drives, ports, index-assign bases),
+/// recursing into branches. Memory stagings define implicit nets, so a
+/// statement touching them is treated as opaque by the merge below.
+fn shir_stmt_defs(stmt: &SHIRStmt, out: &mut HashSet<String>) {
+    match stmt {
+        SHIRStmt::Wire { name, .. } => {
+            out.insert(name.clone());
+        }
+        SHIRStmt::PortDrive { port_name, .. } => {
+            out.insert(port_name.clone());
+        }
+        SHIRStmt::IndexAssign { base, .. } => {
+            out.insert(base.clone());
+        }
+        SHIRStmt::If { then_stmts, else_stmts, .. } => {
+            for st in then_stmts {
+                shir_stmt_defs(st, out);
+            }
+            if let Some(els) = else_stmts {
+                for st in els {
+                    shir_stmt_defs(st, out);
+                }
+            }
+        }
+        SHIRStmt::Match { arms, .. } => {
+            for arm in arms {
+                for st in &arm.stmts {
+                    shir_stmt_defs(st, out);
+                }
+            }
+        }
+        SHIRStmt::ForLoop { body, .. } => {
+            for st in body {
+                shir_stmt_defs(st, out);
+            }
+        }
+        SHIRStmt::MemRead { .. } | SHIRStmt::MemWrite { .. } => {}
+    }
+}
+
+/// Names a comb statement READS, both value and edge forms (conservative).
+fn shir_stmt_uses(stmt: &SHIRStmt, out: &mut HashSet<String>) {
+    use crate::vlir_lower::shir_expr_vars;
+    match stmt {
+        SHIRStmt::Wire { value, .. } => shir_expr_vars(value, out),
+        SHIRStmt::PortDrive { value, edge_value, .. } => {
+            shir_expr_vars(value, out);
+            shir_expr_vars(edge_value, out);
+        }
+        SHIRStmt::IndexAssign { index, value, .. } => {
+            shir_expr_vars(index, out);
+            shir_expr_vars(value, out);
+        }
+        SHIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => {
+            shir_expr_vars(condition, out);
+            shir_expr_vars(edge_condition, out);
+            for st in then_stmts {
+                shir_stmt_uses(st, out);
+            }
+            if let Some(els) = else_stmts {
+                for st in els {
+                    shir_stmt_uses(st, out);
+                }
+            }
+        }
+        SHIRStmt::Match { scrutinee, edge_scrutinee, arms } => {
+            shir_expr_vars(scrutinee, out);
+            shir_expr_vars(edge_scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    shir_expr_vars(g, out);
+                }
+                for st in &arm.stmts {
+                    shir_stmt_uses(st, out);
+                }
+            }
+        }
+        SHIRStmt::ForLoop { start, end, body, .. } => {
+            shir_expr_vars(start, out);
+            shir_expr_vars(end, out);
+            for st in body {
+                shir_stmt_uses(st, out);
+            }
+        }
+        SHIRStmt::MemRead { addr, .. } => shir_expr_vars(addr, out),
+        SHIRStmt::MemWrite { addr, value, .. } => {
+            shir_expr_vars(addr, out);
+            shir_expr_vars(value, out);
+        }
+    }
+}
+
+/// Splice the trailing segment's combinational statements ahead of the head's —
+/// the simulator's execution order (post-edge settle first) — while HOISTING
+/// past them any head statements that define names the trailing statements
+/// read. Without the hoist, a trailing wire computed from a head-segment `let`
+/// (`let next = f(xv)` after the tick, `let xv = x.read()` before it) emits as
+/// use-before-def in the `always_comb`: the settle still converges to the same
+/// fixpoint, but Verilator's ALWCOMBORDER makes it fatal under `-Wall`.
+///
+/// The hoist is exact, not a general reorder: a head statement moves only when
+/// (a) it defines a name the trailing statements (or an already-hoisted
+/// statement) read, (b) it reads nothing the trailing statements define — a
+/// genuine cycle stays in stated order — and (c) every name involved has a
+/// single defining statement, so the default-then-override reassignment idiom
+/// is never split. Statements that do not qualify keep their stated order, so
+/// emission is unchanged wherever the hazard is absent.
+fn merge_trailing_before_head(trailing: Vec<SHIRStmt>, head: Vec<SHIRStmt>) -> Vec<SHIRStmt> {
+    let mut trailing_defs = HashSet::new();
+    let mut needed = HashSet::new();
+    for st in &trailing {
+        shir_stmt_defs(st, &mut trailing_defs);
+        shir_stmt_uses(st, &mut needed);
+    }
+
+    let head_meta: Vec<(HashSet<String>, HashSet<String>)> = head
+        .iter()
+        .map(|st| {
+            let mut d = HashSet::new();
+            let mut u = HashSet::new();
+            shir_stmt_defs(st, &mut d);
+            shir_stmt_uses(st, &mut u);
+            (d, u)
+        })
+        .collect();
+
+    // Names with more than one defining statement (the default-then-override
+    // idiom) are never hoisted across.
+    let mut def_counts: HashMap<String, usize> = HashMap::new();
+    for (d, _) in &head_meta {
+        for n in d {
+            *def_counts.entry(n.clone()).or_insert(0) += 1;
+        }
+    }
+    for n in &trailing_defs {
+        *def_counts.entry(n.clone()).or_insert(0) += 1;
+    }
+    let multi: HashSet<&String> =
+        def_counts.iter().filter(|(_, c)| **c > 1).map(|(n, _)| n).collect();
+
+    let mut hoist = vec![false; head.len()];
+    loop {
+        let mut changed = false;
+        for (i, (defs, uses)) in head_meta.iter().enumerate() {
+            if !hoist[i]
+                && defs.iter().any(|n| needed.contains(n))
+                && defs.iter().all(|n| !multi.contains(n))
+                && uses.iter().all(|n| !trailing_defs.contains(n))
+            {
+                hoist[i] = true;
+                for n in uses {
+                    needed.insert(n.clone());
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Prune: a hoisted statement must not read a name whose only head
+    // definition stays UNHOISTED (that would create the very hazard among the
+    // head statements themselves).
+    loop {
+        let mut unhoisted_defs = HashSet::new();
+        for (i, (defs, _)) in head_meta.iter().enumerate() {
+            if !hoist[i] {
+                for n in defs {
+                    unhoisted_defs.insert(n.clone());
+                }
+            }
+        }
+        let mut changed = false;
+        for (i, (_, uses)) in head_meta.iter().enumerate() {
+            if hoist[i] && uses.iter().any(|n| unhoisted_defs.contains(n)) {
+                hoist[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut merged = Vec::with_capacity(trailing.len() + head.len());
+    let mut rest = Vec::new();
+    for (i, st) in head.into_iter().enumerate() {
+        if hoist[i] {
+            merged.push(st);
+        } else {
+            rest.push(st);
+        }
+    }
+    merged.extend(trailing);
+    merged.extend(rest);
+    merged
+}
+
 fn lower_pre_edge_stmts(
     stmts: &[CHIRStmt],
     promoted_names: &HashSet<String>,

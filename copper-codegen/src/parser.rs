@@ -1047,6 +1047,21 @@ fn extract_local_name(local: &syn::Local) -> Option<String> {
             syn::Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
             _ => None,
         },
+        // A tuple destructuring `let (a, b, _) = …` keeps its binder list as
+        // `"(a, b, _)"`; the CHIR lowering splits it back into one binding per
+        // element. Anything fancier than plain idents/wildcards stays opaque.
+        syn::Pat::Tuple(t) => {
+            let names: Option<Vec<String>> = t
+                .elems
+                .iter()
+                .map(|p| match p {
+                    syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
+                    syn::Pat::Wild(_) => Some("_".to_string()),
+                    _ => None,
+                })
+                .collect();
+            names.map(|n| format!("({})", n.join(", ")))
+        }
         _ => None,
     }
 }

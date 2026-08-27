@@ -29,9 +29,11 @@ fn div8(a: In<Bits<8>, ()>, b: In<Bits<8>, ()>, o: Out<Bits<8>, ()>) {
 }
 "#;
 
-/// `arithmetic_shift_right` — the signed (sign-filling) shift. The simulator has
-/// it (`Bits::arithmetic_shift_right`), but it is not in the transpiler's method
-/// surface, so a signed-shift design has no sim≡transpiled coverage.
+/// `arithmetic_shift_right` — the signed (sign-filling) shift. SUPPORTED as of
+/// 2026-08-27: it lowers to `$signed(a) >>> n`, the same SignCast path the
+/// `as i32` cast spelling takes (signedness_dut anchors that semantics against
+/// Verilator). The sim≡transpiled behavioural check is the corpus sweep of
+/// `tests/fixtures/struct_pipeline_dut.rs::sra_method`.
 const ASR_DUT: &str = r#"
 #[hardware(combinational)]
 fn asr8(a: In<Bits<8>, ()>, o: Out<Bits<8>, ()>) {
@@ -66,14 +68,12 @@ fn remainder_operator_is_supported() {
 }
 
 #[test]
-fn arithmetic_shift_right_is_unsupported() {
-    let err = transpile(ASR_DUT).expect_err(
-        "NOW SUPPORTED: `arithmetic_shift_right` transpiles — add a signed-shift \
-         equivalence test.",
-    );
+fn arithmetic_shift_right_is_supported() {
+    let sv = transpile(ASR_DUT)
+        .expect("`arithmetic_shift_right` should transpile (supported 2026-08-27)");
     assert!(
-        err.contains("arithmetic_shift_right") && err.contains("not supported"),
-        "reproduced a *different* transpile error than the tracked asr gap: {err}"
+        sv.contains(">>>") && sv.contains("$signed"),
+        "expected the signed shift `$signed(…) >>> …` in the emitted SV, got:\n{sv}"
     );
 }
 

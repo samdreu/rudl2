@@ -205,11 +205,17 @@ TRANSPILATION:
   point: coverage was never going to show them, and two of them were silent.
   The 5 still failing, by ROOT CAUSE, as measured on 2026-08-25 (P added 2026-08-26):
     F   Vec ports ................. rv32i_cpu (190:13)
-    P   a RECEIVED `Memory<…>` parameter ... rv32i_cpu_pipelined (224:12), which
-        moved off F on 2026-08-26 when it stopped taking its program as a `Vec`
+    (P is FIXED as of 2026-08-27 — received memories get a bus port ABI, see
+    design_docs/RECEIVED_MEMORY_ABI.md. rv32i_cpu_pipelined then surfaced its
+    OWN blockers; the struct latches / conditional struct+tuple lets / block
+    bindings / `arithmetic_shift_right` all landed 2026-08-27
+    (tests/fixtures/struct_pipeline_dut.rs), leaving exactly two, both known
+    causes: file-scope consts as match PATTERNS, and the word-indexed
+    `[Bits<32>; 32]` register file, which no IR stage supports.)
+    P-remaining  rv32i_cpu_pipelined (413:29 const pattern; regfile array)
     (Q is FIXED as of 2026-08-26 — see below. rv32i_cpu_transpilable now SWEEPS.)
-    J-b tuple-returning helper .... ripple_carry_adder (27:8, reported as a width
-        error — same message, different mechanism; see J)
+    (J-b is FIXED as of 2026-08-27 — the tuple-destructuring `let` lowering
+    inlines the helper and projects per element. ripple_carry_adder SWEEPS.)
     (uart/rx is no longer here — see UART/RX, REWRITTEN below)
     H   file-level `spawn_uart` rejection ... uart_tx, uart_rx (examples/uart/system.rs)
   Full history of every cause, live and retired:
@@ -626,10 +632,13 @@ TRANSPILATION:
             THIS UNBLOCKED NOTHING BY ITSELF: bsg_gray_to_binary now reports its
             real remaining blocker, a `while` loop (cause C). Same
             first-error-was-masking-the-second pattern as rv32i_cpu and D-a.
-        J-b ☐ ripple_carry_adder (27:8) is the TUPLE-RETURNING HELPER gap, not a
-            width gap at all — `let (s, c) = full_adder(…)`. Already pinned by
-            transpile_inference_gaps.rs::tuple_returning_helper_is_a_known_transpile_gap;
-            it was only filed here because it prints the same message.
+        J-b ✔ FIXED (2026-08-27) — ripple_carry_adder (27:8) was the
+            TUPLE-RETURNING HELPER gap, not a width gap at all — `let (s, c) =
+            full_adder(…)`. Closed by the tuple-destructuring `let` lowering
+            (the call inlines via #7b, then projects per element); the pin in
+            transpile_inference_gaps.rs is now the positive assertion
+            `tuple_returning_helper_transpiles`, and ripple_carry_adder sweeps
+            differentially (its build.rs SKIP entry is deleted).
   NO LONGER BLOCKED (verified by the 2026-08-25 sweep, absent from the failing
   list): det_010_awaits, which C-a unblocked. It had been filed under C, then
   re-filed as "tick inside a conditional branch (65:8)" — and neither was its own

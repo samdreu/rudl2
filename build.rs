@@ -78,12 +78,15 @@ const SKIP: &[(&str, &str)] = &[
     (
         "rv32i_cpu_pipelined",
         "receives its unified instruction/data `Memory` as a parameter, so the sweep cannot \
-         supply one (see the Kind::Memory rule below, which would skip it anyway). Cause P is \
-         DISCHARGED (2026-08-27): a received memory now has a bus port ABI \
-         (design_docs/RECEIVED_MEMORY_ABI.md, verified by tests/received_memory_abi.rs) — the \
-         remaining transpile blockers are the module's own: the struct-typed pipeline latches \
-         and the tuple-returning EX stage (width inference at the latch initializers is the \
-         first refusal reached) (TODO, TRANSPILER COVERAGE)",
+         supply one (see the Kind::Memory rule below, which would skip it anyway). Cause P \
+         DISCHARGED 2026-08-27 (received-memory bus ABI, RECEIVED_MEMORY_ABI.md); the \
+         struct latches, conditional struct/tuple lets, block bindings, and \
+         `arithmetic_shift_right` all lower as of 2026-08-27 (tests/fixtures/\
+         struct_pipeline_dut.rs sweeps them). TWO blockers remain, both pre-existing named \
+         causes: file-scope consts as match PATTERNS (`match opcode { OP_LUI => … }`, same \
+         cause as match_on_const_pattern below), and the `[Bits<32>; 32]` register FILE — a \
+         word-indexed array register, which no IR stage supports (Index lowers to a bit \
+         select; the transpilable CPU spells it as 31 named scalars instead)",
     ),
     // ── The claim ledger: tests/fixtures/{bits_ops,signedness,aggregate_locals,
     // match_selector,out_phase,mem_address_width}_dut.rs. Each module below is a
@@ -157,12 +160,6 @@ const SKIP: &[(&str, &str)] = &[
     (
         "uart_rx",
         "does not transpile: cause H, the same file-level `spawn_uart` rejection as `uart_tx`",
-    ),
-    (
-        "ex_combinational_ripple_carry_adder::ripple_carry_adder",
-        "does not transpile: cause J-b, a tuple-returning helper (`let (s, c) = full_adder(…)`), \
-         reported as a width error. Pinned by transpile_inference_gaps.rs. The fixture copy is \
-         written without the helper and does sweep",
     ),
     (
         "trailing_constant",
