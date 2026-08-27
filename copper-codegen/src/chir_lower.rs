@@ -608,7 +608,12 @@ enum ValueCtor {
     FromInt { width: usize },
     /// A zero-argument constructor with a fixed value whose *width comes from
     /// context*: `Bits::from_lit::<V>()` (value V) and `Bits::zero()` (0).
-    Const { value: u128 },
+    /// `width` is the TYPE-position turbofish when the author wrote one
+    /// (`Bits::<32>::from_lit::<1>` / `Bits::<32>::zero`) — before it was
+    /// honoured, such a literal fell back to the 64-bit default and tripped
+    /// WIDTHTRUNC wherever no sibling operand supplied the width (the
+    /// `lit_width_in_ternary` ledger entry).
+    Const { value: u128, width: Option<usize> },
 }
 
 /// Classify a constructor call path.
@@ -618,10 +623,11 @@ enum ValueCtor {
 /// type's width (`Bits::<8>::from_u8`).
 fn classify_value_ctor(path: &str) -> Option<ValueCtor> {
     if path.contains("from_lit") {
-        return trailing_const_param(path).map(|value| ValueCtor::Const { value });
+        return trailing_const_param(path)
+            .map(|value| ValueCtor::Const { value, width: leading_type_width(path) });
     }
     if path.ends_with("::zero") || path == "zero" {
-        return Some(ValueCtor::Const { value: 0 });
+        return Some(ValueCtor::Const { value: 0, width: type_turbofish_width(path) });
     }
     for (name, w) in [
         ("from_u128", 128usize),
@@ -641,6 +647,21 @@ fn classify_value_ctor(path: &str) -> Option<ValueCtor> {
         }
     }
     None
+}
+
+/// The TYPE-position turbofish width of a path that ALSO ends in a method
+/// const-parameter: `Bits::<32>::from_lit::<1>` → 32. `None` when the only
+/// turbofish is the trailing one (`Bits::from_lit::<1>`), whose value position
+/// `type_turbofish_width` already refuses.
+fn leading_type_width(path: &str) -> Option<usize> {
+    let first = path.find("::<")?;
+    let last = path.rfind("::<")?;
+    if first == last {
+        return None;
+    }
+    let rest = &path[first + 3..];
+    let end = rest.find('>')?;
+    rest[..end].trim().parse::<usize>().ok()
 }
 
 /// Value of a **trailing** method const-parameter: `Bits::from_lit::<3>` → 3.
@@ -756,6 +777,23 @@ fn build_struct_registry(fir: &FrontendModuleIR) -> std::collections::HashMap<St
         .iter()
         .map(|s| (s.name.clone(), s.clone()))
         .collect()
+}
+
+/// The bit width of a resolved hardware type when it is CONCRETE; `None` for a
+/// symbolic (module-parameter) width. `width_of_chir_expr` is an Option-typed
+/// query and must DECLINE parametric widths rather than panic — reaching
+/// `Width::concrete()` from it took down every parametric module the moment the
+/// mux-arm literal balancing asked a width question the binop path had never
+/// happened to ask (found by sv-baseline on the BaseJump generics, 2026-08-27).
+fn width_of_type_concrete(ty: &CHIRType) -> Option<usize> {
+    match ty {
+        CHIRType::UInt { width } | CHIRType::SInt { width } => match width {
+            Width::Concrete(n) => Some(*n),
+            Width::Param(_) => None,
+        },
+        CHIRType::Bool => Some(1),
+        CHIRType::Array { elem, .. } => width_of_type_concrete(elem),
+    }
 }
 
 /// The bit width of a resolved hardware type.
@@ -2192,6 +2230,7 @@ fn lower_expr_stmt(
             let mut arms = Vec::new();
             for arm in &match_expr.arms {
                 let patterns = parse_or_patterns(&arm.pattern_text, span, &ctx.enums)?;
+                let patterns = size_patterns_to_scrutinee(patterns, &scrutinee, span, ctx)?;
                 let guard = arm.guard.as_ref().map(|g| lower_expr(g, ctx)).transpose()?;
                 let body_stmts = match arm.body.as_ref() {
                     ExprType::Block(block) => lower_stmts(&block.stmts, ctx)?,
@@ -2338,6 +2377,27 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
         ExprType::Unary(un) => {
             let inner = lower_expr(&un.expr, ctx)?;
             let op = lower_unop(&un.op, un.span)?;
+            // Rust has no `~`: `!` IS bitwise Not on integers and `Bits<N>`
+            // (`std::ops::Not`), and logical not only on `bool`. Emitting `!`
+            // verbatim made `!mask` collapse to one bit (SystemVerilog LOGICAL
+            // negation) — the `bit_not_bits` ledger entry, which reached
+            // rv32i_cpu_pipelined's JALR alignment mask and zeroed every jump
+            // target. Width decides: multi-bit → `~`; 1-bit/bool (or unknown
+            // width) → `!`, which keeps `bit_not_bool` exact and is identical
+            // for one bit anyway.
+            let operand_is_boolean = matches!(&inner,
+                CHIRExpr::BinOp { op, .. } if matches!(op,
+                    CHIRBinOp::Eq | CHIRBinOp::Neq
+                    | CHIRBinOp::Lt | CHIRBinOp::Lte | CHIRBinOp::Gt | CHIRBinOp::Gte
+                    | CHIRBinOp::LogicalAnd | CHIRBinOp::LogicalOr));
+            let op = if matches!(op, CHIRUnOp::LogicalNot)
+                && !operand_is_boolean
+                && width_of_chir_expr(&inner, ctx).is_some_and(|w| w > 1)
+            {
+                CHIRUnOp::BitNot
+            } else {
+                op
+            };
             // Negation of a signed value is bit-identical (two's complement);
             // keep the wrapper on the RESULT so a downstream compare or shift
             // still sees signedness.
@@ -2361,6 +2421,12 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
                     span: if_expr.span,
                     suggested_rewrite: None,
                 })?;
+            // A mux's arms are one value at two spellings, so a default-width
+            // literal arm takes the other arm's width exactly as a binop
+            // operand does (`lit_width_in_ternary`'s `Bits::zero()` else-arm:
+            // the `from_lit` arm carries a declared 32, the bare zero must not
+            // stay 64 and WIDTHTRUNC into the port).
+            let (then_val, else_val) = balance_binop_literals(then_val, else_val, ctx);
             Ok(CHIRExpr::Mux {
                 cond: Box::new(cond),
                 then_val: Box::new(then_val),
@@ -2380,6 +2446,8 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
             }
             for arm in &match_expr.arms {
                 let patterns = parse_or_patterns(&arm.pattern_text, match_expr.span, &ctx.enums)?;
+                let patterns =
+                    size_patterns_to_scrutinee(patterns, &scrutinee, match_expr.span, ctx)?;
                 let guard = arm.guard.as_ref().map(|g| lower_expr(g, ctx)).transpose()?;
                 let value = lower_expr(&arm.body, ctx)?;
                 // Wildcard with no guard → default arm
@@ -2417,11 +2485,13 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
                     // `Bits::from_u32(x)` — the value is the argument,
                     // reinterpreted as a `width`-bit value.
                     ValueCtor::FromInt { width } => lower_bits_constructor(call, width, ctx),
-                    // `Bits::from_lit::<1>()` / `Bits::zero()` — a fixed value at
-                    // the default literal width, so the surrounding assignment or
-                    // operand determines the final width.
-                    ValueCtor::Const { value } => Ok(CHIRExpr::Lit(CHIRLit {
-                        ty: CHIRType::UInt { width: Width::Concrete(DEFAULT_LIT_WIDTH) },
+                    // `Bits::from_lit::<1>()` / `Bits::zero()` — a fixed value.
+                    // A type-position turbofish pins the width; otherwise the
+                    // default lets the surrounding assignment or operand decide.
+                    ValueCtor::Const { value, width } => Ok(CHIRExpr::Lit(CHIRLit {
+                        ty: CHIRType::UInt {
+                            width: Width::Concrete(width.unwrap_or(DEFAULT_LIT_WIDTH)),
+                        },
                         value,
                     })),
                 }
@@ -2966,10 +3036,10 @@ fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
         CHIRExpr::Var(name) => ctx
             .symbols
             .get(name)
-            .map(width_of_type)
+            .and_then(width_of_type_concrete)
             // Not a signal: a `parameter int` / `localparam int` is 32 bits.
             .or_else(|| ctx.params.contains(name).then_some(32)),
-        CHIRExpr::Lit(l) => Some(width_of_type(&l.ty)),
+        CHIRExpr::Lit(l) => width_of_type_concrete(&l.ty),
         CHIRExpr::BinOp { left, right, .. } => {
             width_of_chir_expr(left, ctx).or_else(|| width_of_chir_expr(right, ctx))
         }
@@ -3407,6 +3477,61 @@ fn lower_hardware_call(
 }
 
 // ── Pattern parsing ───────────────────────────────────────────────────────────
+
+/// Size suffix-less integer pattern literals to the scrutinee's width.
+///
+/// `parse_pattern` gives a bare `55` the 64-bit default, and the emitted case
+/// label then compares `op == 64'd55` — WIDTHEXPAND against a narrower
+/// scrutinee (the `match_on_usize` / `match_on_literals` ledger entries; the
+/// width comes from the LITERAL, not the scrutinee). A literal whose value does
+/// not fit the scrutinee's width keeps the default rather than silently
+/// truncating into a different match.
+///
+/// Also the home of the const-in-pattern diagnostic: a name that is really a
+/// file-scope const (a `localparam`) parses as an enum-variant pattern and used
+/// to surface much later as a misleading tuple-pattern error (the
+/// `match_on_const_pattern` ledger entry). Consts are supported in match
+/// EXPRESSIONS only; say so, at the arm, with the working spelling.
+fn size_patterns_to_scrutinee(
+    patterns: Vec<CHIRPattern>,
+    scrutinee: &CHIRExpr,
+    span: SourceSpan,
+    ctx: &LowerCtx,
+) -> Result<Vec<CHIRPattern>, CHIRLowerError> {
+    for p in &patterns {
+        if let CHIRPattern::EnumVariant { name, .. } = p {
+            if ctx.params.contains(name) {
+                return Err(CHIRLowerError::UnsupportedConstruct {
+                    description: format!(
+                        "`{name}` is a file-scope const used as a match PATTERN; consts                          lower to localparams and are supported in match expressions and                          conditions only"
+                    ),
+                    span,
+                    suggested_rewrite: Some(format!(
+                        "rewrite the arm as an if/else-if chain comparing `== {name}`                          (the `ifchain_on_const_expr` spelling)"
+                    )),
+                });
+            }
+        }
+    }
+    let Some(w) = width_of_chir_expr(scrutinee, ctx) else { return Ok(patterns) };
+    Ok(patterns
+        .into_iter()
+        .map(|p| match p {
+            CHIRPattern::Lit(CHIRLit {
+                ty: CHIRType::UInt { width: Width::Concrete(dw) },
+                value,
+            }) if dw == DEFAULT_LIT_WIDTH
+                && (w >= 128 || value < (1u128 << w)) =>
+            {
+                CHIRPattern::Lit(CHIRLit {
+                    ty: CHIRType::UInt { width: Width::Concrete(w) },
+                    value,
+                })
+            }
+            other => other,
+        })
+        .collect())
+}
 
 /// Parse a `pattern_text` string into a single `CHIRPattern`.
 pub fn parse_pattern(

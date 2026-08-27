@@ -128,11 +128,14 @@ const SKIP: &[(&str, &str)] = &[
     ),
     (
         "out_from_reg_before_commit",
-        "ONE-CYCLE DIVERGENCE, and no existing check catches it: a plain `Out` driven from a \
-         register and written BEFORE the register commits leads the simulator by a cycle. \
-         D1's guard exempts the segment because an `In` read precedes the write. Found by the \
-         sweep on rv32i_cpu_transpilable's `program_counter`. \
-         `out_from_reg_after_commit` is the shape that agrees and sweeps",
+        "ONE-CYCLE DIVERGENCE, GUARDED as of 2026-08-27: the trailing clause of \
+         `pretick_out_write_before_update` refuses the shape (a trailing plain-`Out` write \
+         before the update of a register it reads publishes the previous generation for the \
+         whole cycle); this fixture keeps `allow_pretick_alignment` as the demonstration. \
+         Measured minimal as `v8t_stage_publish_then_load`; the landing-day catch was \
+         module_composition_hybrid's three pipeline stages (sim-only tests), migrated to the \
+         canonical write/read/tick/update spelling. `out_from_reg_after_commit` is the \
+         agreeing flip and sweeps",
     ),
     (
         "regout_trailing_single_tick",

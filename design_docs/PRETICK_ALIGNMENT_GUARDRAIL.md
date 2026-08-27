@@ -26,7 +26,7 @@
 > | …its **constant-write** clause (§5.5) | the same, where the port is written on *some* paths only — a constant is idempotent across the phase shift only if it lands on every path | 3 modules, all measured divergences |
 > | `unprotected_trailing_out_write` (§5.4; narrowed 2026-08-27) | the same hazard past the *last* tick, when the body crosses more than one clock edge per iteration **and some tick sits inside control flow** (`has_nested_tick`, the source-level mirror of extraction's trigger) — the LINEAR class is exempt, measured agreeing; the extracted class is measured one-edge-late wherever the last tick sits | 1 real module (`rv32i_cpu_pipelined`, → `RegOut`) |
 > | `multi_phase_out_write` | a plain `Out` driven in more than one clock phase | 9 modules, six of them its own witnesses |
-> | `pretick_out_write_before_update` (§5.6, 2026-08-26) | a plain `Out` written between a leading `In` read and the update of a register the write reads | 0 real modules; caught a silently-divergent compile-only UI fixture the day it landed |
+> | `pretick_out_write_before_update` (§5.6, 2026-08-26; trailing clause 2026-08-27) | a plain `Out` written before the update of a register it reads — behind a leading read in the pre-tick segment, or anywhere in the trailing segment (whose updates commit at the opening edge) | 0 real modules at landing (caught a compile-only UI fixture); the trailing clause then caught THREE real sim-only-tested modules (`module_composition_hybrid`'s stages, measured divergent as `v8t_stage_publish_then_load`, migrated to the canonical write/read/tick/update spelling) |
 >
 > **Pinned by:** `tests/sequential_forwarding_divergence.rs` (10 tests, green; each
 > flips loudly when the corresponding divergence is fixed).
@@ -565,8 +565,24 @@ Rule: `Cfg::pretick_out_write_before_update`, three clauses, each with a flippin
 witness (V8c flips the read clause, V8b the update-order clause, a constant write
 the register-read clause). Enforced in the macro with the same
 `allow_pretick_alignment` opt-out; exact-set pinned as the fourth scan in
-`pretick_alignment_corpus.rs`. Honest scope (R6): pre-tick region only, like D1;
-conditional writes carry no extra clause because none has a measured divergence.
+`pretick_alignment_corpus.rs`.
+
+**The trailing clause (2026-08-27).** The identical mixed-generation hazard
+exists in the trailing segment with no read involved: trailing statements
+execute at the cycle's opening and commit at that same edge, so a
+publish-then-load order shows the previous generation all cycle. Flipping pair:
+the `out_phase_dut.rs` claim-ledger entries (`before_commit` diverges,
+`after_commit` agrees), minimal-measured as `v8t_stage_publish_then_load` (sim
+`[0,2,3,…]`, SV `[2,3,4,…]`). On landing the exact-set pin surfaced **three
+real modules** — `module_composition_hybrid`'s pipeline stages, whose tests were
+sim-only and whose composed pipeline stream also carried the phantom extra
+cycle — migrated to the canonical registered-stage spelling
+(`write; read; tick; update`, which matches `always_ff reg <= f(in); assign out
+= reg` cycle-for-cycle standalone and composed) and their streams re-blessed to
+the true two-flop latency. Honest scope (R6): pre-tick and trailing regions;
+middle segments of multi-tick loops are unexamined (no measured instance);
+conditional writes carry no extra clause because none has a measured
+divergence.
 
 ### 5.7 The dissolution and the narrowing — cycle-dataflow phases B and D, 2026-08-26
 

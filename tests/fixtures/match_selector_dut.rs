@@ -8,7 +8,9 @@
 const OP_ALPHA: u32 = 0x37;
 const OP_BETA:  u32 = 0x6F;
 
-/// **BROKEN.** A `match` emits 64-bit case labels. Measured against a `usize`
+/// FIXED 2026-08-27 (was: a `match` emitted 64-bit case labels — suffix-less
+/// pattern literals now take the scrutinee's width, value-fit guarded).
+/// Measured against a `usize`
 /// scrutinee here and against a `u32` in `match_on_literals` below: the width comes
 /// from the LITERAL, not from the scrutinee, so no integer type escapes it.
 #[hardware(sequential)]
@@ -57,7 +59,10 @@ pub async fn ifchain_on_usize(
     }
 }
 
-/// **BROKEN.** A named `const` as a match PATTERN. It reads as an enum-variant
+/// STILL REFUSED, now with an honest diagnostic (2026-08-27): a named `const`
+/// as a match PATTERN is named as exactly that, pointing at the if-chain
+/// spelling. Full support is a name-carrying pattern kind through the IRs — a
+/// feature, tracked in the SKIP entry. Previously it read as an enum-variant
 /// pattern and is refused — with a message about tuple patterns, which is not
 /// what it is.
 #[hardware(sequential)]
@@ -93,7 +98,8 @@ pub async fn ifchain_on_const_expr(
     }
 }
 
-/// **BROKEN — and it was written as a control that would pass.** A `match` on a
+/// FIXED 2026-08-27 (and originally written as a control expected to pass —
+/// which is how the claim was narrowed to "the literal decides"). A `match` on a
 /// `u32` with literal patterns, which transpiles and which I expected to Verilate.
 /// It emits `op == 64'd55`. That is what narrowed the claim above from "a `match`
 /// on a `usize`" to "a `match` literal", and it is the reason this file exists: the

@@ -351,6 +351,17 @@ const EXPECTED_WRITE_BEFORE_UPDATE: &[&str] = &[
     // fixture nobody had measured; it diverges exactly like V8a and is pinned as
     // this witness; the fixture itself was reordered to the legal V8c form).
     "tests/sequential_forwarding_divergence.rs::v8d_temp_renamed_update",
+    // The TRAILING clause (added 2026-08-27): a plain `Out` written before the
+    // update of a register it reads in the trailing segment publishes the
+    // previous generation for the whole cycle. Its landing-day catch was three
+    // REAL modules — module_composition_hybrid's pipeline stages, whose tests
+    // were sim-only and whose shape was measured divergent as
+    // `v8t_stage_publish_then_load`; they were migrated to the canonical
+    // write/read/tick/update spelling. The two below are the demonstration
+    // witnesses that remain: the claim-ledger pair's divergent half, and the
+    // minimal stage shape.
+    "tests/fixtures/out_phase_dut.rs::out_from_reg_before_commit",
+    "tests/sequential_forwarding_divergence.rs::v8t_stage_publish_then_load",
 ];
 
 #[test]

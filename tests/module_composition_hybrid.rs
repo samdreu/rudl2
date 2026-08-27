@@ -29,20 +29,40 @@ fn affine_mix(x: u8) -> u8 {
 #[hardware(sequential)]
 async fn stage_add_one(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
+    // The canonical registered-stage spelling (migrated 2026-08-27): publish the
+    // committed register at the cycle's opening, sample the input at the
+    // pre-edge exactly as the flop does (a leading read is `Deferred`), commit
+    // the update at the edge. This matches `always_ff reg <= add_one(input);
+    // assign output = reg;` cycle-for-cycle, standalone AND composed — a
+    // two-stage pipeline keeps its two-cycle latency. The old trailing
+    // publish-then-load order published the PRE-update value and diverged from
+    // its own emitted SV by one (measured as `v8t_stage_publish_then_load`);
+    // the extended `pretick_out_write_before_update` now refuses it.
     loop {
-        clk.tick().await;
         output.write(reg);
-        reg = add_one(input.read());
+        let x = input.read();
+        clk.tick().await;
+        reg = add_one(x);
     }
 }
 
 #[hardware(sequential)]
 async fn stage_double(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
+    // The canonical registered-stage spelling (migrated 2026-08-27): publish the
+    // committed register at the cycle's opening, sample the input at the
+    // pre-edge exactly as the flop does (a leading read is `Deferred`), commit
+    // the update at the edge. This matches `always_ff reg <= double(input);
+    // assign output = reg;` cycle-for-cycle, standalone AND composed — a
+    // two-stage pipeline keeps its two-cycle latency. The old trailing
+    // publish-then-load order published the PRE-update value and diverged from
+    // its own emitted SV by one (measured as `v8t_stage_publish_then_load`);
+    // the extended `pretick_out_write_before_update` now refuses it.
     loop {
-        clk.tick().await;
         output.write(reg);
-        reg = double(input.read());
+        let x = input.read();
+        clk.tick().await;
+        reg = double(x);
     }
 }
 
@@ -52,9 +72,10 @@ async fn stage_double(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u
 #[hardware(sequential)]
 async fn counter_by<const STEP: u8>(clk: Clock<MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
+    // Head-write spelling — see stage_add_one's migration note.
     loop {
-        clk.tick().await;
         output.write(reg);
+        clk.tick().await;
         reg = reg.wrapping_add(STEP);
     }
 }
@@ -94,9 +115,14 @@ fn sequential_modules_spawn_with_spawn_child() {
         s2_reads
     );
 
-    // Two-stage registered pipeline: affine_mix has a 2-cycle latency.
+    // Two-stage registered pipeline: affine_mix has a TWO-FLOP latency — the
+    // input driven before edge k is sampled at k's pre-edge, commits through
+    // stage 1 at edge k and stage 2 at edge k+1, so it appears at observation
+    // k+1. Re-blessed with the canonical stage spelling (2026-08-27): the old
+    // stream had one extra cycle, which was the stages' measured divergence
+    // from their own emitted SV, not the pipeline's latency.
     let inputs = [3u8, 7, 11, 1];
-    let expected_outputs = [0u8, 0, 8, 16];
+    let expected_outputs = [0u8, 8, 16, 24];
 
     for (input, expected) in inputs.iter().zip(expected_outputs.iter()) {
         in_drv.write(*input);
@@ -134,7 +160,10 @@ fn peer_modules_continue_using_spawn_untracked() {
     exec.spawn_untracked(counter_by::<2>(clk.clone(), out2_drv), vec![]);
     exec.spawn_untracked(counter_by::<5>(clk.clone(), out3_drv), vec![]);
 
-    let expected = [(0u8, 0u8, 0u8), (1, 2, 5), (2, 4, 10), (3, 6, 15)];
+    // Re-blessed with the head-write migration: the first observation shows the
+    // count committed at the first edge (the `counter` example's anchored
+    // semantics), not the pre-update initial value.
+    let expected = [(1u8, 2u8, 5u8), (2, 4, 10), (3, 6, 15), (4, 8, 20)];
 
     for (exp1, exp2, exp3) in expected {
         exec.tick_clock(&mut clk);

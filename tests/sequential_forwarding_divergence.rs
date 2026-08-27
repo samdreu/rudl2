@@ -1579,3 +1579,113 @@ fn branch_trailing_probe() {
          EXPECTED_TRAILING, and the phase-C scope notes together"
     );
 }
+
+// ── V8t — the TRAILING write-before-update, stage-machine spelling ────────────
+//
+// Added while extending `pretick_out_write_before_update` with its trailing
+// clause (2026-08-27): the exact-set pin flagged `module_composition_hybrid`'s
+// pipeline stages alongside the measured `out_from_reg_before_commit`, and
+// those stages' own tests are SIM-ONLY — their sim ≡ SV status was unmeasured.
+// This is their shape, minimal: publish the register, then recompute it from an
+// input, all in the trailing segment. The mixed-generation derivation says the
+// write publishes the PREVIOUS generation for the cycle while `assign o = reg`
+// shows the one committed at the opening edge.
+
+const V8T_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn v8t_stage_publish_then_load(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut reg: Bits<8> = Bits::zero();
+    loop {
+        clk.tick().await;
+        o.write(reg);
+        reg = i.read() + Bits::from_lit::<1>();
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn v8t_stage_publish_then_load(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+    let mut reg: Bits<8> = Bits::zero();
+    loop {
+        clk.tick().await;
+        o.write(reg);
+        reg = i.read() + Bits::from_lit::<1>();
+    }
+}
+
+#[test]
+fn v8t_trailing_stage_shape_verdict() {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (i_drv, i_in) = wire::<Bits<8>, C>(Bits::zero());
+    let (p, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = p.dirty_handle();
+    let reads = vec![i_in.wire_id()];
+    exec.spawn_wired(v8t_stage_publish_then_load(clk.clone(), i_in, p), vec![dh], reads);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|k| {
+            i_drv.write(Bits::from_usize(k + 1));
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    if !verilator_available() {
+        return;
+    }
+    let sv_rows = {
+        let sv = copper_codegen::transpile_source(
+            V8T_SRC,
+            Some("v8t_stage_publish_then_load"),
+            &copper_codegen::EmitConfig::default(),
+        )
+        .expect("transpile");
+        let dir = std::env::temp_dir().join(format!("copper_v8t_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("v8t_stage_publish_then_load.sv");
+        std::fs::write(&p, &sv).unwrap();
+        let mut tb = String::from(
+            "#include \"Vv8t_stage_publish_then_load.h\"\n#include \"verilated.h\"\n#include <iostream>\n\
+             int main(int c, char** v) { Verilated::commandArgs(c, v);\n\
+             Vv8t_stage_publish_then_load* t = new Vv8t_stage_publish_then_load(); t->clk = 0; t->eval();\n",
+        );
+        for k in 0..CYCLES {
+            tb.push_str(&format!(
+                "t->i = {}; t->clk=0; t->eval(); t->clk=1; t->eval(); std::cout << (int)t->o << std::endl;\n",
+                k + 1
+            ));
+        }
+        tb.push_str("return 0; }\n");
+        let tbp = dir.join("tb.cpp");
+        std::fs::write(&tbp, tb).unwrap();
+        let out = verilator_command()
+            .current_dir(&dir)
+            .args(["--cc", "--exe", "--build", "--top-module", "v8t_stage_publish_then_load",
+                   "-Wno-DECLFILENAME", "-Wno-WIDTHEXPAND", "-CFLAGS", "-std=c++14"])
+            .arg(std::fs::canonicalize(&p).unwrap())
+            .arg(&tbp)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "verilator build failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let run = std::process::Command::new(dir.join("obj_dir/Vv8t_stage_publish_then_load")).output().unwrap();
+        let s = String::from_utf8_lossy(&run.stdout).into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        s.lines().filter_map(|l| l.trim().parse::<u8>().ok()).collect::<Vec<u8>>()
+    };
+    // Measured 2026-08-27, first run: the sim publishes the PRE-update register
+    // for each cycle while the SV shows the value committed at the opening edge
+    // — the one-cycle lead, trailing edition. The three module_composition
+    // stages had this exact shape with SIM-ONLY tests; they were migrated to
+    // the canonical write/read/tick/update spelling the same day.
+    let expected_sim: Vec<u8> = std::iter::once(0u8).chain(2..).take(CYCLES).collect();
+    assert_eq!(sim, expected_sim, "simulator behaviour changed");
+    let expected_sv: Vec<u8> = (2..).take(CYCLES).collect();
+    assert_eq!(sv_rows, expected_sv, "transpiled SV behaviour changed");
+    assert_ne!(
+        sim, sv_rows,
+        "sim and SV now AGREE for the trailing publish-then-load shape — the \
+         trailing clause of pretick_out_write_before_update guards a fixed \
+         divergence; re-bless the rule, EXPECTED_WRITE_BEFORE_UPDATE, and the \
+         out_phase ledger entries together"
+    );
+}

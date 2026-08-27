@@ -14,7 +14,10 @@
 /// ran; the emitted `assign` reads the register itself, which has already moved on
 /// — so the hardware leads by a cycle. D1's guard exempts this segment because an
 /// `In` read precedes the write.
-#[hardware(sequential)]
+// GUARDED 2026-08-27: the trailing clause of `pretick_out_write_before_update`
+// now refuses this shape; the opt-out keeps the demonstration compiling while
+// the detection still counts it (the family convention).
+#[hardware(sequential, allow_pretick_alignment)]
 pub async fn out_from_reg_before_commit(
     clk: Clock<MainClk>,
     step: In<Bits<8>, MainClk>,

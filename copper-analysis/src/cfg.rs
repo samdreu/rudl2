@@ -843,9 +843,21 @@ impl Cfg {
     /// `RegOut` is excluded for free (`Node::writes` holds only combinational
     /// outputs), as everywhere in the family.
     ///
+    /// # The trailing clause (added 2026-08-27)
+    ///
+    /// The same mixed-generation hazard exists in the TRAILING segment without
+    /// any read involved: trailing statements execute at the cycle's opening and
+    /// their register updates commit at that same edge, so a write that precedes
+    /// the update publishes the previous generation for the whole cycle.
+    /// Flipping pair: `out_from_reg_before_commit` / `out_from_reg_after_commit`
+    /// (the claim-ledger entries), minimal-measured as
+    /// `v8t_stage_publish_then_load`. Its landing-day catch was three real
+    /// modules with sim-only tests (`module_composition_hybrid`'s stages),
+    /// since migrated to the canonical write/read/tick/update spelling.
+    ///
     /// # Honest scope (R6)
     ///
-    /// Pre-tick region only, like D1 — a middle segment of a multi-tick loop is
+    /// Pre-tick and trailing regions — a middle segment of a multi-tick loop is
     /// unexamined (no measured instance; measure before widening, per the family's
     /// standing rule). Conditional writes carry no extra clause here: only the
     /// value's generation is at issue, not the write's landing instant, and no
@@ -881,6 +893,42 @@ impl Cfg {
                 flagged.extend(wn.writes.iter().cloned());
             }
         }
+
+        // The TRAILING-region edition (added 2026-08-27, closing the
+        // `out_from_reg_before_commit` claim-ledger entry — the CPU sweep's
+        // `program_counter` divergence #1 in its trailing spelling). Trailing
+        // statements execute at the cycle's OPENING and their register updates
+        // commit at that same opening edge, so a plain-`Out` write that
+        // precedes the update of a register it reads publishes the PREVIOUS
+        // generation for the whole cycle while `assign o = r` shows the
+        // committed one — the identical mixed-generation window as the pre-tick
+        // clause, without needing a read to drag the write anywhere. The
+        // flipping witness pair is in `tests/fixtures/out_phase_dut.rs`:
+        // `out_from_reg_before_commit` (write first) measured DIVERGING,
+        // `out_from_reg_after_commit` (update first) measured AGREEING.
+        let trailing: Vec<usize> = (0..self.nodes.len())
+            .filter(|&n| n != self.head && self.tick_free_reaches(n, self.head))
+            .collect();
+        for &w in &trailing {
+            let wn = &self.nodes[w];
+            if wn.folded || wn.writes.is_empty() {
+                continue;
+            }
+            let read_regs: BTreeSet<String> =
+                wn.uses.intersection(&regs).cloned().collect();
+            if read_regs.is_empty() {
+                continue;
+            }
+            let updated_after = trailing.iter().any(|&a| {
+                a != w
+                    && !self.nodes[a].defs.is_disjoint(&read_regs)
+                    && self.comb_reaches(w, a)
+            });
+            if updated_after {
+                flagged.extend(wn.writes.iter().cloned());
+            }
+        }
+
         flagged.into_iter().collect()
     }
 
@@ -3107,6 +3155,39 @@ mod tests {
             }
         "#;
         assert_eq!(trailing(src), ["o"]);
+    }
+
+    // ── the V8 rule's TRAILING clause (v8t / out_phase pair, 2026-08-27) ────
+
+    /// Trailing publish-then-load: the write precedes the update of the register
+    /// it reads, in the trailing segment. Measured DIVERGING
+    /// (`v8t_stage_publish_then_load`; the `out_from_reg_before_commit` ledger
+    /// entry) — flagged.
+    #[test]
+    fn v8t_trailing_write_before_update_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { clk.tick().await; o.write(r); r = i.read() + Bits::from_lit::<1>(); }
+            }
+        "#;
+        assert_eq!(v8(src), ["o"]);
+    }
+
+    /// The flip: update first, then publish — the write reads the value
+    /// committing at the opening edge, which is what `assign o = r` shows.
+    /// Measured AGREEING (`out_from_reg_after_commit` sweeps) — not flagged.
+    #[test]
+    fn v8t_trailing_write_after_update_not_flagged() {
+        let src = r#"
+            #[hardware(sequential)]
+            async fn m(clk: Clock<C>, i: In<Bits<8>, C>, o: Out<Bits<8>, C>) {
+                let mut r: Bits<8> = Bits::zero();
+                loop { clk.tick().await; r = i.read() + Bits::from_lit::<1>(); o.write(r); }
+            }
+        "#;
+        assert!(v8(src).is_empty());
     }
 
     // ── write between a leading read and the update (V8 battery, m1) ────────

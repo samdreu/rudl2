@@ -6,10 +6,12 @@
 // Each broken module is paired with the spelling that works, so a fix shows up as
 // a SKIP entry that can be deleted rather than as a test nobody wrote.
 
-/// **BROKEN.** `!` on a `Bits<N>` emits SystemVerilog `!` — LOGICAL negation —
-/// rather than `~`. `!32'hFFFF_FFFE` is `1'b0`, so the result collapses to a
-/// single bit. Found via `rv32i_cpu_pipelined`'s JALR alignment mask, where it
-/// turned every jump target into 0.
+/// `!` on a `Bits<N>` — a BITWISE `~` now (fixed 2026-08-27; width- and
+/// boolean-guarded, so `!` on a bool or a comparison stays logical). Was
+/// emitted as SystemVerilog LOGICAL `!`, collapsing the result to one bit —
+/// found via `rv32i_cpu_pipelined`'s JALR alignment mask, where it turned every
+/// jump target into 0. Sweeps green, anchored against the independent
+/// hand-written `reference_sv/bit_not_bits.sv` (`assign o = ~a`).
 #[hardware(sequential)]
 pub async fn bit_not_bits(
     clk: Clock<MainClk>,
@@ -52,8 +54,10 @@ pub async fn bit_not_bool(
 }
 
 /// A constructor call with no sibling operand to take its width from. Both arms
-/// are `Bits<32>` in the source; whether the emitted literals are 32 bits is the
-/// claim under test.
+/// are `Bits<32>` in the source; the emitted literals are 32 bits (fixed
+/// 2026-08-27: the type-position turbofish pins `from_lit`'s width, and a
+/// default-width literal mux arm takes the other arm's width like a binop
+/// operand does). Sweeps green.
 #[hardware(sequential)]
 pub async fn lit_width_in_ternary(
     clk: Clock<MainClk>,
