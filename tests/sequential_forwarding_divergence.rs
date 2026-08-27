@@ -1401,3 +1401,177 @@ fn d_narrowing_battery_verdicts() {
          ui/fail/pretick_alignment case, which all pin this divergence"
     );
 }
+
+// ── The linear-trailing probe (phase-C decision evidence, 2026-08-27) ─────────
+//
+// `unprotected_trailing_out_write` keys on "crosses more than one clock edge per
+// iteration", which covers BOTH lowering paths — but §5.4's divergence was only
+// ever measured on the EXTRACTED path (the folded counted `for`). The linear
+// multi-tick path commits trailing register updates at the last phase's edge
+// (the 2026-08-25 shared-map work), so the model predicts the linear spelling
+// of the identical shape AGREES — measured so (2026-08-27). The rule therefore
+// over-flags the linear class: its refusal there is a lowering limitation, not
+// a semantics rule. The EXTRACTED-with-top-level-last-tick class is NOT
+// over-flagged — measured DIVERGING (2026-08-27), see `branch_trailing`.
+
+const LINEAR_TRAILING_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        clk.tick().await;
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        clk.tick().await;
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+
+#[test]
+fn linear_trailing_probe() {
+    // The rule flags the linear spelling…
+    let f: syn::ItemFn = syn::parse_str(LINEAR_TRAILING_SRC).expect("parses");
+    assert_eq!(
+        copper_analysis::unprotected_trailing_out_write(&f),
+        vec!["o".to_string()],
+        "the trailing rule no longer covers the linear spelling — check deliberate"
+    );
+
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = o.dirty_handle();
+    exec.spawn_wired(linear_trailing(clk.clone(), o), vec![dh], vec![]);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    let expected: Vec<u8> = (1..=CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(sim, expected, "simulator behaviour changed");
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(LINEAR_TRAILING_SRC, "linear_trailing", "clk", "o", "");
+    eprintln!("linear_trailing: sim = {sim:?}\n                 sv  = {sv:?}  -> {}", if sim == sv { "AGREE" } else { "DIVERGE" });
+    assert_eq!(
+        sim, sv,
+        "…but the LINEAR lowering handles the shape correctly, so the flag is a \
+         false positive on this path — an extraction lowering limitation, not a \
+         semantics rule (the phase-C reframing)"
+    );
+}
+
+// The same trailing body behind BRANCH-NESTED ticks — extraction fires with a
+// top-level LAST tick. Measuring this was blocked until 2026-08-27 by an
+// emission-legality bug: the cause-N `edge_condition` substitution puts a
+// compound expression under the branch condition's `Index`, and the emitter
+// rendered `pc <= (((n + 8'd1)[0] == 1'b1) ? …)` — a bit-select on a
+// parenthesized expression, which SV forbids. Fixed in `emit.rs` (`select_legal`
+// gates the `[..]` syntax; compound bases emit the width-cast form
+// `1'((n + 8'd1))`), which unblocked the measurement:
+//
+//   VERDICT (2026-08-27): DIVERGE — the SV trace is the sim trace delayed by
+//   one cycle. The extracted route commits the trailing update one edge late
+//   even when the LAST tick is top-level, so the placement error is a property
+//   of the extraction route as a whole, not just its rotation placement. The
+//   trailing rule's flag on this class is a TRUE positive; only the LINEAR
+//   class (above) is over-flagged, so the phase-C/D narrowing exempts the
+//   linear lowering route alone.
+
+const BRANCH_TRAILING_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn branch_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        if n[0] == Logic::One {
+            clk.tick().await;
+        } else {
+            clk.tick().await;
+        }
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn branch_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        if n[0] == Logic::One {
+            clk.tick().await;
+        } else {
+            clk.tick().await;
+        }
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+
+#[test]
+fn branch_trailing_probe() {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = o.dirty_handle();
+    exec.spawn_wired(branch_trailing(clk.clone(), o), vec![dh], vec![]);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    let expected: Vec<u8> = (1..=CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(sim, expected, "simulator behaviour changed");
+
+    // The emission bug this probe used to pin (`(n + 8'd1)[0]`, illegal SV) is
+    // fixed — selects over compound bases now emit the width-cast form — so
+    // the text must stay select-legal.
+    let sv_text = copper_codegen::transpile_source(
+        BRANCH_TRAILING_SRC,
+        Some("branch_trailing"),
+        &copper_codegen::EmitConfig::default(),
+    )
+    .expect("transpiles");
+    assert!(
+        !sv_text.contains(")["),
+        "a select over a parenthesized expression is back in the emitted SV — \
+         the emit.rs select_legal fallback regressed"
+    );
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(BRANCH_TRAILING_SRC, "branch_trailing", "clk", "o", "");
+    eprintln!("branch_trailing: sim = {sim:?}\n                 sv  = {sv:?}  -> {}", if sim == sv { "AGREE" } else { "DIVERGE" });
+    let one_cycle_late: Vec<u8> = (0..CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(
+        sv, one_cycle_late,
+        "the extracted-route divergence is no longer the one-edge-late trace — \
+         if sim == sv the trailing lowering is fixed for the top-level-last-tick \
+         class: re-bless this probe, EXPECTED_TRAILING, and the phase-C scope \
+         notes in design_docs/PAIRED_IMPLEMENTATION_SCOPE.md together"
+    );
+    assert_ne!(
+        sim, sv,
+        "sim and SV now AGREE for extracted trailing after a TOP-LEVEL last \
+         tick — phase C landed for this class; re-bless this probe, \
+         EXPECTED_TRAILING, and the phase-C scope notes together"
+    );
+}

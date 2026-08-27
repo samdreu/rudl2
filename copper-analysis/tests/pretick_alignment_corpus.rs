@@ -264,6 +264,24 @@ fn multi_phase_out_write_flags_exactly_the_demonstration_modules() {
 /// two clock phases, which is what is actually wrong with it.
 const EXPECTED_TRAILING: &[&str] = &[
     "tests/sequential_forwarding_divergence.rs::trailing_update",
+    // Added 2026-08-27 by the phase-C decision probes (the rule's gate is the
+    // tick count, which cannot see which lowering route the trailing statements
+    // take); both verdicts are now MEASURED:
+    //   * `linear_trailing` — the linear multi-tick spelling, MEASURED AGREEING
+    //     (the linear path commits trailing updates at the right edge), so the
+    //     rule's refusal there is a lowering limitation of the extraction
+    //     route, not a semantics rule: a documented false positive held
+    //     deliberately.
+    //   * `branch_trailing` — extracted with a top-level last tick, MEASURED
+    //     DIVERGING (SV is the sim trace delayed one cycle; unblocked by the
+    //     2026-08-27 parenthesized-bit-select emission fix). A TRUE positive:
+    //     the extraction route commits trailing updates one edge late
+    //     regardless of where the last tick sits.
+    // Recorded follow-up: narrow the rule to the EXTRACTION route alone
+    // (exempting only the linear lowering), or retire it wholesale when
+    // phase C lands the corrected trailing lowering.
+    "tests/sequential_forwarding_divergence.rs::linear_trailing",
+    "tests/sequential_forwarding_divergence.rs::branch_trailing",
 ];
 
 #[test]
