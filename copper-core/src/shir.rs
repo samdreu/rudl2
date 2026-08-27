@@ -105,6 +105,9 @@ pub struct SHIRMemory {
     pub init: Option<SHIRMemInit>,
     /// Read-during-write ordering — see `CHIRMemoryDecl::write_mode`.
     pub write_mode: crate::memory::WriteMode,
+    /// See `CHIRMemoryDecl::received` — a `Memory<…>` PARAMETER, lowered to bus
+    /// ports with the array on the owner's side.
+    pub received: bool,
 }
 
 /// 1:1 with `CHIRMemInit`, over `SHIRExpr`.

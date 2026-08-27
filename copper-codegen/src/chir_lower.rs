@@ -1164,6 +1164,82 @@ fn first_comma_split(s: &str) -> &str {
 
 // ── Port extraction ───────────────────────────────────────────────────────────
 
+/// The module's `Memory<…>` PARAMETERS, as received-memory declarations.
+///
+/// `Memory<ELEM, R, W, DOMAIN, READ_LAT, WRITE_LAT>` — the depth is a runtime
+/// constructor argument and is NOT in the type, which is exactly why a received
+/// memory's address width becomes a module parameter at emission. The collision
+/// policy is likewise the owner's object, so `write_mode` is fixed at
+/// `ReadFirst` here and never consulted for a received memory (no child-side
+/// forwarding mux exists — the read-data net is an input).
+fn received_memory_decls(fir: &FrontendModuleIR) -> Result<Vec<CHIRMemoryDecl>, CHIRLowerError> {
+    let mut out = Vec::new();
+    for param in &fir.signature.params {
+        let compact = compact_type(&param.ty.ty_text);
+        let Some(args) = compact.strip_prefix("Memory<").and_then(|s| s.strip_suffix('>')) else {
+            continue;
+        };
+        let parts = split_top_level_commas(args);
+        if parts.len() != 6 {
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: format!(
+                    "`Memory` parameter `{}` must spell all six generics \
+                     (Memory<T, R, W, Domain, READ_LAT, WRITE_LAT>)",
+                    param.name
+                ),
+                span: param.span,
+                suggested_rewrite: None,
+            });
+        }
+        let elem_ty = resolve_type(parts[0].trim(), param.ty.span)?;
+        let int = |i: usize| -> Result<usize, CHIRLowerError> {
+            parts[i].trim().parse::<usize>().map_err(|_| CHIRLowerError::UnsupportedConstruct {
+                description: format!(
+                    "`Memory` parameter `{}`: generic argument `{}` must be a literal integer",
+                    param.name,
+                    parts[i].trim()
+                ),
+                span: param.span,
+                suggested_rewrite: None,
+            })
+        };
+        let write_lat = int(5)?;
+        if write_lat != 1 {
+            // The bus carries the freshly-staged write nets; at WRITE_LAT > 1
+            // the value that commits is a child-side pipeline register instead,
+            // and wiring the stage-0 nets to the owner would commit a write
+            // WRITE_LAT-1 edges early. Exposing the committing stage is a
+            // straightforward extension — refuse honestly until it is built
+            // and verified, rather than emit the early-commit silently.
+            return Err(CHIRLowerError::UnsupportedConstruct {
+                description: format!(
+                    "received `Memory` parameter `{}` has WRITE_LAT = {write_lat}; the \
+                     bus ABI currently supports WRITE_LAT = 1 only",
+                    param.name
+                ),
+                span: param.span,
+                suggested_rewrite: Some(
+                    "declare the memory inside the module, or use WRITE_LAT = 1".to_string(),
+                ),
+            });
+        }
+        out.push(CHIRMemoryDecl {
+            name: param.name.clone(),
+            elem_ty,
+            depth: 0,
+            read_ports: int(1)?,
+            write_ports: int(2)?,
+            read_lat: int(4)?,
+            write_lat,
+            init: None,
+            received: true,
+            write_mode: copper_core::memory::WriteMode::ReadFirst,
+            span: param.span,
+        });
+    }
+    Ok(out)
+}
+
 fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> {
     let mut ports = Vec::new();
 
@@ -1214,6 +1290,13 @@ fn lower_ports(fir: &FrontendModuleIR) -> Result<Vec<CHIRPort>, CHIRLowerError> 
                 registered: false,
                 span: param.span,
             });
+        } else if compact.starts_with("Memory<") {
+            // A RECEIVED memory is not a data port: it lowers to a bus (address/
+            // data/enable ports) synthesized at emission, with the array on the
+            // owner's side — see `CHIRMemoryDecl::received` and
+            // design_docs/RECEIVED_MEMORY_ABI.md. Collected by
+            // `received_memory_decls`, not here.
+            continue;
         } else {
             // Plain type — input data port (for combinational modules and hardware submodules)
             let ty = resolve_type(&param.ty.ty_text, param.ty.span)?;
@@ -1313,6 +1396,21 @@ fn lower_seq_body(
     let mut memories: Vec<CHIRMemoryDecl> = Vec::new();
     let mut mem_infos: std::collections::HashMap<String, MemInfo> =
         std::collections::HashMap::new();
+    // RECEIVED memories — `Memory<…>` PARAMETERS — join `memories` first, so the
+    // body lowering (staging nets, capture pipeline, write stages) treats them
+    // exactly like a declared memory; only emission differs (bus ports, no
+    // array). See `CHIRMemoryDecl::received`.
+    for decl in received_memory_decls(fir)? {
+        mem_infos.insert(
+            decl.name.clone(),
+            MemInfo {
+                elem_ty: decl.elem_ty.clone(),
+                read_ports: decl.read_ports,
+                write_ports: decl.write_ports,
+            },
+        );
+        memories.push(decl);
+    }
     // (index into `memories`, its source-level preload) — see `RawMemInit`.
     let mut pending_mem_inits: Vec<(usize, RawMemInit)> = Vec::new();
     let mut loop_body_stmts: Option<&[RawStmt]> = None;
@@ -4368,6 +4466,7 @@ fn parse_memory_decl<'a>(
 
     Ok(Some((
         CHIRMemoryDecl {
+            received: false,
             name: name.to_string(),
             elem_ty,
             depth,

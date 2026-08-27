@@ -78,9 +78,12 @@ const SKIP: &[(&str, &str)] = &[
     (
         "rv32i_cpu_pipelined",
         "receives its unified instruction/data `Memory` as a parameter, so the sweep cannot \
-         supply one (see the Kind::Memory rule below, which would skip it anyway). It also does \
-         not transpile — a received memory has no port ABI, and the struct-typed pipeline latches \
-         and tuple-returning EX stage are their own blockers (TODO, TRANSPILER COVERAGE)",
+         supply one (see the Kind::Memory rule below, which would skip it anyway). Cause P is \
+         DISCHARGED (2026-08-27): a received memory now has a bus port ABI \
+         (design_docs/RECEIVED_MEMORY_ABI.md, verified by tests/received_memory_abi.rs) — the \
+         remaining transpile blockers are the module's own: the struct-typed pipeline latches \
+         and the tuple-returning EX stage (width inference at the latch initializers is the \
+         first refusal reached) (TODO, TRANSPILER COVERAGE)",
     ),
     // ── The claim ledger: tests/fixtures/{bits_ops,signedness,aggregate_locals,
     // match_selector,out_phase,mem_address_width}_dut.rs. Each module below is a

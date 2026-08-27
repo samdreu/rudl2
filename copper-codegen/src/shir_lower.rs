@@ -705,6 +705,7 @@ fn lower_seq_body(
         clock: seq.clock.clone(),
         registers,
         memories: seq.memories.iter().map(|m| Ok(SHIRMemory {
+            received: m.received,
             name: m.name.clone(),
             elem_ty: m.elem_ty.clone(),
             depth: m.depth,

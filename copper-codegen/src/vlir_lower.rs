@@ -108,7 +108,7 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
     }
     collect_and_legalize_body_names(&shir.body, &mut leg);
 
-    let ports = shir
+    let ports: Vec<VLIRPort> = shir
         .ports
         .iter()
         .map(|p| VLIRPort {
@@ -148,7 +148,7 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
         SHIRBody::Structural(st) => VLIRBody::Structural(lower_structural(st, &leg)?),
     };
 
-    let params = shir
+    let params: Vec<copper_core::vlir::VLIRParam> = shir
         .params
         .iter()
         .map(|p| copper_core::vlir::VLIRParam { name: p.name.clone(), default: p.default })
@@ -166,6 +166,72 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
             value_expr: lp.value_expr.clone(),
         })
         .collect();
+
+    // RECEIVED memories: synthesize the bus ports and the address-width
+    // parameter (design_docs/RECEIVED_MEMORY_ABI.md). Per USED read port the bus
+    // is `<m>_rd<i>_addr` out + `<m>_rd<i>_data` in (a continuous array read
+    // needs no enable; the child's own valid pipeline handles readiness); per
+    // used write port it is `<m>_wr<j>_{en,addr,data}` out. The names are the
+    // SAME nets the body lowering already drives — the port declaration simply
+    // replaces the internal wire declaration (the emitter skips redeclaring
+    // port names).
+    let mut ports = ports;
+    let mut params = params;
+    if let SHIRBody::Sequential(s) = &shir.body {
+        let mut mem_use = MemPortUse::default();
+        collect_phase_mem_use(&s.phases, &mut mem_use);
+        for m in s.memories.iter().filter(|m| m.received) {
+            params.push(copper_core::vlir::VLIRParam {
+                name: addr_param_name(&m.name),
+                default: Some(1),
+            });
+            let aw = Width::Param(addr_param_name(&m.name));
+            let dw = width_of(&m.elem_ty);
+            let bus = |name: String, dir: VLIRPortDir, width: Width| VLIRPort {
+                name,
+                outer_dim: None,
+                direction: dir,
+                kind: VLIRPortKind::Logic,
+                width,
+                registered: false,
+            };
+            for p in 0..m.read_ports {
+                if !mem_use.reads.contains(&(m.name.clone(), p)) {
+                    continue;
+                }
+                ports.push(bus(
+                    leg.get(&mem_net(&m.name, true, p, "addr")),
+                    VLIRPortDir::Output,
+                    aw.clone(),
+                ));
+                ports.push(bus(
+                    leg.get(&mem_net(&m.name, true, p, "data")),
+                    VLIRPortDir::Input,
+                    dw.clone(),
+                ));
+            }
+            for wp in 0..m.write_ports {
+                if !mem_use.writes.contains(&(m.name.clone(), wp)) {
+                    continue;
+                }
+                ports.push(bus(
+                    leg.get(&mem_net(&m.name, false, wp, "en")),
+                    VLIRPortDir::Output,
+                    Width::Concrete(1),
+                ));
+                ports.push(bus(
+                    leg.get(&mem_net(&m.name, false, wp, "addr")),
+                    VLIRPortDir::Output,
+                    aw.clone(),
+                ));
+                ports.push(bus(
+                    leg.get(&mem_net(&m.name, false, wp, "data")),
+                    VLIRPortDir::Output,
+                    dw.clone(),
+                ));
+            }
+        }
+    }
 
     let mut module = VLIRModule { name, params, localparams, ports, body };
     narrow_sole_resize_wires(&mut module);
@@ -353,7 +419,26 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
     // only reader was the discarded one is genuinely dead — and `-Wall` fails on it.
     let always_ff = VLIRAlwaysFF { clock: clock.clone(), stmts: ff_stmts };
     let mut comb_phases = comb_phases;
-    drop_unread_wires(&mut comb_phases, &always_ff, &output_assigns, &memories);
+    // A RECEIVED memory's bus nets are read by the OWNER, not by anything in
+    // this module (the array and the commit moved across the boundary), so the
+    // dead-wire eliminator must treat them as externally read — without this it
+    // silently deleted the bus's always_comb defaults on landing day.
+    let mut external_reads: HashSet<String> = HashSet::new();
+    for m in s.memories.iter().filter(|m| m.received) {
+        for p in 0..m.read_ports {
+            if mem_use.reads.contains(&(m.name.clone(), p)) {
+                external_reads.insert(leg.get(&mem_net(&m.name, true, p, "addr")));
+            }
+        }
+        for wp in 0..m.write_ports {
+            if mem_use.writes.contains(&(m.name.clone(), wp)) {
+                for suffix in ["en", "addr", "data"] {
+                    external_reads.insert(leg.get(&mem_net(&m.name, false, wp, suffix)));
+                }
+            }
+        }
+    }
+    drop_unread_wires(&mut comb_phases, &always_ff, &output_assigns, &memories, &external_reads);
 
     Ok(VLIRSeqBody {
         clock: clock.clone(),
@@ -1413,9 +1498,11 @@ fn drop_unread_wires(
     always_ff: &VLIRAlwaysFF,
     output_assigns: &[VLIRContinuousAssign],
     memories: &[VLIRMemDecl],
+    // Nets read OUTSIDE this module — a received memory's bus outputs.
+    external_reads: &HashSet<String>,
 ) {
     loop {
-        let mut read: HashSet<String> = HashSet::new();
+        let mut read: HashSet<String> = external_reads.clone();
         for phase in comb_phases.iter() {
             if let Some(g) = &phase.phase_guard {
                 collect_vlir_reads(g, &mut read);
@@ -1895,7 +1982,15 @@ impl MemWidths {
         MemWidths {
             widths: memories
                 .iter()
-                .map(|m| (m.name.clone(), (addr_width(m.depth), width_of(&m.elem_ty))))
+                .map(|m| {
+                    let aw = if m.received {
+                        // Depth unknown to the child — see `addr_param_name`.
+                        Width::Param(addr_param_name(&m.name))
+                    } else {
+                        addr_width(m.depth)
+                    };
+                    (m.name.clone(), (aw, width_of(&m.elem_ty)))
+                })
                 .collect(),
             read_en: memories
                 .iter()
@@ -1950,6 +2045,16 @@ fn write_commit_nets(mem: &str, port: usize, write_lat: usize) -> (String, Strin
             write_stage(mem, port, k, "data"),
         )
     }
+}
+
+/// The module parameter carrying a RECEIVED memory's address width. The depth
+/// of a received memory is a runtime constructor argument of the OWNER's
+/// object — it is not in the type — so the child cannot size the address bus
+/// concretely; a parameter (defaulting to 1, like every generic width) lets the
+/// instantiating context supply it. Named from the source identifier, which is
+/// a valid SystemVerilog identifier already.
+fn addr_param_name(mem: &str) -> String {
+    format!("{}_ADDR_W", mem.to_uppercase())
 }
 
 /// Bits needed to index `depth` entries (at least one).
@@ -2247,7 +2352,13 @@ fn mem_net_defaults(
     let mut out = Vec::new();
     let one_bit = Width::Concrete(1);
     for m in memories {
-        let aw = addr_width(m.depth);
+        let aw = if m.received {
+            // The child cannot size a received memory's address bus concretely —
+            // see `addr_param_name`; the default renders as `M_ADDR_W'd0`.
+            Width::Param(addr_param_name(&m.name))
+        } else {
+            addr_width(m.depth)
+        };
         let dw = width_of(&m.elem_ty);
         let mut push = |is_read: bool, port: usize, with_data: bool| {
             let en = (!is_read || all.needs_read_en(&(m.name.clone(), port)))
@@ -2459,6 +2570,10 @@ fn lower_mem_decls(
 ) -> LowerResult<Vec<VLIRMemDecl>> {
     memories
         .iter()
+        // A RECEIVED memory has no child-side array: the array, its preload and
+        // the continuous read-data assign are the OWNER's; the read-data net is
+        // an input port instead (synthesized in `lower_to_vlir`).
+        .filter(|m| !m.received)
         .map(|m| Ok(VLIRMemDecl {
             name: leg.get(&m.name),
             width: width_of(&m.elem_ty),
@@ -2548,6 +2663,10 @@ fn read_net_value(m: &SHIRMemory, port: usize, use_: &MemPortUse, leg: &Legalize
 fn mem_write_commits(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer) -> Vec<VLIRFFStmt> {
     let mut out = Vec::new();
     for m in memories {
+        if m.received {
+            // The commit is the OWNER's: the child only drives the bus.
+            continue;
+        }
         for port in 0..m.write_ports {
             if !use_.writes.contains(&(m.name.clone(), port)) {
                 continue;

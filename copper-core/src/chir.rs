@@ -213,6 +213,18 @@ pub struct CHIRMemoryDecl {
     /// Preloaded contents from `from_fn` / `from_contents`; `None` for `new`
     /// (which zero-fills, matching an unwritten array).
     pub init: Option<CHIRMemInit>,
+    /// RECEIVED memory (2026-08-27, the cause-P port ABI): the module is HANDED
+    /// its storage as a `Memory<…>` parameter instead of declaring it. The body
+    /// lowering is identical — stagings, capture pipeline, and write stages all
+    /// stay on the module's side — but at emission the array-side nets become
+    /// **bus ports** (per used read port: `<m>_rd<i>_addr` out, `<m>_rd<i>_data`
+    /// in; per used write port: `<m>_wr<j>_{en,addr,data}` out) and the array,
+    /// its preload, the continuous read assign, and the write commit belong to
+    /// the OWNER. The depth is not in the type, so the address width is a module
+    /// parameter (`<M>_ADDR_W`). `depth` is meaningless (0) and `init` is `None`
+    /// when this is set; the collision policy (`write_mode`) is the owner's.
+    /// See `design_docs/RECEIVED_MEMORY_ABI.md`.
+    pub received: bool,
     /// Read-during-write ordering, from the `.read_first()` / `.write_first()`
     /// builder. `ReadFirst` (the default) means a read sees the contents before
     /// this cycle's write commits; `WriteFirst` means it sees the new value.

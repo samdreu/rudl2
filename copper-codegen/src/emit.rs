@@ -26,7 +26,11 @@ impl Default for EmitConfig {
 }
 
 pub fn emit_verilog(module: &VLIRModule, config: &EmitConfig) -> String {
-    let mut e = Emitter { out: String::new(), cfg: config };
+    let mut e = Emitter {
+        out: String::new(),
+        cfg: config,
+        port_names: module.ports.iter().map(|p| p.name.clone()).collect(),
+    };
     e.module(module);
     e.out
 }
@@ -34,6 +38,11 @@ pub fn emit_verilog(module: &VLIRModule, config: &EmitConfig) -> String {
 struct Emitter<'a> {
     out: String,
     cfg: &'a EmitConfig,
+    /// Port names — a received-memory bus port is DRIVEN by the same
+    /// `always_comb` nets an internal memory uses, so the wire-decl collector
+    /// must not redeclare it (`logic … m_wr0_addr;` next to the port is a
+    /// double declaration).
+    port_names: HashSet<String>,
 }
 
 impl Emitter<'_> {
@@ -50,7 +59,11 @@ impl Emitter<'_> {
         // step with every future statement and expression variant.
         let ports_text = self.ports_block(m);
         let body_text = {
-            let mut e = Emitter { out: String::new(), cfg: self.cfg };
+            let mut e = Emitter {
+                out: String::new(),
+                cfg: self.cfg,
+                port_names: self.port_names.clone(),
+            };
             match &m.body {
                 VLIRBody::Combinational(c) => e.comb_body(c),
                 VLIRBody::Sequential(s) => e.seq_body(s),
@@ -186,7 +199,7 @@ impl Emitter<'_> {
         let phase_stmts: Vec<&VLIRStmt> =
             s.comb_phases.iter().flat_map(|p| p.stmts.iter()).collect();
         let mut decls = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = self.port_names.clone();
         for st in phase_stmts {
             collect_wire_decls(std::slice::from_ref(st), &mut decls, &mut seen);
         }
@@ -259,7 +272,7 @@ impl Emitter<'_> {
     /// declared). Deduplicated by name.
     fn emit_wire_decls(&mut self, stmts: &[VLIRStmt]) {
         let mut decls = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = self.port_names.clone();
         collect_wire_decls(stmts, &mut decls, &mut seen);
         for (name, width, outer_dim) in &decls {
             // An array wire declares both packed dimensions, outer first — the
