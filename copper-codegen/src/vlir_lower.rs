@@ -167,7 +167,9 @@ pub fn lower_to_vlir(shir: &SHIRModule) -> LowerResult<VLIRModule> {
         })
         .collect();
 
-    Ok(VLIRModule { name, params, localparams, ports, body })
+    let mut module = VLIRModule { name, params, localparams, ports, body };
+    narrow_sole_resize_wires(&mut module);
+    Ok(module)
 }
 
 // ── Combinational body ──────────────────────────────────────────────────────
@@ -3360,5 +3362,304 @@ endmodule
             .expect("tuple-scrutinee match now transpiles");
         assert!(sv.contains("case ({j, k})"), "expected case over {{j, k}}: {sv}");
         assert!(sv.contains("state <= (!state)"), "expected toggle in the j=k=1 arm: {sv}");
+    }
+}
+
+// ── Sole-consumer index narrowing ────────────────────────────────────────────
+
+/// Narrow a combinational wire whose **every** use is the direct child of a
+/// same-width narrowing `Resize` to that width, resizing its defining
+/// assignments to match.
+///
+/// This is the `wide_index_sole_consumer` decision, ruled 2026-08-27 ("emit the
+/// index at the address width"): a `usize` index local is 32 bits while a
+/// memory address net is `clog2(depth)`, so `10'(i)` reads `i[9:0]` and an
+/// index that feeds NOTHING ELSE has a structurally dead upper half —
+/// UNUSEDSIGNAL, fatal under the sweep's `-Wall`. When the dead half is
+/// provable (every occurrence of the wire sits directly under a `Resize` to one
+/// agreed narrower concrete width), the wire is declared at that width and each
+/// of its assignments truncates explicitly — the same bits every consumer
+/// already read. Any other use, conflicting widths, a widening resize, or a
+/// symbolic width disqualifies the wire (`wide_index_into_narrow_addr`, whose
+/// index is also read whole, stays 32 bits). Registers and ports are never
+/// candidates.
+fn narrow_sole_resize_wires(m: &mut VLIRModule) {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Use {
+        narrow: Option<usize>,
+        conflicted: bool,
+        other: bool,
+    }
+
+    fn scan_expr(e: &VLIRExpr, u: &mut HashMap<String, Use>) {
+        if let VLIRExpr::Resize { expr, width: Width::Concrete(k) } = e {
+            if let VLIRExpr::Var(name) = expr.as_ref() {
+                let entry = u.entry(name.clone()).or_default();
+                match entry.narrow {
+                    None => entry.narrow = Some(*k),
+                    Some(prev) if prev != *k => entry.conflicted = true,
+                    _ => {}
+                }
+                return;
+            }
+        }
+        match e {
+            VLIRExpr::Var(name) => u.entry(name.clone()).or_default().other = true,
+            VLIRExpr::Lit { .. } => {}
+            VLIRExpr::BinOp { left, right, .. } => {
+                scan_expr(left, u);
+                scan_expr(right, u);
+            }
+            VLIRExpr::UnOp { expr, .. }
+            | VLIRExpr::SignCast { expr, .. }
+            | VLIRExpr::Slice { expr, .. }
+            | VLIRExpr::Resize { expr, .. } => scan_expr(expr, u),
+            VLIRExpr::Ternary { cond, then_val, else_val } => {
+                scan_expr(cond, u);
+                scan_expr(then_val, u);
+                scan_expr(else_val, u);
+            }
+            VLIRExpr::Concat(parts) => {
+                for p in parts {
+                    scan_expr(p, u);
+                }
+            }
+            VLIRExpr::DynBit { base, index } => {
+                scan_expr(base, u);
+                scan_expr(index, u);
+            }
+            VLIRExpr::MemIndex { addr, .. } => scan_expr(addr, u),
+        }
+    }
+
+    fn scan_stmt(s: &VLIRStmt, u: &mut HashMap<String, Use>) {
+        match s {
+            VLIRStmt::WireAssign { value, .. } => scan_expr(value, u),
+            VLIRStmt::PortAssign { value, edge_value, .. } => {
+                scan_expr(value, u);
+                scan_expr(edge_value, u);
+            }
+            VLIRStmt::If { condition, edge_condition, then_stmts, else_stmts } => {
+                scan_expr(condition, u);
+                scan_expr(edge_condition, u);
+                for t in then_stmts {
+                    scan_stmt(t, u);
+                }
+                if let Some(es) = else_stmts {
+                    for t in es {
+                        scan_stmt(t, u);
+                    }
+                }
+            }
+            VLIRStmt::Case { selector, edge_selector, arms, default } => {
+                scan_expr(selector, u);
+                scan_expr(edge_selector, u);
+                for a in arms {
+                    scan_expr(&a.selector_value, u);
+                    for t in &a.stmts {
+                        scan_stmt(t, u);
+                    }
+                }
+                if let Some(d) = default {
+                    for t in d {
+                        scan_stmt(t, u);
+                    }
+                }
+            }
+            VLIRStmt::ForLoop { start, end, body, .. } => {
+                scan_expr(start, u);
+                scan_expr(end, u);
+                for t in body {
+                    scan_stmt(t, u);
+                }
+            }
+            VLIRStmt::IndexAssign { index, value, .. } => {
+                scan_expr(index, u);
+                scan_expr(value, u);
+            }
+        }
+    }
+
+    fn scan_ff(s: &VLIRFFStmt, u: &mut HashMap<String, Use>) {
+        match s {
+            VLIRFFStmt::NonBlockingAssign { value, .. } => scan_expr(value, u),
+            VLIRFFStmt::MemAssign { addr, value, .. } => {
+                scan_expr(addr, u);
+                scan_expr(value, u);
+            }
+            VLIRFFStmt::If { condition, then_stmts, else_stmts } => {
+                scan_expr(condition, u);
+                for t in then_stmts {
+                    scan_ff(t, u);
+                }
+                if let Some(es) = else_stmts {
+                    for t in es {
+                        scan_ff(t, u);
+                    }
+                }
+            }
+            VLIRFFStmt::Case { selector, arms, default } => {
+                scan_expr(selector, u);
+                for a in arms {
+                    scan_expr(&a.selector_value, u);
+                    for t in &a.stmts {
+                        scan_ff(t, u);
+                    }
+                }
+                if let Some(d) = default {
+                    for t in d {
+                        scan_ff(t, u);
+                    }
+                }
+            }
+        }
+    }
+
+    fn decl_widths(s: &VLIRStmt, out: &mut HashMap<String, usize>) {
+        match s {
+            VLIRStmt::WireAssign { name, width: Width::Concrete(n), outer_dim: None, .. } => {
+                out.entry(name.clone()).or_insert(*n);
+            }
+            VLIRStmt::If { then_stmts, else_stmts, .. } => {
+                for t in then_stmts {
+                    decl_widths(t, out);
+                }
+                if let Some(es) = else_stmts {
+                    for t in es {
+                        decl_widths(t, out);
+                    }
+                }
+            }
+            VLIRStmt::Case { arms, default, .. } => {
+                for a in arms {
+                    for t in &a.stmts {
+                        decl_widths(t, out);
+                    }
+                }
+                if let Some(d) = default {
+                    for t in d {
+                        decl_widths(t, out);
+                    }
+                }
+            }
+            VLIRStmt::ForLoop { body, .. } => {
+                for t in body {
+                    decl_widths(t, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite(s: &mut VLIRStmt, winners: &HashMap<String, usize>) {
+        match s {
+            VLIRStmt::WireAssign { name, width, value, outer_dim: None } => {
+                if let Some(&k) = winners.get(name) {
+                    *width = Width::Concrete(k);
+                    let old = std::mem::replace(value, VLIRExpr::Var(String::new()));
+                    *value = VLIRExpr::Resize { width: Width::Concrete(k), expr: Box::new(old) };
+                }
+            }
+            VLIRStmt::If { then_stmts, else_stmts, .. } => {
+                for t in then_stmts {
+                    rewrite(t, winners);
+                }
+                if let Some(es) = else_stmts {
+                    for t in es {
+                        rewrite(t, winners);
+                    }
+                }
+            }
+            VLIRStmt::Case { arms, default, .. } => {
+                for a in arms {
+                    for t in &mut a.stmts {
+                        rewrite(t, winners);
+                    }
+                }
+                if let Some(d) = default {
+                    for t in d {
+                        rewrite(t, winners);
+                    }
+                }
+            }
+            VLIRStmt::ForLoop { body, .. } => {
+                for t in body {
+                    rewrite(t, winners);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let VLIRBody::Sequential(seq) = &m.body else { return };
+
+    let mut uses: HashMap<String, Use> = HashMap::new();
+    for ph in &seq.comb_phases {
+        if let Some(g) = &ph.phase_guard {
+            scan_expr(g, &mut uses);
+        }
+        for st in &ph.stmts {
+            scan_stmt(st, &mut uses);
+        }
+    }
+    for st in &seq.always_ff.stmts {
+        scan_ff(st, &mut uses);
+    }
+    for a in &seq.output_assigns {
+        scan_expr(&a.value, &mut uses);
+    }
+    for mem in &seq.memories {
+        for net in &mem.read_data_nets {
+            scan_expr(&net.value, &mut uses);
+        }
+        match &mem.init {
+            Some(VLIRMemInit::Fill { value, .. }) => scan_expr(value, &mut uses),
+            Some(VLIRMemInit::Words(ws)) => {
+                for w in ws {
+                    scan_expr(w, &mut uses);
+                }
+            }
+            None => {}
+        }
+    }
+    for sub in &seq.submodules {
+        for (_, e) in &sub.inputs {
+            scan_expr(e, &mut uses);
+        }
+    }
+
+    let regs: std::collections::HashSet<&str> =
+        seq.reg_decls.iter().map(|r| r.name.as_str()).collect();
+
+    let mut widths = HashMap::new();
+    for ph in &seq.comb_phases {
+        for st in &ph.stmts {
+            decl_widths(st, &mut widths);
+        }
+    }
+    let mut winners: HashMap<String, usize> = HashMap::new();
+    for (name, decl_w) in widths {
+        if regs.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(us) = uses.get(&name) {
+            if let (Some(k), false, false) = (us.narrow, us.conflicted, us.other) {
+                if k < decl_w {
+                    winners.insert(name, k);
+                }
+            }
+        }
+    }
+    if winners.is_empty() {
+        return;
+    }
+
+    let VLIRBody::Sequential(seq) = &mut m.body else { return };
+    for ph in &mut seq.comb_phases {
+        for st in &mut ph.stmts {
+            rewrite(st, &winners);
+        }
     }
 }

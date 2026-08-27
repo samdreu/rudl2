@@ -87,9 +87,12 @@ pub async fn narrow_index_into_narrow_addr(
 /// nothing else always has a dead half. `rv32i_cpu_transpilable` escapes it because
 /// its indices are range-checked, which reads the whole word.
 ///
-/// The fix is not obvious and is deliberately not guessed at here: either the index
-/// local is emitted at the address width, or the lint is accepted as the cost of
-/// binding an index to a name. Pinned so the choice is made once, on purpose.
+/// DECIDED AND FIXED 2026-08-27 ("emit the index at the address width"):
+/// `vlir_lower::narrow_sole_resize_wires` declares a wire at the one narrower
+/// width every use resizes it to, truncating its assignments explicitly —
+/// `logic [9:0] i; i = 10'((addr >> 22));` — the same bits the consumers always
+/// read. Any other use disqualifies (`wide_index_into_narrow_addr` keeps its 32
+/// bits). Sweeps green under `-Wall`.
 #[hardware(sequential)]
 pub async fn wide_index_sole_consumer(
     clk: Clock<MainClk>,

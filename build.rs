@@ -146,15 +146,6 @@ const SKIP: &[(&str, &str)] = &[
          the pre-tick alignment family is about a body crossing two or more edges",
     ),
     (
-        "wide_index_sole_consumer",
-        "UNUSEDSIGNAL: `usize` is 32 bits and a memory address net is narrower, so `10'(i)` \
-         reads `i[9:0]` and an index local that feeds NOTHING ELSE has a dead upper half. \
-         Not the address cast being wrong — `wide_index_into_narrow_addr` is the same index \
-         with a range check (which reads the whole word, as every address in \
-         rv32i_cpu_transpilable does) and sweeps. The fix is a real choice — emit the index \
-         local at the address width, or accept the lint — and is deliberately not guessed at",
-    ),
-    (
         "uart_tx",
         "does not transpile: cause H — `spawn_uart` in the same file has a hardware-looking \
          signature with no `#[hardware]`, which `prepare_source` refuses at FILE level before \
