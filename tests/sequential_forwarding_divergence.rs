@@ -1401,3 +1401,153 @@ fn d_narrowing_battery_verdicts() {
          ui/fail/pretick_alignment case, which all pin this divergence"
     );
 }
+
+// ── The linear-trailing probe (phase-C decision evidence, 2026-08-27) ─────────
+//
+// `unprotected_trailing_out_write` keys on "crosses more than one clock edge per
+// iteration", which covers BOTH lowering paths — but §5.4's divergence was only
+// ever measured on the EXTRACTED path (the folded counted `for`). The linear
+// multi-tick path commits trailing register updates at the last phase's edge
+// (the 2026-08-25 shared-map work), so the model predicts the linear spelling
+// of the identical shape AGREES — measured so (2026-08-27). The rule therefore
+// over-flags the linear class: its refusal there is a lowering limitation, not
+// a semantics rule. Whether the EXTRACTED-with-top-level-last-tick class is
+// also over-flagged is blocked on an emission bug — see `branch_trailing`.
+
+const LINEAR_TRAILING_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        clk.tick().await;
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        clk.tick().await;
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+
+#[test]
+fn linear_trailing_probe() {
+    // The rule flags the linear spelling…
+    let f: syn::ItemFn = syn::parse_str(LINEAR_TRAILING_SRC).expect("parses");
+    assert_eq!(
+        copper_analysis::unprotected_trailing_out_write(&f),
+        vec!["o".to_string()],
+        "the trailing rule no longer covers the linear spelling — check deliberate"
+    );
+
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = o.dirty_handle();
+    exec.spawn_wired(linear_trailing(clk.clone(), o), vec![dh], vec![]);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    let expected: Vec<u8> = (1..=CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(sim, expected, "simulator behaviour changed");
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(LINEAR_TRAILING_SRC, "linear_trailing", "clk", "o", "");
+    eprintln!("linear_trailing: sim = {sim:?}\n                 sv  = {sv:?}  -> {}", if sim == sv { "AGREE" } else { "DIVERGE" });
+    assert_eq!(
+        sim, sv,
+        "…but the LINEAR lowering handles the shape correctly, so the flag is a \
+         false positive on this path — an extraction lowering limitation, not a \
+         semantics rule (the phase-C reframing)"
+    );
+}
+
+// The same trailing body behind BRANCH-NESTED ticks — extraction fires with a
+// top-level LAST tick. The placement question here is UNMEASURABLE today: the
+// module transpiles, but the emitted SystemVerilog does not parse —
+// `pc <= (((n + 8'd1)[0] == 1'b1) ? …)` — a bit-select applied to a
+// parenthesized expression, which SV forbids. That is a pre-existing emission
+// bug in the forwarded branch-condition path (the cause-N `edge_condition`
+// substitution meets an `Index` and emits `(subst)[k]` verbatim; phase B only
+// changed drive values, not conditions), witnessed here for the first time
+// because no corpus module bit-selects a register in a branch condition that
+// guards ticks. Until it is fixed, the probe pins the bug itself; then the
+// run_sv comparison below completes the placement measurement.
+
+const BRANCH_TRAILING_SRC: &str = r#"
+#[hardware(sequential, allow_pretick_alignment)]
+async fn branch_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        if n[0] == Logic::One {
+            clk.tick().await;
+        } else {
+            clk.tick().await;
+        }
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+"#;
+
+#[hardware(sequential, allow_pretick_alignment)]
+async fn branch_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
+    let mut n: Bits<8> = Bits::zero();
+    loop {
+        if n[0] == Logic::One {
+            clk.tick().await;
+        } else {
+            clk.tick().await;
+        }
+        clk.tick().await;
+        n = n + Bits::from_lit::<1>();
+        o.write(n);
+    }
+}
+
+#[test]
+fn branch_trailing_probe() {
+    let mut clk = Clock::<C>::new();
+    let mut exec = HardwareExecutor::new();
+    let (o, obs) = wire::<Bits<8>, C>(Bits::zero());
+    let dh = o.dirty_handle();
+    exec.spawn_wired(branch_trailing(clk.clone(), o), vec![dh], vec![]);
+    let sim: Vec<u8> = (0..CYCLES)
+        .map(|_| {
+            exec.tick_clock(&mut clk);
+            obs.read().as_u128() as u8
+        })
+        .collect();
+    let expected: Vec<u8> = (1..=CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(sim, expected, "simulator behaviour changed");
+
+    // The emitted SV is currently ILLEGAL — pin the bug textually (independent
+    // of Verilator) so its fix flips this loudly instead of silently.
+    let sv_text = copper_codegen::transpile_source(
+        BRANCH_TRAILING_SRC,
+        Some("branch_trailing"),
+        &copper_codegen::EmitConfig::default(),
+    )
+    .expect("transpiles (the bug is in emission legality, not acceptance)");
+    assert!(
+        sv_text.contains(")[") ,
+        "the parenthesized-bit-select emission bug is FIXED — complete this probe: \
+         Verilate the module (transpile_and_run) and compare against `sim` to \
+         settle whether extracted trailing after a TOP-LEVEL last tick is placed \
+         correctly, then re-bless this test and the phase-C scope notes"
+    );
+}
