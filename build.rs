@@ -107,19 +107,6 @@ const SKIP: &[(&str, &str)] = &[
          and sweeps",
     ),
     (
-        "signed_lt_via_cast",
-        "WRONG ANSWER, AND IT LINTS CLEAN: `ExprType::Cast` is stripped and `signed` is \
-         never emitted, so `(a as i32) < (b as i32)` becomes an UNSIGNED compare. The sweep \
-         disagrees from cycle 0. This is RISC-V's SLT/BLT/BGE. `signed_lt_via_bias` is the \
-         working spelling and sweeps",
-    ),
-    (
-        "sign_extend_via_cast",
-        "WRONG ANSWER, AND IT LINTS CLEAN: `as i32 >> 20` is arithmetic in Rust and logical \
-         in the emitted SV, so sign extension becomes zero extension (measured: expected \
-         4294967170, got 3970). `sign_extend_via_mask` is the working spelling and sweeps",
-    ),
-    (
         "match_on_usize",
         "WRONG WIDTH: a `match` emits 64-bit case labels (`s == 64'd1`) — WIDTHEXPAND against \
          the 32-bit selector. `ifchain_on_usize` is the same mux and demux as an if-chain and \

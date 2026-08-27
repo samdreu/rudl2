@@ -330,6 +330,13 @@ pub enum VLIRExpr {
     },
     /// `{a, b, c}`
     Concat(Vec<VLIRExpr>),
+    /// `$signed(expr)` / `$unsigned(expr)` — see `CHIRExpr::SignCast`. The
+    /// emitter renders `>>>` for a `Shr` whose LEFT operand is `SignCast {
+    /// signed: true, .. }`; width is the inner expression's width.
+    SignCast {
+        signed: bool,
+        expr: Box<VLIRExpr>,
+    },
     /// `expr[high:low]`
     Slice {
         expr: Box<VLIRExpr>,

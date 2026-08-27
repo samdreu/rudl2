@@ -2332,16 +2332,21 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
             // so `timer < 1` compares at the register's width rather than the
             // default literal width (which would widen the whole expression).
             let (left, right) = balance_binop_literals(left, right, ctx);
-            Ok(CHIRExpr::BinOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            })
+            Ok(signed_binop(op, left, right))
         }
 
         ExprType::Unary(un) => {
             let inner = lower_expr(&un.expr, ctx)?;
             let op = lower_unop(&un.op, un.span)?;
+            // Negation of a signed value is bit-identical (two's complement);
+            // keep the wrapper on the RESULT so a downstream compare or shift
+            // still sees signedness.
+            if let CHIRExpr::SignCast { signed: true, expr } = inner {
+                return Ok(CHIRExpr::SignCast {
+                    signed: true,
+                    expr: Box::new(CHIRExpr::UnOp { op, expr }),
+                });
+            }
             Ok(CHIRExpr::UnOp { op, expr: Box::new(inner) })
         }
 
@@ -2430,8 +2435,37 @@ pub(crate) fn lower_expr(expr: &ExprType, ctx: &mut LowerCtx) -> Result<CHIRExpr
         }
 
         ExprType::Cast(cast) => {
-            // Strip the cast — width changes are handled at VLIR emission
-            lower_expr(&cast.expr, ctx)
+            // Width changes are handled at VLIR emission; what a cast DOES carry
+            // is signedness. `as i*` wraps the operand in `SignCast { signed:
+            // true }` so a comparison or right shift downstream is emitted
+            // signed (`$signed`, `>>>`) — before this, the cast was stripped
+            // outright and `(a as i32) < (b as i32)` compiled to an UNSIGNED
+            // compare while `as i32 >> 20` compiled to a LOGICAL shift, both
+            // lint-clean and wrong (the signedness claim-ledger entries).
+            // `as u*` of a signed expression re-interprets back (`$unsigned`);
+            // `as u*` of a plain expression stays a strip, as before.
+            let inner = lower_expr(&cast.expr, ctx)?;
+            let target = compact_type(&cast.target_ty.ty_text);
+            let to_signed = matches!(
+                target.as_str(),
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            );
+            Ok(match (to_signed, inner) {
+                (true, CHIRExpr::SignCast { expr, .. }) => {
+                    CHIRExpr::SignCast { signed: true, expr }
+                }
+                (true, plain) => {
+                    CHIRExpr::SignCast { signed: true, expr: Box::new(plain) }
+                }
+                // `as u*` of a SIGNED expression re-interprets it back — the
+                // explicit `$unsigned` keeps the emitted type honest.
+                (false, CHIRExpr::SignCast { expr, .. }) => {
+                    CHIRExpr::SignCast { signed: false, expr }
+                }
+                // `as u*`/`as usize` of a plain expression is the historical
+                // strip: signedness-free, width handled at VLIR emission.
+                (false, plain) => plain,
+            })
         }
 
         ExprType::Reference(r) => {
@@ -2944,6 +2978,8 @@ fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
             width_of_chir_expr(then_val, ctx).or_else(|| width_of_chir_expr(else_val, ctx))
         }
         CHIRExpr::Slice { high, low, .. } => Some(high - low + 1),
+        // A signedness reinterpretation keeps its operand's width.
+        CHIRExpr::SignCast { expr, .. } => width_of_chir_expr(expr, ctx),
         // A memory read result: the element width lives in the memory's
         // declaration, which this expression-only walk does not carry.
         CHIRExpr::MemData { mem, .. } => ctx.memories.get(mem).map(|m| width_of_type(&m.elem_ty)),
@@ -3126,6 +3162,53 @@ fn lower_lit_expr(
         span,
         suggested_rewrite: None,
     })
+}
+
+/// Assemble a binary operation with **signedness propagation** (see
+/// `CHIRExpr::SignCast`). Two's complement makes `+ - * & | ^ <<` bit-identical,
+/// so the wrapper moves to the RESULT there; it stays on the operands where
+/// signedness is observable — comparisons (SystemVerilog compares signed iff
+/// every operand is signed; a plain operand, e.g. a literal, is wrapped along,
+/// matching Rust's same-type requirement) and `%`; a right shift keeps a signed
+/// LEFT operand, which the emitter renders as `>>>`. `==`/`!=` and the logical
+/// ops see bits only.
+fn signed_binop(op: CHIRBinOp, left: CHIRExpr, right: CHIRExpr) -> CHIRExpr {
+    fn peel(e: CHIRExpr) -> (bool, CHIRExpr) {
+        match e {
+            CHIRExpr::SignCast { signed: true, expr } => (true, *expr),
+            other => (false, other),
+        }
+    }
+    fn wrap(e: CHIRExpr) -> Box<CHIRExpr> {
+        Box::new(CHIRExpr::SignCast { signed: true, expr: Box::new(e) })
+    }
+    let (ls, li) = peel(left);
+    let (rs, ri) = peel(right);
+    if !ls && !rs {
+        return CHIRExpr::BinOp { left: Box::new(li), op, right: Box::new(ri) };
+    }
+    match op {
+        CHIRBinOp::Lt | CHIRBinOp::Lte | CHIRBinOp::Gt | CHIRBinOp::Gte => CHIRExpr::BinOp {
+            left: wrap(li),
+            op,
+            right: wrap(ri),
+        },
+        CHIRBinOp::Rem => CHIRExpr::SignCast {
+            signed: true,
+            expr: Box::new(CHIRExpr::BinOp { left: wrap(li), op, right: wrap(ri) }),
+        },
+        CHIRBinOp::Shr => CHIRExpr::SignCast {
+            signed: true,
+            expr: Box::new(CHIRExpr::BinOp { left: wrap(li), op, right: Box::new(ri) }),
+        },
+        CHIRBinOp::Eq | CHIRBinOp::Neq | CHIRBinOp::LogicalAnd | CHIRBinOp::LogicalOr => {
+            CHIRExpr::BinOp { left: Box::new(li), op, right: Box::new(ri) }
+        }
+        _ => CHIRExpr::SignCast {
+            signed: true,
+            expr: Box::new(CHIRExpr::BinOp { left: Box::new(li), op, right: Box::new(ri) }),
+        },
+    }
 }
 
 fn lower_binop(op: &str, span: SourceSpan) -> Result<CHIRBinOp, CHIRLowerError> {
@@ -3602,6 +3685,7 @@ fn validate_expr(
             }
         }
         CHIRExpr::Lit(_) => {}
+        CHIRExpr::SignCast { expr, .. } => validate_expr(expr, known, span)?,
         CHIRExpr::BinOp { left, right, .. } => {
             validate_expr(left, known, span)?;
             validate_expr(right, known, span)?;
@@ -4257,7 +4341,9 @@ fn walk_chir_expr(expr: &CHIRExpr, f: &mut impl FnMut(&CHIRExpr)) {
             walk_chir_expr(left, f);
             walk_chir_expr(right, f);
         }
-        CHIRExpr::UnOp { expr, .. } | CHIRExpr::Resize { expr, .. } => walk_chir_expr(expr, f),
+        CHIRExpr::UnOp { expr, .. }
+        | CHIRExpr::Resize { expr, .. }
+        | CHIRExpr::SignCast { expr, .. } => walk_chir_expr(expr, f),
         CHIRExpr::Mux { cond, then_val, else_val } => {
             walk_chir_expr(cond, f);
             walk_chir_expr(then_val, f);

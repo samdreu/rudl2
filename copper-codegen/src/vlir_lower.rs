@@ -763,6 +763,10 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer, mb: &MemBinding) -> LowerResult<VLI
             expr: Box::new(lower_expr(expr, leg, mb)?),
             width: width.clone(),
         },
+        SHIRExpr::SignCast { signed, expr } => VLIRExpr::SignCast {
+            signed: *signed,
+            expr: Box::new(lower_expr(expr, leg, mb)?),
+        },
         SHIRExpr::PhaseEq(idx) => VLIRExpr::BinOp {
             left: Box::new(VLIRExpr::Var("phase_r".to_string())),
             op: VLIRBinOp::Eq,
@@ -1023,7 +1027,10 @@ fn shir_expr_vars(e: &SHIRExpr, out: &mut HashSet<String>) {
             shir_expr_vars(left, out);
             shir_expr_vars(right, out);
         }
-        SHIRExpr::UnOp { expr, .. } | SHIRExpr::Slice { expr, .. } | SHIRExpr::Resize { expr, .. } => {
+        SHIRExpr::UnOp { expr, .. }
+        | SHIRExpr::Slice { expr, .. }
+        | SHIRExpr::Resize { expr, .. }
+        | SHIRExpr::SignCast { expr, .. } => {
             shir_expr_vars(expr, out)
         }
         SHIRExpr::Mux { cond, then_val, else_val } => {
@@ -1554,6 +1561,7 @@ fn collect_vlir_reads(expr: &VLIRExpr, out: &mut HashSet<String>) {
             collect_vlir_reads(then_val, out);
             collect_vlir_reads(else_val, out);
         }
+        VLIRExpr::SignCast { expr, .. } => collect_vlir_reads(expr, out),
         VLIRExpr::Concat(parts) => {
             for p in parts {
                 collect_vlir_reads(p, out);
@@ -2193,7 +2201,8 @@ fn collect_read_uses_expr(
         }
         SHIRExpr::UnOp { expr, .. }
         | SHIRExpr::Resize { expr, .. }
-        | SHIRExpr::Slice { expr, .. } => collect_read_uses_expr(expr, data, valid),
+        | SHIRExpr::Slice { expr, .. }
+        | SHIRExpr::SignCast { expr, .. } => collect_read_uses_expr(expr, data, valid),
         SHIRExpr::Mux { cond, then_val, else_val } => {
             collect_read_uses_expr(cond, data, valid);
             collect_read_uses_expr(then_val, data, valid);

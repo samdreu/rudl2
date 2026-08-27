@@ -1,14 +1,20 @@
 // Signedness — the sharpest case for running both sides rather than reading the
 // SystemVerilog and nodding.
 //
-// `ExprType::Cast` is stripped in `chir_lower` and the word `signed` is never
-// emitted by the backend, so `as i32` simply disappears. The broken modules here
-// transpile AND pass Verilator's `-Wall` cleanly: `assign o = (a >> 32'd20)` is
-// perfectly good SystemVerilog that computes the wrong number. Only the
-// differential sweep separates them from their working twins.
+// HISTORY: `ExprType::Cast` used to be stripped in `chir_lower` and `signed`
+// was never emitted, so `as i32` simply disappeared — the two `via_cast`
+// modules below transpiled AND passed Verilator's `-Wall` cleanly while
+// computing the wrong number, and only the differential sweep separated them
+// from their working twins. FIXED 2026-08-27: `as i*` lowers to
+// `CHIRExpr::SignCast` and propagates (`chir_lower::signed_binop`), so these
+// now emit `$signed(a) < $signed(b)` and `$signed(instr) >>> 20` and SWEEP
+// GREEN — their build.rs SKIP entries are deleted, which is the claim ledger
+// working as designed. The `via_bias`/`via_mask` twins stay as the
+// spelled-out controls.
 
-/// **BROKEN.** `(a as i32) < (b as i32)` emits an UNSIGNED compare. This is
-/// RISC-V's SLT / BLT / BGE, and it is wrong for every negative operand.
+/// `(a as i32) < (b as i32)` — a SIGNED compare (`$signed(a) < $signed(b)`).
+/// This is RISC-V's SLT / BLT / BGE. Was an unsigned compare before the
+/// SignCast fix; sweeps green now.
 #[hardware(sequential)]
 pub async fn signed_lt_via_cast(
     clk: Clock<MainClk>,
@@ -44,9 +50,9 @@ pub async fn signed_lt_via_bias(
     }
 }
 
-/// **BROKEN.** `as i32 >> 20` is an ARITHMETIC shift in Rust and a LOGICAL shift
-/// in the emitted SV, so sign extension silently becomes zero extension. This is
-/// RISC-V's I-type immediate.
+/// `as i32 >> 20` — an ARITHMETIC shift (`$signed(instr) >>> 20`), matching
+/// Rust. This is RISC-V's I-type immediate. Was a logical shift (sign extension
+/// silently became zero extension) before the SignCast fix; sweeps green now.
 #[hardware(sequential)]
 pub async fn sign_extend_via_cast(
     clk: Clock<MainClk>,
@@ -76,5 +82,29 @@ pub async fn sign_extend_via_mask(
         } else {
             raw
         });
+    }
+}
+
+/// Propagation coverage (added with the 2026-08-27 fix): arithmetic on a signed
+/// value BEFORE the compare. Two's complement makes the subtraction
+/// bit-identical, but the comparison must still see signed operands — the
+/// `SignCast` wrapper travels through `wrapping_sub` onto the result
+/// (`chir_lower::signed_binop`), so this emits
+/// `($signed((a - 1)) < $signed(b))`, not an unsigned compare of the difference.
+#[hardware(sequential)]
+pub async fn signed_lt_after_sub(
+    clk: Clock<MainClk>,
+    a: In<Bits<32>, MainClk>,
+    b: In<Bits<32>, MainClk>,
+    o: Out<Logic, MainClk>,
+) {
+    loop {
+        clk.tick().await;
+        let x: i32 = (a.read().as_u32() as i32).wrapping_sub(1);
+        if x < (b.read().as_u32() as i32) {
+            o.write(Logic::One);
+        } else {
+            o.write(Logic::Zero);
+        }
     }
 }

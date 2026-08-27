@@ -1205,6 +1205,7 @@ fn collect_expr_vars(expr: &CHIRExpr, visitor: &mut impl FnMut(&str)) {
         }
         CHIRExpr::Concat(exprs) => { for e in exprs { collect_expr_vars(e, visitor); } }
         CHIRExpr::Slice { expr, .. } => collect_expr_vars(expr, visitor),
+        CHIRExpr::SignCast { expr, .. } => collect_expr_vars(expr, visitor),
         CHIRExpr::DynBit { base, index } => {
             collect_expr_vars(base, visitor);
             collect_expr_vars(index, visitor);
@@ -1252,6 +1253,10 @@ fn subst_vars(expr: SHIRExpr, subst: &HashMap<String, SHIRExpr>) -> SHIRExpr {
         SHIRExpr::Concat(exprs) => SHIRExpr::Concat(
             exprs.into_iter().map(|e| subst_vars(e, subst)).collect()
         ),
+        SHIRExpr::SignCast { signed, expr } => SHIRExpr::SignCast {
+            signed,
+            expr: Box::new(subst_vars(*expr, subst)),
+        },
         SHIRExpr::Slice { expr, high, low } => SHIRExpr::Slice {
             expr: Box::new(subst_vars(*expr, subst)),
             high,
@@ -1321,6 +1326,10 @@ pub fn lower_expr(expr: &CHIRExpr) -> Result<SHIRExpr, SHIRLowerError> {
                 default: Box::new(default_expr),
             })
         }
+        CHIRExpr::SignCast { signed, expr } => Ok(SHIRExpr::SignCast {
+            signed: *signed,
+            expr: Box::new(lower_expr(expr)?),
+        }),
         CHIRExpr::Concat(exprs) => Ok(SHIRExpr::Concat(
             exprs.iter().map(lower_expr).collect::<Result<_, _>>()?
         )),

@@ -281,6 +281,12 @@ pub enum SHIRExpr {
         default: Box<SHIRExpr>,
     },
     Concat(Vec<SHIRExpr>),
+    /// Signedness reinterpretation — see `CHIRExpr::SignCast`; passes through
+    /// this stage unchanged.
+    SignCast {
+        signed: bool,
+        expr: Box<SHIRExpr>,
+    },
     Slice {
         expr: Box<SHIRExpr>,
         high: usize,

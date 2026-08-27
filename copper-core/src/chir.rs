@@ -410,6 +410,23 @@ pub enum CHIRExpr {
         default: Option<Box<CHIRExpr>>,
     },
     Concat(Vec<CHIRExpr>),
+    /// Signedness reinterpretation — `$signed(expr)` / `$unsigned(expr)`.
+    ///
+    /// Produced by `chir_lower` for `as i*` / `as u*` casts, and PROPAGATED
+    /// through bit-identical operators so composed signed arithmetic stays
+    /// signed where it observably matters: comparisons keep the wrapper on both
+    /// operands (SystemVerilog compares signed iff every operand is signed), a
+    /// right shift keeps it on the left operand (the emitter renders `>>>` for a
+    /// signed left operand — SystemVerilog's `>>` is logical even on signed
+    /// values), and everything width- or bit-shaped strips it (two's complement
+    /// makes `+ - * & | ^ <<` bit-identical). Before this variant existed the
+    /// cast was stripped outright, so `(a as i32) < (b as i32)` compiled to an
+    /// UNSIGNED compare and `as i32 >> 20` to a LOGICAL shift — both lint-clean
+    /// and wrong (the signedness claim-ledger entries, fixed 2026-08-27).
+    SignCast {
+        signed: bool,
+        expr: Box<CHIRExpr>,
+    },
     Slice {
         expr: Box<CHIRExpr>,
         high: usize,

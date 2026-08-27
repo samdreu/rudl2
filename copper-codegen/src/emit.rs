@@ -731,7 +731,16 @@ fn expr_str(e: &VLIRExpr) -> String {
         VLIRExpr::Var(name) => name.clone(),
         VLIRExpr::Lit { width, value } => lit_str(width, *value),
         VLIRExpr::BinOp { left, op, right } => {
-            format!("({} {} {})", expr_str(left), binop_str(*op), expr_str(right))
+            // SystemVerilog's `>>` is LOGICAL even on a signed operand; the
+            // arithmetic shift Rust's `as i32 >> k` means needs `>>>` (and a
+            // signed left operand, which the SignCast wrapper supplies). This is
+            // the signedness ledger's `sign_extend_via_cast` — sign extension
+            // silently became zero extension before this arm existed.
+            let op_str = match (op, left.as_ref()) {
+                (VLIRBinOp::Shr, VLIRExpr::SignCast { signed: true, .. }) => ">>>",
+                _ => binop_str(*op),
+            };
+            format!("({} {} {})", expr_str(left), op_str, expr_str(right))
         }
         VLIRExpr::UnOp { op, expr } => format!("({}{})", unop_str(*op), expr_str(expr)),
         VLIRExpr::Ternary { cond, then_val, else_val } => format!(
@@ -771,6 +780,15 @@ fn expr_str(e: &VLIRExpr) -> String {
             }
         }
         VLIRExpr::MemIndex { mem, addr } => format!("{}[{}]", mem, expr_str(addr)),
+        // Signedness reinterpretation. `$signed`/`$unsigned` change the TYPE of
+        // the expression, not its bits: a comparison is signed iff every operand
+        // is signed, so the CHIR lowering keeps the wrapper on both compare
+        // operands and strips it wherever signedness is unobservable.
+        VLIRExpr::SignCast { signed, expr } => format!(
+            "{}({})",
+            if *signed { "$signed" } else { "$unsigned" },
+            expr_str(expr)
+        ),
         // `width'(expr)` — SV width-cast; the size may be a parameter.
         VLIRExpr::Resize { expr, width } => {
             let size = match width {
