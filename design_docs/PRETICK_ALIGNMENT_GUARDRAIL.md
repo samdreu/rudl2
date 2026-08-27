@@ -24,7 +24,7 @@
 > |---|---|---|
 > | `unprotected_pretick_out_write` (D1, narrowed §5.7) | a plain `Out` written where an `In` read reaches the write on some path while a register is assigned unprotected on another (path-dependent boundary), or a conditional/constant write in such a segment | — |
 > | …its **constant-write** clause (§5.5) | the same, where the port is written on *some* paths only — a constant is idempotent across the phase shift only if it lands on every path | 3 modules, all measured divergences |
-> | `unprotected_trailing_out_write` (§5.4) | the same hazard past the *last* tick, when the body crosses more than one clock edge per iteration | 1 real module (`rv32i_cpu_pipelined`, → `RegOut`) |
+> | `unprotected_trailing_out_write` (§5.4; narrowed 2026-08-27) | the same hazard past the *last* tick, when the body crosses more than one clock edge per iteration **and some tick sits inside control flow** (`has_nested_tick`, the source-level mirror of extraction's trigger) — the LINEAR class is exempt, measured agreeing; the extracted class is measured one-edge-late wherever the last tick sits | 1 real module (`rv32i_cpu_pipelined`, → `RegOut`) |
 > | `multi_phase_out_write` | a plain `Out` driven in more than one clock phase | 9 modules, six of them its own witnesses |
 > | `pretick_out_write_before_update` (§5.6, 2026-08-26) | a plain `Out` written between a leading `In` read and the update of a register the write reads | 0 real modules; caught a silently-divergent compile-only UI fixture the day it landed |
 >

@@ -277,10 +277,13 @@ const EXPECTED_TRAILING: &[&str] = &[
     //     2026-08-27 parenthesized-bit-select emission fix). A TRUE positive:
     //     the extraction route commits trailing updates one edge late
     //     regardless of where the last tick sits.
-    // Recorded follow-up: narrow the rule to the EXTRACTION route alone
-    // (exempting only the linear lowering), or retire it wholesale when
-    // phase C lands the corrected trailing lowering.
-    "tests/sequential_forwarding_divergence.rs::linear_trailing",
+    // NARROWED 2026-08-27 (user-approved): the rule now gates on
+    // `has_nested_tick` — the source-level mirror of extraction's trigger — so
+    // the linear class is EXEMPT and `linear_trailing` left this set (it keeps
+    // living in the divergence file as the exemption's measured witness, now
+    // without an opt-out). `branch_trailing` stays: a measured TRUE positive.
+    // Remaining follow-up: retire the rule wholesale when phase C lands the
+    // corrected extraction-path trailing lowering.
     "tests/sequential_forwarding_divergence.rs::branch_trailing",
 ];
 

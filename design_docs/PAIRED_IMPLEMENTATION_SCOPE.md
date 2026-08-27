@@ -27,6 +27,10 @@ deferred — see below).** Execution notes, in the order things were learned:
   which `unprotected_trailing_out_write` keeps unwritable. Cost/benefit: the
   code change would only legalize the `trailing_update` witness. Deferred like
   E; the trailing rule is therefore **kept**, not retired.
+  **Narrowed instead (2026-08-27, user-approved):** the trailing rule now gates
+  on `has_nested_tick` — the linear class (measured agreeing) is exempt and
+  compiles clean; the extracted class (measured one-edge-late in both
+  spellings) stays refused. Retirement remains gated on phase C proper.
 * **D — DONE, evidence-first.** The V-battery was re-measured under B before the
   rule moved (`d_narrowing_battery_verdicts`): V5 **and V7** dissolved (V7's
   2026-08-21 verdict was stale even before B — the 2026-08-25 trailing

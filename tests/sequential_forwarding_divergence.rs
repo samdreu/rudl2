@@ -1415,7 +1415,7 @@ fn d_narrowing_battery_verdicts() {
 // over-flagged — measured DIVERGING (2026-08-27), see `branch_trailing`.
 
 const LINEAR_TRAILING_SRC: &str = r#"
-#[hardware(sequential, allow_pretick_alignment)]
+#[hardware(sequential)]
 async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut n: Bits<8> = Bits::zero();
     loop {
@@ -1427,7 +1427,7 @@ async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
 }
 "#;
 
-#[hardware(sequential, allow_pretick_alignment)]
+#[hardware(sequential)]
 async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
     let mut n: Bits<8> = Bits::zero();
     loop {
@@ -1440,12 +1440,16 @@ async fn linear_trailing(clk: Clock<C>, o: Out<Bits<8>, C>) {
 
 #[test]
 fn linear_trailing_probe() {
-    // The rule flags the linear spelling…
+    // NARROWED 2026-08-27: the rule now exempts the linear class (its gate is
+    // `has_nested_tick`, the source-level mirror of extraction's trigger), so
+    // this spelling compiles WITHOUT an opt-out and the rule must return
+    // nothing for it — this probe is the exemption's standing witness.
     let f: syn::ItemFn = syn::parse_str(LINEAR_TRAILING_SRC).expect("parses");
-    assert_eq!(
-        copper_analysis::unprotected_trailing_out_write(&f),
-        vec!["o".to_string()],
-        "the trailing rule no longer covers the linear spelling — check deliberate"
+    assert!(
+        copper_analysis::unprotected_trailing_out_write(&f).is_empty(),
+        "the trailing rule flags the LINEAR spelling again — it was measured \
+         AGREEING (the linear path commits trailing updates at the right edge), \
+         so that is a false positive unless the linear lowering itself changed"
     );
 
     let mut clk = Clock::<C>::new();
