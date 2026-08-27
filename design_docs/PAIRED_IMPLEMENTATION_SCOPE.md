@@ -99,7 +99,7 @@ decision".
 | closing suffix (a commit depends on a same-cycle `In` read; statements after the barrier) | **unforwarded** commit-frontier expression | unforwarded | none |
 | opening region (pre-tick with no input-dependent commit — e.g. no `In` reads at all) | **forwarded** expression (`assign o = r + 1` for V1) | unforwarded | **phase B** |
 | opening prefix (statements before the first leading read) | committed-state expression | unforwarded (≡ committed here) | none |
-| trailing region (multi-tick) | commit trailing updates at the edge **opening** the trailing cycle; assign the committed register | commits one edge late | **phase C** |
+| trailing region (multi-tick) | commit trailing updates at the edge **opening** the trailing cycle; assign the committed register | extraction route commits one edge late; linear route measured correct (2026-08-27) | **phase C** |
 
 The phase-B target is §5.3's Prost-style measurement (matches V1's sim exactly);
 the phase-C target is m2's hand-lowered module (matches the sim cycle-for-cycle,
@@ -149,7 +149,17 @@ pinned).
 
 ### Phase C — trailing lowering (m2's target)
 
-* `copper-codegen` (`shir_lower`, both paths): trailing register updates fold
+* **Decision evidence (2026-08-27, the two trailing probes in
+  `sequential_forwarding_divergence.rs`):** the LINEAR multi-tick lowering
+  already commits trailing updates at the correct edge (`linear_trailing`,
+  measured agreeing), so phase C's change is scoped to the **extraction
+  route** — which commits one edge late wherever the last tick sits, top-level
+  included (`branch_trailing`, measured diverging by exactly one cycle once the
+  parenthesized-bit-select emission bug was fixed in `emit.rs`). The
+  `unprotected_trailing_out_write` flag is thus a false positive only on the
+  linear class.
+* `copper-codegen` (`shir_lower`, extraction route; the linear path already
+  conforms): trailing register updates fold
   into the edge that opens the trailing cycle; the port assign reads the
   committed register — byte-for-byte the m2 hand lowering that matches the sim.
 * **Predicted corpus delta: zero live modules** (the shape is guarded today;

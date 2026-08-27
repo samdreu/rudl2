@@ -718,6 +718,13 @@ fn lit_str(width: &Width, value: u128) -> String {
     }
 }
 
+/// Whether `[..]` may legally select from this expression's rendered text —
+/// SV allows selects only on (possibly memory-indexed) identifiers, never on
+/// a parenthesized expression.
+fn select_legal(e: &VLIRExpr) -> bool {
+    matches!(e, VLIRExpr::Var(_) | VLIRExpr::MemIndex { .. })
+}
+
 /// Fully parenthesized expression text — never rely on operator precedence.
 fn expr_str(e: &VLIRExpr) -> String {
     match e {
@@ -738,13 +745,31 @@ fn expr_str(e: &VLIRExpr) -> String {
             format!("{{{}}}", inner.join(", "))
         }
         VLIRExpr::Slice { expr, high, low } => {
-            if high == low {
-                format!("{}[{}]", expr_str(expr), high)
+            if select_legal(expr) {
+                if high == low {
+                    format!("{}[{}]", expr_str(expr), high)
+                } else {
+                    format!("{}[{}:{}]", expr_str(expr), high, low)
+                }
             } else {
-                format!("{}[{}:{}]", expr_str(expr), high, low)
+                // SV forbids a select on a non-identifier expression (the
+                // forwarding substitution can put a compound here, e.g.
+                // `(n + 8'd1)[0]`); `W'(expr >> low)` selects the same bits.
+                let width = high - low + 1;
+                if *low == 0 {
+                    format!("{}'({})", width, expr_str(expr))
+                } else {
+                    format!("{}'({} >> {})", width, expr_str(expr), low)
+                }
             }
         }
-        VLIRExpr::DynBit { base, index } => format!("{}[{}]", expr_str(base), loop_bound_str(index)),
+        VLIRExpr::DynBit { base, index } => {
+            if select_legal(base) {
+                format!("{}[{}]", expr_str(base), loop_bound_str(index))
+            } else {
+                format!("1'({} >> {})", expr_str(base), loop_bound_str(index))
+            }
+        }
         VLIRExpr::MemIndex { mem, addr } => format!("{}[{}]", mem, expr_str(addr)),
         // `width'(expr)` — SV width-cast; the size may be a parameter.
         VLIRExpr::Resize { expr, width } => {

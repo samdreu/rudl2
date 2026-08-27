@@ -1411,8 +1411,8 @@ fn d_narrowing_battery_verdicts() {
 // (the 2026-08-25 shared-map work), so the model predicts the linear spelling
 // of the identical shape AGREES — measured so (2026-08-27). The rule therefore
 // over-flags the linear class: its refusal there is a lowering limitation, not
-// a semantics rule. Whether the EXTRACTED-with-top-level-last-tick class is
-// also over-flagged is blocked on an emission bug — see `branch_trailing`.
+// a semantics rule. The EXTRACTED-with-top-level-last-tick class is NOT
+// over-flagged — measured DIVERGING (2026-08-27), see `branch_trailing`.
 
 const LINEAR_TRAILING_SRC: &str = r#"
 #[hardware(sequential, allow_pretick_alignment)]
@@ -1476,16 +1476,21 @@ fn linear_trailing_probe() {
 }
 
 // The same trailing body behind BRANCH-NESTED ticks — extraction fires with a
-// top-level LAST tick. The placement question here is UNMEASURABLE today: the
-// module transpiles, but the emitted SystemVerilog does not parse —
-// `pc <= (((n + 8'd1)[0] == 1'b1) ? …)` — a bit-select applied to a
-// parenthesized expression, which SV forbids. That is a pre-existing emission
-// bug in the forwarded branch-condition path (the cause-N `edge_condition`
-// substitution meets an `Index` and emits `(subst)[k]` verbatim; phase B only
-// changed drive values, not conditions), witnessed here for the first time
-// because no corpus module bit-selects a register in a branch condition that
-// guards ticks. Until it is fixed, the probe pins the bug itself; then the
-// run_sv comparison below completes the placement measurement.
+// top-level LAST tick. Measuring this was blocked until 2026-08-27 by an
+// emission-legality bug: the cause-N `edge_condition` substitution puts a
+// compound expression under the branch condition's `Index`, and the emitter
+// rendered `pc <= (((n + 8'd1)[0] == 1'b1) ? …)` — a bit-select on a
+// parenthesized expression, which SV forbids. Fixed in `emit.rs` (`select_legal`
+// gates the `[..]` syntax; compound bases emit the width-cast form
+// `1'((n + 8'd1))`), which unblocked the measurement:
+//
+//   VERDICT (2026-08-27): DIVERGE — the SV trace is the sim trace delayed by
+//   one cycle. The extracted route commits the trailing update one edge late
+//   even when the LAST tick is top-level, so the placement error is a property
+//   of the extraction route as a whole, not just its rotation placement. The
+//   trailing rule's flag on this class is a TRUE positive; only the LINEAR
+//   class (above) is over-flagged, so the phase-C/D narrowing exempts the
+//   linear lowering route alone.
 
 const BRANCH_TRAILING_SRC: &str = r#"
 #[hardware(sequential, allow_pretick_alignment)]
@@ -1535,19 +1540,38 @@ fn branch_trailing_probe() {
     let expected: Vec<u8> = (1..=CYCLES).map(|k| (k / 2) as u8).collect();
     assert_eq!(sim, expected, "simulator behaviour changed");
 
-    // The emitted SV is currently ILLEGAL — pin the bug textually (independent
-    // of Verilator) so its fix flips this loudly instead of silently.
+    // The emission bug this probe used to pin (`(n + 8'd1)[0]`, illegal SV) is
+    // fixed — selects over compound bases now emit the width-cast form — so
+    // the text must stay select-legal.
     let sv_text = copper_codegen::transpile_source(
         BRANCH_TRAILING_SRC,
         Some("branch_trailing"),
         &copper_codegen::EmitConfig::default(),
     )
-    .expect("transpiles (the bug is in emission legality, not acceptance)");
+    .expect("transpiles");
     assert!(
-        sv_text.contains(")[") ,
-        "the parenthesized-bit-select emission bug is FIXED — complete this probe: \
-         Verilate the module (transpile_and_run) and compare against `sim` to \
-         settle whether extracted trailing after a TOP-LEVEL last tick is placed \
-         correctly, then re-bless this test and the phase-C scope notes"
+        !sv_text.contains(")["),
+        "a select over a parenthesized expression is back in the emitted SV — \
+         the emit.rs select_legal fallback regressed"
+    );
+
+    if !verilator_available() {
+        return;
+    }
+    let sv = transpile_and_run(BRANCH_TRAILING_SRC, "branch_trailing", "clk", "o", "");
+    eprintln!("branch_trailing: sim = {sim:?}\n                 sv  = {sv:?}  -> {}", if sim == sv { "AGREE" } else { "DIVERGE" });
+    let one_cycle_late: Vec<u8> = (0..CYCLES).map(|k| (k / 2) as u8).collect();
+    assert_eq!(
+        sv, one_cycle_late,
+        "the extracted-route divergence is no longer the one-edge-late trace — \
+         if sim == sv the trailing lowering is fixed for the top-level-last-tick \
+         class: re-bless this probe, EXPECTED_TRAILING, and the phase-C scope \
+         notes in design_docs/PAIRED_IMPLEMENTATION_SCOPE.md together"
+    );
+    assert_ne!(
+        sim, sv,
+        "sim and SV now AGREE for extracted trailing after a TOP-LEVEL last \
+         tick — phase C landed for this class; re-bless this probe, \
+         EXPECTED_TRAILING, and the phase-C scope notes together"
     );
 }
