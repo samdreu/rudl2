@@ -53,7 +53,18 @@ pub fn transpile_fir(
     // path downstream cannot name. Computed BEFORE the pass runs, since a declined
     // module is left untouched and there is nothing to inspect afterwards.
     let declined = control_extract::unflattenable_reason(&fir);
+    let preloop_muts_before = preloop_mut_names(&fir);
     control_extract::extract_control(&mut fir);
+    // Register state SYNTHESIZED by the FIR→FIR passes — `pc`, the
+    // `__copper_ctr*` counters, and hoisted cross-state locals — appears as new
+    // pre-loop `let mut` declarations. Append the diff to the FIR's register
+    // authority so `chir_lower` classifies them without a second heuristic; a
+    // future pass that introduces register state is covered automatically.
+    for name in preloop_mut_names(&fir) {
+        if !preloop_muts_before.contains(&name) && !fir.registers.contains(&name) {
+            fir.registers.push(name);
+        }
+    }
     let fir = &fir;
 
     // A declined module cannot be flattened, so whatever the linear lowering
@@ -69,6 +80,19 @@ pub fn transpile_fir(
     let shir = lower_to_shir(&chir).map_err(|e| format!("{e}"))?;
     let vlir = lower_to_vlir(&shir).map_err(|e| format!("{e}"))?;
     Ok(emit_verilog(&vlir, config))
+}
+
+/// The pre-loop `let mut` names of a FIR body — the declarations the FIR→FIR
+/// passes add register state through (see the diff in [`transpile_fir`]).
+fn preloop_mut_names(fir: &copper_core::FrontendModuleIR) -> std::collections::BTreeSet<String> {
+    use copper_core::frontend_ir::RawStmtKind;
+    fir.raw_statements
+        .iter()
+        .filter_map(|s| match &s.kind {
+            RawStmtKind::Local(l) if l.is_mut => Some(l.name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Transpile one hardware module out of a Rust *source string*. Finds hardware

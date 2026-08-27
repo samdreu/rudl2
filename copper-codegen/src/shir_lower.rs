@@ -1786,7 +1786,7 @@ mod tests {
                     clk.tick().await;
                     let step1: u8 = input.wrapping_add(1u8);
                     clk.tick().await;
-                    acc = step1.wrapping_add(step1);
+                    acc = acc.wrapping_add(step1);
                 }
             }"
         );

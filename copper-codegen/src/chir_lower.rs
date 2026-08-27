@@ -1302,13 +1302,29 @@ fn lower_seq_body(
                     (None, None) => return Err(CHIRLowerError::AmbiguousWidth { span: local.span }),
                 };
                 symbols.insert(local.name.clone(), ty.clone());
-                let init = local.init.as_ref().and_then(|e| lower_init_to_lit(e, &enums));
-                registers.push(CHIRRegDecl {
-                    name: local.name.clone(),
-                    ty,
-                    init,
-                    span: local.span,
-                });
+                // Register or wire? CONSULT the FIR's register authority — the
+                // shared source-level liveness inference plus the names the
+                // FIR→FIR passes synthesized (see `FrontendModuleIR::registers`).
+                // The old rule here — every pre-loop `let mut` is a register —
+                // was a second, syntactic decider that merely happened to agree
+                // with the shared inference (register_reconciliation.rs was the
+                // measurement); making this arm consume the authority closes the
+                // register half of the c2 obligation. A pre-loop `let mut` the
+                // authority calls a wire lowers exactly like a pre-loop `let`
+                // (a combinational wire, often a constant). A demoted local
+                // WITHOUT an init has no wire value to take, so it stays a
+                // register conservatively — no corpus instance exists.
+                if fir.registers.iter().any(|r| r == &local.name) || local.init.is_none() {
+                    let init = local.init.as_ref().and_then(|e| lower_init_to_lit(e, &enums));
+                    registers.push(CHIRRegDecl {
+                        name: local.name.clone(),
+                        ty,
+                        init,
+                        span: local.span,
+                    });
+                } else if let Some(init) = &local.init {
+                    pre_loop_wires.push((local.name.clone(), ty, init, local.span));
+                }
             }
             RawStmtKind::Local(local) => {
                 // A `Memory<..>` binding is a hardware submodule (an array plus
@@ -4699,7 +4715,7 @@ mod tests {
         let fir = make_fir(
             "async fn counter(clk: Clock<MainClk>) {
                 let mut count: u8 = 5u8;
-                loop { clk.tick().await; }
+                loop { count = count.wrapping_add(1u8); clk.tick().await; }
             }"
         );
         let body = lower_seq_body(&fir, &no_hw(), &empty_registry()).unwrap();
@@ -4713,7 +4729,7 @@ mod tests {
         let fir = make_fir(
             "async fn counter(clk: Clock<MainClk>) {
                 let mut count = 0u16;
-                loop { clk.tick().await; }
+                loop { count = count.wrapping_add(1u16); clk.tick().await; }
             }"
         );
         let body = lower_seq_body(&fir, &no_hw(), &empty_registry()).unwrap();
@@ -5068,9 +5084,14 @@ mod tests {
     #[test]
     fn test_seq_body_detects_register_decl() {
         let fir = make_fir(
+            // The local must be a REGISTER by the shared liveness rule
+            // (defined in the loop, live across the tick) — a pre-loop
+            // `let mut` the loop never touches is a constant wire now that
+            // this arm consults `FrontendModuleIR::registers` instead of
+            // deciding syntactically (re-blessed with the authority change).
             "async fn counter(clk: Clock<MainClk>, data: In<u8, MainClk>) {
                 let mut count: u8 = 0u8;
-                loop { clk.tick().await; }
+                loop { count = count.wrapping_add(1u8); clk.tick().await; }
             }"
         );
         let body = lower_seq_body(&fir, &no_hw(), &empty_registry()).unwrap();

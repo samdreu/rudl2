@@ -21,6 +21,25 @@ pub struct FrontendModuleIR {
     /// injected by the caller (they are not reachable from the `ItemFn` alone).
     pub enums: Vec<ItemEnum>,
 
+    /// The module's **register set — the shared authority, riding the IR.**
+    ///
+    /// Filled by `capture_frontend_ir` from `copper_analysis::infer_registers`
+    /// (the same source-level backward-liveness inference the sim macro
+    /// consumes), then **appended to** by the FIR→FIR passes for the register
+    /// state they synthesize (`transpile_fir` diffs the pre-loop `let mut` set
+    /// after desugar + control extraction, which covers `pc`, the
+    /// `__copper_ctr*` counters, and hoisted cross-state locals without any
+    /// pass having to report names by hand).
+    ///
+    /// `chir_lower` CONSULTS this to classify a pre-loop `let mut` as register
+    /// or wire — it no longer decides syntactically. That closes the register
+    /// half of the c2 obligation (`CYCLE_DATAFLOW_SEMANTICS.md` §2): one
+    /// authoritative analysis, not two that must agree.
+    /// `copper-codegen/tests/register_reconciliation.rs` remains the oracle,
+    /// now verifying the plumbing end-to-end rather than a coincidence of two
+    /// deciders.
+    pub registers: Vec<String>,
+
     /// The mode declared in the `#[hardware(<mode>)]` attribute, when present.
     /// `None` when the function carries no `#[hardware(...)]` attribute (e.g. a
     /// bare `ItemFn` handed directly to `transpile_item_fn`). This is the

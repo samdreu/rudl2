@@ -101,13 +101,21 @@ computation. Its meaning:
   Prost, the only other coroutine HDL, lowers (§10.5). *This clause is the meaning of
   the source; both implementations owe it.*
 - **Registers = the liveness rule** (defined-in-loop ∧ live-across-a-tick, with the
-  back-edge clause). Unchanged, and already shared. What changes is *authority*: the
-  shared inference is the definition, and codegen must **consume** it, not log it
-  (`copper-codegen/src/lib.rs:324` logs; `chir_lower.rs:1295` re-decides
-  syntactically; `held_temp_trap` is the standing witness of disagreement — codegen
-  registers `u, v` where the inference correctly says wire). Deleting the syntactic
-  rival, with `register_reconciliation.rs` as the oracle, is a self-contained work
-  item independent of everything else here.
+  back-edge clause). Unchanged, and already shared. **The authority obligation is
+  DISCHARGED (2026-08-27):** `capture_frontend_ir` fills
+  `FrontendModuleIR::registers` from `infer_registers` — the identical inference,
+  on the identical input, the sim macro consumes — `transpile_fir` appends the
+  names the FIR→FIR passes synthesize (`pc`, counters, hoisted locals, found by
+  diffing the pre-loop `let mut` set across the passes), and `chir_lower`
+  **consults** that authority instead of deciding syntactically. The change was
+  byte-identical across all 195 corpus modules (sv-baseline), which is the proof
+  the old syntactic decider had only ever *coincided* with the inference;
+  `register_reconciliation.rs` remains the end-to-end oracle, now verifying
+  plumbing rather than a coincidence. (`held_temp_trap`, the historical
+  disagreement this bullet used to cite, had already been repaired by the
+  2026-08-26 reassigned-wire fix.) Four degenerate unit fixtures that pinned the
+  rival's behavior on never-touched locals were re-blessed with genuinely-live
+  registers.
 - **Commits anchor to the closing edge.** The segment's final forwarded values for
   register locals and `RegOut` ports commit at edge N+1. An `In` value that feeds a
   commit is sampled at the closing edge's pre-edge settle (`x_{N+1}`) — this is the

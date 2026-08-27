@@ -80,6 +80,9 @@ pub fn capture_frontend_ir(design_fn: &ItemFn, hardware_fns: &std::collections::
         clocks,
         raw_statements,
         enums,
+        // The shared register authority (see the field's docs): the identical
+        // inference the sim macro consumes, computed on the identical input.
+        registers: copper_analysis::infer_registers(design_fn),
         declared_mode: capture_hardware_mode(design_fn),
         // File-scope items are injected by the caller (see `transpile_source`),
         // just like `enums`; a bare `ItemFn` has none.
