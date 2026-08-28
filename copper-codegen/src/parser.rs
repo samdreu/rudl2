@@ -9,8 +9,6 @@ use copper_core::frontend_ir::{
     ItemMacro, ItemOther, ItemStmt, ItemStruct, ItemType, LocalStmt, RawParam, RawStmt, RawStmtKind,
     RawTypeRef, Receiver, SourceSpan, StructField,
 };
-use copper_core::{ModuleIR, Port};
-use copper_core::ir::Statement;
 use quote::{ToTokens, quote};
 use syn::spanned::Spanned;
 use syn::{BinOp, Expr, ItemFn, Stmt, UnOp};
@@ -38,21 +36,6 @@ impl std::fmt::Display for LowerError {
             LowerError::MissingArgument { name, span } =>
                 write!(f, "{}:{}: missing argument: {}", span.start_line, span.start_col, name),
         }
-    }
-}
-
-pub struct IRBuilder;
-
-// Is this a NO-OP rn?
-// TODO: Remove
-impl IRBuilder {
-    pub fn from_ast(_design_fn: &ItemFn, ports: Vec<Port>) -> Result<ModuleIR, LowerError> {
-        Ok(ModuleIR {
-            name: String::new(),
-            ports,
-            statements: Vec::<Statement>::new(),
-            submodules: Vec::new(),
-        })
     }
 }
 

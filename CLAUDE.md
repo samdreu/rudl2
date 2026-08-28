@@ -230,7 +230,8 @@ receive/clone one.
   drops those modules from corpus scans (`pretick_alignment_corpus`,
   `register_reconciliation`, `real_examples` all had this). Read the first token of
   the attribute list instead.
-- Generated artifacts (`tb_*.cpp`, `obj_dir/`, `waveforms/*.vcd`) land in the
-  repo root and subdirs and are gitignored.
+- Generated Verilator artifacts (`tb_*.cpp`, `obj_dir_*`) land under
+  `target/verilator/` (per-invocation names, reclaimed by `cargo clean`);
+  `waveforms/*.vcd` is gitignored.
 - Do research on prior HDLs and hardware DSLs to get knowledge on what correct semantics
   should be and to get advice on design decisions.

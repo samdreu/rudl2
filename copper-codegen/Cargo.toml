@@ -2,6 +2,7 @@
 name = "copper-codegen"
 version = "0.1.0"
 edition = "2024"
+description = "Copper transpiler (FIR -> CHIR -> SHIR -> VLIR -> SystemVerilog) and the copper-transpile CLI"
 
 [[bin]]
 name = "copper-transpile"

@@ -357,8 +357,15 @@ pub(crate) fn verify_with_verilator_traced(
         std::process::id(),
         WORK_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let obj_dir = format!("obj_dir_{module_name}{param_suffix}_{unique}");
-    let tb_file = format!("tb_{module_name}{param_suffix}_{unique}.cpp");
+    // Under `target/verilator/`, not the repo root: these are per-invocation and
+    // never cleaned (uniqueness is what makes them safe, see above), so in the
+    // root they accumulated by the dozen. `target/` already means "generated,
+    // safe to delete" and `cargo clean` reclaims them.
+    let work_root = std::path::Path::new("target/verilator");
+    fs::create_dir_all(work_root)
+        .map_err(|e| format!("Failed to create {}: {e}", work_root.display()))?;
+    let obj_dir = format!("target/verilator/obj_dir_{module_name}{param_suffix}_{unique}");
+    let tb_file = format!("target/verilator/tb_{module_name}{param_suffix}_{unique}.cpp");
     fs::write(&tb_file, &testbench)
         .map_err(|e| format!("Failed to write testbench: {}", e))?;
 

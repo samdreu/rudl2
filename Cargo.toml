@@ -6,6 +6,7 @@ members = ["copper-core", "copper-analysis", "copper-macros", "copper-codegen", 
 name = "copper"
 version = "0.1.0"
 edition = "2024"
+description = "Copper: a Rust-embedded HDL — hardware as #[hardware] async fns, simulated and transpiled to SystemVerilog"
 
 [dependencies]
 copper-core = { path = "copper-core" }

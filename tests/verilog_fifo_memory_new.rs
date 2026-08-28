@@ -47,7 +47,7 @@ impl MemoryBackedFifo {
     /// One clock cycle of a synchronous-read FIFO built on the pipelined
     /// `Memory` (READ_LAT = WRITE_LAT = 1, ReadFirst).
     ///
-    /// Timing (matches `verilog/fifo_mem_new.v`): control flags come from the
+    /// Timing (matches `tests/fixtures/reference_sv/fifo_mem_new.sv`): control flags come from the
     /// pre-edge count; memory write + a read of the current `read_ptr` are staged
     /// this cycle and take effect at the posedge (`clock.advance()`); `dout` is
     /// the *registered* read output, i.e. `mem[read_ptr]` captured at that edge
@@ -157,7 +157,7 @@ fn fifo_memory_new_matches_verilog_cycle_by_cycle() {
         );
     }
 
-    let verified = verify_with_verilator("verilog/fifo_mem_new.v", "fifo_mem_new", &trace)
+    let verified = verify_with_verilator("tests/fixtures/reference_sv/fifo_mem_new.sv", "fifo_mem_new", &trace)
         .expect("Verilator verification should run successfully");
     assert!(verified, "Expected Verilator comparison to pass");
 }

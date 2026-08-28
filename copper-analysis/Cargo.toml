@@ -10,6 +10,7 @@
 name = "copper-analysis"
 version = "0.1.0"
 edition = "2024"
+description = "Copper shared compile-time control/liveness analysis over syn::ItemFn, consumed by both front-ends"
 
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
