@@ -1,6 +1,8 @@
 # Pre-Tick Segment Alignment — Divergence Analysis and Guardrail Plan
 
-> **Status (2026-08-25): the family is GUARDED — four rules, D2 fixed outright.**
+> **Status (2026-08-27): the family is GUARDED — five rules, D2 fixed outright.**
+> (`pretick_out_write_before_update` — V8, with its trailing clause — joined on
+> 2026-08-27; the four below plus it each carry an exact-set corpus pin.)
 > Phases 0–3 complete, gates G0–G3 met. D1 is a compile error (the language is
 > restricted); D2 was adjudicated against independent hardware and fixed in the
 > simulator at no corpus cost. Three candidate fixes were tried and rejected with
@@ -9,7 +11,7 @@
 > that works was located. This doc is both the plan and the record of what was ruled
 > out and why.
 >
-> **The four rules, each with an exact-set corpus pin in
+> **The rules, each with an exact-set corpus pin in
 > `copper-analysis/tests/pretick_alignment_corpus.rs`:**
 >
 > **NARROWED 2026-08-26 (cycle-dataflow phase D, §5.7):** phase B's forwarded

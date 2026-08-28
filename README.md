@@ -39,9 +39,10 @@ against *independent, third-party* Verilog rather than against Copper's own
 output.
 
 > **Status: research prototype (v0.1.0).** The semantics are anchored and
-> regression-tested, but the language surface is deliberately narrow. See
-> [Limitations](#limitations) for the measured list of what does not transpile
-> yet — it is kept honest rather than aspirational.
+> regression-tested, but the language surface is deliberately narrow. Every
+> example module transpiles (34/34); see [Limitations](#limitations) for what
+> is refused **by design** and what is still a gap — the list is measured
+> rather than aspirational.
 
 ---
 
@@ -140,6 +141,17 @@ Run one example end-to-end (simulate → transpile → Verilate → compare):
 
 ```bash
 cargo run --example pattern_detector
+```
+
+The largest design in the tree is a 5-stage pipelined RV32I CPU
+(`examples/cpu/rv32i_cpu_pipelined.rs` — forwarding, load-use stalls, branch
+flush, a word-indexed register file, and a unified instruction/data memory
+received as a parameter). It runs 13 architectural programs on the simulator
+**and** on its own transpiled SystemVerilog under Verilator, matching
+cycle-for-cycle:
+
+```bash
+cargo test --test rv32i_pipelined_verilator
 ```
 
 Run the full regression — build, CLI, `cargo test --workspace`, and **every**
@@ -310,9 +322,11 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **943 tests pass, 0 fail, 16 ignored** across 112 test binaries
+- **1006 tests pass, 0 fail, 23 ignored** across 122 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
-- **95 corpus differential cases pass**, 12 ignored with a recorded reason
+- **131 corpus differential cases pass**, 12 ignored with a recorded reason
+- the pipelined RV32I CPU matches its Verilated self **cycle-for-cycle on all
+  13 architectural programs** (`tests/rv32i_pipelined_verilator.rs`)
 - all four wiring guards (G-A / G-B / G-C / G-D) clean
 
 Every ignored test prints its reason on each run. They are divergence witnesses,
@@ -323,35 +337,56 @@ documented startup transient — not silent skips.
 
 ## Limitations
 
-Measured, not guessed — **29 of 34** `#[hardware]` modules in `examples/`
-currently transpile (`tools/transpile_coverage.sh` prints the current number;
-don't trust this one). The 5 that do not, grouped by root cause:
-
-| Cause | Blocks |
-|---|---|
-| `Vec` ports | `rv32i_cpu`, `rv32i_cpu_pipelined` |
-| tuple-returning helper functions | `ripple_carry_adder` |
-| a hardware-typed function without `#[hardware]` in the same file | `uart_tx`, `uart_rx` |
-
-The last row is a whole-file rejection rather than anything about those two
-modules: `examples/uart/system.rs` also defines `spawn_uart`, a plain wiring
-function whose signature takes a `Clock` and ports, which is refused before any
-module is examined.
+Measured, not guessed — **34 of 34** `#[hardware]` modules in `examples/`
+transpile (`tools/transpile_coverage.sh` prints the current number). The cause
+ledger that used to sit here — `Vec` ports, tuple-returning helpers, struct
+pipeline latches, const match patterns, the word-indexed register file, the
+whole-file `spawn_uart` rejection — is empty as of 2026-08-27; its full history
+lives in [`TODO`](TODO).
 
 Transpiling is not the same as being *checked*: coverage counts acceptance, and
 the corpus sweep above is what says the emitted SystemVerilog agrees with the
-simulator.
+simulator. The equivalence harness runs Verilator under `-Wall`, and warnings
+are failures.
 
-Note that transpiling and *linting* are different bars: the equivalence harness
-runs Verilator under `-Wall`, and a module can emit SystemVerilog that the CLI
-accepts but the linter rejects (a `usize` local becomes a 64-bit signal, so
-assigning it to a narrow port is a width-truncation error).
+What remains unsupported falls into two kinds.
 
-Also unsupported, each pinned with its own diagnostic and a regression test:
-signed arithmetic / arithmetic shift right, division, `continue` inside a nested
-loop, and several memory shapes that would lower to something subtly wrong
-(two accesses to one port in a cycle, run-time-computed preloads, zero-latency
-memories).
+**Decisions, not gaps** — constructs that cannot be given the same meaning in
+simulation and in silicon are refused with a spanned error and a recorded
+counterexample rather than lowered to something plausible:
+
+- **The mid-phase read seam**: an `In` read placed *after* a delay
+  (`for _ in 0..N { clk.tick().await; } let x = input.read();`) samples
+  post-edge in the simulator but pre-edge in a flip-flop, a cycle apart under
+  any testbench that moves inputs between edges. Write the read first and the
+  delay last — `examples/uart/rx.rs` shows the anchored spelling.
+- **The pre-tick alignment family**: five compile-time rules refuse plain-`Out`
+  drive shapes whose phase would silently differ between the simulator and the
+  synthesized FSM (a path-dependent read boundary, a port written in more than
+  one clock phase, and their trailing-segment variants). The remedy each error
+  names is usually `RegOut`. Five *rejected* fixes are recorded with measured
+  evidence in
+  [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md)
+  so they are not re-tried.
+- A **wait loop that ticks before testing** its condition, and `continue`
+  inside such a wait — refused orderings, each with its own diagnostic.
+- **Zero-latency memories**, two accesses to one memory port in a cycle, and
+  run-time-computed memory preloads — memory shapes that would lower to
+  something subtly wrong.
+- **Two writes to one array register in a cycle**: `let mut regs = [Bits<W>; N]`
+  lowers to storage with one write port; a second write statement in the same
+  cycle is refused with the muxed-address rewrite suggested.
+
+**Gaps** — expressible in the simulator, not yet in the transpiler:
+
+- the division operator `/` (`%` works);
+- a behavioral module is **single-clock**; multi-clock designs compose clock
+  domains through `#[hardware(structural)]` parents (transpile-only today);
+- the CLI transpiles **concrete** modules only — generic ones are
+  monomorphized at example-run time;
+- a module that *receives* a `Memory` parameter emits a bus the corpus sweep
+  cannot drive by itself; anchoring one behaviorally takes a Verilated parent
+  that owns the array (`tests/rv32i_pipelined_verilator.rs` is the pattern).
 
 One correctness rule is worth knowing when reading the generated Verilog: an
 output drive that is *sampled at the clock edge* is emitted from the values the
@@ -360,15 +395,11 @@ read **after** it. Copper carries both forms and picks at the point where the
 choice actually exists, because "is this drive edge-sampled?" is not answerable
 from the port type — a plain `Out` written conditionally becomes a register too.
 Getting this wrong is a silent one-cycle error, so it is pinned by
-`tests/regout_forwarding_equivalence.rs` rather than left to inspection; `TODO`
-causes L, L-1 and L-2 record the measurements.
+`tests/regout_forwarding_equivalence.rs` rather than left to inspection.
 
-Two further notes on what "unsupported" means here. Some of these are
-**decisions, not gaps** — a construct that cannot be given the same meaning in
-simulation and in silicon is refused with a spanned error and a recorded
-counterexample rather than lowered to something plausible. And X-propagation
-cannot be checked against Verilator even in principle (Verilator is 2-state), so
-Copper's 4-state behavior is pinned by its own tests instead.
+And X-propagation cannot be checked against Verilator even in principle
+(Verilator is 2-state), so Copper's 4-state behavior is pinned by its own tests
+instead.
 
 The everything-still-open list lives in [`TODO`](TODO).
 
@@ -380,7 +411,7 @@ The everything-still-open list lives in [`TODO`](TODO).
 |---|---|
 | [`design_docs/SYNCHRONOUS_SEMANTICS.md`](design_docs/SYNCHRONOUS_SEMANTICS.md) | the timing model — start here |
 | [`design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`](design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md) | the executor/analysis architecture and its sequenced items |
-| [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md) | the pre-tick alignment family — its four compile-time rules, and five rejected fixes with measured evidence |
+| [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md) | the pre-tick alignment family — its five compile-time rules, and the rejected fixes with measured evidence |
 | [`design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`](design_docs/CORPUS_DIFFERENTIAL_SWEEP.md) | why every module gets a generated sim-vs-emitted-SV case, and how |
 | [`design_docs/TIMING_MODEL_UNIFICATION.md`](design_docs/TIMING_MODEL_UNIFICATION.md) | how far the simulator's and the transpiler's timing derivations actually diverge — measured |
 | [`design_docs/LEVELIZED_SCHEDULING_SCOPE.md`](design_docs/LEVELIZED_SCHEDULING_SCOPE.md) | the levelized scheduler |
