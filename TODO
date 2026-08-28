@@ -65,10 +65,9 @@ TRANSPILATION:
   than in the grammar; then unannotated struct/tuple locals (needs inference, so it
   is rule 2 not rule 1); then the file-level `spawn_uart` rule, which is about a
   FILE not a module and may not belong in this grammar at all.
-  KNOWN: enforcing the grammar breaks `examples/cpu/old/` (untracked scratch, two
-  `Vec` ports) because build.rs's sweep include!s it. The tracked corpus is
-  unaffected — verified with old/ moved aside: 113 sweep cases pass, all crate
-  suites green.
+  (The KNOWN entry about `examples/cpu/old/` is retired: the scratch copies are
+  DELETED as of 2026-08-27. The `old/`-exclusion in build.rs and regression.sh
+  stays as the convention for any future set-aside scratch.)
 
   ── A REASSIGNED WIRE IS NOT A REGISTER — FIXED 2026-08-26 ──────────────────
   `shir_lower::extract_updates_from_stmts` turned EVERY `CHIRStmt::Assign` into a
@@ -204,7 +203,9 @@ TRANSPILATION:
   wrong-CODE bugs, not rejections, so they move no counter either — which is the
   point: coverage was never going to show them, and two of them were silent.
   The 5 still failing, by ROOT CAUSE, as measured on 2026-08-25 (P added 2026-08-26):
-    F   Vec ports ................. rv32i_cpu (190:13)
+    (F is GONE as of 2026-08-27 — its last instances were the two
+    `examples/cpu/old/` pre-subset copies, now deleted. No tracked module has a
+    `Vec` port; the admissible grammar refuses the construct outright.)
     (P is FIXED as of 2026-08-27 — received memories get a bus port ABI, see
     design_docs/RECEIVED_MEMORY_ABI.md. rv32i_cpu_pipelined then surfaced its
     OWN blockers; the struct latches / conditional struct+tuple lets / block

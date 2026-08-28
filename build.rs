@@ -409,11 +409,11 @@ fn main() {
 
 /// Every `.rs` under `dir`, recursively (`examples/` has subdirectories).
 ///
-/// `old/` directories are excluded: `examples/cpu/old/` is untracked scratch
-/// holding pre-subset spellings (`Vec` ports the admissible grammar rejects), and
-/// sweeping it generates corpus cases that cannot compile. The `TODO`'s KNOWN
-/// entry for the admissible grammar verified the tracked corpus is unaffected
-/// with `old/` set aside; this makes that the sweep's actual behaviour.
+/// `old/` directories are excluded — the convention for set-aside scratch whose
+/// modules must not enter the sweep (the deleted `examples/cpu/old/` pre-subset
+/// copies, with `Vec` ports the admissible grammar rejects, were the original
+/// case; sweeping them generated corpus cases that could not compile).
+/// `tools/regression.sh`'s G-A guard prunes the same way.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.filter_map(Result::ok) {

@@ -217,9 +217,10 @@ else
     while IFS= read -r line; do EXAMPLES+=("$line"); done < <(registered_examples)
 
     # G-A — an examples/**.rs with no [[example]] entry can never be run by anything.
-    # `old/` directories are exempt: examples/cpu/old/ is untracked scratch holding
-    # pre-subset spellings that no longer compile (Vec ports); build.rs's corpus
-    # sweep prunes it the same way, so the two scans stay consistent.
+    # `old/` directories are exempt — the convention for set-aside scratch that
+    # must not count as an example (the deleted examples/cpu/old/ pre-subset
+    # copies were the original case); build.rs's corpus sweep prunes the same
+    # way, so the two scans stay consistent.
     UNREG=""
     for f in $(find examples -path '*/old/*' -prune -o -name '*.rs' -print | sort); do
       grep -q "path = \"$f\"" Cargo.toml || UNREG="$UNREG $f"
