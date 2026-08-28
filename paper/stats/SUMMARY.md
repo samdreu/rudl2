@@ -1,4 +1,4 @@
-# Evaluation numbers (generated 2026-08-26)
+# Evaluation numbers (generated 2026-08-27)
 
 Regenerate with `tools/stats/collect.sh`. **Do not edit by hand** — every
 number here is derived from the repo, and a hand-copied number goes stale.
@@ -8,9 +8,9 @@ number here is derived from the repo, and a hand-copied number goes stale.
 | property | count |
 |---|---|
 | example `#[hardware]` modules | 34 |
-| transpile to SystemVerilog | 29/34 |
-| covered by the differential sweep (sim vs Verilator, seeded random) | 28/34 |
-| with a dedicated equivalence test | 22/34 |
+| transpile to SystemVerilog | 34/34 |
+| covered by the differential sweep (sim vs Verilator, seeded random) | 32/34 |
+| with a dedicated equivalence test | 21/34 |
 | anchored to third-party hardware (BaseJump STL) | 7/34 |
 | **anchored AND differentially swept** | 7/34 |
 
@@ -20,11 +20,7 @@ hardware neither Copper nor its transpiler wrote.
 Not swept, each with the reviewed reason from `build.rs`'s `SKIP`:
 
 * `two_domain_top` — a `#[hardware(structural)]` parent: transpile-only by design, with no simulatable body to drive (item 4 — the sim wires the hierarchy by hand)
-* `ripple_carry_adder` — does not transpile: cause J-b, a tuple-returning helper (`let (s, c) = full_adder(…)`), reported as a width error. Pinned by transpile_inference_gaps.rs. The fixture copy is written without the helper and does sweep
-* `rv32i_cpu` — does not transpile: cause F, a `Vec<Bits<32>>` port (TODO, TRANSPILER COVERAGE)
-* `rv32i_cpu_pipelined` — does not transpile: cause F, a `Vec<Bits<32>>` port (TODO, TRANSPILER COVERAGE)
-* `uart_tx` — does not transpile: cause H — `spawn_uart` in the same file has a hardware-looking signature with no `#[hardware]`, which `prepare_source` refuses at FILE level before either module is looked at
-* `uart_rx` — does not transpile: cause H, the same file-level `spawn_uart` rejection as `uart_tx`
+* `rv32i_cpu_pipelined` — ANCHORED OUTSIDE THIS SWEEP as of 2026-08-27: tests/rv32i_pipelined_verilator.rs runs all 13 architectural programs on the simulator AND on the transpiled core Verilated under a hand-written owner (the received-memory ABI's parent, WriteFirst collision policy), comparing (program_counter, halted, a0) cycle-for-cycle through the halt. THIS sweep still cannot cover it — its `Memory` PARAMETER cannot be supplied by the harness (the Kind::Memory rule below) — so the dedicated lane is the behavioural gate. Every transpile cause is closed; see the lane's header for the timing rules it pinned (edge-form staging, ff-position array reads, the RegOut halt outputs)
 
 > **Scope.** The RISC-V CPUs are in that list. `tests/rv32i_integration.rs` is a
 > simulator self-check against known program results, **not** a sim≡synth check.
@@ -72,9 +68,9 @@ Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 
 ## M6 — transpiler performance
 
-* 29 modules lowered to SystemVerilog
-* median **3.7 ms** per module (min 2.8, max 6.1)
-* slowest: `bsg_counter_up_down` at 6.1 ms
+* 34 modules lowered to SystemVerilog
+* median **3.9 ms** per module (min 3.0, max 1262.0)
+* slowest: `rv32i_cpu_transpilable` at 1262.0 ms
 
 > **Scope.** Release binary, median of repeated runs after a warm-up. Simulation
 > throughput vs Verilator is **not** measured — no fixed-cycle benchmark harness
