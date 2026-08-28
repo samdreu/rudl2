@@ -378,17 +378,32 @@ pub fn is_hardware_fn(f: &syn::ItemFn) -> bool {
         .any(|a| a.path().segments.last().map(|s| s.ident == "hardware").unwrap_or(false))
 }
 
-/// True if `f`'s signature has a `Clock<D>` / `In<T,D>` / `Out<T,D>` parameter,
-/// independent of whether it carries `#[hardware(...)]`. Used to catch
-/// functions that look like hardware modules but are missing the attribute.
+/// True if `f` COULD be a hardware module missing its `#[hardware(...)]`
+/// attribute: at least one port-typed parameter, EVERY parameter port-typed
+/// (`Clock` / `In` / `Out` / `RegOut` / `Memory` — the macro accepts nothing
+/// else), and no return type (a module returns `()`).
+///
+/// The old rule — ANY port-typed parameter — condemned the whole FILE when a
+/// harness function merely handled ports: `spawn_uart(exec: &mut
+/// HardwareExecutor, clk: Clock<MainClk>) -> UartPorts` composes two modules
+/// for the SIMULATOR and can never be one itself (the executor parameter and
+/// the return type both prove it), yet its presence made `uart_tx`/`uart_rx`
+/// untranspilable from their own file (cause H). A genuinely forgotten
+/// attribute — all ports, no return — is still caught.
 fn has_hardware_signature(f: &syn::ItemFn) -> bool {
-    f.sig.inputs.iter().any(|arg| {
-        if let syn::FnArg::Typed(pt) = arg {
-            matches!(outer_type_name(&pt.ty).as_deref(), Some("Clock" | "In" | "Out"))
-        } else {
-            false
-        }
-    })
+    let mut saw_port = false;
+    let all_ports = f.sig.inputs.iter().all(|arg| match arg {
+        syn::FnArg::Typed(pt) => match outer_type_name(&pt.ty).as_deref() {
+            Some("Clock" | "In" | "Out" | "RegOut" | "Memory") => {
+                saw_port = true;
+                true
+            }
+            _ => false,
+        },
+        // A `self` receiver is a method, never a module.
+        syn::FnArg::Receiver(_) => false,
+    });
+    saw_port && all_ports && matches!(f.sig.output, syn::ReturnType::Default)
 }
 
 fn outer_type_name(ty: &syn::Type) -> Option<String> {

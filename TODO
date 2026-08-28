@@ -253,7 +253,17 @@ TRANSPILATION:
     (J-b is FIXED as of 2026-08-27 — the tuple-destructuring `let` lowering
     inlines the helper and projects per element. ripple_carry_adder SWEEPS.)
     (uart/rx is no longer here — see UART/RX, REWRITTEN below)
-    H   file-level `spawn_uart` rejection ... uart_tx, uart_rx (examples/uart/system.rs)
+    (H is FIXED as of 2026-08-27 — `has_hardware_signature` now requires a
+    signature that COULD be a module: at least one port param, EVERY param a
+    port type, no return. `spawn_uart(exec: &mut HardwareExecutor, …) ->
+    UartPorts` is harness code and no longer condemns its file; a genuinely
+    forgotten attribute — all ports, no return — is still caught. uart_tx
+    transpiled immediately; uart_rx then surfaced its REAL blocker, the
+    delay-then-read sampling loop — the MID-PHASE READ SEAM, outside the
+    language by design — and was migrated to rx.rs's anchored read-first body
+    (same sampled instants; rx_byte became RegOut like rx.rs's). BOTH sweep.
+    TRANSPILER COVERAGE IS 34/34 — every example module transpiles; no live
+    causes remain.)
   Full history of every cause, live and retired:
     A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
     B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)

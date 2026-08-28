@@ -22,6 +22,7 @@ struct MainClk;
 impl ClockDomain for MainClk {}
 
 const CLKS_PER_BIT: usize = 434; // 50 MHz / 115200 baud
+const CLKS_PER_HALF_BIT: usize = CLKS_PER_BIT / 2;
 
 // ── TX ────────────────────────────────────────────────────────────────────────
 // Serializes one 8N1 frame (start + 8 data bits LSB-first + stop) each time
@@ -76,22 +77,35 @@ async fn uart_rx(
     // REGISTERED — a one-cycle pulse written before the tick that publishes it, so
     // it is driven in two phases; see `uart_tx` above and `examples/uart/rx.rs`.
     rx_dv:     RegOut<Logic, MainClk>,
-    rx_byte:   Out<Bits<8>, MainClk>,
+    rx_byte:   RegOut<Bits<8>, MainClk>,
 ) {
+    // MIGRATED 2026-08-27 to `examples/uart/rx.rs`'s anchored body (its 2026-08-25
+    // rewrite): each sampling iteration READS FIRST AND DELAYS LAST. The old
+    // delay-then-read ordering is a post-tick `In` read — the mid-phase read
+    // seam, outside the language by design (see rx.rs's comment) — and was this
+    // module's real transpile blocker once cause H stopped masking it. The
+    // sampled instants are unchanged: a full-bit advance moves from the start
+    // bit's centre to data bit 0's centre, and the eighth iteration's trailing
+    // delay lands on the stop bit's centre where the separate stop wait used to.
+    // `rx_byte` is RegOut like rx.rs's, so dv and byte publish on the same edge.
     loop {
         while rx_serial.read() == Logic::One { clk.tick().await; }
-        for _ in 0..CLKS_PER_BIT / 2 { clk.tick().await; }
+        for _ in 0..CLKS_PER_HALF_BIT { clk.tick().await; }
         if rx_serial.read() != Logic::Zero { continue; }
 
-        let mut byte_val = 0u8;
-        for i in 0..8 {
-            for _ in 0..CLKS_PER_BIT { clk.tick().await; }
-            if rx_serial.read() == Logic::One { byte_val |= 1 << i; }
-        }
         for _ in 0..CLKS_PER_BIT { clk.tick().await; }
 
+        let mut byte_val: Bits<8> = Bits::zero();
+        for _ in 0..8 {
+            byte_val = byte_val >> 1;
+            if rx_serial.read() == Logic::One {
+                byte_val = byte_val | Bits::from_u8(0x80);
+            }
+            for _ in 0..CLKS_PER_BIT { clk.tick().await; }
+        }
+
         rx_dv.write(Logic::One);
-        rx_byte.write(Bits::from_u8(byte_val));
+        rx_byte.write(byte_val);
         clk.tick().await;
         rx_dv.write(Logic::Zero);
     }
@@ -125,9 +139,9 @@ fn spawn_uart(exec: &mut HardwareExecutor, clk: Clock<MainClk>) -> UartPorts {
     let (tx_start_port, tx_start_in) = wire::<Logic, MainClk>(Logic::Zero);
     let (tx_busy_out,   tx_busy_in)  = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
 
-    // RX caller-side ports
+    // RX caller-side ports (both registered — RegOut on the module side)
     let (rx_dv_out,   rx_dv_in)   = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
-    let (rx_byte_out, rx_byte_in) = wire::<Bits<8>, MainClk>(Bits::zero());
+    let (rx_byte_out, rx_byte_in) = registered_wire::<Bits<8>, MainClk>(&clk, Bits::zero());
 
     let dh_serial  = serial_out.dirty_handle();
     let dh_busy    = tx_busy_out.dirty_handle();

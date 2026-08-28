@@ -131,16 +131,6 @@ const SKIP: &[(&str, &str)] = &[
          the pre-tick alignment family is about a body crossing two or more edges",
     ),
     (
-        "uart_tx",
-        "does not transpile: cause H — `spawn_uart` in the same file has a hardware-looking \
-         signature with no `#[hardware]`, which `prepare_source` refuses at FILE level before \
-         either module is looked at",
-    ),
-    (
-        "uart_rx",
-        "does not transpile: cause H, the same file-level `spawn_uart` rejection as `uart_tx`",
-    ),
-    (
         "trailing_constant",
         "STARTUP TRANSIENT, not a divergence in steady state: `dv` is written only in \
          the trailing segment, so the simulator first drives it at cycle 1 (it holds \
