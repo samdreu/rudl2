@@ -104,9 +104,11 @@ exactly one driver, with no separate analysis pass.
    as hand-written-SV evidence. They contain NO assertions — they are `eprintln!` diagnostics —
    and both are `#[ignore]`d, so they neither check anything nor run. Citing them overstated the
    evidence base. Do not re-add them without giving them assertions.
-   SCOPE: this claim covers the transpilable subset only; `Memory`, array ports, `/` and `asr`
-   have no transpiled artifact to agree with (00_claims_audit.md §Scope, Threats T7).
-   TODO: expand the BaseJump set and the transpiler-verified set.]`
+   SCOPE (updated 2026-08-27): the old subset bound is gone — every example module transpiles
+   (34/34), `Memory` and `asr` included, and the pipelined RV32I CPU is itself an equivalence
+   result (00_claims_audit.md §Re-verification; Threats T7 re-scoped). The remaining bound is
+   language design (refused-by-construction shapes), plus the one operator gap `/`.
+   TODO: expand the BaseJump set.]`
 
 5. **A minimal, provably-necessary output-timing annotation — with a compile-time boundary on the
    residual.** Control-flow inference resolves register-vs-combinational timing for *internal* state
@@ -189,9 +191,11 @@ exactly one driver, with no separate analysis pass.
   that thesis independently. Our claim is the realization — reuse of a general-purpose compiler's
   lowering, verified same-source equivalence, third-party anchoring — and the concession belongs
   in the first sentence, not a footnote.
-- **Not "the same source simulates and synthesizes" without qualification.** It holds for the
-  transpilable subset; `Memory` in particular has no transpiled path, which also excludes the
-  RISC-V CPU example (§Threats T7, 00_claims_audit.md §Scope).
+- **Not "the same source simulates and synthesizes" without qualification — but the
+  qualification changed (2026-08-27).** The bound is no longer capability (34/34 example modules
+  transpile, `Memory` and the RISC-V CPU included — the CPU is an equivalence result) but
+  language design: shapes the compile-time rules refuse. State the bound as refusal-by-design,
+  not as a missing subset (§Threats T7 re-scoped, 00_claims_audit.md §Re-verification).
 - **Not "X-accurate."** The simulator models 3-state logic, but that modelling is unverified
   against the reference simulator — Verilator is 2-state — and Copper's control *aborts* on X
   where 4-state Verilog takes the else branch (§Threats T8).
@@ -221,9 +225,11 @@ exactly one driver, with no separate analysis pass.
       generics) and `Memory`'s absence written up as §Threats T7. Contribution 2's evidence list
       was also **corrected**: two cited files (`timing_probe_investigation.rs`,
       `mem_latency_probe.rs`) contain no assertions and are `#[ignore]`d, so they were withdrawn.
-- [ ] Expand transpiler coverage and the equivalence-verified example set (bounds the eval). The
-      single largest gap is `Memory` — an entire first-class construct with no transpiled path,
-      which also excludes the RISC-V CPU from the equivalence claim.
+- [x] Expand transpiler coverage and the equivalence-verified example set — **DONE 2026-08-27**:
+      34/34 example modules transpile, the corpus sweep covers 32/34 (both exceptions reasoned),
+      `Memory` transpiles (declared and received), and the RISC-V CPU is an equivalence result
+      (`tests/rv32i_pipelined_verilator.rs`, 13 programs cycle-for-cycle). Remaining eval-bound
+      work is anchor breadth, not coverage.
 - [ ] Decide whether to add a soundness/semantics argument for the async-lowering ↔ transpiler
       correspondence, or lean on empirical equivalence (reviewer risk either way).
 - [ ] Pick the target venue framing (PLDI-style PL contribution vs. systems/CAD-style artifact).

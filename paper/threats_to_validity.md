@@ -39,8 +39,8 @@ independent hand-written SystemVerilog** (`copper_analysis::assert_source_regist
 wired into `tests/common::EquivalenceTest::with_reference_registers` for `mac_fsm` name-exact and
 `det_010`/`det_110101`/`lfsr` storage-equivalent); and (ii) a **reconciliation against the
 transpiler's own emitted flip-flops** (`copper-codegen/tests/register_reconciliation.rs`), which
-holds across the fixture corpus (24 clocked modules) with codegen adding only its synthesized phase/pc
-FSM counter — i.e. the inferred set is exactly the design's registers, with no rustc-style
+holds across the fixture corpus (97 clocked modules as of 2026-08-27) with codegen adding only its
+synthesized phase/pc FSM counter — i.e. the inferred set is exactly the design's registers, with no rustc-style
 over-capture.
 
 **A counter-example found and fixed (2026-08-21) — worth reporting, because it is evidence the
@@ -62,7 +62,8 @@ to the next iteration it needs storage.
 
 The fix is validated against a differential oracle rather than by argument: inference is now
 compared to codegen's emitted flip-flops across every clocked module that transpiles in
-`tests/fixtures`, `examples`, and `src` — **41 of 41 agree**, synchronizers included, with nothing newly over-reported. `register_reconciliation.rs`
+`tests/fixtures`, `examples`, and `src` — **41 of 41 agreed** at the time (97 as of 2026-08-27),
+synchronizers included, with nothing newly over-reported. `register_reconciliation.rs`
 covers `synchronizer` permanently so the shape cannot regress, and
 `tests/cdc_synchronizer_anchor.rs` adds a structural reg-for-reg match against the independent
 reference. Both production call sites of `infer_registers` only log it, so the correction changed
@@ -167,7 +168,9 @@ forms and an explicit `allow_pretick_alignment` waiver for fixtures that demonst
 the `sim ≡ synth` claim holds for every *accepted* program — but the accepted set is now smaller in a
 way a reader should be told about, and finding the boundary took three rejected candidate fixes
 (a uniform pre-edge barrier, a register-keyed static rule, and Prost-style codegen), each rejected on
-measured evidence rather than argument.
+measured evidence rather than argument — five rejected fixes by 2026-08-27, once two widenings of
+D1 were also measured and refused (`PRETICK_ALIGNMENT_GUARDRAIL.md` §5). The family itself grew to
+five rules the same way, each with an exact-set corpus pin.
 
 **The honest framing for contribution 5.** Copper did not merely *rediscover* the
 blocking/non-blocking distinction — it rediscovered it **three times**, in three different
@@ -189,29 +192,37 @@ T-align: the fix was in the *simulator*, and it cost nothing (666/667 corpus, th
 being the test that pinned the old behaviour). Worth reporting as the counterweight: not every
 member of this family has to be paid for with a restriction on the language.
 
-## T7 — the same-source claim does not extend to `Memory` (added 2026-08-22)
+## T7 — the same-source claim and `Memory` (added 2026-08-22; RESOLVED and re-scoped 2026-08-27)
 
-**`Memory`, Copper's first-class memory construct, has no transpiled path at all.**
-`examples/memory/dual_port_ram.rs` — a shipped example with an independent hand-written SV
-reference — fails to transpile with `cannot infer bit width; add an explicit type annotation`.
+**As written on 2026-08-22 this threat said `Memory` had no transpiled path at all.** True then,
+false now: `Memory` transpiles — declared, preloaded, multi-port, both read-during-write modes,
+and **received as a parameter** (the bus ABI, `design_docs/RECEIVED_MEMORY_ABI.md`) — and the
+guarantees that were simulator-only are sweep-verified: `dual_port_ram` and the
+latency/write-mode/arbitration fixtures (`tests/fixtures/pipelined_ram_dut.rs`,
+`write_first_ram_dut.rs`) all run sim ≡ emitted-SV under Verilator `-Wall`. The closing
+sentence of the old text — that the RISC-V CPU is not covered by the equivalence claim — is
+retired in the strongest way available: the pipelined CPU transpiles and matches the simulator
+cycle-for-cycle on 13 architectural programs (`tests/rv32i_pipelined_verilator.rs`; see
+`00_claims_audit.md` §Re-verification). `arithmetic_shift_right` and the other constructs the
+old list bundled here are likewise supported; the one operator gap left is `/`.
 
-This is a *scope* limit on contribution 2, not a rough edge. Every memory guarantee Copper
-offers is simulator-only: the read/write-latency pipelines, the read-during-write modes, the
-multi-port arbitration priority. The one memory anchor that exists
-(`tests/verilog_fifo_memory_new.rs`) compares the simulator against **hand-written** Verilog, not
-against transpiled output — so it is evidence about the simulator's fidelity, not about
-same-source agreement.
+**The residual threats are narrower, and worth stating precisely:**
 
-The honest statement for the paper is therefore: *the same source simulates and synthesises,
-provably in agreement, for the subset of designs the transpiler supports* — and `Memory` is
-outside that subset, along with array-typed ports, `/`, and `arithmetic_shift_right` (all pinned
-in `copper-codegen/tests/unsupported_constructs.rs`). A reader who assumes the RISC-V CPU example
-is covered by the equivalence claim would be wrong; it uses `Memory` and does not transpile.
-
-It also removes the usual way of settling semantics questions in this project. Out-of-range
-addressing was decided on *diagnostic* grounds — a deliberate panic naming the port, address and
-size — precisely because there is no synthesised counterpart to adjudicate against. Where the rest
-of the system settles "which behaviour is correct" against independent hardware, memory cannot.
+1. **A received memory's collision policy lives in the OWNER, not in the type.** `Memory<…>`
+   carries no write mode (`.write_first()` is a runtime builder), so the transpiled child's bus
+   is policy-agnostic and read-during-write semantics are whatever the instantiating owner
+   wires. The CPU lane's owner implements WriteFirst to match its `build_memory`; an owner with
+   the wrong policy would diverge silently. Today this is a documented ABI contract verified
+   for the shipped designs, not a checked property of every instantiation.
+2. **Out-of-range addressing still splits.** The simulator panics, naming the port, address and
+   size; the synthesized side truncates the address to `clog2(depth)` bits via an explicit
+   width cast. The split is confined to designs that have already failed in simulation, but it
+   is a stated semantic divergence at the boundary, not an adjudicated equivalence.
+3. **Memory's independent-anchor set is still thin.** The sweep proves sim ≡ own-SV
+   *consistency*; the anchors that adjudicate memory *semantics* remain the hand-written
+   references (`tests/verilog_fifo_memory_new.rs` is sim-vs-hand-written; `dual_port_ram`'s
+   independent RAM template) plus, indirectly, the CPU's ISA-level programs. "The two agree"
+   and "the two are right" stay distinct claims here, as in T6.
 
 ## T8 — X-propagation cannot be checked against the reference simulator (added 2026-08-22)
 
