@@ -472,7 +472,7 @@ fn lower_reg_updates(
             let selector = lower_expr(scrutinee, leg, mb)?;
             let mut ff_arms = Vec::new();
             for arm in arms {
-                let selector_value = pattern_to_selector(&arm.pattern)?;
+                let selector_value = pattern_to_selector(&arm.pattern, leg)?;
                 ff_arms.push(copper_core::vlir::VLIRFFCaseArm {
                     selector_value,
                     stmts: vec![VLIRFFStmt::NonBlockingAssign {
@@ -697,7 +697,7 @@ fn lower_comb_stmt(
                 } else {
                     for p in &arm.patterns {
                         case_arms.push(VLIRCaseArm {
-                            selector_value: pattern_to_selector(p)?,
+                            selector_value: pattern_to_selector(p, leg)?,
                             stmts: stmts
                                 .iter()
                                 .map(|s| clone_comb_stmt(s))
@@ -874,7 +874,7 @@ fn lower_expr(e: &SHIRExpr, leg: &Legalizer, mb: &MemBinding) -> LowerResult<VLI
                 let mut cond = VLIRExpr::BinOp {
                     left: Box::new(sel.clone()),
                     op: VLIRBinOp::Eq,
-                    right: Box::new(pattern_to_selector(&arm.pattern)?),
+                    right: Box::new(pattern_to_selector(&arm.pattern, leg)?),
                 };
                 if let Some(g) = &arm.guard {
                     cond = VLIRExpr::BinOp {
@@ -932,12 +932,19 @@ fn lower_unop(op: &CHIRUnOp) -> VLIRUnOp {
     }
 }
 
-/// Convert a scalar SHIR pattern into a concrete case-selector literal.
+/// Convert a scalar SHIR pattern into a case-selector expression.
 /// Tuple patterns are deferred to M2.
-fn pattern_to_selector(p: &copper_core::shir::SHIRPattern) -> LowerResult<VLIRExpr> {
+fn pattern_to_selector(
+    p: &copper_core::shir::SHIRPattern,
+    leg: &Legalizer,
+) -> LowerResult<VLIRExpr> {
     use copper_core::shir::SHIRPattern;
     match p {
         SHIRPattern::Lit(lit) => Ok(lower_lit(lit)),
+        // A named constant (`localparam` / parameter) — the case label is the
+        // NAME; SystemVerilog evaluates it (a case item may be any constant
+        // expression).
+        SHIRPattern::Const(name) => Ok(VLIRExpr::Var(leg.get(name))),
         // Tuple pattern → a single concatenated literal matching the `Concat`
         // scrutinee (VLIR_DESIGN §Pass 2). First element is most-significant.
         SHIRPattern::Tuple(_) => {
@@ -969,7 +976,9 @@ fn flatten_tuple_pattern(p: &copper_core::shir::SHIRPattern) -> LowerResult<(usi
             }
             Ok((width, value))
         }
-        SHIRPattern::Wildcard | SHIRPattern::EnumVariant { .. } => {
+        // A const name has no compile-time value here, so it cannot join a
+        // concatenated tuple selector.
+        SHIRPattern::Wildcard | SHIRPattern::EnumVariant { .. } | SHIRPattern::Const(_) => {
             Err(VLIRLowerError::TuplePatternUnsupported)
         }
     }
@@ -3363,9 +3372,10 @@ endmodule
             SHIRPattern::Lit(SHIRLit { ty: CHIRType::UInt { width: Width::Concrete(w) }, value: v })
         };
 
+        let leg = Legalizer::new();
         // (State=2 :: 3 bits, in=0 :: 1 bit) -> {010, 0} = 4'd4
         let p = SHIRPattern::Tuple(vec![lit(3, 2), lit(1, 0)]);
-        match pattern_to_selector(&p).expect("selector") {
+        match pattern_to_selector(&p, &leg).expect("selector") {
             VLIRExpr::Lit { width, value } => {
                 assert_eq!(width, Width::Concrete(4));
                 assert_eq!(value, 4);
@@ -3375,14 +3385,14 @@ endmodule
 
         // (State=5 :: 3 bits, in=1 :: 1 bit) -> {101, 1} = 4'd11
         let p = SHIRPattern::Tuple(vec![lit(3, 5), lit(1, 1)]);
-        match pattern_to_selector(&p).expect("selector") {
+        match pattern_to_selector(&p, &leg).expect("selector") {
             VLIRExpr::Lit { value, .. } => assert_eq!(value, 11),
             other => panic!("expected literal selector, got {other:?}"),
         }
 
         // A wildcard inside a tuple has no single selector value → rejected.
         let p = SHIRPattern::Tuple(vec![lit(3, 1), SHIRPattern::Wildcard]);
-        assert!(pattern_to_selector(&p).is_err());
+        assert!(pattern_to_selector(&p, &leg).is_err());
     }
 
     /// Latch inference is rejected, not emitted. Copper's premise is that this

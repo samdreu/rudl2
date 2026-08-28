@@ -59,12 +59,11 @@ pub async fn ifchain_on_usize(
     }
 }
 
-/// STILL REFUSED, now with an honest diagnostic (2026-08-27): a named `const`
-/// as a match PATTERN is named as exactly that, pointing at the if-chain
-/// spelling. Full support is a name-carrying pattern kind through the IRs — a
-/// feature, tracked in the SKIP entry. Previously it read as an enum-variant
-/// pattern and is refused — with a message about tuple patterns, which is not
-/// what it is.
+/// SUPPORTED as of 2026-08-27: a named `const` as a match PATTERN lowers as the
+/// name-carrying `CHIRPattern::Const` — the emitted label/comparison is the
+/// `localparam` NAME (`op == OP_ALPHA`), which SystemVerilog evaluates, exactly
+/// as consts do in expression position. Sweeps differentially. Previously it
+/// read as an enum-variant pattern and was refused.
 #[hardware(sequential)]
 pub async fn match_on_const_pattern(
     clk: Clock<MainClk>,

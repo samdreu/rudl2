@@ -1566,6 +1566,7 @@ fn lower_pattern(pattern: &CHIRPattern) -> Result<SHIRPattern, SHIRLowerError> {
             let lowered = parts.iter().map(lower_pattern).collect::<Result<_, _>>()?;
             Ok(SHIRPattern::Tuple(lowered))
         }
+        CHIRPattern::Const { name } => Ok(SHIRPattern::Const(name.clone())),
         CHIRPattern::EnumVariant { name, inner } => Ok(SHIRPattern::EnumVariant {
             name: name.clone(),
             inner: inner.as_ref()

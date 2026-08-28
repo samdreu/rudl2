@@ -82,11 +82,12 @@ const SKIP: &[(&str, &str)] = &[
          DISCHARGED 2026-08-27 (received-memory bus ABI, RECEIVED_MEMORY_ABI.md); the \
          struct latches, conditional struct/tuple lets, block bindings, and \
          `arithmetic_shift_right` all lower as of 2026-08-27 (tests/fixtures/\
-         struct_pipeline_dut.rs sweeps them). TWO blockers remain, both pre-existing named \
-         causes: file-scope consts as match PATTERNS (`match opcode { OP_LUI => … }`, same \
-         cause as match_on_const_pattern below), and the `[Bits<32>; 32]` register FILE — a \
-         word-indexed array register, which no IR stage supports (Index lowers to a bit \
-         select; the transpilable CPU spells it as 31 named scalars instead)",
+         struct_pipeline_dut.rs sweeps them; const match patterns lower as of the same day \
+         via CHIRPattern::Const — match_selector_dut's three match modules all sweep). ONE \
+         blocker remains: the `[Bits<32>; 32]` register FILE — a word-indexed array \
+         register, which no IR stage supports (Index lowers to a bit select; the \
+         transpilable CPU spells it as 31 named scalars instead). With the regfile stubbed, \
+         the whole module transpiles",
     ),
     // ── The claim ledger: tests/fixtures/{bits_ops,signedness,aggregate_locals,
     // match_selector,out_phase,mem_address_width}_dut.rs. Each module below is a
@@ -111,26 +112,6 @@ const SKIP: &[(&str, &str)] = &[
          from emits a 64-bit literal — WIDTHTRUNC into the 32-bit port. \
          `lit_width_via_locals` is the same value through explicitly-typed `let` bindings \
          and sweeps",
-    ),
-    (
-        "match_on_usize",
-        "WRONG WIDTH: a `match` emits 64-bit case labels (`s == 64'd1`) — WIDTHEXPAND against \
-         the 32-bit selector. `ifchain_on_usize` is the same mux and demux as an if-chain and \
-         sweeps. See `match_on_literals`: the width comes from the LITERAL, not the scrutinee",
-    ),
-    (
-        "match_on_literals",
-        "WRONG WIDTH, and this one was WRITTEN AS A CONTROL EXPECTED TO PASS: a `match` on a \
-         `u32` with literal patterns also emits `op == 64'd55`. That is what narrowed the \
-         claim from \"a match on a usize\" to \"a match literal\" — a probe that only asked \
-         \"does it transpile\" had already recorded this shape as working",
-    ),
-    (
-        "match_on_const_pattern",
-        "REFUSED: a named `const` in a match PATTERN reads as an enum-variant pattern and is \
-         rejected as `tuple-pattern match lowering is not yet implemented (M2)`, which is not \
-         what it is. Cause D-a made file-scope consts work as EXPRESSIONS only. \
-         `ifchain_on_const_expr` is the working spelling and sweeps",
     ),
     (
         "out_from_reg_before_commit",

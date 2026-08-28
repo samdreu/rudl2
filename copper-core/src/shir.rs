@@ -256,6 +256,9 @@ pub enum SHIRPattern {
     Wildcard,
     Tuple(Vec<SHIRPattern>),
     EnumVariant { name: String, inner: Option<Box<SHIRPattern>> },
+    /// A named constant (`localparam` / parameter) as a case label — see
+    /// [`crate::chir::CHIRPattern::Const`].
+    Const(String),
 }
 
 // ── Expression model ──────────────────────────────────────────────────────────

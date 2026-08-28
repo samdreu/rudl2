@@ -3491,6 +3491,9 @@ enum PatElem {
     /// A binder (`t`) — contributes no condition, but names that position so the
     /// arm's guard and body can refer to it.
     Bind(String),
+    /// A named constant (`localparam` / parameter) — contributes an equality
+    /// test against the name; SystemVerilog evaluates it.
+    Const(String),
 }
 
 /// Parse one pattern alternative into positional elements.
@@ -3498,22 +3501,24 @@ fn parse_pattern_elems(
     text: &str,
     span: SourceSpan,
     enums: &EnumRegistry,
+    params: &std::collections::HashSet<String>,
 ) -> Result<Vec<PatElem>, CHIRLowerError> {
     let s = text.trim();
     if s.starts_with('(') && s.ends_with(')') {
         let inner = &s[1..s.len() - 1];
         return split_top_level_commas(inner)
             .iter()
-            .map(|p| parse_pattern_elem(p.trim(), span, enums))
+            .map(|p| parse_pattern_elem(p.trim(), span, enums, params))
             .collect();
     }
-    Ok(vec![parse_pattern_elem(s, span, enums)?])
+    Ok(vec![parse_pattern_elem(s, span, enums, params)?])
 }
 
 fn parse_pattern_elem(
     s: &str,
     span: SourceSpan,
     enums: &EnumRegistry,
+    params: &std::collections::HashSet<String>,
 ) -> Result<PatElem, CHIRLowerError> {
     if s == "_" {
         return Ok(PatElem::Wildcard);
@@ -3521,6 +3526,11 @@ fn parse_pattern_elem(
     // Reuse the scalar pattern parser for literals / enum paths / `Logic::*`.
     match parse_pattern(s, span, enums)? {
         CHIRPattern::Lit(lit) => return Ok(PatElem::Lit(lit)),
+        // A const/parameter name before enum-variant resolution: it is a value,
+        // not a variant.
+        CHIRPattern::EnumVariant { name, inner: None } if params.contains(&name) => {
+            return Ok(PatElem::Const(name));
+        }
         CHIRPattern::EnumVariant { name, .. } => {
             // A bare variant name (no enum prefix): resolve it if exactly one
             // enum declares it.
@@ -3590,8 +3600,10 @@ fn match_expr_is_case_compatible(
             return Ok(false);
         }
         for alt in split_top_level_pipes(&arm.pattern_text) {
-            let elems = parse_pattern_elems(&alt, m.span, &ctx.enums)?;
-            let all_lit = elems.iter().all(|e| matches!(e, PatElem::Lit(_)));
+            let elems = parse_pattern_elems(&alt, m.span, &ctx.enums, &ctx.params)?;
+            let all_lit = elems
+                .iter()
+                .all(|e| matches!(e, PatElem::Lit(_) | PatElem::Const(_)));
             let whole_wildcard = elems.len() == 1 && matches!(elems[0], PatElem::Wildcard);
             if !all_lit && !whole_wildcard {
                 return Ok(false);
@@ -3624,7 +3636,7 @@ fn lower_match_as_chain(
         let mut has_binder = false;
 
         for alt in &alts {
-            let elems = parse_pattern_elems(alt, span, &ctx.enums)?;
+            let elems = parse_pattern_elems(alt, span, &ctx.enums, &ctx.params)?;
             // A lone `_` matches the whole scrutinee regardless of its arity
             // (`match (a, b) { _ => .. }`), so it is unconditional. Only when the
             // pattern is a tuple must its arity match the scrutinee's.
@@ -3654,6 +3666,17 @@ fn lower_match_as_chain(
                                 left: Box::new(sc),
                                 op: CHIRBinOp::Eq,
                                 right: Box::new(CHIRExpr::Lit(lit.clone())),
+                            },
+                        );
+                    }
+                    PatElem::Const(name) => {
+                        let sc = lower_expr(scrut_elems[i], ctx)?;
+                        alt_cond = and_cond(
+                            alt_cond,
+                            CHIRExpr::BinOp {
+                                left: Box::new(sc),
+                                op: CHIRBinOp::Eq,
+                                right: Box::new(CHIRExpr::Var(name.clone())),
                             },
                         );
                     }
@@ -4351,32 +4374,28 @@ fn lower_hardware_call(
 /// not fit the scrutinee's width keeps the default rather than silently
 /// truncating into a different match.
 ///
-/// Also the home of the const-in-pattern diagnostic: a name that is really a
-/// file-scope const (a `localparam`) parses as an enum-variant pattern and used
-/// to surface much later as a misleading tuple-pattern error (the
-/// `match_on_const_pattern` ledger entry). Consts are supported in match
-/// EXPRESSIONS only; say so, at the arm, with the working spelling.
+/// Also the home of const-name patterns: a name that is really a file-scope
+/// const (a `localparam`) or a const-generic parameter parses as an enum-variant
+/// pattern; it is rewritten here to [`CHIRPattern::Const`], which carries the
+/// NAME to the emitted case label (SystemVerilog evaluates the localparam —
+/// consts deliberately keep their source expression, see `file_consts`). This
+/// was a refusal until 2026-08-27 (the `match_on_const_pattern` ledger entry).
 fn size_patterns_to_scrutinee(
     patterns: Vec<CHIRPattern>,
     scrutinee: &CHIRExpr,
     span: SourceSpan,
     ctx: &LowerCtx,
 ) -> Result<Vec<CHIRPattern>, CHIRLowerError> {
-    for p in &patterns {
-        if let CHIRPattern::EnumVariant { name, .. } = p {
-            if ctx.params.contains(name) {
-                return Err(CHIRLowerError::UnsupportedConstruct {
-                    description: format!(
-                        "`{name}` is a file-scope const used as a match PATTERN; consts                          lower to localparams and are supported in match expressions and                          conditions only"
-                    ),
-                    span,
-                    suggested_rewrite: Some(format!(
-                        "rewrite the arm as an if/else-if chain comparing `== {name}`                          (the `ifchain_on_const_expr` spelling)"
-                    )),
-                });
+    let _ = span;
+    let patterns: Vec<CHIRPattern> = patterns
+        .into_iter()
+        .map(|p| match p {
+            CHIRPattern::EnumVariant { name, inner: None } if ctx.params.contains(&name) => {
+                CHIRPattern::Const { name }
             }
-        }
-    }
+            other => other,
+        })
+        .collect();
     let Some(w) = width_of_chir_expr(scrutinee, ctx) else { return Ok(patterns) };
     Ok(patterns
         .into_iter()

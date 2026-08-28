@@ -394,6 +394,12 @@ pub enum CHIRPattern {
     Wildcard,
     Tuple(Vec<CHIRPattern>),
     EnumVariant { name: String, inner: Option<Box<CHIRPattern>> },
+    /// A named compile-time constant — a file-scope `const` (a `localparam`) or
+    /// a const-generic parameter — used as a pattern (`match op { OP_LUI => … }`).
+    /// Carries the NAME, not a value: consts keep their source expression all
+    /// the way to SystemVerilog (see `file_consts`), so the case label emits the
+    /// name and SystemVerilog evaluates it.
+    Const { name: String },
 }
 
 // ── Expression model ──────────────────────────────────────────────────────────

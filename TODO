@@ -211,9 +211,15 @@ TRANSPILATION:
     OWN blockers; the struct latches / conditional struct+tuple lets / block
     bindings / `arithmetic_shift_right` all landed 2026-08-27
     (tests/fixtures/struct_pipeline_dut.rs), leaving exactly two, both known
-    causes: file-scope consts as match PATTERNS, and the word-indexed
-    `[Bits<32>; 32]` register file, which no IR stage supports.)
-    P-remaining  rv32i_cpu_pipelined (413:29 const pattern; regfile array)
+    causes — of which const match patterns CLOSED the same day: they lower as
+    the name-carrying `CHIRPattern::Const`, emitting the localparam name in the
+    case label / comparison; the stale WRONG-WIDTH skips for match_on_usize and
+    match_on_literals fell with it (labels have been scrutinee-sized since
+    `size_patterns_to_scrutinee`), so all of match_selector_dut sweeps.)
+    P-remaining  rv32i_cpu_pipelined (234:4) — ONLY the `[Bits<32>; 32]`
+        register file: word-indexed array registers, which no IR stage supports
+        (`Index` lowers to a bit select). With the regfile stubbed, the whole
+        pipeline transpiles.
     (Q is FIXED as of 2026-08-26 — see below. rv32i_cpu_transpilable now SWEEPS.)
     (J-b is FIXED as of 2026-08-27 — the tuple-destructuring `let` lowering
     inlines the helper and projects per element. ripple_carry_adder SWEEPS.)
