@@ -803,6 +803,10 @@ fn lower_submodule(
 fn lower_expr(e: &SHIRExpr, leg: &Legalizer, mb: &MemBinding) -> LowerResult<VLIRExpr> {
     Ok(match e {
         SHIRExpr::Var(name) => VLIRExpr::Var(leg.get(name)),
+        SHIRExpr::MemIndex { mem, addr } => VLIRExpr::MemIndex {
+            mem: leg.get(mem),
+            addr: Box::new(lower_expr(addr, leg, mb)?),
+        },
         SHIRExpr::Lit(lit) => lower_lit(lit),
         // The read port's output, and its valid flag. WHICH net that is depends
         // on where this expression sits relative to the capture edge — see
@@ -1118,6 +1122,10 @@ pub(crate) fn shir_expr_vars(e: &SHIRExpr, out: &mut HashSet<String>) {
     match e {
         SHIRExpr::Var(n) => {
             out.insert(n.clone());
+        }
+        SHIRExpr::MemIndex { mem, addr } => {
+            out.insert(mem.clone());
+            shir_expr_vars(addr, out);
         }
         SHIRExpr::BinOp { left, right, .. } => {
             shir_expr_vars(left, out);
@@ -2304,6 +2312,9 @@ fn collect_read_uses_expr(
     valid: &mut HashSet<MemPort>,
 ) {
     match e {
+        SHIRExpr::MemIndex { addr, .. } => {
+            collect_read_uses_expr(addr, data, valid);
+        }
         SHIRExpr::MemData { mem, port } => {
             data.insert((mem.clone(), *port));
         }

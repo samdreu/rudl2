@@ -314,6 +314,8 @@ pub enum SHIRExpr {
     MemData { mem: String, port: usize },
     /// `mem.read_port::<port>().is_ready()` — the read port's output-valid flag.
     MemValid { mem: String, port: usize },
+    /// Combinational memory-array word read — see `CHIRExpr::MemIndex`.
+    MemIndex { mem: String, addr: Box<SHIRExpr> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

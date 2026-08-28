@@ -270,8 +270,30 @@ fn infer_type_from_expr(
             }
             Err(CHIRLowerError::AmbiguousWidth { span })
         }
-        // A single-bit index `x[i]` is 1-bit.
-        ExprType::Index(_) => Ok(CHIRType::UInt { width: Width::Concrete(1) }),
+        // An index into an ARRAY-typed base (`regs[rs1]`) is a WORD select of
+        // the element type; a single-bit index `x[i]` over a packed vector is
+        // 1-bit.
+        ExprType::Index(i) => {
+            if let ExprType::Path(pth) = i.base.as_ref() {
+                let name: String = pth.path_text.chars().filter(|c| !c.is_whitespace()).collect();
+                if let Some(CHIRType::Array { elem, .. }) = symbols.get(&name) {
+                    return Ok((**elem).clone());
+                }
+            }
+            Ok(CHIRType::UInt { width: Width::Concrete(1) })
+        }
+        // An `if`-as-expression carries its arms' type: the first leaf that
+        // knows its width wins (`if rs1 == 0 { Bits::zero() } else { regs[rs1] }`
+        // — the zero is context-width, the word read is definite).
+        ExprType::If(_) | ExprType::Match(_) | ExprType::Block(_) => {
+            let mut leaves = Vec::new();
+            collect_value_leaves(expr, &mut leaves);
+            leaves
+                .iter()
+                .filter(|l| !std::ptr::eq(**l, expr))
+                .find_map(|l| infer_type_from_expr(l, span, symbols, enums).ok())
+                .ok_or(CHIRLowerError::AmbiguousWidth { span })
+        }
         // `[Logic::Zero; N]` — a repeated array of hardware elements is a packed
         // vector: N elements of width W is an (N*W)-bit value. This is the same
         // representation `Bits<N>` already has, and `a[k]` already lowers as a
@@ -300,26 +322,9 @@ fn infer_type_from_expr(
             }
             Ok(CHIRType::UInt { width: Width::Concrete(total) })
         }
-        ExprType::If(if_expr) => match &if_expr.else_branch {
-            Some(else_br) => infer_type_from_expr(else_br, span, symbols, enums),
-            None => Err(CHIRLowerError::AmbiguousWidth { span }),
-        },
-        ExprType::Match(m) => m
-            .arms
-            .first()
-            .map(|a| infer_type_from_expr(&a.body, span, symbols, enums))
-            .unwrap_or(Err(CHIRLowerError::AmbiguousWidth { span })),
-        // A block's type is its tail expression's type.
-        ExprType::Block(b) => b
-            .stmts
-            .iter()
-            .rev()
-            .find_map(|s| match &s.kind {
-                RawStmtKind::Expr(es) if !es.has_semi => Some(&es.expr),
-                _ => None,
-            })
-            .map(|e| infer_type_from_expr(e, span, symbols, enums))
-            .unwrap_or(Err(CHIRLowerError::AmbiguousWidth { span })),
+        // (If/Match/Block are handled above, from ALL their value leaves —
+        // which subsumes the older else-branch-only / first-arm / tail-only
+        // rules that used to sit here.)
         _ => Err(CHIRLowerError::AmbiguousWidth { span }),
     }
 }
@@ -493,7 +498,7 @@ fn substitute_expr(expr: &ExprType, subst: &std::collections::HashMap<String, Ex
     e
 }
 
-fn subst_in_place(e: &mut ExprType, subst: &std::collections::HashMap<String, ExprType>) {
+pub(crate) fn subst_in_place(e: &mut ExprType, subst: &std::collections::HashMap<String, ExprType>) {
     match e {
         ExprType::Path(p) => {
             if let Some(rep) = simple_ident(&p.path_text).and_then(|id| subst.get(&id)) {
@@ -570,14 +575,28 @@ fn subst_in_place(e: &mut ExprType, subst: &std::collections::HashMap<String, Ex
                 subst_in_place(v, subst);
             }
         }
-        // Await/Async/Assign/Let/Loop/While/Macro/Break/Continue/Yield/Const do
-        // not appear in the pure combinational tails we inline; a body using them
-        // is rejected before substitution or fails to lower afterward.
+        // Statement-position forms: absent from the pure combinational tails
+        // inlining substitutes into, but REACHED by `extract_control`'s
+        // state-counter rename, which substitutes over the whole extracted body
+        // (`pc = n;` assigns inside the FSM loop). The right-hand sides recurse;
+        // an Assign LEFT that is a plain path is a write TARGET and renames too.
+        ExprType::Assign(a) => {
+            subst_in_place(&mut a.left, subst);
+            subst_in_place(&mut a.right, subst);
+        }
+        ExprType::Loop(l) => subst_in_stmts(&mut l.body, subst),
+        ExprType::While(w) => {
+            subst_in_place(&mut w.condition, subst);
+            subst_in_stmts(&mut w.body, subst);
+        }
+        ExprType::Await(aw) => subst_in_place(&mut aw.base, subst),
+        // Async/Let/Macro/Break/Continue/Yield/Const carry no substitutable
+        // expressions of interest.
         _ => {}
     }
 }
 
-fn subst_in_stmts(stmts: &mut [RawStmt], subst: &std::collections::HashMap<String, ExprType>) {
+pub(crate) fn subst_in_stmts(stmts: &mut [RawStmt], subst: &std::collections::HashMap<String, ExprType>) {
     for s in stmts {
         match &mut s.kind {
             RawStmtKind::Local(l) => {
@@ -705,10 +724,18 @@ fn width_from_turbofish(path: &str) -> Option<usize> {
 
 /// Infer the type of a constructor-style call such as `Bits::from_u32(x)`.
 fn infer_type_from_call(call: &ExprCall, span: SourceSpan) -> Result<CHIRType, CHIRLowerError> {
-    match call_path(call).as_deref().and_then(constructor_width) {
-        Some(w) => Ok(CHIRType::UInt { width: Width::Concrete(w) }),
-        None => Err(CHIRLowerError::AmbiguousWidth { span }),
+    let path = call_path(call);
+    if let Some(w) = path.as_deref().and_then(constructor_width) {
+        return Ok(CHIRType::UInt { width: Width::Concrete(w) });
     }
+    // A context-width ctor with an HONOURED type turbofish (`Bits::<8>::zero()`)
+    // has a definite width too.
+    if let Some(ValueCtor::Const { width: Some(w), .. }) =
+        path.as_deref().and_then(classify_value_ctor)
+    {
+        return Ok(CHIRType::UInt { width: Width::Concrete(w) });
+    }
+    Err(CHIRLowerError::AmbiguousWidth { span })
 }
 
 // ── Enum encoding ─────────────────────────────────────────────────────────────
@@ -1443,10 +1470,82 @@ fn lower_seq_body(
     let structs_reg = build_struct_registry(fir);
     let mut pre_struct_locals: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut array_regs: std::collections::HashMap<String, (CHIRType, usize, usize)> =
+        std::collections::HashMap::new();
 
     for stmt in &fir.raw_statements {
         match &stmt.kind {
             RawStmtKind::Local(local) if local.is_mut => {
+                // An ARRAY register (`let mut regs = [Bits::<32>::zero(); 32]`)
+                // — the register file — lowers as an INTERNAL MEMORY: the
+                // unpacked array and its staged, edge-committed write reuse the
+                // memory machinery wholesale; reads are lowered separately as
+                // combinational word selects (`CHIRExpr::MemIndex`), not staged
+                // read ports. A one-bit element keeps the historical packed-
+                // vector lowering (bit-selects over `logic [N-1:0]`).
+                if let Some(ExprType::Repeat(rep)) = &local.init {
+                    let elem_ty =
+                        infer_type_from_expr(&rep.expr, local.span, &symbols, &enums).ok();
+                    let elem_w = elem_ty.as_ref().and_then(width_of_type_concrete);
+                    let depth = match repeat_len(&rep.len) {
+                        Some(Width::Concrete(n)) => Some(n),
+                        _ => None,
+                    };
+                    if let (Some(elem_ty), Some(w), Some(depth)) = (elem_ty, elem_w, depth) {
+                        if w > 1 && fir.registers.iter().any(|r| r == &local.name) {
+                            let addr_w = depth.next_power_of_two().trailing_zeros().max(1) as usize;
+                            mem_infos.insert(
+                                local.name.clone(),
+                                MemInfo {
+                                    elem_ty: elem_ty.clone(),
+                                    read_ports: 0,
+                                    write_ports: 1,
+                                },
+                            );
+                            memories.push(CHIRMemoryDecl {
+                                name: local.name.clone(),
+                                elem_ty: elem_ty.clone(),
+                                depth,
+                                read_ports: 0,
+                                write_ports: 1,
+                                read_lat: 1,
+                                // The write is staged in the POST-tick segment,
+                                // whose reads are post-edge values: the commit
+                                // lands at the NEXT edge (visible the following
+                                // cycle), which in the memory machinery's terms
+                                // is one pipeline stage — WRITE_LAT 2, not 1.
+                                // Measured: WL=1 commits an edge early
+                                // (regfile_read_first showed the write in the
+                                // same cycle the simulator still reads the old
+                                // word).
+                                write_lat: 2,
+                                write_mode: WriteMode::ReadFirst,
+                                init: None,
+                                received: false,
+                                span: local.span,
+                            });
+                            // The write staging nets the memory lowering
+                            // synthesizes; registered here so the write-through
+                            // mux can reference them (and width queries answer).
+                            symbols.insert(
+                                local.name.clone(),
+                                CHIRType::Array {
+                                    elem: Box::new(elem_ty.clone()),
+                                    len: Width::Concrete(depth),
+                                },
+                            );
+                            symbols.insert(format!("{}_wr0_en", local.name), CHIRType::Bool);
+                            symbols.insert(
+                                format!("{}_wr0_addr", local.name),
+                                CHIRType::UInt { width: Width::Concrete(addr_w) },
+                            );
+                            symbols.insert(format!("{}_wr0_data", local.name), elem_ty.clone());
+                            array_regs
+                                .insert(local.name.clone(), (elem_ty, depth, addr_w));
+                            continue;
+                        }
+                    }
+                }
                 // A struct-valued latch flattens to one register per declared
                 // field, named `<local>_<field>` — the same flattening every
                 // struct WIRE binding gets, so a field read (`if_id.pc` →
@@ -1598,6 +1697,7 @@ fn lower_seq_body(
     ctx.structs = build_struct_registry(fir);
     ctx.write_inferred = build_write_inferred_types(fir, &ctx.symbols);
     ctx.struct_locals = pre_struct_locals;
+    ctx.array_regs = array_regs;
     ctx.memories = mem_infos;
 
     // Preloads, now that expressions can be lowered. Each word is retyped and
@@ -1976,6 +2076,14 @@ pub(crate) struct LowerCtx<'a> {
     /// File-scope free functions available for inlining (#7b), by name. Built
     /// from `FrontendModuleIR::file_fns`.
     fns: std::collections::HashMap<String, FrontendFnIR>,
+    /// ARRAY REGISTERS (`let mut regs = [Bits<W>; N]` at register position):
+    /// name → (element type, depth, address width). Lowered as an internal
+    /// memory (array + staged write commit) with COMBINATIONAL word reads.
+    array_regs: std::collections::HashMap<String, (CHIRType, usize, usize)>,
+    /// Array registers already written in the CURRENT tick-free segment: a read
+    /// lowered after the write statement takes the write-through mux against
+    /// the `<name>_fwd_*` wires. Cleared at every `AwaitTick`.
+    array_written: std::collections::HashSet<String>,
     /// Locals (wires AND flattened registers) of struct type: name → struct
     /// name. What lets a whole-struct copy (`ex_mem = new_ex_mem;`) and a
     /// struct-typed leaf in a conditional tree expand per-field.
@@ -2015,6 +2123,8 @@ impl<'a> LowerCtx<'a> {
             enums: EnumRegistry::new(),
             bindings: std::collections::HashMap::new(),
             fns: std::collections::HashMap::new(),
+            array_regs: std::collections::HashMap::new(),
+            array_written: std::collections::HashSet::new(),
             struct_locals: std::collections::HashMap::new(),
             inlining: std::collections::HashSet::new(),
             structs: std::collections::HashMap::new(),
@@ -2922,6 +3032,9 @@ fn lower_expr_stmt(
                     clock: ctx.clock_name.clone(),
                     span,
                 });
+                // A tick advances the write pipeline; the new segment reads
+                // the committed array until its own write runs.
+                ctx.array_written.clear();
             } else {
                 return Err(CHIRLowerError::UnsupportedConstruct {
                     description: "await on non-clock value".to_string(),
@@ -3037,9 +3150,43 @@ fn lower_expr_stmt(
                 }
             }
             // LHS bit-assign: `base[index] = value` drives a single bit of an
-            // already-declared signal.
+            // already-declared signal — or, for an ARRAY REGISTER, a WORD
+            // write: a `MemWrite` staged through the memory machinery
+            // (WRITE_LAT 2 — committed at the edge AFTER the one that closes
+            // this segment, matching the simulator's next-iteration
+            // visibility); a later read in the same segment sees the written
+            // word through the staging-net mux (write-through).
             if let ExprType::Index(idx) = assign.left.as_ref() {
                 let base = extract_assign_target(&idx.base, span)?;
+                if let Some((elem_ty, _, addr_w)) = ctx.array_regs.get(&base).cloned() {
+                    if ctx.array_written.contains(&base) {
+                        return Err(CHIRLowerError::UnsupportedConstruct {
+                            description: format!(
+                                "array register `{base}` is written twice in one cycle; it \
+                                 has ONE write port. Merge the writes into a single \
+                                 statement with muxed address and data"
+                            ),
+                            span,
+                            suggested_rewrite: None,
+                        });
+                    }
+                    let addr = resize_index(lower_expr(&idx.index, ctx)?, addr_w, ctx);
+                    let ew = type_width(&elem_ty);
+                    let value = retype_default_literals_in_values(
+                        lower_expr(&assign.right, ctx)?,
+                        ew.clone(),
+                    );
+                    let value = resize_to_target(value, &ew, ctx);
+                    out.push(CHIRStmt::MemWrite {
+                        mem: base.clone(),
+                        port: 0,
+                        addr,
+                        value,
+                        span,
+                    });
+                    ctx.array_written.insert(base);
+                    return Ok(());
+                }
                 let index = lower_expr(&idx.index, ctx)?;
                 let value = lower_expr(&assign.right, ctx)?;
                 out.push(CHIRStmt::IndexAssign { base, index, value, span });
@@ -3847,6 +3994,7 @@ fn expr_width(e: &CHIRExpr, ctx: &LowerCtx) -> Option<Width> {
         CHIRExpr::Lit(l) => Some(type_width(&l.ty)),
         CHIRExpr::Slice { high, low, .. } => Some(Width::Concrete(high - low + 1)),
         CHIRExpr::DynBit { .. } => Some(Width::Concrete(1)),
+        CHIRExpr::MemIndex { mem, .. } => ctx.memories.get(mem).map(|m| type_width(&m.elem_ty)),
         CHIRExpr::Resize { width, .. } => Some(width.clone()),
         _ => None,
     }
@@ -3928,6 +4076,7 @@ fn width_of_chir_expr(e: &CHIRExpr, ctx: &LowerCtx) -> Option<usize> {
         // A memory read result: the element width lives in the memory's
         // declaration, which this expression-only walk does not carry.
         CHIRExpr::MemData { mem, .. } => ctx.memories.get(mem).map(|m| width_of_type(&m.elem_ty)),
+        CHIRExpr::MemIndex { mem, .. } => ctx.memories.get(mem).map(|m| width_of_type(&m.elem_ty)),
         CHIRExpr::MemValid { .. } => Some(1),
         CHIRExpr::DynBit { .. } => Some(1),
         CHIRExpr::Resize { width, .. } => match width {
@@ -4029,7 +4178,55 @@ fn project_tuple_element(
 /// Lower a bit-index `base[i]` to a single-bit slice. The index must be a
 /// compile-time constant (variable indices require loop unrolling, which is a
 /// separate lowering step).
+/// Cast an array-register index to the address width — the same treatment a
+/// memory address gets (cause Q): an unresized wide index into a narrow
+/// selector is a Verilator width warning, fatal under `-Wall`.
+fn resize_index(expr: CHIRExpr, addr_w: usize, ctx: &LowerCtx) -> CHIRExpr {
+    let target = Width::Concrete(addr_w);
+    let expr = retype_default_literals_in_values(expr, target.clone());
+    if width_of_chir_expr(&expr, ctx) == Some(addr_w) {
+        expr
+    } else {
+        CHIRExpr::Resize { expr: Box::new(expr), width: target }
+    }
+}
+
 fn lower_index(idx: &ExprIndex, ctx: &mut LowerCtx) -> Result<CHIRExpr, CHIRLowerError> {
+    // An ARRAY REGISTER (`regs[i]`) reads a WORD, combinationally: the
+    // committed array — or, for a read lowered AFTER this segment's write
+    // statement, the write-through mux against the write's own comb staging
+    // nets (`<r>_wr0_*` — per-phase defaulted by `mem_net_defaults`, assigned
+    // at the write site). That is the WB→ID regfile half-cycle. A read before
+    // the write never muxes, so a pure read-first module reads the array
+    // directly.
+    if let ExprType::Path(pth) = idx.base.as_ref() {
+        let name = compact_ident(&pth.path_text);
+        if let Some((_, _, addr_w)) = ctx.array_regs.get(&name).cloned() {
+            let raw = lower_expr(&idx.index, ctx)?;
+            let index = resize_index(raw, addr_w, ctx);
+            let plain = CHIRExpr::MemIndex {
+                mem: name.clone(),
+                addr: Box::new(index.clone()),
+            };
+            if !ctx.array_written.contains(&name) {
+                return Ok(plain);
+            }
+            let hit = CHIRExpr::BinOp {
+                left: Box::new(CHIRExpr::Var(format!("{name}_wr0_en"))),
+                op: CHIRBinOp::LogicalAnd,
+                right: Box::new(CHIRExpr::BinOp {
+                    left: Box::new(index),
+                    op: CHIRBinOp::Eq,
+                    right: Box::new(CHIRExpr::Var(format!("{name}_wr0_addr"))),
+                }),
+            };
+            return Ok(CHIRExpr::Mux {
+                cond: Box::new(hit),
+                then_val: Box::new(CHIRExpr::Var(format!("{name}_wr0_data"))),
+                else_val: Box::new(plain),
+            });
+        }
+    }
     let base = lower_expr(&idx.base, ctx)?;
     // A compile-time constant index is a static one-bit `Slice`; anything else
     // (e.g. a loop variable) is a dynamic single-bit select `base[index]`.
@@ -4573,6 +4770,13 @@ fn validate_module_scope(module: &CHIRModule) -> Result<(), CHIRLowerError> {
             for reg in &body.registers {
                 known.insert(reg.name.clone());
             }
+            // An ARRAY REGISTER's write staging nets: synthesized by the memory
+            // lowering, referenced by the write-through mux (see `lower_index`).
+            for mem in &body.memories {
+                for suffix in ["en", "addr", "data"] {
+                    known.insert(format!("{}_wr0_{suffix}", mem.name));
+                }
+            }
             for sub in &body.submodules {
                 for (_, expr) in &sub.inputs {
                     validate_expr(expr, &known, module.span)?;
@@ -4683,6 +4887,7 @@ fn validate_expr(
     span: SourceSpan,
 ) -> Result<(), CHIRLowerError> {
     match expr {
+        CHIRExpr::MemIndex { addr, .. } => validate_expr(addr, known, span)?,
         CHIRExpr::Var(name) => {
             if !known.contains(name.as_str()) {
                 return Err(CHIRLowerError::UnsupportedConstruct {
@@ -5346,6 +5551,7 @@ fn mem_result_type(
 fn walk_chir_expr(expr: &CHIRExpr, f: &mut impl FnMut(&CHIRExpr)) {
     f(expr);
     match expr {
+        CHIRExpr::MemIndex { addr, .. } => walk_chir_expr(addr, f),
         CHIRExpr::BinOp { left, right, .. } => {
             walk_chir_expr(left, f);
             walk_chir_expr(right, f);

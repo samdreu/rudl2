@@ -467,6 +467,11 @@ pub enum CHIRExpr {
     MemData { mem: String, port: usize },
     /// `mem.read_port::<port>().is_ready()` — the read port's output-valid flag.
     MemValid { mem: String, port: usize },
+    /// `<mem>[<addr>]` — a COMBINATIONAL read of a memory array (an ARRAY
+    /// REGISTER, `let mut regs = [Bits<W>; N]`): the committed word, this
+    /// settle, no staging. Distinct from `MemData`, which is a staged read
+    /// port's output.
+    MemIndex { mem: String, addr: Box<CHIRExpr> },
 }
 
 #[derive(Debug, Clone)]

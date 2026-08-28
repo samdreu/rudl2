@@ -77,17 +77,15 @@ const SKIP: &[(&str, &str)] = &[
     ),
     (
         "rv32i_cpu_pipelined",
-        "receives its unified instruction/data `Memory` as a parameter, so the sweep cannot \
-         supply one (see the Kind::Memory rule below, which would skip it anyway). Cause P \
-         DISCHARGED 2026-08-27 (received-memory bus ABI, RECEIVED_MEMORY_ABI.md); the \
-         struct latches, conditional struct/tuple lets, block bindings, and \
-         `arithmetic_shift_right` all lower as of 2026-08-27 (tests/fixtures/\
-         struct_pipeline_dut.rs sweeps them; const match patterns lower as of the same day \
-         via CHIRPattern::Const — match_selector_dut's three match modules all sweep). ONE \
-         blocker remains: the `[Bits<32>; 32]` register FILE — a word-indexed array \
-         register, which no IR stage supports (Index lowers to a bit select; the \
-         transpilable CPU spells it as 31 named scalars instead). With the regfile stubbed, \
-         the whole module transpiles",
+        "TRANSPILES AND LINTS CLEAN under -Wall as of 2026-08-27 — every cause is closed \
+         (cause P: received-memory bus ABI; struct latches / tuple lets / block bindings / \
+         arithmetic_shift_right: struct_pipeline_dut.rs; const match patterns: \
+         CHIRPattern::Const; the register FILE: word-indexed ARRAY REGISTERS, \
+         regfile_dut.rs, incl. the WB->ID write-through mux; the extraction counter renames \
+         to pc_1 around the CPU's own pc). What keeps it OUT OF THE SWEEP is only its \
+         `Memory` PARAMETER: the sweep cannot supply one (the Kind::Memory rule below). \
+         Behavioural anchoring needs a Verilated parent owning the memory — the \
+         received_memory_abi.rs harness pattern, scaled up",
     ),
     // ── The claim ledger: tests/fixtures/{bits_ops,signedness,aggregate_locals,
     // match_selector,out_phase,mem_address_width}_dut.rs. Each module below is a

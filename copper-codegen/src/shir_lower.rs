@@ -1344,7 +1344,7 @@ fn find_promoted_wires(
 }
 
 /// Walk a statement and call `visitor` on every variable name in every expression.
-fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
+pub(crate) fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
     match stmt {
         CHIRStmt::Wire { value, .. } => collect_expr_vars(value, visitor),
         CHIRStmt::Assign { value, .. } => collect_expr_vars(value, visitor),
@@ -1383,6 +1383,10 @@ fn collect_expr_vars_in_stmt(stmt: &CHIRStmt, visitor: &mut impl FnMut(&str)) {
 fn collect_expr_vars(expr: &CHIRExpr, visitor: &mut impl FnMut(&str)) {
     match expr {
         CHIRExpr::Var(name) => visitor(name),
+        CHIRExpr::MemIndex { mem, addr } => {
+            visitor(mem);
+            collect_expr_vars(addr, visitor);
+        }
         CHIRExpr::Lit(_) => {}
         CHIRExpr::BinOp { left, right, .. } => {
             collect_expr_vars(left, visitor);
@@ -1422,6 +1426,10 @@ fn subst_vars(expr: SHIRExpr, subst: &HashMap<String, SHIRExpr>) -> SHIRExpr {
     if subst.is_empty() { return expr; }
     match expr {
         SHIRExpr::Var(ref name) => subst.get(name).cloned().unwrap_or(expr),
+        SHIRExpr::MemIndex { mem, addr } => SHIRExpr::MemIndex {
+            mem,
+            addr: Box::new(subst_vars(*addr, subst)),
+        },
         SHIRExpr::Lit(_)
         | SHIRExpr::PhaseEq(_)
         | SHIRExpr::MemData { .. }
@@ -1490,6 +1498,10 @@ fn rename_vars(expr: SHIRExpr, renames: &HashMap<String, String>) -> SHIRExpr {
 pub fn lower_expr(expr: &CHIRExpr) -> Result<SHIRExpr, SHIRLowerError> {
     match expr {
         CHIRExpr::Var(name) => Ok(SHIRExpr::Var(name.clone())),
+        CHIRExpr::MemIndex { mem, addr } => Ok(SHIRExpr::MemIndex {
+            mem: mem.clone(),
+            addr: Box::new(lower_expr(addr)?),
+        }),
         CHIRExpr::Lit(lit) => Ok(SHIRExpr::Lit(lower_lit(lit))),
         CHIRExpr::BinOp { left, op, right } => Ok(SHIRExpr::BinOp {
             left: Box::new(lower_expr(left)?),

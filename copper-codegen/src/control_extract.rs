@@ -50,8 +50,12 @@ use copper_core::frontend_ir::{
     ExprType, FrontendModuleIR, LocalStmt, RawStmt, RawStmtKind, RawTypeRef, SourceSpan,
 };
 
-/// The synthesized program-counter register name.
-const PC: &str = "pc";
+/// The synthesized program-counter register name — a PLACEHOLDER during
+/// extraction, renamed to its final spelling at the end of `extract_control`:
+/// `pc` when the module doesn't already use that name, `pc_1` (`pc_2`, …)
+/// when it does. The pipelined CPU has its own 32-bit `pc` register, and both
+/// emitting under one name was a duplicate declaration in the SystemVerilog.
+const PC: &str = "__cx_pc";
 
 /// The `pc` register's Rust type. `match`-arm literals carry the matching suffix
 /// so they lower to the same width as `pc` (else Verilator flags `WIDTHEXPAND` on
@@ -587,6 +591,107 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
     // in source order.
     for decl in hoisted.into_iter().rev() {
         fir.raw_statements.insert(loop_idx, decl);
+    }
+
+    // Final name for the state counter — see the `PC` doc.
+    let declared = declared_names(fir);
+    let mut chosen = "pc".to_string();
+    let mut n = 0usize;
+    while declared.contains(&chosen) {
+        n += 1;
+        chosen = format!("pc_{n}");
+    }
+    if chosen != PC {
+        let subst: std::collections::HashMap<String, ExprType> = [(
+            PC.to_string(),
+            ExprType::Path(ExprPath { path_text: chosen.clone(), span }),
+        )]
+        .into();
+        crate::chir_lower::subst_in_stmts(&mut fir.raw_statements, &subst);
+        rename_locals(&mut fir.raw_statements, PC, &chosen);
+    }
+}
+
+/// Every name the module declares — params, generics, file consts, and locals
+/// at any depth — i.e. anything the synthesized counter must not collide with.
+fn declared_names(fir: &FrontendModuleIR) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &fir.signature.params {
+        out.insert(p.name.clone());
+    }
+    for g in &fir.signature.generics {
+        out.insert(g.name.clone());
+    }
+    for c in &fir.file_consts {
+        out.insert(c.name.clone());
+    }
+    fn walk_stmts(stmts: &[RawStmt], out: &mut std::collections::HashSet<String>) {
+        for s in stmts {
+            match &s.kind {
+                RawStmtKind::Local(l) => {
+                    out.insert(l.name.clone());
+                    if let Some(init) = &l.init {
+                        walk_expr(init, out);
+                    }
+                }
+                RawStmtKind::Expr(es) => walk_expr(&es.expr, out),
+                RawStmtKind::Item(_) => {}
+            }
+        }
+    }
+    fn walk_expr(e: &ExprType, out: &mut std::collections::HashSet<String>) {
+        match e {
+            ExprType::Loop(l) => walk_stmts(&l.body, out),
+            ExprType::If(f) => {
+                walk_stmts(&f.then_block, out);
+                if let Some(else_br) = &f.else_branch {
+                    walk_expr(else_br, out);
+                }
+            }
+            ExprType::Match(m) => {
+                for arm in &m.arms {
+                    walk_expr(&arm.body, out);
+                }
+            }
+            ExprType::Block(b) => walk_stmts(&b.stmts, out),
+            _ => {}
+        }
+    }
+    walk_stmts(&fir.raw_statements, &mut out);
+    out
+}
+
+/// Rename `Local` declarations of `from` to `to`, at any statement depth.
+fn rename_locals(stmts: &mut [RawStmt], from: &str, to: &str) {
+    for s in stmts {
+        match &mut s.kind {
+            RawStmtKind::Local(l) => {
+                if l.name == from {
+                    l.name = to.to_string();
+                }
+            }
+            RawStmtKind::Expr(es) => rename_locals_in_expr(&mut es.expr, from, to),
+            RawStmtKind::Item(_) => {}
+        }
+    }
+}
+
+fn rename_locals_in_expr(e: &mut ExprType, from: &str, to: &str) {
+    match e {
+        ExprType::Loop(l) => rename_locals(&mut l.body, from, to),
+        ExprType::If(f) => {
+            rename_locals(&mut f.then_block, from, to);
+            if let Some(else_br) = &mut f.else_branch {
+                rename_locals_in_expr(else_br, from, to);
+            }
+        }
+        ExprType::Match(m) => {
+            for arm in &mut m.arms {
+                rename_locals_in_expr(&mut arm.body, from, to);
+            }
+        }
+        ExprType::Block(b) => rename_locals(&mut b.stmts, from, to),
+        _ => {}
     }
 }
 

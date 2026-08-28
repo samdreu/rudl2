@@ -65,6 +65,13 @@ use syn::ItemFn;
 /// inference legitimately does not produce (they are synthesized during lowering).
 const SYNTHETIC: &[&str] = &["phase", "pc"];
 
+/// `pc_<digits>` — the extraction counter's collision-fallback spelling (a
+/// module that already names `pc`, like the pipelined CPU, gets `pc_1`).
+fn is_pc_fallback(name: &str) -> bool {
+    name.strip_prefix("pc_")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// A register synthesized by the lowering rather than named in the source.
 ///
 /// Two kinds: the phase/pc counter above, and a memory read port's pipeline stage
@@ -79,7 +86,7 @@ const SYNTHETIC: &[&str] = &["phase", "pc"];
 /// one renamed, so a name of this shape in the emitted SV really is a memory
 /// pipeline stage.
 fn is_synthetic(name: &str) -> bool {
-    if SYNTHETIC.contains(&name) {
+    if SYNTHETIC.contains(&name) || is_pc_fallback(name) {
         return true;
     }
     // The counter control extraction synthesizes for `for _ in <range>` — the same
@@ -194,6 +201,33 @@ fn struct_register_fields(f: &ItemFn, file: &syn::File, name: &str) -> Option<Ve
     })
 }
 
+/// Names the emitted SV declares as UNPACKED ARRAYS (`logic [..] <name> [0:..];`)
+/// — an ARRAY REGISTER lowered through the memory machinery. It IS registered
+/// storage (one flop per word, committed in `always_ff`), but the flop
+/// extractor deliberately filters memory-array writes, so the inferred name is
+/// satisfied here instead.
+fn sv_array_nets(sv: &str) -> BTreeSet<String> {
+    sv.lines()
+        .filter_map(|l| {
+            let t = l.trim().strip_suffix(';')?;
+            let mut parts = t.split_whitespace();
+            if parts.next()? != "logic" {
+                return None;
+            }
+            let rest: Vec<&str> = parts.collect();
+            // `[w:0] name [0:d]` — the trailing token is the unpacked dimension.
+            if rest.len() >= 2 && rest.last()?.starts_with('[') {
+                let name = rest[rest.len() - 2];
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .then(|| name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Every net the emitted SV declares (`logic … <name>;`), flop or not. Minus the
 /// flop set, this is the comb-wire set the absorption allowance checks against.
 fn sv_declared_nets(sv: &str) -> BTreeSet<String> {
@@ -284,9 +318,13 @@ fn codegen_registers_match_shared_inference() {
                 BTreeSet::new()
             };
 
+            let arrays = sv_array_nets(&sv);
             let missing: Vec<_> = inferred
                 .difference(&codegen)
                 .filter(|n| {
+                    if arrays.contains(*n) {
+                        return false;
+                    }
                     if let Some(fields) = struct_fields_of.get(*n) {
                         if fields.iter().all(|fl| codegen.contains(&format!("{n}_{fl}"))) {
                             return false;
