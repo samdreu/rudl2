@@ -4,7 +4,8 @@
 crates, not the design docs, which are out of sync in several places) and how each claim
 should be framed against prior work. Read this before writing any paper prose.
 
-Last verified against source: 2026-08-22 (see §Scope of the equivalence claim).
+Last verified against source: **2026-08-27** (see §Re-verification 2026-08-27 — the
+equivalence scope changed materially; earlier sections stand as the dated record).
 
 ---
 
@@ -12,17 +13,21 @@ Last verified against source: 2026-08-22 (see §Scope of the equivalence claim).
 
 | Feature | Mechanism in source | Evidence |
 |---|---|---|
-| Clock domains | Phantom type `Clock<Domain: ClockDomain>` with `PhantomData<Domain>` | `copper-core/src/types.rs:822-839` |
-| Clock-domain-crossing safety | **Phantom-type**, not ownership: `In<T,D>`/`Out<T,D>` carry `PhantomData<D>`; cross-domain pass = `E0308` type mismatch | `copper-core/src/port.rs:13-37`; `examples/cdc/two_domain_counter.rs:40-48` |
-| Single-driver guarantee | `Out<T,D>` is **non-`Clone`** (move-only); `In<T,D>` is `Clone`. One writer per wire, by Rust move semantics | `copper-core/src/port.rs:12-49` |
+| Clock domains | Phantom type `Clock<Domain: ClockDomain>` with `PhantomData<Domain>` | `copper-core/src/types.rs:865` |
+| Clock-domain-crossing safety | **Phantom-type**, not ownership: `In<T,D>`/`Out<T,D>` carry `PhantomData<D>`; cross-domain pass = `E0308` type mismatch | `copper-core/src/port.rs:82,111`; `copper-core/src/cdc.rs` (compile_fail doctests ARE the spec) |
+| Single-driver guarantee | `Out<T,D>` is **non-`Clone`** (move-only); `In<T,D>` is `Clone`. One writer per wire, by Rust move semantics | `copper-core/src/port.rs:64-118` |
 | Async/await FSMs | `#[hardware]` macro only validates + injects a sim barrier; **rustc's own async→state-machine lowering is the FSM the *simulator* runs**. Vars live across `.await` are the design's registers — but the *synthesizable* set is Copper's own liveness result, **not** rustc's over-captured `Future` fields; the emitted netlist is an independent transpiler lowering. See §Claim-scope correction (2026-07-30) | `copper-macros/src/lib.rs:118-138`; `examples/sequential/traffic_light_fsm.rs:26-28` |
-| Same-source sim = synth | DUT source included once as Rust (rustc sim) and once via `include_str!` → `copper_codegen::transpile_source` → SV; traces compared under Verilator. **Holds only for the transpilable subset — see §Scope below** | `tests/lfsr_equivalence.rs`, `tests/m1_counter_equivalence.rs` |
-| Transpiler pipeline | FIR → CHIR → SHIR → VLIR → SV; entry `copper_codegen::transpile_source`; CLI `copper-transpile` | `copper-codegen/src/{parser,chir_lower,shir_lower,vlir_lower,emit}.rs`, `main.rs` |
+| Same-source sim = synth | DUT source included once as Rust (rustc sim) and once via `include_str!` → `copper_codegen::transpile_source` → SV; traces compared under Verilator. **As of 2026-08-27 every example module transpiles (34/34) and the corpus sweep covers 32/34 — see §Re-verification** | `tests/lfsr_equivalence.rs`; `build.rs` corpus sweep (G-D); `tests/rv32i_pipelined_verilator.rs` |
+| Transpiler pipeline | FIR → control_extract → CHIR → SHIR → VLIR → SV; entry `copper_codegen::transpile_source`; CLI `copper-transpile` | `copper-codegen/src/{parser,control_extract,chir_lower,shir_lower,vlir_lower,emit}.rs`, `main.rs` |
 
-## Doc/code mismatches to fix before publication
-- README says `#[hardware(function_typed)]`; the macro only supports `sequential` / `combinational`.
-- Several examples use bare `async fn` + `HardwareExecutor` with **no macro at all**.
-- README's "first HDL to use ownership semantics for compile-time CDC" is **not** what the code does (CDC is phantom-typed) and is contested by Clash/Arch.
+## Doc/code mismatches to fix before publication — ALL RESOLVED (2026-08-27)
+- ~~README says `#[hardware(function_typed)]`~~ — gone; the README documents the
+  real modes (`sequential`/`combinational`/`synchronizer`/`structural`).
+- ~~Several examples use bare `async fn` + `HardwareExecutor` with no macro~~ —
+  every example file spawning modules now carries `#[hardware]` modules
+  (re-checked mechanically: no `HardwareExecutor`-using example lacks the attribute).
+- ~~README claims "first HDL to use ownership semantics for compile-time CDC"~~ —
+  the README now states CDC as phantom-typed, with no priority claim.
 
 ---
 
@@ -72,7 +77,10 @@ Last verified against source: 2026-08-22 (see §Scope of the equivalence claim).
 
 **RETIRE:** all "first HDL" / "ownership-based CDC" phrasing.
 
-## Current status caveat (C2) — as of 2026-07-16 on branch `transpilation/fir-chir-shir`
+## Current status caveat (C2) — as of 2026-07-16 on branch `transpilation/fir-chir-shir` — RESOLVED
+**(Resolved long since: both tests are tracked and green, and the equivalence
+evidence now spans the whole example corpus — §Re-verification 2026-08-27.
+Kept as the dated record of when the claim was NOT yet demonstrable.)**
 The `counter` + `lfsr` equivalence tests (`tests/m1_counter_equivalence.rs`,
 `tests/lfsr_equivalence.rs`) are **new, untracked, and currently FAILING**: the in-progress
 parser refactor emits `ExprType::Path` for a bare-identifier `port.write()` receiver, but
@@ -126,7 +134,7 @@ hardware-anchored cycle-accurate sim, and we transpile the same source to RTL in
 equivalent; the synthesizable register set is Copper's liveness result.* This is exactly the G4
 re-scope ("reuse of rustc's async lowering" = the sim running it) and now has evidence:
 `copper-analysis` liveness CFG (the register analysis), `register_reconciliation.rs` (codegen ≡ shared
-inference across 19 modules), and the G2 structural reg-match vs 4 independent hand-written SVs.
+inference — 97 clocked modules as of 2026-08-27), and the G2 structural reg-match vs 4 independent hand-written SVs.
 
 **Is the corrected claim still strong? Yes — arguably stronger, but its *character* changes.**
 - **Stronger:** (a) it stops contradicting T1 (an internal contradiction a reviewer would exploit);
@@ -145,16 +153,35 @@ inference across 19 modules), and the G2 structural reg-match vs 4 independent h
   overreach look like the thesis. The novelty remains the *conjunction* + third-party hardware
   anchoring, which the correction leaves intact and cleaner.
 
-## Known weaknesses a reviewer will attack
-- **Transpiler coverage is thin** (counter + lfsr end-to-end, *once the fix lands*). The eval
-  section is bounded by how many examples pass `transpile_source` + Verilator. Active TODO.
+## Known weaknesses a reviewer will attack (re-scoped 2026-08-27)
+- ~~Transpiler coverage is thin~~ — RESOLVED: 34/34 example modules transpile, 131
+  corpus differential cases green, and the pipelined RV32I CPU is itself an
+  equivalence result. The residual version of this attack: the **language is
+  narrowed by design** — five pre-tick alignment rules, the mid-phase read seam,
+  and one write port per array register refuse shapes rather than support them.
+  Pre-empt by framing restriction as the mechanism (the cycle-dataflow model
+  refuses what it cannot give one meaning), with the guardrail doc's five
+  REJECTED fixes as evidence the boundary is measured, not convenient.
 - **No formal semantics / soundness argument yet.** Filament (PLDI'23), Anvil (ASPLOS'26),
   Spade all carry one. Leading with a "correctness guarantee" invites demand for a proof
   sketch of the async-lowering ↔ transpiler correspondence, or a much larger verified set.
+  Partial mitigation now on file: `design_docs/CYCLE_DATAFLOW_SEMANTICS.md` is a
+  normative denotation (one value per signal per cycle, commit/forwarding rules)
+  from which the guard rules are derived — a semantics document, not a proof.
+- **Third-party anchoring is 7 designs.** The sweep (131 cases) proves sim ≡
+  emitted-SV CONSISTENCY; only the BaseJump anchors and the hand-written
+  references adjudicate SEMANTICS. The CPU lane strengthens this (13
+  architectural programs are an ISA-level oracle), but "the two agree" and "the
+  two are right" remain distinct claims — keep them distinct in prose.
 
 ---
 
-## Scope of the equivalence claim (added 2026-08-22) — read before writing "the same source"
+## Scope of the equivalence claim (added 2026-08-22) — SUPERSEDED by §Re-verification 2026-08-27
+
+**(Kept as the dated record. Every row of the table below has since landed, and
+the boxed CPU trap is obsolete in the opposite direction — the CPU is now an
+equivalence result. Do not cite this section; cite the re-verification.)**
+
 
 The same-source claim is real but **bounded**, and the bound is not a rough edge. State it as
 *"the same source simulates and synthesises, provably in agreement, for the subset the transpiler
@@ -185,3 +212,53 @@ transpilation), and the harness producing all of this evidence had five defects 
 check pass or vanish silently (T9). Neither invalidates the claim; both bound how much weight it
 carries, and both are worth pre-empting rather than having a reviewer find.
 
+---
+
+## Re-verification 2026-08-27 — the equivalence scope is now the whole example corpus
+
+Everything in the 2026-08-22 scope table landed within five days of being
+written down, so the claim's shape changes. Verified against source and the
+current regression (`REGRESSION OK`: 1006 tests / 0 failures across 122
+binaries; 26/26 examples; 131 corpus differential cases green, 12
+ignored-with-reason):
+
+| 2026-08-22 said | 2026-08-27 reality | evidence |
+|---|---|---|
+| `Memory` does not transpile | transpiles — declared, preloaded, multi-port, WriteFirst, and RECEIVED as a parameter (bus ABI) | `examples/memory/dual_port_ram.rs`; `design_docs/RECEIVED_MEMORY_ABI.md`; `tests/received_memory_abi.rs` |
+| `arithmetic_shift_right` unsupported | lowers to `$signed(a) >>> n` | `unsupported_constructs.rs::arithmetic_shift_right_is_supported`; `fx_struct_pipeline_dut::sra_method` (swept) |
+| tuple-returning helpers = inference gap | tuple/struct/block bindings all lower | `tests/fixtures/struct_pipeline_dut.rs` (5 modules, swept); `ripple_carry_adder` swept |
+| the CPU "does not transpile … no sentence may place it beside the equivalence claim" | **the CPU IS an equivalence result**: transpiles (892 SV SLOC per `paper/stats/loc.csv`, from 208 SLOC of Rust), lints under `-Wall`, and matches the simulator **cycle-for-cycle on all 13 architectural programs** under a Verilated owner | `tests/rv32i_pipelined_verilator.rs` |
+
+**Transpiler coverage is 34/34** (`tools/transpile_coverage.sh`; the per-cause
+history is in the repo `TODO`, all entries retired). The corpus sweep covers
+32/34 — the two exceptions are the structural multi-clock parent (no
+simulatable body by design) and the pipelined CPU (its `Memory` parameter
+cannot be supplied by the sweep harness; the dedicated lane above is its
+behavioural gate, and is *stronger* than a sweep case: seeded-random stimulus
+becomes 13 ISA-level programs).
+
+**How to state the claim now.** Not "for the subset the transpiler supports" —
+that bound is gone. The honest bound moved from *capability* to *language
+design*: Copper **refuses** constructs it cannot give one meaning in simulation
+and silicon (the five pre-tick alignment rules, the mid-phase read seam, one
+write port per array register, the refused wait orderings and memory shapes),
+each with a spanned diagnostic and a measured counterexample on file. Suggested
+sentence: *"every example design — including a 5-stage pipelined RV32I CPU —
+simulates and synthesises from one source, verified cycle-equivalent under
+Verilator; constructs that cannot carry one meaning across both are compile
+errors, not lowered approximations."*
+
+**What the CPU lane is evidence FOR** (be precise; it earned it): the aggregate
+surface (struct pipeline latches, tuple/block bindings), const match patterns,
+word-indexed array registers with WB→ID write-through, the received-memory bus
+ABI under a WriteFirst owner, control extraction of a halt state, and the
+edge-form staging rules — each of which was FOUND WRONG by this lane and fixed
+with a pinned fixture before the traces matched. It is a discovery instrument,
+not a demo.
+
+**Still true and still worth pre-empting** (unchanged from 2026-08-22): the
+X-propagation limit (T8 — Verilator is 2-state), the harness-defect history
+(T9 — why the wiring guards G-A…G-D exist), and the generic-module CLI note
+(monomorphisation happens at example-run time; the CLI emits parametric SV and
+concrete widths come from the harness). The `%`-yes-`/`-no division asymmetry
+remains the one pure capability gap in the operator surface.
