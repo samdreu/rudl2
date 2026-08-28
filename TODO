@@ -231,6 +231,24 @@ TRANSPILATION:
         receives its Memory as a parameter, which the harness cannot supply —
         anchoring it behaviourally needs a Verilated parent owning the memory
         (the received_memory_abi.rs pattern, scaled up).
+        LANE BUILT 2026-08-27: tests/rv32i_pipelined_verilator.rs — all 13
+        architectural programs, sim vs Verilated-under-owner, cycle-for-cycle
+        (pc, halted, a0) through the halt, ALL GREEN. What it took, each with
+        a fixture or measured in the lane: pre-loop actions move into the
+        extracted FSM's state 0 (the first fetch was silently dropped); memory
+        staging takes the EDGE form — values AND the guards of staging-only
+        branches (enable and data fired one EX/MEM generation apart);
+        ff-position array reads mux the committing write stage
+        (forward_ff_mem_index — a0 at halt read the pre-commit array);
+        MemIndex-bearing wires substitute into edge forms, which needed the
+        WIRE branch-merge in extract_updates (a conditionally-assigned wire
+        forwards the mux of its branch values, generalizing cause L-2);
+        literal overrides in branches survive hoist_branch_local_defaults
+        (`if_id.valid = true` was silently deleted — nothing ever decoded);
+        halted/a0_out became RegOut like program_counter (held plain Outs emit
+        registered, one cycle after the sim's same-cycle write); deep dead-wire
+        pruning; RegOut port types seed the symbol table.
+        extracted_dut.rs pins the extracted regfile and reg-then-wire shapes.
     (Q is FIXED as of 2026-08-26 — see below. rv32i_cpu_transpilable now SWEEPS.)
     (J-b is FIXED as of 2026-08-27 — the tuple-destructuring `let` lowering
     inlines the helper and projects per element. ripple_carry_adder SWEEPS.)

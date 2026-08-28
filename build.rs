@@ -77,15 +77,15 @@ const SKIP: &[(&str, &str)] = &[
     ),
     (
         "rv32i_cpu_pipelined",
-        "TRANSPILES AND LINTS CLEAN under -Wall as of 2026-08-27 — every cause is closed \
-         (cause P: received-memory bus ABI; struct latches / tuple lets / block bindings / \
-         arithmetic_shift_right: struct_pipeline_dut.rs; const match patterns: \
-         CHIRPattern::Const; the register FILE: word-indexed ARRAY REGISTERS, \
-         regfile_dut.rs, incl. the WB->ID write-through mux; the extraction counter renames \
-         to pc_1 around the CPU's own pc). What keeps it OUT OF THE SWEEP is only its \
-         `Memory` PARAMETER: the sweep cannot supply one (the Kind::Memory rule below). \
-         Behavioural anchoring needs a Verilated parent owning the memory — the \
-         received_memory_abi.rs harness pattern, scaled up",
+        "ANCHORED OUTSIDE THIS SWEEP as of 2026-08-27: tests/rv32i_pipelined_verilator.rs \
+         runs all 13 architectural programs on the simulator AND on the transpiled core \
+         Verilated under a hand-written owner (the received-memory ABI's parent, WriteFirst \
+         collision policy), comparing (program_counter, halted, a0) cycle-for-cycle through \
+         the halt. THIS sweep still cannot cover it — its `Memory` PARAMETER cannot be \
+         supplied by the harness (the Kind::Memory rule below) — so the dedicated lane is \
+         the behavioural gate. Every transpile cause is closed; see the lane's header for \
+         the timing rules it pinned (edge-form staging, ff-position array reads, the \
+         RegOut halt outputs)",
     ),
     // ── The claim ledger: tests/fixtures/{bits_ops,signedness,aggregate_locals,
     // match_selector,out_phase,mem_address_width}_dut.rs. Each module below is a

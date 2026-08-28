@@ -259,6 +259,28 @@ impl Forwarding {
 /// Used in both comb body lowering and pre_edge lowering. `wire_types` names the
 /// combinational wires that a reassignment may target (empty for the sequential
 /// pre-edge path, where an `Assign` is a register update handled elsewhere).
+/// A statement list that contains at least one memory staging statement and
+/// nothing except staging, wires, and staging-only sub-branches — the shape
+/// whose gating condition must take the EDGE form (see the If arm below).
+fn is_staging_only(stmts: &[SHIRStmt]) -> bool {
+    fn all_staging(stmts: &[SHIRStmt], has_mem: &mut bool) -> bool {
+        stmts.iter().all(|s| match s {
+            SHIRStmt::MemRead { .. } | SHIRStmt::MemWrite { .. } => {
+                *has_mem = true;
+                true
+            }
+            SHIRStmt::Wire { .. } => true,
+            SHIRStmt::If { then_stmts, else_stmts, .. } => {
+                all_staging(then_stmts, has_mem)
+                    && else_stmts.as_ref().is_none_or(|e| all_staging(e, has_mem))
+            }
+            _ => false,
+        })
+    }
+    let mut has_mem = false;
+    all_staging(stmts, &mut has_mem) && has_mem
+}
+
 fn lower_stmt_list(
     stmts: &[CHIRStmt],
     promoted_names: &std::collections::HashSet<String>,
@@ -335,6 +357,23 @@ fn lower_stmt_list(
                 let else_stmts = else_body.as_ref()
                     .map(|eb| lower_stmt_list(eb, promoted_names, renames, wire_types, &mut fwd.clone()))
                     .transpose()?;
+                // A branch that exists only to GATE memory staging is edge-
+                // sampled through and through: its staged values already take
+                // the edge form (see the MemRead/MemWrite arms), and the ENABLE
+                // the branch structure becomes must switch in the same phase —
+                // a comb-form guard opened one statement-order generation late
+                // (the pipelined CPU staged the store's data from the committed
+                // EX/MEM latch but its enable from the previous one). Applies
+                // only when the branch holds nothing but staging (and wires,
+                // which either feed the staging and are substituted through, or
+                // are pruned as dead).
+                let condition = if is_staging_only(&then_stmts)
+                    && else_stmts.as_ref().is_none_or(|e| is_staging_only(e) || e.is_empty())
+                {
+                    edge_condition.clone()
+                } else {
+                    condition
+                };
                 if !then_stmts.is_empty() || else_stmts.as_ref().map_or(false, |e| !e.is_empty()) {
                     out.push(SHIRStmt::If { condition, edge_condition, then_stmts, else_stmts });
                 }
@@ -385,19 +424,28 @@ fn lower_stmt_list(
             // Memory accesses stage the address/data buses that this segment's
             // clock edge captures. They ride along with the pre-edge statements so
             // their surrounding `if` structure (the port enable) is preserved.
+            //
+            // Their expressions take the EDGE form: the staging nets exist only
+            // to be sampled at the edge (the capture registers, the write
+            // pipeline, an owner's array), so a register assigned earlier in
+            // the segment must appear as the value it was assigned — exactly a
+            // `PortDrive`'s `edge_value` reasoning. The pipelined CPU is the
+            // measured witness: it stages the NEXT fetch with the pc it just
+            // committed (`pc = new_pc; … read(pc >> 2)`), and the unforwarded
+            // form fetched one instruction behind, forever.
             CHIRStmt::MemRead { mem, port, addr, .. } => {
                 out.push(SHIRStmt::MemRead {
                     mem: mem.clone(),
                     port: *port,
-                    addr: rename_vars(lower_expr(addr)?, renames),
+                    addr: fwd.at_edge(&rename_vars(lower_expr(addr)?, renames)),
                 });
             }
             CHIRStmt::MemWrite { mem, port, addr, value, .. } => {
                 out.push(SHIRStmt::MemWrite {
                     mem: mem.clone(),
                     port: *port,
-                    addr: rename_vars(lower_expr(addr)?, renames),
-                    value: rename_vars(lower_expr(value)?, renames),
+                    addr: fwd.at_edge(&rename_vars(lower_expr(addr)?, renames)),
+                    value: fwd.at_edge(&rename_vars(lower_expr(value)?, renames)),
                 });
             }
             // Assign (to a register), AwaitTick — not pre_edge statements. A
@@ -1169,7 +1217,18 @@ fn extract_updates_from_stmts(
             CHIRStmt::Wire { name, value, .. } => {
                 let plain = rename_vars(lower_expr(value)?, renames);
                 let resolved = subst_vars(plain.clone(), forwarding);
-                if resolved != plain {
+                // Recorded when substitution changed it (cause L-2) — and ALSO
+                // when it reads a memory array (`MemIndex`): an edge-sampled
+                // consumer must see the read through the wire's DEFINITION, so
+                // `vlir_lower::forward_ff_mem_index` can mux the in-flight
+                // write stage into the `always_ff` copy. Without this, a
+                // register-file read that feeds a pipeline register through a
+                // `let` (`rs1_val` into ID/EX) sampled the array during the
+                // one-cycle window a write spends in its pipeline stage — in
+                // the simulator that write is already visible. Ports keep
+                // reading the wire's comb form, which post-edge observation
+                // sees AFTER the commit, so they need no mux.
+                if resolved != plain || contains_mem_index(&resolved) {
                     forwarding.insert(name.clone(), resolved);
                 }
             }
@@ -1191,6 +1250,7 @@ fn extract_updates_from_stmts(
                 for u in &then_updates { if !touched.contains(&u.target) { touched.push(u.target.clone()); } }
                 for u in &else_updates { if !touched.contains(&u.target) { touched.push(u.target.clone()); } }
 
+                let reg_touched: HashSet<String> = touched.iter().cloned().collect();
                 for target in touched {
                     // Missing branch → hold: use current forwarding value or Var(target).
                     let hold = || forwarding.get(&target).cloned()
@@ -1213,6 +1273,46 @@ fn extract_updates_from_stmts(
                     };
                     forwarding.insert(target.clone(), mux_val.clone());
                     updates.push(SHIRRegUpdate { target, next_value: mux_val });
+                }
+
+                // The same sequential merge for WIRE forwarding. A wire assigned
+                // inside a branch (the default-then-override lowering writes
+                // `new_id_ex_rs1_val = rs1_val` inside an `if` arm) carries the
+                // mux of its branch values forward, so an edge-sampled consumer
+                // downstream still resolves to the segment-order value — the
+                // register-file read that feeds ID/EX reaches the `always_ff`
+                // copy only through this chain. Registers were merged above;
+                // everything else whose forwarded value CHANGED in either
+                // branch merges here.
+                let mut wire_keys: Vec<String> = then_fwd
+                    .keys()
+                    .chain(else_fwd.keys())
+                    .filter(|k| !reg_touched.contains(*k))
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                wire_keys.sort();
+                for k in wire_keys {
+                    let outer = forwarding.get(&k).cloned();
+                    let t = then_fwd.get(&k).cloned();
+                    let e = else_fwd.get(&k).cloned();
+                    if t == outer && e == outer {
+                        continue;
+                    }
+                    let fallthrough = || outer.clone().unwrap_or_else(|| SHIRExpr::Var(k.clone()));
+                    let then_val = t.unwrap_or_else(fallthrough);
+                    let else_val = e.unwrap_or_else(fallthrough);
+                    let merged = if then_val == else_val {
+                        then_val
+                    } else {
+                        SHIRExpr::Mux {
+                            cond: Box::new(cond_expr.clone()),
+                            then_val: Box::new(then_val),
+                            else_val: Box::new(else_val),
+                        }
+                    };
+                    forwarding.insert(k, merged);
                 }
             }
 
@@ -1420,6 +1520,54 @@ fn collect_expr_vars(expr: &CHIRExpr, visitor: &mut impl FnMut(&str)) {
 }
 
 // ── Expression lowering ───────────────────────────────────────────────────────
+
+/// Does the expression read a memory array combinationally?
+fn contains_mem_index(e: &SHIRExpr) -> bool {
+    let mut found = false;
+    fn walk(e: &SHIRExpr, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match e {
+            SHIRExpr::MemIndex { .. } => *found = true,
+            SHIRExpr::BinOp { left, right, .. } => {
+                walk(left, found);
+                walk(right, found);
+            }
+            SHIRExpr::UnOp { expr, .. }
+            | SHIRExpr::Slice { expr, .. }
+            | SHIRExpr::Resize { expr, .. }
+            | SHIRExpr::SignCast { expr, .. } => walk(expr, found),
+            SHIRExpr::Mux { cond, then_val, else_val } => {
+                walk(cond, found);
+                walk(then_val, found);
+                walk(else_val, found);
+            }
+            SHIRExpr::Case { scrutinee, arms, default } => {
+                walk(scrutinee, found);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        walk(g, found);
+                    }
+                    walk(&a.value, found);
+                }
+                walk(default, found);
+            }
+            SHIRExpr::Concat(parts) => {
+                for pt in parts {
+                    walk(pt, found);
+                }
+            }
+            SHIRExpr::DynBit { base, index } => {
+                walk(base, found);
+                walk(index, found);
+            }
+            _ => {}
+        }
+    }
+    walk(e, &mut found);
+    found
+}
 
 /// Substitute variable references with expressions (used for sequential forwarding).
 fn subst_vars(expr: SHIRExpr, subst: &HashMap<String, SHIRExpr>) -> SHIRExpr {

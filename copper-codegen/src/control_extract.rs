@@ -492,9 +492,28 @@ pub fn extract_control(fir: &mut FrontendModuleIR) {
 
     let span = fir.raw_statements[loop_idx].span;
 
+    // PRE-LOOP expression statements — initial port writes and the first
+    // memory staging (`memory.read_port::<0>().read(pc >> 2)` before the CPU's
+    // loop) — execute ONCE before the first edge. The FSM has exactly that
+    // slot: state 0 runs once and transitions out at the first edge, so they
+    // MOVE into its body (and out of the pre-loop position, which the CHIR
+    // scan does not lower). Their order among themselves is preserved, ahead
+    // of the loop head's own statements.
+    let mut preloop_actions: Vec<RawStmt> = Vec::new();
+    let mut idx = 0;
+    let mut loop_idx = loop_idx;
+    while idx < loop_idx {
+        if matches!(&fir.raw_statements[idx].kind, RawStmtKind::Expr(_)) {
+            preloop_actions.push(fir.raw_statements.remove(idx));
+            loop_idx -= 1;
+        } else {
+            idx += 1;
+        }
+    }
+
     // Flatten the CFG into per-state segment bodies (state 0 = loop head).
     let mut sm = StateMachine::new();
-    let mut state0 = Vec::new();
+    let mut state0 = preloop_actions;
     lower_into(&loop_body, &mut state0, &mut sm, &LoopCtx::module());
     sm.set_body(0, state0);
 

@@ -1086,7 +1086,8 @@ fn build_symbol_table(fir: &FrontendModuleIR) -> SymbolTable {
     for p in &fir.signature.params {
         let compact = compact_type(&p.ty.ty_text);
         let inner = strip_port_wrapper("In<", &compact)
-            .or_else(|| strip_port_wrapper("Out<", &compact));
+            .or_else(|| strip_port_wrapper("Out<", &compact))
+            .or_else(|| strip_port_wrapper("RegOut<", &compact));
         if let Some(inner) = inner {
             if let Ok(ty) = resolve_type(inner, p.span) {
                 symbols.insert(p.name.clone(), ty);

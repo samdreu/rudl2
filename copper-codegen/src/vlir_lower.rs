@@ -405,6 +405,14 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
         }
     }
 
+    // A `MemIndex` sampled in ALWAYS_FF position reads the array JUST BEFORE
+    // the edge — one commit behind the simulator's statement-order read (the
+    // pipelined CPU's halt-state `a0_out <= regs[10]` captured the register
+    // file without the write committing at that same edge). Forward from each
+    // write port's COMMITTING stage, exactly `read_net_value`'s WriteFirst
+    // rule applied in edge position.
+    forward_ff_mem_index(&mut ff_stmts, &s.memories, &mem_use, leg);
+
     // The read pipeline stage and the write commits close out `always_ff`;
     // nonblocking assignment makes their position relative to the register
     // updates immaterial.
@@ -1545,15 +1553,44 @@ fn drop_unread_wires(
 
         let mut removed = false;
         for phase in comb_phases.iter_mut() {
-            let before = phase.stmts.len();
-            phase.stmts.retain(|st| match st {
-                // Only a TOP-LEVEL wire assignment is considered: a nested one is
-                // part of a conditional structure whose other paths may assign the
-                // same name, and dropping one arm would create a latch.
-                VLIRStmt::WireAssign { name, .. } => read.contains(name),
-                _ => true,
-            });
-            removed |= phase.stmts.len() != before;
+            // A wire read NOWHERE loses every assignment, at any depth — with
+            // all of them gone the declaration disappears too, so no partial
+            // conditional structure (and hence no latch) can result. That is
+            // the difference from dropping a SINGLE nested arm of a wire that
+            // is still read, which would create one; reads gate the whole
+            // removal above.
+            fn prune(stmts: &mut Vec<VLIRStmt>, read: &HashSet<String>) -> bool {
+                let before = stmts.len();
+                stmts.retain(|st| match st {
+                    VLIRStmt::WireAssign { name, .. } => read.contains(name),
+                    _ => true,
+                });
+                let mut removed = stmts.len() != before;
+                for st in stmts.iter_mut() {
+                    match st {
+                        VLIRStmt::If { then_stmts, else_stmts, .. } => {
+                            removed |= prune(then_stmts, read);
+                            if let Some(e) = else_stmts {
+                                removed |= prune(e, read);
+                            }
+                        }
+                        VLIRStmt::Case { arms, default, .. } => {
+                            for a in arms {
+                                removed |= prune(&mut a.stmts, read);
+                            }
+                            if let Some(d) = default {
+                                removed |= prune(d, read);
+                            }
+                        }
+                        VLIRStmt::ForLoop { body, .. } => {
+                            removed |= prune(body, read);
+                        }
+                        _ => {}
+                    }
+                }
+                removed
+            }
+            removed |= prune(&mut phase.stmts, &read);
         }
         // Dropping one wire can orphan another, so iterate to a fixpoint.
         if !removed {
@@ -1924,12 +1961,21 @@ fn strip_nested_defaults(
             None
         };
         match hoistable {
-            // Literal: the assignment IS the default.
+            // Literal: the FIRST assignment per name is the default and moves to
+            // the top. A LATER literal assign to the same name is an OVERRIDE —
+            // the default-then-override lowering writes exactly that shape
+            // (`n_valid = 1'b1` inside a match arm, after the hoisted zero), and
+            // two branch-scoped `let`s sharing a lowered name are the same
+            // situation — so it STAYS where it was written. Stripping it too
+            // silently deleted the write (found by the pipelined CPU's IF stage:
+            // `if_id.valid = true` vanished and nothing ever decoded).
             Some((name, None)) => {
                 if seen.insert(name) {
                     hoisted.push(s);
+                    continue;
                 }
-                continue; // stripped from the branch either way
+                keep.push(s);
+                continue;
             }
             // Computed: default at the top, computation stays in the branch.
             Some((name, Some((width, outer_dim)))) => {
@@ -2704,6 +2750,128 @@ fn mem_write_commits(memories: &[SHIRMemory], use_: &MemPortUse, leg: &Legalizer
         }
     }
     out
+}
+
+/// See the call site: rewrite every `MemIndex` in `always_ff` position into the
+/// committing-stage forwarding mux, per write port, highest index outermost
+/// (the priority `read_net_value` establishes). Received memories are skipped —
+/// the child has no array to index.
+fn forward_ff_mem_index(
+    stmts: &mut [VLIRFFStmt],
+    memories: &[SHIRMemory],
+    use_: &MemPortUse,
+    leg: &Legalizer,
+) {
+    fn rewrite_expr(
+        e: &mut VLIRExpr,
+        memories: &[SHIRMemory],
+        use_: &MemPortUse,
+        leg: &Legalizer,
+    ) {
+        // Children first, so a nested MemIndex inside a rewritten mux's address
+        // is handled exactly once.
+        match e {
+            VLIRExpr::BinOp { left, right, .. } => {
+                rewrite_expr(left, memories, use_, leg);
+                rewrite_expr(right, memories, use_, leg);
+            }
+            VLIRExpr::UnOp { expr, .. }
+            | VLIRExpr::Slice { expr, .. }
+            | VLIRExpr::Resize { expr, .. }
+            | VLIRExpr::SignCast { expr, .. } => rewrite_expr(expr, memories, use_, leg),
+            VLIRExpr::Ternary { cond, then_val, else_val } => {
+                rewrite_expr(cond, memories, use_, leg);
+                rewrite_expr(then_val, memories, use_, leg);
+                rewrite_expr(else_val, memories, use_, leg);
+            }
+            VLIRExpr::Concat(parts) => {
+                for p in parts {
+                    rewrite_expr(p, memories, use_, leg);
+                }
+            }
+            VLIRExpr::DynBit { base, index } => {
+                rewrite_expr(base, memories, use_, leg);
+                rewrite_expr(index, memories, use_, leg);
+            }
+            VLIRExpr::MemIndex { mem, addr } => {
+                rewrite_expr(addr, memories, use_, leg);
+                let Some(m) = memories
+                    .iter()
+                    .find(|m| !m.received && leg.get(&m.name) == *mem)
+                else {
+                    return;
+                };
+                let read_addr = (**addr).clone();
+                let mut value = e.clone();
+                for port in 0..m.write_ports {
+                    if !use_.writes.contains(&(m.name.clone(), port)) {
+                        continue;
+                    }
+                    let (en, waddr, wdata) = write_commit_nets(&m.name, port, m.write_lat);
+                    let addr_expr = read_addr.clone();
+                    value = VLIRExpr::Ternary {
+                        cond: Box::new(VLIRExpr::BinOp {
+                            left: Box::new(VLIRExpr::Var(leg.get(&en))),
+                            op: VLIRBinOp::LogicalAnd,
+                            right: Box::new(VLIRExpr::BinOp {
+                                left: Box::new(addr_expr),
+                                op: VLIRBinOp::Eq,
+                                right: Box::new(VLIRExpr::Var(leg.get(&waddr))),
+                            }),
+                        }),
+                        then_val: Box::new(VLIRExpr::Var(leg.get(&wdata))),
+                        else_val: Box::new(value),
+                    };
+                }
+                *e = value;
+            }
+            VLIRExpr::Var(_) | VLIRExpr::Lit { .. } => {}
+        }
+    }
+    fn rewrite_stmt(
+        st: &mut VLIRFFStmt,
+        memories: &[SHIRMemory],
+        use_: &MemPortUse,
+        leg: &Legalizer,
+    ) {
+        match st {
+            VLIRFFStmt::NonBlockingAssign { value, .. } => {
+                rewrite_expr(value, memories, use_, leg)
+            }
+            VLIRFFStmt::MemAssign { addr, value, .. } => {
+                rewrite_expr(addr, memories, use_, leg);
+                rewrite_expr(value, memories, use_, leg);
+            }
+            VLIRFFStmt::If { condition, then_stmts, else_stmts } => {
+                rewrite_expr(condition, memories, use_, leg);
+                for s in then_stmts {
+                    rewrite_stmt(s, memories, use_, leg);
+                }
+                if let Some(e) = else_stmts {
+                    for s in e {
+                        rewrite_stmt(s, memories, use_, leg);
+                    }
+                }
+            }
+            VLIRFFStmt::Case { selector, arms, default } => {
+                rewrite_expr(selector, memories, use_, leg);
+                for a in arms {
+                    rewrite_expr(&mut a.selector_value, memories, use_, leg);
+                    for s in &mut a.stmts {
+                        rewrite_stmt(s, memories, use_, leg);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        rewrite_stmt(s, memories, use_, leg);
+                    }
+                }
+            }
+        }
+    }
+    for st in stmts {
+        rewrite_stmt(st, memories, use_, leg);
+    }
 }
 
 // ── Width helper ────────────────────────────────────────────────────────────

@@ -245,11 +245,14 @@ fn sv_declared_nets(sv: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Exactly one `.tick()` in the body — the single-tick shape whose absorption
-/// allowance the header describes.
-fn is_single_tick(f: &ItemFn) -> bool {
-    let body = quote::quote!(#f).to_string();
-    body.matches(". tick ()").count() + body.matches(".tick()").count() == 1
+/// A SINGLE-PHASE emission — one always_comb settle per cycle — is where the
+/// absorption allowance applies: a single-tick body, or a control-EXTRACTED one
+/// (branch-nested ticks collapse into a one-phase `match pc` FSM; the extracted
+/// regfile fixtures are the instances). A multi-tick LINEAR module emits a
+/// `phase_r` counter, and there a tick-crossing wire must be PROMOTED — that
+/// regression still fails here.
+fn is_single_phase(sv: &str) -> bool {
+    !sv.contains("phase_r")
 }
 
 #[test]
@@ -312,7 +315,7 @@ fn codegen_registers_match_shared_inference() {
                 .flat_map(|(n, fields)| fields.iter().map(move |fl| format!("{n}_{fl}")))
                 .collect();
             // Single-tick absorption — see the header.
-            let comb: BTreeSet<String> = if is_single_tick(f) {
+            let comb: BTreeSet<String> = if is_single_phase(&sv) {
                 sv_declared_nets(&sv).difference(&codegen).cloned().collect()
             } else {
                 BTreeSet::new()

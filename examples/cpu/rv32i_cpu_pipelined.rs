@@ -228,8 +228,14 @@ async fn rv32i_cpu_pipelined(
     // Its scalar sibling was migrated for the multi-phase rule in the same way; the
     // port is observed by nothing in the harness, so only the type and its wire change.
     program_counter: RegOut<Bits<32>, MainClk>,
-    halted: Out<Logic, MainClk>,
-    a0_out: Out<Bits<32>, MainClk>,
+    // `RegOut` like `program_counter` (2026-08-27): both are held outputs
+    // written only in the halt state, and a held plain `Out` emits as an
+    // enabled register — committed at the edge, observed one cycle after the
+    // simulator's same-cycle write. Registering them on BOTH sides makes the
+    // simulator and the hardware agree on the halt cycle; the architectural
+    // results are unchanged.
+    halted: RegOut<Logic, MainClk>,
+    a0_out: RegOut<Bits<32>, MainClk>,
 ) {
     let mut regs = [Bits::<32>::zero(); 32];
 
@@ -529,8 +535,8 @@ pub fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let memory = build_memory(&clk, program);
 
     let (pc_out,  _pc_in)       = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
-    let (halt_out, halt_in)     = wire::<Logic, MainClk>(Logic::Zero);
-    let (a0_out,  a0_in)        = wire::<Bits<32>, MainClk>(Bits::zero());
+    let (halt_out, halt_in)     = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
+    let (a0_out,  a0_in)        = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
 
     // No `reads`: the core has no `In` ports at all now — its only state comes
     // from the clock and the memory it was handed.
