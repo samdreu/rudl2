@@ -120,9 +120,10 @@ The rest of phase 4 was mechanical and worked first time:
   by a rule for `N`, and a substring replace does exactly that.
 
 One skip was added rather than removed: the *example* copy of `ripple_carry_adder`
-does not transpile (cause J-b, a tuple-returning helper) while the fixture copy,
-written without the helper, does. Same module name, two files, one blocked — which is
-why `SKIP` accepts a `<wrapper>::<module>` key.
+did not transpile (cause J-b, a tuple-returning helper) while the fixture copy,
+written without the helper, did. Same module name, two files, one blocked — which is
+why `SKIP` accepts a `<wrapper>::<module>` key. (J-b closed on 2026-08-27 — the
+helper call now inlines and both copies sweep — but the key mechanism stays.)
 
 ---
 
@@ -153,10 +154,10 @@ mechanical, and mechanical is what makes it complete.
 |---|---|---|
 | Memory result → plain `Out` in an extracted module, one cycle late (2026-08-25) | yes | sim vs SV, any stimulus |
 | `CASEINCOMPLETE` on an extracted comb `case` (2026-08-25) | yes | Verilator `-Wall` build |
-| `WIDTHTRUNC` on a literal memory address (2026-08-25, still open) | yes | Verilator `-Wall` build |
+| `WIDTHTRUNC` on a literal memory address (2026-08-25; FIXED — addresses carry an explicit width cast, `4'(64'd0)`) | yes | Verilator `-Wall` build |
 | `uart/rx` wrong twice after it started transpiling | yes | sim vs SV |
 | D1 pre-tick alignment instances | yes | sim vs SV |
-| `RegOut` sequential forwarding ([TODO:1283](../TODO)) | likely | needs the write-after-update shape to exist in a swept module |
+| `RegOut` sequential forwarding | yes | the shape exists and sweeps: `tests/fixtures/regout_forwarding_dut.rs` (write_then_assign / assign_then_write) |
 
 ### What it would NOT catch, and why the existing checks stay
 

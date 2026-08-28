@@ -35,6 +35,16 @@
 > `copper-analysis` crate consumed by both macro + codegen, no cycle; `syn::ItemFn` input),
 > **G2 DONE** (structural reg-match defined + `copper-analysis` capability built), and **G5 DONE**
 > (provable-claims register below). **All gates G1–G6 cleared** — item 2 can begin.
+>
+> **Addendum (2026-08-27):** the Progress block above is the dated record of the
+> item-2/3 landing and is not maintained line-by-line. Since then: **item 6 is
+> COMPLETE** (levelized scheduling is the production default —
+> `LEVELIZED_SCHEDULING_SCOPE.md`), **item 5 is DONE** (`SYNCHRONOUS_SEMANTICS.md`
+> was rebased onto the cycle-dataflow model), the reconciliation now spans **97
+> clocked modules** (was "17+"), and the equivalence scope grew to the whole
+> example corpus (34/34 transpile; the pipelined CPU is itself an equivalence
+> result — `tests/rv32i_pipelined_verilator.rs`). Current per-cause status lives
+> in the repo `TODO` and `paper/00_claims_audit.md` §Re-verification.
 
 ## Architecture decision (the foundation) — c2 + "just Rust"
 
@@ -553,7 +563,7 @@ not a rewrite of `tick_clock`.
 ## Out of scope / resolved
 
 - **Mid-phase read-timing is no longer a standing open bug.** The old "cocotb-vs-Esterel startup
-  semantics" question (archived `design_docs/OUTDATED/SESSION_HANDOFF_READ_TIMING.md`) is
+  semantics" question (a working note since deleted) is
   effectively resolved against independent hardware (see *Empirical status* — `sipo_block` passes).
   What remains is the `det_010`-class heuristic *fragility*, addressed by item 3's static timing.
 - **Reusing rustc's async-fn coroutine as an FSM-IR target** — investigated and rejected (item 7).

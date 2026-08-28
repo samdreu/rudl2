@@ -232,7 +232,7 @@ measurement before it is believed.
 | memory staging rules (4) | **retained-derived** — bus-per-cycle and observe-after-edge are window statements about the address/data nets; expected to restate cleanly | predict (paperwork, not risk) |
 | reachability, CDC, poll-order, comb-loop rules | **untouched** — orthogonal to segment anchoring | — |
 
-## 6. What the paired implementation would be (not yet scoped)
+## 6. What the paired implementation would be (since scoped and LANDED — see `PAIRED_IMPLEMENTATION_SCOPE.md`; this section is the pre-scoping sketch)
 
 Recorded so the shape is visible; **no code moves until §5's predict rows are
 measured** and the per-module impact table (§7) exists.
