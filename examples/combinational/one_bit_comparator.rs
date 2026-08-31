@@ -20,13 +20,15 @@ fn main() {
 
     let dh = eq_out.dirty_handle();
 
+    let reads = vec![i0_in.wire_id(), i1_in.wire_id()];
     executor.spawn_wired(
         one_bit_comparator(i0_in, i1_in, eq_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("one_bit_comparator")
-        .with_verilog("/Users/sdreussi/project/final_copper/examples/combinational/sv/one_bit_comparator.sv")
+        .with_verilog("examples/combinational/sv/one_bit_comparator.sv")
         .with_waveform("waveforms/one_bit_comparator.vcd");
 
     // test cases

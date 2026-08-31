@@ -2,11 +2,21 @@
 name = "copper-codegen"
 version = "0.1.0"
 edition = "2024"
+description = "Copper transpiler (FIR -> CHIR -> SHIR -> VLIR -> SystemVerilog) and the copper-transpile CLI"
+
+[[bin]]
+name = "copper-transpile"
+path = "src/main.rs"
+
+[[bin]]
+name = "surface-audit"
+path = "src/bin/surface-audit.rs"
 
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
+copper-analysis = { version = "0.1.0", path = "../copper-analysis" }
 log = "0.4.29"
 paste = "1.0.15"
-proc-macro2 = "1.0.106"
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 quote = "1.0.44"
 syn = { version="2.0.114", features = ["full"] }

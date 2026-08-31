@@ -1,5 +1,5 @@
 use copper_core::{Bits, Clock, ClockDomain, Logic, Memory};
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, RegOut};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
@@ -34,6 +34,10 @@ enum State {
 }
 
 const CLKS_PER_BIT: usize = 434; // 50 MHz / 115200
+// Named rather than written as `CLKS_PER_BIT / 2` at the use site: `/` is a real
+// divider in a hardware expression and is refused there, but a file-scope `const`
+// is elaboration-time arithmetic and lowers to `localparam int … = CLKS_PER_BIT / 2`.
+const CLKS_PER_HALF_BIT: usize = CLKS_PER_BIT / 2;
 
 
 struct packet {
@@ -42,11 +46,12 @@ struct packet {
     stop: Logic,
 }
 
+#[hardware(sequential)]
 async fn rx (
     clk: Clock<MainClk>,
     rx_serial: In<Logic, MainClk>,
-    rx_dv: Out<Logic, MainClk>,
-    rx_byte: Out<Bits<8>, MainClk>,
+    rx_dv: RegOut<Logic, MainClk>,
+    rx_byte: RegOut<Bits<8>, MainClk>,
 ) {
 
     loop {
@@ -56,32 +61,54 @@ async fn rx (
         }
 
         // start: skip to center of start bit and verify
-        for _ in 0..CLKS_PER_BIT / 2 {
+        for _ in 0..CLKS_PER_HALF_BIT {
             clk.tick().await;
         }
         if rx_serial.read() != Logic::Zero {
             continue; // go back to idle
         }
 
-        // data: sample 8 bits
-        let mut byte_val = 0;
-        for i in 0..8 {
-            for _ in 0..CLKS_PER_BIT {
-                clk.tick().await;
-            }
-            if rx_serial.read() == Logic::One {
-                byte_val |= 1 << i; // not sure about this tbh...
-            }
-        }
-
-        // stop: wait through stop bit
+        // Advance from the centre of the START bit to the centre of DATA BIT 0.
+        // This step exists so the sampling loop below can read BEFORE it delays;
+        // see the note on that loop. The instants sampled are unchanged.
         for _ in 0..CLKS_PER_BIT {
             clk.tick().await;
         }
 
+        // data: sample 8 bits, LSB first, at the centre of each bit period.
+        //
+        // EACH ITERATION READS FIRST AND DELAYS LAST, and that ordering is
+        // required rather than stylistic. A read placed *after* the delay is a
+        // post-tick `In` read: the simulator samples the value the just-past edge
+        // produced, a flip-flop samples the value present before its own edge, and
+        // under any testbench that moves inputs between edges those are a cycle
+        // apart. Copper declines to choose between them, so the ordering is
+        // outside the language — the same disposition as the pre-tick alignment
+        // hazard. See design_docs/SYNCHRONOUS_SEMANTICS.md and `TODO`, THE
+        // MID-PHASE READ SEAM.
+        //
+        // A shift register rather than an indexed write, because the byte is
+        // assembled across eight clock boundaries and is therefore a REGISTER: a
+        // `[Logic; 8]` filled one element per iteration is assigned on some paths
+        // and not others, which infers a latch. Shifting right and inserting at
+        // the top leaves the first bit on the wire in position 0.
+        let mut byte_val: Bits<8> = Bits::zero();
+        for _ in 0..8 {
+            byte_val = byte_val >> 1;
+            if rx_serial.read() == Logic::One {
+                byte_val = byte_val | Bits::from_u8(0x80);
+            }
+            // …and on to the centre of the next bit. After the eighth iteration
+            // this lands on the centre of the STOP bit, which is where the
+            // separate stop-bit wait used to leave us.
+            for _ in 0..CLKS_PER_BIT {
+                clk.tick().await;
+            }
+        }
+
         // pulse data value for one cycle
         rx_dv.write(Logic::One);
-        rx_byte.write(Bits::from_u8(byte_val));
+        rx_byte.write(byte_val);
         clk.tick().await;
         rx_dv.write(Logic::Zero);
     }
@@ -92,14 +119,22 @@ fn main() {
     let mut exec = HardwareExecutor::new();
 
     let (serial_drv, serial_in) = wire::<Logic, MainClk>(Logic::One);
-    let (dv_out,     dv_obs)    = wire::<Logic, MainClk>(Logic::Zero);
-    let (byte_out,   byte_obs)  = wire::<Bits<8>, MainClk>(Bits::zero());
+    // REGISTERED outputs. `rx_dv` is a one-cycle pulse written before the tick
+    // that publishes it — write-before-tick Moore, which is what `RegOut` is for.
+    // As a plain `Out` the simulator observes the write in the post-edge settle of
+    // the cycle it was issued in, while the synthesized FSM puts it in the state
+    // that runs the NEXT cycle: a measured sim ≢ SV of exactly one cycle (the
+    // pre-tick alignment family, design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md).
+    let (dv_out,     dv_obs)    = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
+    let (byte_out,   byte_obs)  = registered_wire::<Bits<8>, MainClk>(&clk, Bits::zero());
 
     let dh_dv   = dv_out.dirty_handle();
     let dh_byte = byte_out.dirty_handle();
+    let reads = vec![serial_in.wire_id()];
     exec.spawn_wired(
         rx(clk.clone(), serial_in, dv_out, byte_out),
         vec![dh_dv, dh_byte],
+        reads,
     );
 
     // One complete 8N1 UART frame as a clock-by-clock waveform (start + 8 data + stop).

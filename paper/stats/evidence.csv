@@ -1,0 +1,35 @@
+module,file,transpiles,blocked_by,swept,skip_reason,dedicated_test,third_party_anchor
+bsg_adder_one_hot,examples/basejump/bsg_adder_one_hot.rs,yes,,yes,,logic_array_pack_equivalence.rs,BaseJump STL
+bsg_counter_up_down,examples/basejump/bsg_counter_up_down.rs,yes,,yes,,branch_local_temp_equivalence.rs;bsg_counter_up_down_equivalence.rs,BaseJump STL
+bsg_dff_en,examples/basejump/bsg_dff_en.rs,yes,,yes,,accumulator_en_equivalence.rs;branch_local_temp_equivalence.rs;plain_out_multiphase_equivalence.rs,BaseJump STL
+bsg_encode_one_hot,examples/basejump/bsg_encode_one_hot.rs,yes,,yes,,bsg_encode_one_hot_equivalence.rs;file_scope_const_equivalence.rs,BaseJump STL
+bsg_gray_to_binary,examples/basejump/bsg_gray_to_binary.rs,yes,,yes,,gray_to_binary_equivalence.rs;logic_array_pack_equivalence.rs,BaseJump STL
+bsg_mux_one_hot,examples/basejump/bsg_mux_one_hot.rs,yes,,yes,,bsg_mux_one_hot_equivalence.rs;mux_equivalence.rs,BaseJump STL
+sipo_block,examples/basejump/sipo_block.rs,yes,,yes,,logic_array_pack_equivalence.rs;plain_out_multiphase_equivalence.rs;regout_multiphase_equivalence.rs;sipo_block_equivalence.rs,BaseJump STL
+event_source,examples/cdc/flag_crossing.rs,yes,,yes,,,
+event_sink,examples/cdc/flag_crossing.rs,yes,,yes,,,
+fast_counter,examples/cdc/two_domain_counter.rs,yes,,yes,,,
+slow_consumer,examples/cdc/two_domain_counter.rs,yes,,yes,,,
+fast_counter,examples/cdc/two_domain_hierarchy.rs,yes,,yes,,,
+flag_sync,examples/cdc/two_domain_hierarchy.rs,yes,,yes,,,
+slow_consumer,examples/cdc/two_domain_hierarchy.rs,yes,,yes,,,
+two_domain_top,examples/cdc/two_domain_hierarchy.rs,yes,,no,"a `#[hardware(structural)]` parent: transpile-only by design, with no simulatable body to drive (item 4 — the sim wires the hierarchy by hand)",,
+mux,examples/combinational/mux.rs,yes,,yes,,match_hold_default_arm_equivalence.rs;mux_equivalence.rs;pipelined_memory_equivalence.rs;write_first_memory_equivalence.rs,
+one_bit_comparator,examples/combinational/one_bit_comparator.rs,yes,,yes,,one_bit_comparator_equivalence.rs;randomized_combinational_equivalence.rs,
+priority_encode,examples/combinational/priority_encode.rs,yes,,yes,,priority_encode_equivalence.rs;randomized_combinational_equivalence.rs,
+ripple_carry_adder,examples/combinational/ripple_carry_adder.rs,yes,,yes,,logic_array_pack_equivalence.rs;randomized_combinational_equivalence.rs;ripple_carry_adder_equivalence.rs,
+rotate_right,examples/combinational/rotate_right.rs,yes,,yes,,randomized_combinational_equivalence.rs;rotate_right_equivalence.rs,
+rv32i_cpu_pipelined,examples/cpu/rv32i_cpu_pipelined.rs,yes,,no,"ANCHORED OUTSIDE THIS SWEEP as of 2026-08-27: tests/rv32i_pipelined_verilator.rs runs all 13 architectural programs on the simulator AND on the transpiled core Verilated under a hand-written owner (the received-memory ABI's parent, WriteFirst collision policy), comparing (program_counter, halted, a0) cycle-for-cycle through the halt. THIS sweep still cannot cover it — its `Memory` PARAMETER cannot be supplied by the harness (the Kind::Memory rule below) — so the dedicated lane is the behavioural gate. Every transpile cause is closed; see the lane's header for the timing rules it pinned (edge-form staging, ff-position array reads, the RegOut halt outputs)",,
+rv32i_cpu_transpilable,examples/cpu/rv32i_cpu_transpilable.rs,yes,,yes,,,
+dual_port_ram,examples/memory/dual_port_ram.rs,yes,,yes,,dual_port_ram_equivalence.rs;multiphase_memory_equivalence.rs,
+lfsr,examples/sequential/lfsr.rs,yes,,yes,,lfsr_equivalence.rs,
+det_110101,examples/sequential/pattern_detector.rs,yes,,yes,,pattern_detector_equivalence.rs,
+det_010,examples/sequential/pattern_detector_2.rs,yes,,yes,,det_010_equivalence.rs,
+det_010_awaits,examples/sequential/pattern_detector_2.rs,yes,,yes,,,
+mac_fsm,examples/sequential/pipeline_mac.rs,yes,,yes,,mac_fsm_equivalence.rs;regout_multiphase_equivalence.rs,
+mac_pipeline,examples/sequential/pipeline_mac.rs,yes,,yes,,mac_fsm_equivalence.rs;mac_pipeline_equivalence.rs;plain_out_multiphase_equivalence.rs,
+shift_register,examples/sequential/shift_register.rs,yes,,yes,,randomized_sequential_equivalence.rs;shift_register_equivalence.rs,
+traffic_light,examples/sequential/traffic_light_fsm.rs,yes,,yes,,fsm_six_state_equivalence.rs;traffic_light_equivalence.rs,
+rx,examples/uart/rx.rs,yes,,yes,,uart_rx_equivalence.rs,
+uart_tx,examples/uart/system.rs,yes,,yes,,,
+uart_rx,examples/uart/system.rs,yes,,yes,,,

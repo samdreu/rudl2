@@ -1,0 +1,19 @@
+error: clock-domain crossing: memory `rom` is in domain `OtherClk`, but this module is clocked on `MainClk`. A memory is clocked on its own domain and cannot be synchronized across one — give this module a `Clock<OtherClk>` and receive the memory there, or hand it a memory in `MainClk`.
+  --> tests/ui/fail/cdc_memory_parameter.rs:16:5
+   |
+16 |     rom: Memory<Bits<16>, 1, 0, OtherClk, 1, 1>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Bits`, `Clock`, and `Memory`
+ --> tests/ui/fail/cdc_memory_parameter.rs:4:19
+  |
+4 | use copper_core::{Bits, Clock, ClockDomain, Memory};
+  |                   ^^^^  ^^^^^               ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `In` and `RegOut`
+ --> tests/ui/fail/cdc_memory_parameter.rs:5:25
+  |
+5 | use copper_core::port::{In, RegOut};
+  |                         ^^  ^^^^^^

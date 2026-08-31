@@ -15,41 +15,54 @@ use crate::verification::{SimulationTrace, CycleData, verify_with_verilator_trac
 ///
 /// # Cycle-level recording (simple)
 /// ```rust,no_run
+/// # use copper_sim::{HardwareTest, SimulationTrace};
+/// # use copper_core::Logic;
+/// # let expected = SimulationTrace::new();
 /// let mut test = HardwareTest::new("inverter")
 ///     .with_verilog("verilog/inverter.v")
 ///     .with_waveform("waveforms/inverter.vcd");
 ///
-/// for (i, &input) in inputs.iter().enumerate() {
-///     let output = inverter(Bit(input));
-///     test.record_cycle(i + 1, &[("bit", &[input])], &[("out", &[output.0])]);
+/// for (i, &input) in [Logic::Zero, Logic::One].iter().enumerate() {
+///     let output = if input == Logic::Zero { Logic::One } else { Logic::Zero };
+///     test.record_cycle(i + 1, &[("bit", &[input])], &[("out", &[output])]);
 /// }
 /// test.finish_with_expected(&expected).assert_passed();
 /// ```
 ///
 /// # Phased recording (pre/post clock edge)
 /// ```rust,no_run
+/// # use copper_sim::{HardwareTest, HardwareExecutor};
+/// # use copper_core::{Clock, ClockDomain, Logic};
+/// # use copper_core::port::wire;
+/// # struct MainClk; impl ClockDomain for MainClk {}
+/// # let mut clk = Clock::<MainClk>::new();
+/// # let mut exec = HardwareExecutor::new();
+/// # let pattern: Vec<(Logic, Logic)> = vec![];
+/// # let (j_drv, _j_in) = wire::<Logic, MainClk>(Logic::Zero);
+/// # let (k_drv, _k_in) = wire::<Logic, MainClk>(Logic::Zero);
+/// # let (_q_drv, q_obs) = wire::<Logic, MainClk>(Logic::Zero);
 /// let mut test = HardwareTest::new("jk_ff")
 ///     .with_verilog("verilog/jk_ff.v")
 ///     .with_phased_waveform("waveforms/jk_ff_phased.vcd")
 ///     .with_verilator_waveform("waveforms/jk_ff_verilator.vcd");
 ///
-/// for (cycle, (jv, kv)) in pattern.iter().enumerate() {
-///     *j.lock().unwrap() = *jv;
-///     *k.lock().unwrap() = *kv;
+/// for (cycle, &(jv, kv)) in pattern.iter().enumerate() {
+///     j_drv.write(jv);
+///     k_drv.write(kv);
 ///
 ///     exec.poll_tasks();
-///     let q_pre = *out.lock().unwrap();
+///     let q_pre = q_obs.read();
 ///
 ///     exec.advance(&mut clk);
 ///     exec.poll_tasks();
-///     let q_post = *out.lock().unwrap();
+///     let q_post = q_obs.read();
 ///
 ///     // Record inputs + pre/post outputs. Also populates actual_trace for Verilator.
 ///     test.record_cycle_phased(
 ///         cycle,
-///         &[("j", &[jv.0]), ("k", &[kv.0])],  // inputs
-///         &[("q", &[q_pre.0])],                  // pre-clock-edge outputs
-///         &[("q", &[q_post.0])],                 // post-clock-edge outputs
+///         &[("j", &[jv]), ("k", &[kv])],  // inputs
+///         &[("q", &[q_pre])],             // pre-clock-edge outputs
+///         &[("q", &[q_post])],            // post-clock-edge outputs
 ///     );
 /// }
 /// test.finish().assert_passed();
@@ -62,6 +75,9 @@ pub struct HardwareTest {
     verilator_waveform_path: Option<String>,
     actual_trace: SimulationTrace,
     phase_data: Vec<PhasedCycleData>,
+    /// SystemVerilog module parameter overrides for Verilator (`-G<name>=<val>`),
+    /// so a parametric DUT is Verilated at the same widths the simulator ran.
+    params: Vec<(String, i64)>,
 }
 
 /// One simulation cycle with explicit pre-clock and post-clock signal snapshots.
@@ -85,12 +101,20 @@ impl HardwareTest {
             verilator_waveform_path: None,
             actual_trace: SimulationTrace::new(),
             phase_data: Vec::new(),
+            params: Vec::new(),
         }
     }
 
     /// Set the Verilog file path for Verilator cross-verification.
     pub fn with_verilog(mut self, path: &str) -> Self {
         self.verilog_path = Some(path.to_string());
+        self
+    }
+
+    /// Override SystemVerilog module parameters when Verilating (`-GN=8`), so a
+    /// parametric DUT is checked at the concrete widths the simulator used.
+    pub fn with_params(mut self, params: &[(&str, i64)]) -> Self {
+        self.params = params.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         self
     }
 
@@ -172,6 +196,27 @@ impl HardwareTest {
         );
     }
 
+    /// Add extra signals to the phased waveform for `cycle` (which must already
+    /// have been recorded via `record_cycle_phased`) — visible in the VCD only,
+    /// NOT fed into the Verilator cross-check. Use this for internal debug/probe
+    /// signals (e.g. an internal register mirrored onto a debug `Out` port) that
+    /// have no reliably-accessible matching member on the compiled Verilog side
+    /// (unlike top-level ports, a `reg` internal to the reference module isn't
+    /// guaranteed to show up as a `top->name` struct member Verilator will let a
+    /// generated testbench compare against) — routing them through
+    /// `record_cycle_phased` instead would risk a testbench that doesn't compile.
+    pub fn add_debug_signals_phased(
+        &mut self,
+        cycle: usize,
+        pre: &[(&str, &[Logic])],
+        post: &[(&str, &[Logic])],
+    ) {
+        if let Some(pd) = self.phase_data.iter_mut().find(|pd| pd.cycle == cycle) {
+            pd.pre_signals.extend(to_owned_signals(pre));
+            pd.post_signals.extend(to_owned_signals(post));
+        }
+    }
+
     /// Finalize: export waveforms and run Verilator (if configured). No trace assertion.
     pub fn finish(self) -> TestResult {
         self.finish_internal(None)
@@ -231,7 +276,7 @@ impl HardwareTest {
         // 4. Run Verilator cross-validation (with optional trace output)
         if let Some(ref verilog_path) = self.verilog_path {
             let vcd_out = self.verilator_waveform_path.as_deref();
-            match verify_with_verilator_traced(verilog_path, &self.name, &self.actual_trace, vcd_out) {
+            match verify_with_verilator_traced(verilog_path, &self.name, &self.actual_trace, vcd_out, &self.params) {
                 Ok(true) => {
                     result.verilator_ok = Some(true);
                     result.verilator_waveform_path = self.verilator_waveform_path.clone();
@@ -240,7 +285,13 @@ impl HardwareTest {
                     result.verilator_ok = Some(false);
                     result.errors.push("Verilator simulation did not pass all tests".to_string());
                 }
-                Err(e) if e.contains("not found") || e.contains("not installed") => {
+                // ONLY a genuinely absent binary is skippable, and it says so with
+                // an unambiguous marker. This used to match `e.contains("not found")`,
+                // which silently swallowed real build failures and reported PASS:
+                // Verilator's C++ stage emits `fatal error: 'Vfoo.h' file not found`
+                // for a broken testbench, matching that substring exactly. A stale
+                // `VERILATOR_ROOT` is likewise NOT a skip — see `verilator_status`.
+                Err(e) if crate::verification::is_missing_verilator(&e) => {
                     println!("  [verilator] not available: {}", e);
                 }
                 Err(e) => {
@@ -338,20 +389,25 @@ fn export_phased_vcd(
     }
     vcd.push_str("$end\n");
 
-    // One pre/post pair per cycle.
-    // Start at time 2 (not 0) so cycle 0's pre-edge doesn't collide with the
-    // $dumpvars block above, which is also at #0.
-    for pd in phase_data {
-        let t_pre  = (pd.cycle as u64) * 2 + 2;
+    // One pre/post pair per cycle, at `2*cycle`/`2*cycle+1` — the same convention
+    // Verilator's own generated testbench uses (`tb->clk=0; eval(); dump();
+    // tb->clk=1; eval(); dump();` once per cycle, starting at time 0), so the two
+    // VCDs land on the same absolute time axis and can be diffed directly in a
+    // viewer. The very first cycle's PRE edge is skipped here — it was already
+    // declared by the `$dumpvars` block above, at the same time 0.
+    for (i, pd) in phase_data.iter().enumerate() {
+        let t_pre  = (pd.cycle as u64) * 2;
         let t_post = t_pre + 1;
 
-        // Pre-clock edge: clk = 0
-        vcd.push_str(&format!("#{}\n", t_pre));
-        vcd.push_str(&format!("b0 {}\n", clk_sym));
-        for (name, sym) in &signal_symbols {
-            let vals = lookup_signal(&pd.pre_signals, name).map(Vec::as_slice);
-            let width = widths.get(name).copied().unwrap_or(1);
-            vcd.push_str(&format!("{} {}\n", logic_vals_to_vcd(vals, width), sym));
+        if i > 0 {
+            // Pre-clock edge: clk = 0
+            vcd.push_str(&format!("#{}\n", t_pre));
+            vcd.push_str(&format!("b0 {}\n", clk_sym));
+            for (name, sym) in &signal_symbols {
+                let vals = lookup_signal(&pd.pre_signals, name).map(Vec::as_slice);
+                let width = widths.get(name).copied().unwrap_or(1);
+                vcd.push_str(&format!("{} {}\n", logic_vals_to_vcd(vals, width), sym));
+            }
         }
 
         // Post-clock edge: clk = 1
@@ -419,7 +475,9 @@ fn compare_traces(actual: &SimulationTrace, expected: &SimulationTrace) -> Resul
 /// Build a `CycleData` from slice references. Useful for constructing expected traces.
 ///
 /// # Example
-/// ```rust,no_run
+/// ```rust
+/// # use copper_sim::{SimulationTrace, make_cycle};
+/// # use copper_core::Logic;
 /// let expected = SimulationTrace::from_cycles(vec![
 ///     make_cycle(1, &[("bit", &[Logic::Zero])], &[("out", &[Logic::One])]),
 ///     make_cycle(2, &[("bit", &[Logic::One])],  &[("out", &[Logic::Zero])]),

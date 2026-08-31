@@ -1,5 +1,6 @@
 use copper_core::types::{Logic, Clock, ClockDomain};
 use copper_core::port::{In, Out, wire};
+use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
 struct MainClk;
@@ -16,6 +17,7 @@ enum Phase {
     RedYellow,
 }
 
+#[hardware(sequential)]
 async fn traffic_light(
     clk: Clock<MainClk>,
     request: In<Logic, MainClk>,
@@ -99,9 +101,11 @@ fn main() {
     let dh_y = yellow_out.dirty_handle();
     let dh_g = green_out.dirty_handle();
 
+    let reads = vec![req_in.wire_id()];
     exec.spawn_wired(
         traffic_light(clk.clone(), req_in, red_out, yellow_out, green_out),
         vec![dh_r, dh_y, dh_g],
+        reads,
     );
 
     // request goes high on cycle 3 to trigger the phase sequence.

@@ -5,16 +5,25 @@
 // Load-use hazard: 1 stall cycle detected in EX/ID boundary
 // Forwarding: EX/MEM → EX and MEM/WB → EX (EX/MEM has priority)
 //
-// Adapted from a MIPS pipeline reference to RV32I ISA.
-// Instruction/data memory modelled as direct Vec indexing (no-latency)
-// to keep pipeline control logic clean.
+// Instruction/data memory is a single unified `Memory` (2 read ports, 1 write
+// port, READ_LAT = 1) RECEIVED as a parameter: read port 0 is the instruction
+// fetch, read port 1 is the data load, write port 0 is the store. The core does
+// not own or fill it — `run_program` builds it with the program image already in
+// it, the same way it hands over the clock. Its addresses are staged before the
+// clock edge and its results read after it, so the memory's own output register
+// IS the pipeline register the combinational read used to feed. That is why a
+// synchronous memory costs no extra stage here and the cycle counts are
+// unchanged: the fetch issued with `pc` lands where IF/ID latched it, and the
+// load issued with the freshly-latched EX/MEM address lands in the MEM cycle.
 
-use copper_core::{Bits, Clock, ClockDomain, Logic};
-use copper_core::port::{wire, In, Out};
+use copper_core::{Bits, Clock, ClockDomain, Logic, Memory};
+use copper_core::port::{registered_wire, wire, Out, RegOut};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
-struct MainClk;
+// `pub` because `build_memory` hands a `Memory<…, MainClk, …>` back to the caller,
+// so the domain is part of the harness's public surface.
+pub struct MainClk;
 impl ClockDomain for MainClk {}
 
 // ── Opcode constants ──────────────────────────────────────────────────────────
@@ -29,6 +38,14 @@ const OP_STORE:   u32 = 0x23;
 const OP_ALU_IMM: u32 = 0x13;
 const OP_ALU_REG: u32 = 0x33;
 const OP_ECALL:   u32 = 0x73;
+
+// Words in the unified memory the core expects to be handed. `Memory` panics on
+// an out-of-range address rather than substituting a value, so every address is
+// bounds-checked before it is staged — the same guard the `Vec` version spelled as
+// `idx < memory.len()`. `pub` because the harness that builds the memory has to
+// agree with the core about its size; `build_memory` below is the one place that
+// reads it, so the two cannot drift.
+pub const MEM_WORDS: usize = 1024;
 
 // ── Pipeline register types ───────────────────────────────────────────────────
 
@@ -198,15 +215,28 @@ fn branch_taken(rv1: Bits<32>, rv2: Bits<32>, f3: usize) -> bool {
 #[hardware(sequential)]
 async fn rv32i_cpu_pipelined(
     clk: Clock<MainClk>,
-    program: In<Vec<Bits<32>>, MainClk>,
-    program_counter: Out<Bits<32>, MainClk>,
-    halted: Out<Logic, MainClk>,
-    a0_out: Out<Bits<32>, MainClk>,
+    // Unified address space: instruction fetch and data loads/stores all hit this
+    // one memory. It arrives already holding the program — the core has no notion
+    // of loading one, which is why there is no longer a `program` port and no
+    // reset-time fill. MEM_WORDS below is the size it is expected to have; a
+    // smaller one would fault on the first address past its end rather than read
+    // a wrong value, so the mismatch is loud.
+    memory: Memory<Bits<32>, 2, 1, MainClk, 1, 1>,
+    // `RegOut` since 2026-08-25: this port is driven from `pc` in the loop's TRAILING
+    // segment, and the body crosses more than one clock edge per iteration — D1's
+    // hazard past the last tick, which `unprotected_trailing_out_write` now rejects.
+    // Its scalar sibling was migrated for the multi-phase rule in the same way; the
+    // port is observed by nothing in the harness, so only the type and its wire change.
+    program_counter: RegOut<Bits<32>, MainClk>,
+    // `RegOut` like `program_counter` (2026-08-27): both are held outputs
+    // written only in the halt state, and a held plain `Out` emits as an
+    // enabled register — committed at the edge, observed one cycle after the
+    // simulator's same-cycle write. Registering them on BOTH sides makes the
+    // simulator and the hardware agree on the halt cycle; the architectural
+    // results are unchanged.
+    halted: RegOut<Logic, MainClk>,
+    a0_out: RegOut<Bits<32>, MainClk>,
 ) {
-    // Unified address space: instruction fetch and data loads/stores all hit
-    // the same Vec.  run_program pads it to 1024 words so the stack region
-    // (sp=0x1000, growing down) and any .rodata constants have room.
-    let mut memory = { let mut v = program.read(); v.resize(1024, Bits::zero()); v };
     let mut regs = [Bits::<32>::zero(); 32];
 
     let mut pc: Bits<32> = Bits::zero();
@@ -220,8 +250,33 @@ async fn rv32i_cpu_pipelined(
     halted.write(Logic::Zero);
     a0_out.write(Bits::zero());
 
+    // The first fetch, staged before the first edge: with a synchronous memory an
+    // address presented in one cycle is answered in the next, so cycle 1 needs an
+    // address presented in cycle 0. pc is 0 here, always in range.
+    memory.read_port::<0>().read((pc >> 2).as_usize());
+
     loop {
         clk.tick().await;
+
+        // ── Memory results ──────────────────────────────────────────────────
+        // Both were staged at the bottom of the previous iteration, with the
+        // addresses that iteration committed — so `fetched` is the instruction at
+        // this cycle's `pc` and `mem_load` is the data for this cycle's EX/MEM,
+        // exactly the two values the combinational `memory[idx]` reads produced.
+        // A port that was not issued reads back not-ready, which stands in for the
+        // `else { Bits::zero() }` arms the `Vec` version wrote by hand: read port 1
+        // is issued only for a load, and neither is issued for an out-of-range
+        // address.
+        let fetched: Bits<32> = if memory.read_port::<0>().is_ready() {
+            memory.read_port::<0>().data()
+        } else {
+            Bits::zero()
+        };
+        let mem_load: Bits<32> = if memory.read_port::<1>().is_ready() {
+            memory.read_port::<1>().data()
+        } else {
+            Bits::zero()
+        };
 
         // ── WB ──────────────────────────────────────────────────────────────
         if mem_wb.valid && mem_wb.is_ecall {
@@ -235,20 +290,12 @@ async fn rv32i_cpu_pipelined(
         }
 
         // ── MEM ─────────────────────────────────────────────────────────────
-        let mem_result: Bits<32> = if ex_mem.valid && ex_mem.is_load {
-            let addr = (ex_mem.alu_result >> 2).as_usize();
-            if addr < memory.len() { memory[addr] } else { Bits::zero() }
-        } else {
-            Bits::zero()
-        };
-        if ex_mem.valid && ex_mem.is_store {
-            let addr = (ex_mem.alu_result >> 2).as_usize();
-            if addr < memory.len() { memory[addr] = ex_mem.rs2_val; }
-        }
+        // The load result arrived above; the store for this same EX/MEM entry was
+        // staged with it and committed on the edge that opened this cycle.
         let new_mem_wb = if ex_mem.valid {
             MEMWBReg {
                 valid: true,
-                result: if ex_mem.is_load { mem_result } else { ex_mem.alu_result },
+                result: if ex_mem.is_load { mem_load } else { ex_mem.alu_result },
                 rd: ex_mem.rd,
                 writes_reg: ex_mem.writes_reg,
                 is_ecall: ex_mem.is_ecall,
@@ -407,9 +454,7 @@ async fn rv32i_cpu_pipelined(
         } else if load_use_stall {
             if_id  // hold
         } else {
-            let idx   = (pc >> 2).as_usize();
-            let instr = if idx < memory.len() { memory[idx] } else { Bits::zero() };
-            IFIDReg { valid: true, pc, instr }
+            IFIDReg { valid: true, pc, instr: fetched }
         };
 
         // ── PC update ───────────────────────────────────────────────────────
@@ -429,23 +474,76 @@ async fn rv32i_cpu_pipelined(
         mem_wb = new_mem_wb;
 
         program_counter.write(pc);
+
+        // ── Stage the next cycle's memory accesses ──────────────────────────
+        // After the commit, so these are the addresses the NEXT iteration's IF and
+        // MEM stages will use — the same values the combinational reads took from
+        // `pc` and `ex_mem` at the top of that iteration. `is_load` and `is_store`
+        // are mutually exclusive, so at most one data-side access is ever in
+        // flight and the load port cannot collide with the store port.
+        let fetch_idx = (pc >> 2).as_usize();
+        if fetch_idx < MEM_WORDS {
+            memory.read_port::<0>().read(fetch_idx);
+        }
+        if ex_mem.valid {
+            let addr = (ex_mem.alu_result >> 2).as_usize();
+            if addr < MEM_WORDS {
+                if ex_mem.is_load {
+                    memory.read_port::<1>().read(addr);
+                } else if ex_mem.is_store {
+                    memory.write_port::<0>().write(addr, ex_mem.rs2_val);
+                }
+            }
+        }
     }
 }
 
 // ── Execution engine ──────────────────────────────────────────────────────────
 
-fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
-    let program_bits: Vec<Bits<32>> = program.into_iter().map(Bits::<32>::from_u32).collect();
+/// Build the core's unified memory with `program` already loaded.
+///
+/// This is the testbench's job, not the core's: the image is padded to MEM_WORDS
+/// so the stack region (sp=0x1000, growing down) and any .rodata constants have
+/// room, and instruction and data space are one array so a program can load its
+/// own constants.
+///
+/// WriteFirst, because the `Vec` version this replaced committed a store earlier
+/// in the loop body than it ran the fetch — so a store to the word being fetched
+/// in the same cycle was visible to that fetch. ReadFirst would quietly change
+/// that. It only shows up for self-modifying code, which none of the programs
+/// below use, which is exactly why it is worth pinning rather than leaving to luck.
+pub fn build_memory(
+    clk: &Clock<MainClk>,
+    program: Vec<u32>,
+) -> Memory<Bits<32>, 2, 1, MainClk, 1, 1> {
+    let mut image: Vec<Bits<32>> = program.into_iter().map(Bits::<32>::from_u32).collect();
+    assert!(
+        image.len() <= MEM_WORDS,
+        "program is {} words but the core's memory is {MEM_WORDS}",
+        image.len()
+    );
+    image.resize(MEM_WORDS, Bits::zero());
+    Memory::from_contents(clk.clone(), image).write_first()
+}
+
+pub fn run_program(program: Vec<u32>, max_cycles: usize) -> (u32, usize) {
     let mut clk  = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let (prog_out, prog_in)     = wire::<Vec<Bits<32>>, MainClk>(vec![]);
-    let (pc_out,  _pc_in)       = wire::<Bits<32>, MainClk>(Bits::zero());
-    let (halt_out, halt_in)     = wire::<Logic, MainClk>(Logic::Zero);
-    let (a0_out,  a0_in)        = wire::<Bits<32>, MainClk>(Bits::zero());
+    // The memory is built and filled out here and handed over, so the core starts
+    // with the program already in place and never sees a loading phase.
+    let memory = build_memory(&clk, program);
 
-    prog_out.write(program_bits);
-    exec.spawn(rv32i_cpu_pipelined(clk.clone(), prog_in, pc_out, halt_out, a0_out));
+    let (pc_out,  _pc_in)       = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
+    let (halt_out, halt_in)     = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
+    let (a0_out,  a0_in)        = registered_wire::<Bits<32>, MainClk>(&clk, Bits::zero());
+
+    // No `reads`: the core has no `In` ports at all now — its only state comes
+    // from the clock and the memory it was handed.
+    exec.spawn_untracked(
+        rv32i_cpu_pipelined(clk.clone(), memory, pc_out, halt_out, a0_out),
+        vec![],
+    );
 
     for cycle in 1..=max_cycles {
         exec.tick_clock(&mut clk);
@@ -503,7 +601,7 @@ fn sw  (rs1: u32, rs2: u32, off: i32) -> u32 { s_type(rs1, rs2, off, 0x2) }
 
 // ── Test programs ─────────────────────────────────────────────────────────────
 
-fn test_addi() -> Vec<u32> {
+pub fn test_addi() -> Vec<u32> {
     vec![
         addi(1, 0, 10),
         addi(2, 0, 5),
@@ -512,7 +610,7 @@ fn test_addi() -> Vec<u32> {
     ]
 }
 
-fn test_sub() -> Vec<u32> {
+pub fn test_sub() -> Vec<u32> {
     vec![
         addi(1, 0, 15),
         addi(2, 0, 10),
@@ -521,7 +619,7 @@ fn test_sub() -> Vec<u32> {
     ]
 }
 
-fn test_multiple_adds() -> Vec<u32> {
+pub fn test_multiple_adds() -> Vec<u32> {
     vec![
         addi(1, 0, 0),
         addi(1, 1, 1),
@@ -534,7 +632,7 @@ fn test_multiple_adds() -> Vec<u32> {
     ]
 }
 
-fn test_branch_taken() -> Vec<u32> {
+pub fn test_branch_taken() -> Vec<u32> {
     // PC=0:  addi x1,x0,1
     // PC=4:  beq  x0,x0,+12  → jump to PC=16
     // PC=8:  addi x10,x0,1   (skipped)
@@ -551,7 +649,7 @@ fn test_branch_taken() -> Vec<u32> {
     ]
 }
 
-fn test_branch_not_taken() -> Vec<u32> {
+pub fn test_branch_not_taken() -> Vec<u32> {
     vec![
         addi(1, 0, 5),
         addi(2, 0, 10),
@@ -561,7 +659,7 @@ fn test_branch_not_taken() -> Vec<u32> {
     ]
 }
 
-fn test_load_store() -> Vec<u32> {
+pub fn test_load_store() -> Vec<u32> {
     vec![
         addi(1, 0, 88),
         sw(0, 1, 0),
@@ -570,7 +668,7 @@ fn test_load_store() -> Vec<u32> {
     ]
 }
 
-fn test_negative_numbers() -> Vec<u32> {
+pub fn test_negative_numbers() -> Vec<u32> {
     vec![
         addi(1, 0, 10),
         addi(2, 0, -3),
@@ -579,7 +677,7 @@ fn test_negative_numbers() -> Vec<u32> {
     ]
 }
 
-fn test_zero_operations() -> Vec<u32> {
+pub fn test_zero_operations() -> Vec<u32> {
     vec![
         addi(1, 0, 0),
         addi(2, 0, 42),
@@ -588,7 +686,7 @@ fn test_zero_operations() -> Vec<u32> {
     ]
 }
 
-fn test_fibonacci() -> Vec<u32> {
+pub fn test_fibonacci() -> Vec<u32> {
     // Compute fib(10) = 55 iteratively
     // x1=prev, x2=curr, x3=countdown
     // PC=0:  x1 = 0
@@ -617,7 +715,7 @@ fn test_fibonacci() -> Vec<u32> {
     ]
 }
 
-fn test_jal() -> Vec<u32> {
+pub fn test_jal() -> Vec<u32> {
     // PC=0: addi x1,x0,7
     // PC=4: jal  x0,+8   → jump to PC=12
     // PC=8: addi x1,x0,0 (skipped)
@@ -632,7 +730,7 @@ fn test_jal() -> Vec<u32> {
     ]
 }
 
-fn test_data_hazard_forwarding() -> Vec<u32> {
+pub fn test_data_hazard_forwarding() -> Vec<u32> {
     // Back-to-back RAW: each addi reads the register written by the previous one.
     // Forwarding must supply the value without stalls.
     // x1=1, x1=x1+1=2, x1=x1+1=3 → a0=3
@@ -645,7 +743,7 @@ fn test_data_hazard_forwarding() -> Vec<u32> {
     ]
 }
 
-fn test_load_use_stall() -> Vec<u32> {
+pub fn test_load_use_stall() -> Vec<u32> {
     // lw immediately followed by a use of the loaded register.
     // Hazard unit must insert a stall bubble so forwarding from MEM/WB works.
     // Store 42 to dmem[0], load it back, add 1.
@@ -658,7 +756,7 @@ fn test_load_use_stall() -> Vec<u32> {
     ]
 }
 
-fn test_bubblesort() -> Vec<u32> {
+pub fn test_bubblesort() -> Vec<u32> {
     // Bubble-sort of [64,34,25,12,22,11,90,42,8,55]; returns sum = 363.
     // Compiled: riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -O1
     // Flat binary: .text at 0x000, .rodata (array) at 0x0C0, stack at 0xFD0-0xFFC.
@@ -689,6 +787,9 @@ fn test_bubblesort() -> Vec<u32> {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+// Excluded under cfg(test) so an integration test can `include!` this file
+// without its harness `main` clashing (see rv32i_cpu.rs for the rationale).
+#[cfg(not(test))]
 fn main() {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║          RV32I CPU - 5-Stage Pipelined - Test Suite           ║");

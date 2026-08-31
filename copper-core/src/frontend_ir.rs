@@ -16,8 +16,124 @@ pub struct FrontendModuleIR {
     /// source-ordered top-level body statements
     pub raw_statements: Vec<RawStmt>,
 
+    /// Enum definitions visible to this module. Populated with enums declared
+    /// inside the function body by `capture_frontend_ir`; file-scope enums are
+    /// injected by the caller (they are not reachable from the `ItemFn` alone).
+    pub enums: Vec<ItemEnum>,
+
+    /// The module's **register set — the shared authority, riding the IR.**
+    ///
+    /// Filled by `capture_frontend_ir` from `copper_analysis::infer_registers`
+    /// (the same source-level backward-liveness inference the sim macro
+    /// consumes), then **appended to** by the FIR→FIR passes for the register
+    /// state they synthesize (`transpile_fir` diffs the pre-loop `let mut` set
+    /// after desugar + control extraction, which covers `pc`, the
+    /// `__copper_ctr*` counters, and hoisted cross-state locals without any
+    /// pass having to report names by hand).
+    ///
+    /// `chir_lower` CONSULTS this to classify a pre-loop `let mut` as register
+    /// or wire — it no longer decides syntactically. That closes the register
+    /// half of the c2 obligation (`CYCLE_DATAFLOW_SEMANTICS.md` §2): one
+    /// authoritative analysis, not two that must agree.
+    /// `copper-codegen/tests/register_reconciliation.rs` remains the oracle,
+    /// now verifying the plumbing end-to-end rather than a coincidence of two
+    /// deciders.
+    pub registers: Vec<String>,
+
+    /// The mode declared in the `#[hardware(<mode>)]` attribute, when present.
+    /// `None` when the function carries no `#[hardware(...)]` attribute (e.g. a
+    /// bare `ItemFn` handed directly to `transpile_item_fn`). This is the
+    /// *authoritative* mode as written; `classification` is only inferred from
+    /// async-ness and cannot distinguish `synchronizer` (which is also async)
+    /// from `sequential`.
+    pub declared_mode: Option<HardwareMode>,
+
+    /// File-scope items visible to this module but not reachable from its
+    /// `ItemFn`, injected by the caller (see `transpile_source`) exactly like
+    /// `enums`. Populated for later inlining/monomorphization; empty when a FIR
+    /// is captured from an `ItemFn` alone. Nothing consumes these yet.
+    pub file_fns: Vec<FrontendFnIR>,
+    pub file_structs: Vec<ItemStruct>,
+    pub file_consts: Vec<ItemConst>,
+    pub file_impls: Vec<FrontendImplIR>,
+    pub file_traits: Vec<FrontendTraitIR>,
+
     /// span for full module/function declaration
     pub span: SourceSpan,
+}
+
+/// A free function or a method body captured from file scope, source-shaped.
+/// This is `capture_frontend_ir` minus the hardware-only fields (clocks,
+/// classification, declared_mode) — enough to inline the callee later.
+#[derive(Debug, Clone)]
+pub struct FrontendFnIR {
+    pub name: String,
+
+    pub signature: FrontendSignature,
+
+    /// The `self` receiver for a method (`&self`, `&mut self`, `self`); `None`
+    /// for free functions and associated functions like `Opcode::from_bits`.
+    pub receiver: Option<Receiver>,
+
+    /// Body statements, source-ordered. Empty for a bodyless trait-method
+    /// declaration (`fn read_ready(&self) -> bool;`).
+    pub raw_statements: Vec<RawStmt>,
+
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receiver {
+    /// `self`
+    Value,
+    /// `&self`
+    Ref,
+    /// `&mut self`
+    RefMut,
+}
+
+/// An `impl` block captured from file scope.
+#[derive(Debug, Clone)]
+pub struct FrontendImplIR {
+    /// The implementing type as source text: `Opcode`, `MainClk`.
+    pub self_ty: String,
+
+    /// The implemented trait, if any: `Some("ClockDomain")` for a trait impl,
+    /// `None` for an inherent impl (`impl Opcode { ... }`).
+    pub trait_name: Option<String>,
+
+    pub methods: Vec<FrontendFnIR>,
+
+    pub span: SourceSpan,
+}
+
+/// A `trait` definition captured from file scope. Methods carry their signature
+/// and any default body (empty `raw_statements` for a bare signature decl).
+#[derive(Debug, Clone)]
+pub struct FrontendTraitIR {
+    pub name: String,
+
+    pub methods: Vec<FrontendFnIR>,
+
+    pub span: SourceSpan,
+}
+
+/// The argument of the `#[hardware(<mode>)]` attribute. Mirrors the modes the
+/// `copper-macros` `#[hardware]` proc-macro accepts, plus `Synchronizer` (the
+/// sanctioned CDC crossing point). Kept in the FIR so later phases — CDC 2-FF
+/// emission in particular — can act on the mode the author actually declared
+/// rather than re-deriving it from the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareMode {
+    Sequential,
+    Combinational,
+    Synchronizer,
+    /// A pure-hierarchy parent: receives one or more `Clock`s and *instantiates*
+    /// clocked submodules, threading each child's clock through. It has no
+    /// `always_ff` of its own — no top-level loop, no `tick`. This is the
+    /// multi-clock enabler (item 4): a parent with no native clock domain that
+    /// wires independently-clocked children into one coherent component.
+    Structural,
 }
 
 #[derive(Debug, Clone)]
@@ -25,8 +141,53 @@ pub struct FrontendSignature {
     /// parameter list in declared order
     pub params: Vec<RawParam>,
 
+    /// Generic parameters in declared order: const generics
+    /// (`<const N: usize>` — shift_register, mux), generic clock domains
+    /// (`<SrcD: ClockDomain>` — sync_2ff), and any type/lifetime params. Empty
+    /// for a non-generic module. Needed for monomorphization: a const generic
+    /// pairs with a call-site turbofish value, a `ClockDomain`-bounded type
+    /// param names a domain to substitute.
+    pub generics: Vec<GenericParamMeta>,
+
+    /// A `where` clause as raw source text, if the function declares one.
+    /// Preserved verbatim because bounds there can be arbitrarily complex; no
+    /// current example uses one, but the FIR must not silently drop it.
+    pub where_clause_text: Option<String>,
+
     /// return type info
     pub return_ty: Option<RawTypeRef>,
+}
+
+/// One generic parameter from a module's signature, source-shaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericParamMeta {
+    pub kind: GenericParamKind,
+
+    /// Parameter name without sigil: `N`, `SrcD`, `a` (for `'a`).
+    pub name: String,
+
+    /// For a `const` param, the declared type text (`usize`); `None` otherwise.
+    pub const_ty: Option<RawTypeRef>,
+
+    /// Trait or lifetime bounds as source text, e.g. `["ClockDomain"]` for
+    /// `<SrcD: ClockDomain>`. Empty when the param is unbounded.
+    pub bounds: Vec<String>,
+
+    /// Default type/const as source text if declared (`T = u8`,
+    /// `const N: usize = 8`); `None` otherwise.
+    pub default: Option<String>,
+
+    /// Full raw token text of the parameter, for a lossless round-trip.
+    pub raw_text: String,
+
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericParamKind {
+    Type,
+    Const,
+    Lifetime,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +214,11 @@ pub struct RawTypeRef {
 pub enum FrontendClassification {
     CombinationalFn,
     AsyncSequentialFn,
+    /// A pure-hierarchy parent (`#[hardware(structural)]`): submodule
+    /// instantiations + internal wiring, no top-level loop/tick. Cannot be
+    /// inferred from async-ness alone (a structural parent is also async), so it
+    /// is set only from the declared `#[hardware(structural)]` mode.
+    StructuralFn,
 }
 
 #[derive(Debug, Clone)]
@@ -175,22 +341,121 @@ pub enum ExprType {
     Async(ExprAsync),
     Await(ExprAwait),
     Binary(ExprBinary),
+    Block(ExprBlock),
     Call(ExprCall),
     Cast(ExprCast),
+    Closure(ExprClosure),
     Field(ExprField),
+    Index(ExprIndex),
     If(ExprIf),
     Let(ExprLet),
     Lit(ExprLit),
     Loop(ExprLoop),
     Match(ExprMatch),
     MethodCall(ExprMethodCall),
+    Path(ExprPath),
     Range(ExprRange),
     Reference(ExprReference),
     Repeat(ExprRepeat),
     Return(ExprReturn),
+    Struct(ExprStruct),
+    Tuple(ExprTuple),
     Unary(ExprUnary),
+    Break(ExprBreak),
+    Continue(ExprContinue),
     While(ExprWhile),
     Yield(ExprYield),
+    Const(ExprConst),
+    Try(ExprTry),
+    Macro(ExprMacro),
+    ForLoop(ExprForLoop),
+}
+
+impl ExprType {
+    /// The construct's name as a user would write it, for diagnostics. A
+    /// discriminant is not something to put in front of someone reading an error.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ExprType::Array(_) => "array literal",
+            ExprType::Assign(_) => "assignment",
+            ExprType::Async(_) => "async block",
+            ExprType::Await(_) => "await",
+            ExprType::Binary(_) => "binary operator",
+            ExprType::Block(_) => "block",
+            ExprType::Call(_) => "call",
+            ExprType::Cast(_) => "cast",
+            ExprType::Closure(_) => "closure",
+            ExprType::Field(_) => "field access",
+            ExprType::Index(_) => "index",
+            ExprType::If(_) => "if",
+            ExprType::Let(_) => "let",
+            ExprType::Lit(_) => "literal",
+            ExprType::Loop(_) => "loop",
+            ExprType::Match(_) => "match",
+            ExprType::MethodCall(_) => "method call",
+            ExprType::Path(_) => "path",
+            ExprType::Range(_) => "range",
+            ExprType::Reference(_) => "reference",
+            ExprType::Repeat(_) => "array repeat",
+            ExprType::Return(_) => "return",
+            ExprType::Struct(_) => "struct literal",
+            ExprType::Tuple(_) => "tuple",
+            ExprType::Unary(_) => "unary operator",
+            ExprType::Break(_) => "break",
+            ExprType::Continue(_) => "continue",
+            ExprType::While(_) => "while",
+            ExprType::Yield(_) => "yield",
+            ExprType::Const(_) => "const block",
+            ExprType::Try(_) => "`?`",
+            ExprType::Macro(_) => "macro invocation",
+            ExprType::ForLoop(_) => "for loop",
+        }
+    }
+
+    /// The expression's source span.
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            ExprType::Array(e) => e.span,
+            ExprType::Assign(e) => e.span,
+            ExprType::Async(e) => e.span,
+            ExprType::Await(e) => e.span,
+            ExprType::Binary(e) => e.span,
+            ExprType::Block(e) => e.span,
+            ExprType::Call(e) => e.span,
+            ExprType::Cast(e) => e.span,
+            ExprType::Closure(e) => e.span,
+            ExprType::Field(e) => e.span,
+            ExprType::Index(e) => e.span,
+            ExprType::If(e) => e.span,
+            ExprType::Let(e) => e.span,
+            ExprType::Lit(e) => e.span,
+            ExprType::Loop(e) => e.span,
+            ExprType::Match(e) => e.span,
+            ExprType::MethodCall(e) => e.span,
+            ExprType::Path(e) => e.span,
+            ExprType::Range(e) => e.span,
+            ExprType::Reference(e) => e.span,
+            ExprType::Repeat(e) => e.span,
+            ExprType::Return(e) => e.span,
+            ExprType::Struct(e) => e.span,
+            ExprType::Tuple(e) => e.span,
+            ExprType::Unary(e) => e.span,
+            ExprType::Break(e) => e.span,
+            ExprType::Continue(e) => e.span,
+            ExprType::While(e) => e.span,
+            ExprType::Yield(e) => e.span,
+            ExprType::Const(e) => e.span,
+            ExprType::Try(e) => e.span,
+            ExprType::Macro(e) => e.span,
+            ExprType::ForLoop(e) => e.span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprBlock {
+    pub stmts: Vec<RawStmt>,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +516,14 @@ pub struct ExprField {
     pub span: SourceSpan,
 }
 
+/// Index expression: `base[index]` (e.g. bit selection `state[0]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprIndex {
+    pub base: Box<ExprType>,
+    pub index: Box<ExprType>,
+    pub span: SourceSpan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprIf {
     pub condition: Box<ExprType>,
@@ -298,6 +571,20 @@ pub struct ExprMethodCall {
     pub receiver: Box<ExprType>,
     pub method: String,
     pub args: Vec<ExprType>,
+    /// Turbofish generic arguments on the method itself, one canonical token
+    /// string per argument: `port.read_port::<0>()` → `["0"]`,
+    /// `instr.part_select::<3>(12)` → `["3"]` (the `12` is an `arg`, not here).
+    /// Empty when the call has no `::<...>`. Path-form turbofish
+    /// (`Bits::<32>::from_lit::<4>()`) is preserved separately inside
+    /// `ExprPath::path_text`; this field is only for the *method* form, which
+    /// syn exposes as `ExprMethodCall::turbofish`.
+    pub turbofish: Vec<String>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprPath {
+    pub path_text: String,
     pub span: SourceSpan,
 }
 
@@ -316,6 +603,18 @@ pub struct ExprReference {
     pub span: SourceSpan,
 }
 
+/// A closure expression — `|i| i * 3`. Captured structurally because a memory
+/// preload (`Memory::<..>::from_fn(clk, N, |i| …)`) is an initializer the
+/// transpiler has to look *inside*: the body becomes the emitted fill loop's
+/// value, with `params[0]` as the loop variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprClosure {
+    /// Parameter patterns as source text, in order (`|i|` → `["i"]`).
+    pub params: Vec<String>,
+    pub body: Box<ExprType>,
+    pub span: SourceSpan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprRepeat {
     pub expr: Box<ExprType>,
@@ -324,8 +623,42 @@ pub struct ExprRepeat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprStructField {
+    pub member: String,
+    pub expr: Box<ExprType>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprStruct {
+    pub path_text: String,
+    pub fields: Vec<ExprStructField>,
+    pub rest: Option<Box<ExprType>>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprTuple {
+    pub elements: Vec<ExprType>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprReturn {
     pub value: Option<Box<ExprType>>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprBreak {
+    pub label: Option<String>,
+    pub expr: Option<Box<ExprType>>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprContinue {
+    pub label: Option<String>,
     pub span: SourceSpan,
 }
 
@@ -343,9 +676,50 @@ pub struct ExprWhile {
     pub span: SourceSpan,
 }
 
+/// A `for <pat> in <iter> { <body> }` loop. `pat_text` is the loop-variable
+/// pattern as source text (`i`, `_`); `iter` is the iterator expression, usually
+/// a range (`0..N`). Lowering unrolls or emits an SV loop (a later increment);
+/// this captures it structurally instead of dropping it to opaque text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprForLoop {
+    pub pat_text: String,
+    pub iter: Box<ExprType>,
+    pub body: Vec<RawStmt>,
+    pub span: SourceSpan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprYield {
     pub value: Option<Box<ExprType>>,
+    pub span: SourceSpan,
+}
+
+/// A `const { ... }` block. In hardware bodies these are compile-time checks
+/// (`const { assert!(N_LOG == safe_clog2(N)) }` — shift_register, mux,
+/// rotate_right, priority_encode); a lowering pass elides them, but the body is
+/// captured here rather than flattened to opaque text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprConst {
+    pub stmts: Vec<RawStmt>,
+    pub span: SourceSpan,
+}
+
+/// The `?` try operator: `expr?`. Appears in `decode()`'s
+/// `Opcode::from_bits(...)?` (rv32i_cpu) once file-scope helpers are inlined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprTry {
+    pub expr: Box<ExprType>,
+    pub span: SourceSpan,
+}
+
+/// A macro invocation in expression position: `panic!(...)` (rv32i_cpu decode
+/// arm), `println!(...)`. The delimited tokens are kept as raw text — a macro
+/// body is not Rust-expression-shaped, so there is nothing structured to
+/// descend into. `name` is the macro path (`panic`, `assert`, `println`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprMacro {
+    pub name: String,
+    pub tokens_text: String,
     pub span: SourceSpan,
 }
 

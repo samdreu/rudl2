@@ -1,8 +1,13 @@
-// Single dual-port RAM with single clock
+// Single dual-port RAM with single clock.
+//
+// Port A writes, port B reads — the same split as the hand-written reference in
+// `sv/dual_port_ram.sv`, whose `doa` output is commented out. Copper had a dead
+// `data_out_a` output here until 2026-08-24; it was removed when the module
+// started transpiling, because an undriven output is a Verilator UNDRIVEN error.
 
 use copper_core::{Bits, Clock, ClockDomain, Logic, Memory, port::{DirtyHandle, In, Out, wire}};
 use copper_macros::hardware;
-use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
+use copper_sim::HardwareExecutor;
 
 
 struct MainClk;
@@ -17,7 +22,6 @@ async fn dual_port_ram (
     addr_a: In<Bits<8>, MainClk>,
     addr_b: In<Bits<8>, MainClk>,
     data_in_a: In<Bits<16>, MainClk>,
-    data_out_a: Out<Bits<16>, MainClk>,
     data_out_b: Out<Bits<16>, MainClk>
 ) {
     let memory = Memory::<Bits<16>, 1, 1, MainClk, 1, 1>::new(clk.clone(), 256);
@@ -42,7 +46,14 @@ async fn dual_port_ram (
     }
 }
 
+// `include!`d by tests/dual_port_ram_equivalence.rs, which supplies its own
+// harness — so the example's own `main` must not be compiled there.
+#[cfg(not(test))]
 fn main() {
+    // Harness-only imports live here so `include!`ing this file into a test (which
+    // compiles out `main`) does not drag in unused ones.
+    use copper_sim::{make_cycle, HardwareTest, SimulationTrace};
+
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
@@ -52,17 +63,21 @@ fn main() {
     let (addra_drv, addra_in)  = wire::<Bits<8>,  MainClk>(Bits::zero());
     let (addrb_drv, addrb_in)  = wire::<Bits<8>,  MainClk>(Bits::zero());
     let (dia_drv,   dia_in)    = wire::<Bits<16>, MainClk>(Bits::zero());
-    let (doa_out,   _doa_obs)  = wire::<Bits<16>, MainClk>(Bits::zero());
     let (dob_out,   dob_obs)   = wire::<Bits<16>, MainClk>(Bits::zero());
 
     let dh: DirtyHandle = dob_out.dirty_handle();
+    let reads = vec![
+        ena_in.wire_id(), enb_in.wire_id(), wea_in.wire_id(),
+        addra_in.wire_id(), addrb_in.wire_id(), dia_in.wire_id(),
+    ];
     exec.spawn_wired(
-        dual_port_ram(clk.clone(), ena_in, enb_in, wea_in, addra_in, addrb_in, dia_in, doa_out, dob_out),
+        dual_port_ram(clk.clone(), ena_in, enb_in, wea_in, addra_in, addrb_in, dia_in, dob_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("dual_port_ram")
-        .with_verilog("examples/memory/sv/dual_port_ram.v")
+        .with_verilog("examples/memory/sv/dual_port_ram.sv")
         .with_waveform("waveforms/dual_port_ram.vcd")
         .with_verilator_waveform("waveforms/dual_port_ram_v.vcd");
 

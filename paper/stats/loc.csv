@@ -1,0 +1,27 @@
+module,path,copper_sloc,emitted_sv_sloc,reference_sv_sloc,copper_vs_reference,scope
+bsg_adder_one_hot,examples/basejump/bsg_adder_one_hot.rs,18,25,27,0.667,third-party reference (BaseJump STL)
+bsg_counter_up_down,examples/basejump/bsg_counter_up_down.rs,22,28,20,1.1,third-party reference (BaseJump STL)
+bsg_dff_en,examples/basejump/bsg_dff_en.rs,14,12,15,0.933,third-party reference (BaseJump STL)
+bsg_encode_one_hot,examples/basejump/bsg_encode_one_hot.rs,18,25,40,0.45,third-party reference (BaseJump STL)
+bsg_gray_to_binary,examples/basejump/bsg_gray_to_binary.rs,10,18,50,0.2,third-party reference (BaseJump STL)
+bsg_mux_one_hot,examples/basejump/bsg_mux_one_hot.rs,16,23,22,0.727,third-party reference (BaseJump STL)
+sipo_block,examples/basejump/sipo_block.rs,33,75,17,1.941,third-party reference (BaseJump STL)
+flag_crossing,examples/cdc/flag_crossing.rs,14,,,,no independent reference — ratio not meaningful
+two_domain_counter,examples/cdc/two_domain_counter.rs,29,,,,no independent reference — ratio not meaningful
+two_domain_hierarchy,examples/cdc/two_domain_hierarchy.rs,53,,,,no independent reference — ratio not meaningful
+mux,examples/combinational/mux.rs,17,17,,,no independent reference — ratio not meaningful
+one_bit_comparator,examples/combinational/one_bit_comparator.rs,6,13,,,no independent reference — ratio not meaningful
+priority_encode,examples/combinational/priority_encode.rs,19,25,,,no independent reference — ratio not meaningful
+ripple_carry_adder,examples/combinational/ripple_carry_adder.rs,19,31,,,no independent reference — ratio not meaningful
+rotate_right,examples/combinational/rotate_right.rs,15,21,,,no independent reference — ratio not meaningful
+rv32i_cpu_pipelined,examples/cpu/rv32i_cpu_pipelined.rs,208,892,,,no independent reference — ratio not meaningful
+rv32i_cpu_transpilable,examples/cpu/rv32i_cpu_transpilable.rs,434,325,,,no independent reference — ratio not meaningful
+dual_port_ram,examples/memory/dual_port_ram.rs,27,43,,,no independent reference — ratio not meaningful
+lfsr,examples/sequential/lfsr.rs,23,16,,,no independent reference — ratio not meaningful
+pattern_detector,examples/sequential/pattern_detector.rs,30,18,,,no independent reference — ratio not meaningful
+pattern_detector_2,examples/sequential/pattern_detector_2.rs,58,,,,no independent reference — ratio not meaningful
+pipeline_mac,examples/sequential/pipeline_mac.rs,49,,,,no independent reference — ratio not meaningful
+shift_register,examples/sequential/shift_register.rs,33,37,,,no independent reference — ratio not meaningful
+traffic_light_fsm,examples/sequential/traffic_light_fsm.rs,45,44,,,no independent reference — ratio not meaningful
+rx,examples/uart/rx.rs,36,257,,,no independent reference — ratio not meaningful
+system,examples/uart/system.rs,52,,,,no independent reference — ratio not meaningful

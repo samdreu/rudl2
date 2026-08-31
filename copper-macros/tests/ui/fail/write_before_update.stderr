@@ -1,0 +1,5 @@
+error: output port `o` is written BEFORE the update of a register the write reads — either behind a leading input read in the pre-tick segment, or in the trailing segment (after the last `clk.tick().await`). Either way the write publishes the register's PRE-update value, which the synthesized `assign` (the flip-flop's Q) never shows at any observation instant: the hardware leads the simulator by one cycle, silently. Move the write after the register update (it then publishes the committing value), or move it before the tick/input read so it runs at the cycle's opening on committed state, or declare `o` as `RegOut<…>` (registered, immune because it commits at the edge). If this module exists to DEMONSTRATE the divergence, opt out explicitly with `#[hardware(sequential, allow_pretick_alignment)]`.
+  --> tests/ui/fail/write_before_update.rs:17:73
+   |
+17 | async fn stale_publish(clk: Clock<MainClk>, step: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk>) {
+   |                                                                         ^

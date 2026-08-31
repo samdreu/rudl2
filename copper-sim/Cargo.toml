@@ -2,6 +2,7 @@
 name = "copper-sim"
 version = "0.1.0"
 edition = "2024"
+description = "Copper async simulation executor and the Verilator equivalence verifier"
 
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }

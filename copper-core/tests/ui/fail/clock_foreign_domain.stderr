@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail/clock_foreign_domain.rs:19:17
+   |
+19 |     slow_module(Clock::<Fast>::new()); // E0308: expected Clock<Slow>, found Clock<Fast>
+   |     ----------- ^^^^^^^^^^^^^^^^^^^^ expected `Clock<Slow>`, found `Clock<Fast>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `copper_core::Clock<Slow>`
+              found struct `copper_core::Clock<Fast>`
+note: function defined here
+  --> tests/ui/fail/clock_foreign_domain.rs:16:4
+   |
+16 | fn slow_module(_c: Clock<Slow>) {}
+   |    ^^^^^^^^^^^ ---------------

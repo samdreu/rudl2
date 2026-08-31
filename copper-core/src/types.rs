@@ -8,7 +8,6 @@
 use std::marker::PhantomData;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::task::Waker;
 
 
 // primitive logic values (0, 1, X)
@@ -148,13 +147,30 @@ pub struct Bits<const N: usize> {
 }
 
 impl<const N: usize> Bits<N> {
-    /// Create a bit vector with all zeros
+    /// A bit vector of all zeros — which is also the *value* zero.
+    ///
+    /// Its counterpart is [`Bits::all_ones`], deliberately not named `one`:
+    /// all-ones is `2^N - 1`, not 1. For the value 1, use
+    /// `Bits::from_lit::<1>()`.
     pub fn zero() -> Self {
         Self { bits: [Logic::Zero; N] }
     }
-    
-    /// Create a bit vector with all ones
-    pub fn one() -> Self {
+
+    /// A bit vector with every bit set — the value `2^N - 1`, **not** 1.
+    ///
+    /// `Bits::<3>::all_ones()` is 7. This was called `one()`, which read as the
+    /// value 1 next to [`Bits::zero`] (where the all-zeros/value-zero reading
+    /// happens to coincide) and silently produced an all-ones mask instead — it
+    /// cost a BaseJump counter 49 wrong cycles before the reference caught it.
+    ///
+    /// For the value 1, use `Bits::from_lit::<1>()`.
+    ///
+    /// ```
+    /// use copper_core::Bits;
+    /// assert_eq!(Bits::<3>::all_ones().as_u128(), 7);
+    /// assert_eq!(Bits::<3>::from_lit::<1>().as_u128(), 1);
+    /// ```
+    pub fn all_ones() -> Self {
         Self { bits: [Logic::One; N] }
     }
     
@@ -213,7 +229,19 @@ impl<const N: usize> Bits<N> {
     /// The required bit width is inferred from the constant value itself,
     /// and the call is rejected at compile time if `N` is too narrow.
     ///
+    /// STAYS A DOCTEST, deliberately — the other `compile_fail` cases moved to
+    /// trybuild in 2026-08-26, this one cannot. The guard is a
+    /// post-monomorphization `const` assert, which `cargo check` does not evaluate
+    /// (measured: `cargo check` passes, `cargo build` fails), and trybuild compiles
+    /// check-style. A doctest builds fully, so it is the only form that observes it.
+    ///
+    /// THE `use` IS LOAD-BEARING. Without it this doctest failed on `E0412: cannot
+    /// find type `Bits`` — it passed for years without ever reaching the width
+    /// guard. That is precisely what a bare `compile_fail` cannot tell you, and it
+    /// was found by trying to migrate it.
+    ///
     /// ```compile_fail
+    /// use copper_core::Bits;
     /// let _: Bits<4> = Bits::from_lit::<31>(); // 31 needs 5 bits — compile error
     /// ```
     pub fn from_lit<const VAL: u128>() -> Self {
@@ -824,7 +852,6 @@ pub trait ClockDomain: 'static {}
 #[derive(Debug)]
 struct ClockState {
     cycle: u64,
-    wakers: Vec<Waker>,
     listeners: Vec<std::sync::Weak<dyn ClockEdgeListener>>,
 }
 
@@ -844,7 +871,6 @@ impl<Domain: ClockDomain> Clock<Domain> {
         Self {
             state: Arc::new(Mutex::new(ClockState {
                 cycle: 0, // starts at t=0
-                wakers: Vec::new(), // no wakers initially
                 listeners: Vec::new(), // no listeners initially
             })),
             _domain: PhantomData, 
@@ -871,12 +897,6 @@ impl<Domain: ClockDomain> Clock<Domain> {
                 None => false, // remove if listener was dropped
             }
         });
-        // wake any tasks waiting on this clock tick
-        let wakers = std::mem::take(&mut state.wakers);
-        drop(state); // release lock before waking ?????
-        for w in wakers {
-            w.wake();
-        }
     }
     
     /// Create a future that completes on the next clock edge
@@ -931,18 +951,57 @@ pub struct ClockTick<Domain: ClockDomain> {
     _domain: PhantomData<Domain>,
 }
 
+thread_local! {
+    /// Whether a `clk.tick()` resolves in the current settle pass, keyed per clock
+    /// domain (by `TypeId`) so that ticking one domain's clock cannot perturb
+    /// another domain's phase-gated futures. The executor enables this in the
+    /// POST-edge pass only, so a reaction's post-tick code runs after
+    /// `clk.advance()` within the same `tick_clock` (the post-edge continuation
+    /// convention — a register clocked at edge N is observable in cycle N). Each loop
+    /// reaction still advances by exactly one tick per `tick_clock` — never compressed
+    /// into the same call as the previous reaction. See
+    /// design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md. A domain with no entry yet
+    /// defaults to `true` so bare-future unit tests that don't drive the phase
+    /// still progress.
+    static TICK_RESOLVING: std::cell::RefCell<std::collections::HashMap<std::any::TypeId, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Executor hook: mark whether `Domain`'s `clk.tick()` resolves in the current
+/// settle pass. Scoped per clock domain — setting this for one domain has no
+/// effect on any other domain's tasks.
+pub fn set_tick_resolving<Domain: ClockDomain>(resolves: bool) {
+    TICK_RESOLVING.with(|c| {
+        c.borrow_mut().insert(std::any::TypeId::of::<Domain>(), resolves);
+    });
+}
+
+fn tick_resolves_now<Domain: ClockDomain>() -> bool {
+    TICK_RESOLVING.with(|c| {
+        c.borrow().get(&std::any::TypeId::of::<Domain>()).copied().unwrap_or(true)
+    })
+}
+
 impl<Domain: ClockDomain> std::future::Future for ClockTick<Domain> {
     type Output = ();
-    
+
+    // No waker registration: the simulation executor doesn't use one (it polls
+    // every task unconditionally every delta cycle via a noop waker — see
+    // `HardwareExecutor::poll_tasks`), and this future previously pushed a new
+    // `Waker` clone into `state.wakers` on every Pending poll with no dedup,
+    // growing unboundedly across the delta cycles within a single settle phase
+    // before `advance()` finally drained it. Removed rather than fixed to dedup:
+    // a real waker-based executor is not on the roadmap (the fixed-point
+    // delta-cycle model has no equivalent in `futures`' wake-driven primitives),
+    // so there was nothing for the registration to ever usefully serve.
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut state = self.state.lock().unwrap();
-        if state.cycle >= self.target_cycle {
+        let state = self.state.lock().unwrap();
+        if state.cycle >= self.target_cycle && tick_resolves_now::<Domain>() {
             std::task::Poll::Ready(())
         } else {
-            state.wakers.push(cx.waker().clone());
             std::task::Poll::Pending
         }
     }
@@ -1138,8 +1197,8 @@ mod tests {
     }
 
     #[test]
-    fn test_one_bits() {
-        let bits: Bits<8> = Bits::one();
+    fn test_all_ones_bits() {
+        let bits: Bits<8> = Bits::all_ones();
 
         assert_eq!(bits.as_u128(), 255);
         assert_eq!(format!("{}", bits), "11111111");
@@ -1463,7 +1522,7 @@ mod tests {
 
     #[test]
     fn test_and_reduce() {
-        assert_eq!(Bits::<4>::one().and_reduce(), Logic::One);
+        assert_eq!(Bits::<4>::all_ones().and_reduce(), Logic::One);
         assert_eq!(Bits::<4>::from_lit::<0b1110>().and_reduce(), Logic::Zero);
         // X & 1 & 1 & 1 = X
         let x1 = Bits::from_array([Logic::X, Logic::One, Logic::One, Logic::One]);
@@ -1495,7 +1554,7 @@ mod tests {
 
     #[test]
     fn test_nand_nor_xnor_reduce() {
-        assert_eq!(Bits::<4>::one().nand_reduce(), Logic::Zero);
+        assert_eq!(Bits::<4>::all_ones().nand_reduce(), Logic::Zero);
         assert_eq!(Bits::<4>::zero().nor_reduce(), Logic::One);
         assert_eq!(Bits::<4>::from_lit::<0b0110>().xnor_reduce(), Logic::One); // even parity → xnor = 1
     }
@@ -1635,7 +1694,7 @@ mod tests {
 
     #[test]
     fn test_mux_x_all_differ() {
-        let a: Bits<4> = Bits::one();
+        let a: Bits<4> = Bits::all_ones();
         let b: Bits<4> = Bits::zero();
         let r = Bits::mux(Logic::X, &a, &b);
         assert_eq!(r, Bits::x());

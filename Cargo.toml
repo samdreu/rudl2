@@ -1,11 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["copper-core", "copper-macros", "copper-codegen", "copper-sim"]
+members = ["copper-core", "copper-analysis", "copper-macros", "copper-codegen", "copper-sim"]
 
 [package]
 name = "copper"
 version = "0.1.0"
 edition = "2024"
+description = "Copper: a Rust-embedded HDL — hardware as #[hardware] async fns, simulated and transpiled to SystemVerilog"
 
 [dependencies]
 copper-core = { path = "copper-core" }
@@ -14,6 +15,22 @@ copper-codegen = { path = "copper-codegen" }
 copper-sim = { path = "copper-sim" }
 env_logger = "0.11.8"
 log = "0.4.29"
+
+[build-dependencies]
+# `build.rs` generates one differential equivalence test per `#[hardware]` module in
+# tests/fixtures/ (phase 2 of design_docs/CORPUS_DIFFERENTIAL_SWEEP.md), which means
+# parsing their signatures — the same `syn` the rest of the pipeline reads.
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+
+[dev-dependencies]
+# The shared control/liveness analysis — the equivalence harness uses it to
+# structurally reg-match inferred registers against independent hand-written SV
+# (G2 of design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md).
+copper-analysis = { path = "copper-analysis" }
+# `tests/cdc_synchronizer_anchor.rs` parses a fixture to call `infer_registers`
+# directly (pinning the synchronizer register-inference gap).
+syn = { version = "2", features = ["full", "parsing"] }
 
 [[example]]
 name = "one_bit_comparator"
@@ -44,6 +61,10 @@ name = "pattern_detector"
 path = "examples/sequential/pattern_detector.rs"
 
 [[example]]
+name = "pattern_detector_2"
+path = "examples/sequential/pattern_detector_2.rs"
+
+[[example]]
 name = "traffic_light_fsm"
 path = "examples/sequential/traffic_light_fsm.rs"
 
@@ -60,12 +81,16 @@ name = "dual_port_ram"
 path = "examples/memory/dual_port_ram.rs"
 
 [[example]]
-name = "rv32i_cpu"
-path = "examples/cpu/rv32i_cpu.rs"
-
-[[example]]
 name = "rv32i_cpu_pipelined"
 path = "examples/cpu/rv32i_cpu_pipelined.rs"
+
+[[example]]
+name = "rv32i_cpu_transpilable"
+path = "examples/cpu/rv32i_cpu_transpilable.rs"
+# `cargo test` builds an example but does not run it. This compiles the file as a
+# test target too, so its self-check runs under `cargo test` instead of only under
+# `tools/regression.sh`.
+test = true
 
 [[example]]
 name = "uart_rx"
@@ -78,3 +103,40 @@ path = "examples/uart/system.rs"
 [[example]]
 name = "two_domain_counter"
 path = "examples/cdc/two_domain_counter.rs"
+
+[[example]]
+name = "two_domain_hierarchy"
+path = "examples/cdc/two_domain_hierarchy.rs"
+
+[[example]]
+name = "flag_crossing"
+path = "examples/cdc/flag_crossing.rs"
+
+# BaseJump STL — Copper modules checked against independent (BaseJump) Verilog.
+[[example]]
+name = "bsg_dff_en"
+path = "examples/basejump/bsg_dff_en.rs"
+
+[[example]]
+name = "bsg_mux_one_hot"
+path = "examples/basejump/bsg_mux_one_hot.rs"
+
+[[example]]
+name = "bsg_counter_up_down"
+path = "examples/basejump/bsg_counter_up_down.rs"
+
+[[example]]
+name = "bsg_encode_one_hot"
+path = "examples/basejump/bsg_encode_one_hot.rs"
+
+[[example]]
+name = "bsg_gray_to_binary"
+path = "examples/basejump/bsg_gray_to_binary.rs"
+
+[[example]]
+name = "bsg_adder_one_hot"
+path = "examples/basejump/bsg_adder_one_hot.rs"
+
+[[example]]
+name = "sipo_block"
+path = "examples/basejump/sipo_block.rs"

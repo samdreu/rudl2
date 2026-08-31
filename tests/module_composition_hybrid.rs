@@ -1,11 +1,17 @@
+//! Module-composition tests: combinational logic as plain functions, sequential
+//! modules spawned as a tracked hierarchy (`spawn_child` / `module_info`) and as
+//! peers (`spawn_untracked`). Uses the current `In<T,D>` / `Out<T,D>` wire port
+//! model.
+
+use copper_core::port::{wire, In, Out};
 use copper_core::{Clock, ClockDomain};
 use copper_macros::hardware;
-use copper_sim::{HardwareExecutor, spawn_child};
-use std::sync::{Arc, Mutex};
+use copper_sim::{spawn_child, HardwareExecutor};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
+// Combinational logic is just plain Rust functions — no hardware wrapper needed.
 fn add_one(x: u8) -> u8 {
     x.wrapping_add(1)
 }
@@ -18,35 +24,59 @@ fn affine_mix(x: u8) -> u8 {
     double(add_one(x))
 }
 
-#[hardware]
-async fn stage_add_one(clk: Clock<MainClk>, input: Arc<Mutex<u8>>, output: Arc<Mutex<u8>>) {
+// A registered pipeline stage: drives `output` with the previous cycle's value,
+// then latches `add_one(input)` into its register.
+#[hardware(sequential)]
+async fn stage_add_one(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
+    // The canonical registered-stage spelling (migrated 2026-08-27): publish the
+    // committed register at the cycle's opening, sample the input at the
+    // pre-edge exactly as the flop does (a leading read is `Deferred`), commit
+    // the update at the edge. This matches `always_ff reg <= add_one(input);
+    // assign output = reg;` cycle-for-cycle, standalone AND composed — a
+    // two-stage pipeline keeps its two-cycle latency. The old trailing
+    // publish-then-load order published the PRE-update value and diverged from
+    // its own emitted SV by one (measured as `v8t_stage_publish_then_load`);
+    // the extended `pretick_out_write_before_update` now refuses it.
     loop {
+        output.write(reg);
+        let x = input.read();
         clk.tick().await;
-        *output.lock().unwrap() = reg;
-        let in_val = *input.lock().unwrap();
-        reg = add_one(in_val);
+        reg = add_one(x);
     }
 }
 
-#[hardware]
-async fn stage_double(clk: Clock<MainClk>, input: Arc<Mutex<u8>>, output: Arc<Mutex<u8>>) {
+#[hardware(sequential)]
+async fn stage_double(clk: Clock<MainClk>, input: In<u8, MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
+    // The canonical registered-stage spelling (migrated 2026-08-27): publish the
+    // committed register at the cycle's opening, sample the input at the
+    // pre-edge exactly as the flop does (a leading read is `Deferred`), commit
+    // the update at the edge. This matches `always_ff reg <= double(input);
+    // assign output = reg;` cycle-for-cycle, standalone AND composed — a
+    // two-stage pipeline keeps its two-cycle latency. The old trailing
+    // publish-then-load order published the PRE-update value and diverged from
+    // its own emitted SV by one (measured as `v8t_stage_publish_then_load`);
+    // the extended `pretick_out_write_before_update` now refuses it.
     loop {
+        output.write(reg);
+        let x = input.read();
         clk.tick().await;
-        *output.lock().unwrap() = reg;
-        let in_val = *input.lock().unwrap();
-        reg = double(in_val);
+        reg = double(x);
     }
 }
 
-#[hardware]
-async fn counter_by(clk: Clock<MainClk>, step: u8, output: Arc<Mutex<u8>>) {
+// `step` is a compile-time constant (a module parameter in hardware), so it is a
+// const generic rather than a runtime port — which also lets it be a `#[hardware]`
+// module (the macro requires ports to be `Clock`/`In`/`Out`).
+#[hardware(sequential)]
+async fn counter_by<const STEP: u8>(clk: Clock<MainClk>, output: Out<u8, MainClk>) {
     let mut reg = 0u8;
+    // Head-write spelling — see stage_add_one's migration note.
     loop {
+        output.write(reg);
         clk.tick().await;
-        *output.lock().unwrap() = reg;
-        reg = reg.wrapping_add(step);
+        reg = reg.wrapping_add(STEP);
     }
 }
 
@@ -63,30 +93,41 @@ fn sequential_modules_spawn_with_spawn_child() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let in_data = Arc::new(Mutex::new(0u8));
-    let wire = Arc::new(Mutex::new(0u8));
-    let out_data = Arc::new(Mutex::new(0u8));
+    // in_data → stage_add_one → mid → stage_double → out_data
+    let (in_drv, in_port) = wire::<u8, MainClk>(0);
+    let (mid_out, mid_in) = wire::<u8, MainClk>(0);
+    let (out_drv, out_obs) = wire::<u8, MainClk>(0);
 
+    let s1_reads = vec![in_port.wire_id()];
     spawn_child!(
         exec,
         "pipeline",
         "stage_add_one",
-        stage_add_one(clk.clone(), Arc::clone(&in_data), Arc::clone(&wire))
+        stage_add_one(clk.clone(), in_port, mid_out),
+        s1_reads
     );
+    let s2_reads = vec![mid_in.wire_id()];
     spawn_child!(
         exec,
         "pipeline",
         "stage_double",
-        stage_double(clk.clone(), Arc::clone(&wire), Arc::clone(&out_data))
+        stage_double(clk.clone(), mid_in, out_drv),
+        s2_reads
     );
 
+    // Two-stage registered pipeline: affine_mix has a TWO-FLOP latency — the
+    // input driven before edge k is sampled at k's pre-edge, commits through
+    // stage 1 at edge k and stage 2 at edge k+1, so it appears at observation
+    // k+1. Re-blessed with the canonical stage spelling (2026-08-27): the old
+    // stream had one extra cycle, which was the stages' measured divergence
+    // from their own emitted SV, not the pipeline's latency.
     let inputs = [3u8, 7, 11, 1];
-    let expected_outputs = [0u8, 0, 8, 16];
+    let expected_outputs = [0u8, 8, 16, 24];
 
     for (input, expected) in inputs.iter().zip(expected_outputs.iter()) {
-        *in_data.lock().unwrap() = *input;
+        in_drv.write(*input);
         exec.tick_clock(&mut clk);
-        let observed = *out_data.lock().unwrap();
+        let observed = out_obs.read();
         assert_eq!(observed, *expected, "cycle {}", clk.cycle());
     }
 
@@ -107,24 +148,27 @@ fn sequential_modules_spawn_with_spawn_child() {
 }
 
 #[test]
-fn peer_modules_continue_using_exec_spawn() {
+fn peer_modules_continue_using_spawn_untracked() {
     let mut clk = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();
 
-    let out1 = Arc::new(Mutex::new(0u8));
-    let out2 = Arc::new(Mutex::new(0u8));
-    let out3 = Arc::new(Mutex::new(0u8));
+    let (out1_drv, out1_obs) = wire::<u8, MainClk>(0);
+    let (out2_drv, out2_obs) = wire::<u8, MainClk>(0);
+    let (out3_drv, out3_obs) = wire::<u8, MainClk>(0);
 
-    exec.spawn(counter_by(clk.clone(), 1, Arc::clone(&out1)));
-    exec.spawn(counter_by(clk.clone(), 2, Arc::clone(&out2)));
-    exec.spawn(counter_by(clk.clone(), 5, Arc::clone(&out3)));
+    exec.spawn_untracked(counter_by::<1>(clk.clone(), out1_drv), vec![]);
+    exec.spawn_untracked(counter_by::<2>(clk.clone(), out2_drv), vec![]);
+    exec.spawn_untracked(counter_by::<5>(clk.clone(), out3_drv), vec![]);
 
-    let expected = [(0u8, 0u8, 0u8), (1, 2, 5), (2, 4, 10), (3, 6, 15)];
+    // Re-blessed with the head-write migration: the first observation shows the
+    // count committed at the first edge (the `counter` example's anchored
+    // semantics), not the pre-update initial value.
+    let expected = [(1u8, 2u8, 5u8), (2, 4, 10), (3, 6, 15), (4, 8, 20)];
 
     for (exp1, exp2, exp3) in expected {
         exec.tick_clock(&mut clk);
-        assert_eq!(*out1.lock().unwrap(), exp1, "counter1 cycle {}", clk.cycle());
-        assert_eq!(*out2.lock().unwrap(), exp2, "counter2 cycle {}", clk.cycle());
-        assert_eq!(*out3.lock().unwrap(), exp3, "counter3 cycle {}", clk.cycle());
+        assert_eq!(out1_obs.read(), exp1, "counter1 cycle {}", clk.cycle());
+        assert_eq!(out2_obs.read(), exp2, "counter2 cycle {}", clk.cycle());
+        assert_eq!(out3_obs.read(), exp3, "counter3 cycle {}", clk.cycle());
     }
 }

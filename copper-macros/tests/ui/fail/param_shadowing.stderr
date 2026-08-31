@@ -1,0 +1,19 @@
+error: `d` shadows the hardware port parameter of the same name; the `let` binding hides the port for the rest of the body (reads and writes hit the local, not the wire). Rename the local.
+  --> tests/ui/fail/param_shadowing.rs:14:13
+   |
+14 |         let d: Bits<8> = Bits::zero();
+   |             ^
+
+warning: unused imports: `Bits` and `Clock`
+ --> tests/ui/fail/param_shadowing.rs:1:19
+  |
+1 | use copper_core::{Bits, Clock, ClockDomain};
+  |                   ^^^^  ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `In` and `Out`
+ --> tests/ui/fail/param_shadowing.rs:2:25
+  |
+2 | use copper_core::port::{In, Out};
+  |                         ^^  ^^^

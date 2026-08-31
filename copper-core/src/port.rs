@@ -2,19 +2,85 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct DirtyHandle(Arc<AtomicBool>);
+use crate::types::{Clock, ClockDomain, ClockEdgeListener};
+
+/// Stable identity of a wire — the address of its shared value cell.
+///
+/// Two ports share a `WireId` iff they share the same cell: an `Out`/`RegOut`
+/// writer and every `In` reader of the same wire. The executor uses this to match
+/// a producer (writes wire `W`) to its consumers (read wire `W`) when building the
+/// inter-module dependency graph (levelized scheduling, item 6). A wire's identity
+/// is its cell pointer, so it is stable for the wire's lifetime and cheap to hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WireId(pub usize);
+
+/// How a producer drives its output wire — the discriminator the executor uses to
+/// keep the dependency graph **combinational-only** (item 6).
+///
+/// A plain `Out` write lands *during* the settle, so a consumer reading that wire
+/// depends on the producer within the same phase → a real combinational edge. A
+/// `RegOut` commits at the clock edge (via its `ClockEdgeListener`), *between* the
+/// pre- and post-edge settles, so during a settle its value is constant: a
+/// registered output is a phase **source**, never a settle-phase sink, and must
+/// not induce a combinational edge (that is exactly what would create false cycles
+/// for legal sequential feedback — see `LEVELIZED_SCHEDULING_SCOPE.md`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WireKind {
+    /// Plain `Out` — a combinational sink; induces producer→consumer edges.
+    Comb,
+    /// `RegOut` — a phase source (edge-committed); induces no combinational edge.
+    Registered,
+}
+
+pub struct DirtyHandle {
+    dirty: Arc<AtomicBool>,
+    /// The wire this handle's output drives — recorded so the executor can learn
+    /// which wire a producer writes (its dependency-graph out-edges) directly from
+    /// the dirty handles a task is spawned with.
+    wire_id: WireId,
+    /// Whether that output is combinational (`Out`) or registered (`RegOut`) —
+    /// only combinational outputs are dependency-graph sinks.
+    kind: WireKind,
+}
 impl DirtyHandle {
     pub fn take(&self) -> bool {
-        self.0.swap(false, Ordering::SeqCst)
+        self.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// The wire this handle drives (a producer's dependency-graph out-edge).
+    pub fn wire_id(&self) -> WireId {
+        self.wire_id
+    }
+
+    /// Whether the driven output is combinational or registered — the executor
+    /// only draws a dependency edge for [`WireKind::Comb`] outputs.
+    pub fn wire_kind(&self) -> WireKind {
+        self.kind
     }
 }
 
-// Non-Clone - one writer per wire, enforced by the compiler
+/// A wire's single **write** handle.
+///
+/// `Out` is deliberately **not `Clone`**: a wire has exactly one driver, so a
+/// second writer — a multi-driver conflict — is a *compile error*, not a run-time
+/// race. This is the executable spec for that invariant (cf. `In`, which *is*
+/// `Clone` because many readers are fine):
+///
+/// Asserted, with its compiler message pinned, in
+/// `copper-core/tests/ui/fail/out_not_clone_single_driver.rs`. Shown here rather
+/// than run: `compile_fail` would pass whatever the reason for failing.
+///
+/// ```ignore
+/// use copper_core::port::wire;
+/// use copper_core::Logic;
+/// let (out, _in) = wire::<Logic, ()>(Logic::Zero);
+/// let _second_driver = out.clone(); // error: `Out<Logic>` is not `Clone`
+/// ```
 pub struct Out<T, D = ()> {
     inner: Arc<Mutex<T>>,
     dirty: Arc<AtomicBool>,
     _domain: PhantomData<D>
-} 
+}
 
 impl<T: PartialEq + Clone, D> Out<T, D> {
     pub fn write(&self, value: T) {
@@ -26,7 +92,16 @@ impl<T: PartialEq + Clone, D> Out<T, D> {
     }
 
     pub fn dirty_handle(&self) -> DirtyHandle {
-        DirtyHandle(self.dirty.clone())
+        DirtyHandle { dirty: self.dirty.clone(), wire_id: self.wire_id(), kind: WireKind::Comb }
+    }
+}
+
+impl<T, D> Out<T, D> {
+    /// The identity of the wire this output drives. Equal to the [`WireId`] of
+    /// every `In` reading the same wire, so the executor can match producer to
+    /// consumer.
+    pub fn wire_id(&self) -> WireId {
+        WireId(Arc::as_ptr(&self.inner) as usize)
     }
 }
 
@@ -48,6 +123,15 @@ impl<T: Clone, D> In<T, D> {
     }
 }
 
+impl<T, D> In<T, D> {
+    /// The identity of the wire this input reads. Equal to the [`WireId`] of the
+    /// `Out`/`RegOut` that drives the same wire, so the executor can record this
+    /// task's dependency-graph in-edges from the `In` handles it is spawned with.
+    pub fn wire_id(&self) -> WireId {
+        WireId(Arc::as_ptr(&self.inner) as usize)
+    }
+}
+
 pub fn wire<T: Clone + PartialEq, D>(initial: T) -> (Out<T, D>, In<T, D>) {
     let inner = Arc::new(Mutex::new(initial));
     let dirty = Arc::new(AtomicBool::new(false));
@@ -60,6 +144,93 @@ pub fn wire<T: Clone + PartialEq, D>(initial: T) -> (Out<T, D>, In<T, D>) {
         inner,
         _domain: PhantomData,
     };
+    (out, input)
+}
+
+// ── Registered (implicit-hold) output ─────────────────────────────────────────
+//
+// The simulation model of a conditionally-driven output port. In hardware such an
+// output is a flip-flop with enable: it captures its written value at the clock
+// edge and holds otherwise (a combinational conditional drive would be a latch).
+// A `RegOut` mirrors that: `write` buffers a value, and at each `posedge` (via the
+// `ClockEdgeListener` path `clk.advance()` fires, between the pre- and post-edge
+// settle) the buffered value commits to the observed cell — so it is seen one
+// cycle after the write executes, exactly like the transpiled implicit-hold
+// register. Unconditional outputs stay on plain combinational `Out`.
+//
+// See EXECUTION_MODEL_RECONCILIATION.md (output-timing) and `Memory`, which uses
+// the same `on_posedge` commit pattern.
+
+struct RegOutShared<T> {
+    /// The observed value (what the reader sees). Shared with the `In` handle.
+    committed: Arc<Mutex<T>>,
+    /// A write buffered this cycle, committed at the next posedge; `None` = hold.
+    pending: Mutex<Option<T>>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl<T: Clone + PartialEq + Send + Sync> ClockEdgeListener for RegOutShared<T> {
+    fn on_posedge(&self) {
+        if let Some(v) = self.pending.lock().unwrap().take() {
+            let mut c = self.committed.lock().unwrap();
+            if *c != v {
+                *c = v;
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        // No pending write → the register holds its committed value.
+    }
+}
+
+/// The write handle for a registered output. Same surface as `Out` (`write`,
+/// `dirty_handle`), so a module body is identical whether its output is plain or
+/// registered.
+pub struct RegOut<T, D> {
+    shared: Arc<RegOutShared<T>>,
+    _domain: PhantomData<D>,
+}
+
+impl<T: Clone + PartialEq + Send + Sync, D> RegOut<T, D> {
+    pub fn write(&self, value: T) {
+        *self.shared.pending.lock().unwrap() = Some(value);
+    }
+
+    pub fn dirty_handle(&self) -> DirtyHandle {
+        DirtyHandle {
+            dirty: self.shared.dirty.clone(),
+            wire_id: self.wire_id(),
+            kind: WireKind::Registered,
+        }
+    }
+}
+
+impl<T, D> RegOut<T, D> {
+    /// The identity of the wire this registered output drives — the committed
+    /// cell the reader observes, so it matches the [`WireId`] of every `In` on the
+    /// same wire. (A `RegOut` commits at the clock edge, so it is a phase *source*
+    /// rather than a combinational sink — the executor uses that distinction when
+    /// classifying dependency edges, item 6.)
+    pub fn wire_id(&self) -> WireId {
+        WireId(Arc::as_ptr(&self.shared.committed) as usize)
+    }
+}
+
+/// Create a registered output wired to a reader, clocked by `clock`. The output
+/// commits buffered writes at each `posedge` and holds between them.
+pub fn registered_wire<T: Clone + PartialEq + Send + Sync + 'static, D: ClockDomain>(
+    clock: &Clock<D>,
+    initial: T,
+) -> (RegOut<T, D>, In<T, D>) {
+    let committed = Arc::new(Mutex::new(initial));
+    let shared = Arc::new(RegOutShared {
+        committed: committed.clone(),
+        pending: Mutex::new(None),
+        dirty: Arc::new(AtomicBool::new(false)),
+    });
+    let listener: Arc<dyn ClockEdgeListener> = shared.clone();
+    clock.register_listener(Arc::downgrade(&listener));
+    let out = RegOut { shared, _domain: PhantomData };
+    let input = In { inner: committed, _domain: PhantomData };
     (out, input)
 }
 

@@ -2,12 +2,14 @@
 name = "copper-macros"
 version = "0.1.0"
 edition = "2024"
+description = "The #[hardware] proc macro: signature validation, CDC enforcement, simulation wiring"
 
 [lib]
 proc-macro = true
 
 [dependencies]
 copper-core = { version = "0.1.0", path = "../copper-core" }
+copper-analysis = { version = "0.1.0", path = "../copper-analysis" }
 env_logger = "0.11.8"
 log = "0.4.29"
 proc-macro2 = "1.0.106"

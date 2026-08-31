@@ -1,0 +1,586 @@
+# Copper Executor & Synchronous-Semantics — Implementation Plan
+
+> **Single source of truth** for the executor/semantics work on `feat/reachability-cfg` and its
+> follow-ons. Absorbed the former `EXECUTOR_CHANGE_PLAN.md` on 2026-07-29 (that doc is deleted;
+> its decision, empirical status, preconditions, and staged phases are folded in here).
+> Companion spec: `SYNCHRONOUS_SEMANTICS.md` (updating it is item 5). Paper cross-refs:
+> `paper/threats_to_validity.md` (T1, T6), `paper/00_claims_audit.md` (LEAD #1),
+> `paper/related_work.md` (coroutine prior art).
+>
+> **Progress:** items 1 + 1b **DONE** (commits `8e66144`, `3452d38`); item 2 **DONE (analysis +
+> well-formedness; 2026-07-30)** — landed in `copper-analysis` as a real CFG over `syn::ItemFn`
+> consumed by both front-ends, across 7 commits (`f4d144d`, `f3eb72e`, `c03022f`, `b4a8325`,
+> `fb45929`, `51ec9dc`, `d32c788`). What shipped and is enforced/verified:
+> **(a) backward-liveness register inference** (interior-await regs + tuple assigns), validated
+> against 4 independent hand-written SVs (G2 reg-match, wired into `EquivalenceTest`) *and*
+> reconciled against codegen's own emitted flip-flops (`register_reconciliation.rs`, 17+ modules ≡
+> the shared set + only synthetic phase/pc); **(b) reachability well-formedness** — hard spanned
+> compile error in `copper-macros` + `copper-codegen` (caught the real `det_010_awaits` tickless
+> spin, since fixed; all 38 real sequential modules pass); **(c) definite-assignment** for
+> `#[hardware(combinational)]` modules, enforced in the macro (re-scoped after finding a sequential
+> `Out` legitimately *holds* — enabled register, `sim ≡ BaseJump`); **(d) nested-loop CFG builder**
+> — recursive reachability inside nested loops; **(e) control_extract match-arm FSM lowering**
+> (structurally verified). Formalized in `SYNCHRONOUS_SEMANTICS.md` (CFG model) and
+> `paper/threats_to_validity.md` (T1). **Deferred / out of scope (decided):** combinational-loop
+> detection → **item 6** (cross-module, needs the inter-module wiring DAG; runtime oscillation
+> covers it); retiring `split_at_ticks` so codegen *consumes* the set → behavior-neutral churn,
+> skipped (the sets provably agree); nested-loop *codegen* support (codegen rejects nested loops —
+> sim-only). **Item 3 DONE (2026-07-30)** — the runtime read-timing oracle (`synced_read.rs`) is
+> retired for the macro's static per-read edge-phase classification (`copper_analysis::classify_reads`);
+> `det_010_awaits_matches_independent_verilog` is un-ignored & passing; see the item 3 section. Items
+> 4–7 not started. Gates **G1 DONE** (`design_docs/TIMING_COVERAGE_MATRIX.md` +
+> `tests/det_010_independent_golden.rs`), **G3 DONE** (`tests/poll_order_fuzz.rs` +
+> `tests/golden_traces.rs`), **G4 DONE** (MyHDL boundary holds; Prost LATTE'26 found →
+> contribution 1 re-scopes; recorded in `paper/`), **G6 DONE** (c2 feasible — new
+> `copper-analysis` crate consumed by both macro + codegen, no cycle; `syn::ItemFn` input),
+> **G2 DONE** (structural reg-match defined + `copper-analysis` capability built), and **G5 DONE**
+> (provable-claims register below). **All gates G1–G6 cleared** — item 2 can begin.
+>
+> **Addendum (2026-08-27):** the Progress block above is the dated record of the
+> item-2/3 landing and is not maintained line-by-line. Since then: **item 6 is
+> COMPLETE** (levelized scheduling is the production default —
+> `LEVELIZED_SCHEDULING_SCOPE.md`), **item 5 is DONE** (`SYNCHRONOUS_SEMANTICS.md`
+> was rebased onto the cycle-dataflow model), the reconciliation now spans **97
+> clocked modules** (was "17+"), and the equivalence scope grew to the whole
+> example corpus (34/34 transpile; the pipelined CPU is itself an equivalence
+> result — `tests/rv32i_pipelined_verilator.rs`). Current per-cause status lives
+> in the repo `TODO` and `paper/00_claims_audit.md` §Re-verification.
+
+## Architecture decision (the foundation) — c2 + "just Rust"
+
+**Approach (c2): the default simulator always executes plain Rust; read-timing/register knowledge
+moves out of the runtime heuristic (`synced_read`) into a shared, compile-time control/liveness
+analysis (a CFG) consumed by *both* the sim macro and the transpiler.**
+
+Explicitly rejected:
+- **(b) IR interpreter as the sim** — having the simulator interpret CHIR/an FSM-IR instead of
+  executing the Rust. Rejected because it abandons sim/transpiler independence (what makes the
+  same-source equivalence non-circular — T6) and dissolves LEAD contribution #1 ("rustc's async
+  transform *is* the FSM"). (A CHIR interpreter may still exist as a *validation-only* backend —
+  item 7 — but never as the default sim.)
+- **(c1) duplicate analysis** — the macro building its own control analysis independent of
+  codegen's. Rejected because register inference (T1) and the FSM report already need one
+  authoritative CFG, and two analyses that must nonetheless agree is itself a correctness hazard.
+
+**Why the two constraints are locked:**
+1. **"Sim is plain Rust" is load-bearing for the paper.** LEAD #1 = rustc's coroutine lowering is
+   the FSM; contribution 2's non-circularity (T6) rests on sim and transpiler being independent
+   derivations from one source. Runtime execution stays plain Rust; no runtime timing oracle.
+2. **rustc over-captures (T1).** The synthesizable register set can't be read off the `Future`
+   layout (a conservative, unstable superset), so Copper needs its own liveness analysis anyway —
+   the same reachability/liveness CFG this branch is about. One analysis, three payoffs: register
+   inference, read-timing facts, and the FSM report.
+
+## Context / motivation
+
+Copper's execution model is under-specified in two ways that matter for capabilities designs
+should support: (1) multiple `clk.tick().await` points per loop iteration, distributed across
+branches, not just today's single-trailing-tick shape; and (2) genuine multi-clock designs (e.g.
+an async/dual-clock FIFO) as one coherent component, not a hand-wired bundle of separately-spawned
+modules.
+
+Investigating both surfaced that Copper's core invariant — "every path through a hardware loop
+must eventually reach an await" — **is not actually checked anywhere today**; it holds only as an
+accident of the single-tick-per-iteration construction. That accident silently masks real bugs (a
+zero-tick branch gets a phantom cycle it never asked for) and stops holding once
+branch-tick-distribution generalizes. So formalizing the semantics and making the invariant a
+real, checkable analysis is required groundwork regardless of multi-clock.
+
+For multi-clock, the investigation reframed the problem: the missing piece isn't "let one
+coroutine tick multiple clocks" (needs new concurrent-loop syntax, and creates a multiple-driver
+problem) — it's **hierarchical instantiation of a clocked submodule**, which doesn't exist for
+*any* case yet. Real hardware idiom already assumes this: a parent with no `always_ff` of its own
+that purely instantiates children, each on its own clock.
+
+**Standing priority:** correct simulation semantics first, transpilation follows — verified
+empirically against **independent hand-written Verilog** (BaseJump STL), never against the
+transpiler's own output (circular). Overarching: **novel claims that are proven/evidence-backed.**
+
+## Empirical status of the read-timing problem (measured 2026-07-29)
+
+Against **independent hardware**, the sim has **no known read-timing failure**:
+- `examples/basejump/sipo_block.rs` — the mid-phase-read question with a **third-party BaseJump
+  hardware golden** — **PASSES** cycle-by-cycle under Verilator (uses `RegOut` for the output
+  axis). So the mid-phase *read* timing is correct in the current sim.
+- The still-ignored cases are **not** hardware-proven read-timing bugs: `accum_2`
+  (`tests/read_timing_equivalence.rs`) and `probe_timing_investigation` are sim-vs-**transpiler**
+  comparisons whose residual is the output register-vs-combinational (RegOut) axis, not read
+  timing; `det_010_variants` (`examples/sequential/pattern_detector_2.rs`) is a **heuristic
+  fragility** case that only checks two Copper codings against each other, not hardware.
+
+**Consequence:** the read-timing part of this work (item 3) is a **robustness + capability**
+investment — retire a fragile runtime heuristic; gain register inference + the FSM report — **not**
+a fix for a live hardware-divergence bug. This lowers its urgency/risk and should be stated
+honestly.
+
+## Preconditions (gates) before the c2/CFG-timing work proceeds
+
+The two priorities — **proven/evidence-backed novelty** and **correctness** — make these gates to
+clear before the c2 refactor + read-timing retirement (items 3/6 and the c2-sharing of item 2)
+proceed. They do *not* block continuing the item-2 CFG scaffolding already in progress on the
+branch. G1/G3/G4/G6 are do-first tasks (**all four DONE**); G2/G5 are decisions (**both now
+recorded — DONE**).
+
+- **G1 — Timing-pattern coverage matrix + fill the `det_010` gap (correctness). DONE — see
+  `design_docs/TIMING_COVERAGE_MATRIX.md`.** c2 makes sim-vs-transpiler *timing* agree by
+  construction, so an independent hardware golden becomes the *only* thing that can catch a timing
+  bug. Matrix built: 5 of 6 patterns (multi-tick FSM, mid-phase read, Moore-`RegOut` vs Mealy-`Out`,
+  memory read latency) are anchored to independent hardware; **the `det_010` variable-iteration-loop
+  gap is now filled** by a hand-written independent golden `examples/sequential/sv/pattern_detector_010.sv`
+  + `tests/det_010_independent_golden.rs` (canonical `det_010` coding LIVE-passes it;
+  `det_010_awaits` is `#[ignore]`d and empirically diverges at the *repeat* detections — the golden
+  sides with the canonical Moore semantics, making item 3's claim provable, not self-asserted).
+  **One gap remains — CDC/synchronizer latency (pattern 5)** — deferred by design to **item 4**'s
+  multi-clock verification (which already calls for an independent async-FIFO Verilog reference); it
+  is *not* on item 3's critical path.
+- **G2 — Register-inference correctness is defined *structurally* (decision). DONE.** A behavioral
+  pass doesn't prove it (an over-approximated register set can still simulate correctly), so
+  correctness is defined as a **structural match of the inferred register set against the sequential
+  (flip-flop) registers of an independent hand-written reference SV**, with the reference side
+  computed by the convention that **nonblocking `<=` targets are the flip-flops** (excluding
+  combinational `next_*` blocking-`=` regs and `output reg` — the `RegOut` axis). Two forms,
+  empirically calibrated on the actual references:
+  - **Name-exact** — valid only when the reference is a *faithful translation* mirroring the design's
+    own names (e.g. `mac_fsm.sv` → {stage, product, c_latch, result}).
+  - **Storage-equivalent** (count now; count + per-register bit-width once item 2 carries widths from
+    resolved Rust types) — the honest bar for a *truly independent* reference whose author chose
+    different names/encoding (e.g. `pattern_detector_010.sv`'s two-process Moore `cur_state` vs
+    Copper's `state`: names cannot match, count does).
+  **Capability built & exercised** in `copper-analysis`: `reference_sv_registers`, `RegMatch`, and
+  `assert_registers_match_reference_sv` (unit-tested on `mac_fsm` name-exact + `det_010`
+  storage-equivalent). **Wired for item 2 (DONE):** `tests/common::EquivalenceTest` now exposes
+  `with_reference_registers(reference_sv, mode)` and, in `finish`, calls
+  `copper_analysis::assert_source_registers_match_reference_sv` — so the equivalence suite asserts
+  the inferred reg set against the independent reference alongside behavior + Verilator, for
+  `mac_fsm`/`det_010`/`det_110101`/`lfsr`. This is the artifact behind item 2's G5 claim.
+- **G3 — Guardrails land before the refactor (correctness). DONE.** Both artifacts landed: (1) a
+  **poll-order fuzzer** — `HardwareExecutor` gained a test-only `PollOrder` knob
+  (`Insertion` default = unchanged production behavior; `Reversed`; `Seeded(u64)` reshuffles every
+  delta cycle via a dependency-free SplitMix64), driven by an executor unit test
+  (`poll_order_does_not_change_cross_task_settle`) and `tests/poll_order_fuzz.rs` (combinational
+  settle chain + multi-domain interleave, each asserted identical across reversed/seeded orders); (2)
+  **frozen golden traces** — `tests/golden_traces.rs` + committed `tests/golden_traces/*.trace`
+  bit-exact snapshots for counter/lfsr/shift_register/det_110101/det_010/mac_pipeline (spanning the
+  matrix), with a `BLESS_GOLDEN=1` re-bless path and a verified tamper-detection tripwire. Both
+  superseded-by-design once item 6 makes poll order canonical.
+- **G4 — Resolve the MyHDL prior-art boundary (novelty). DONE (2026-07-29) — with a bigger find.**
+  MyHDL boundary **verified and holds**: its convertible subset is broader than its RTL-synthesis
+  subset, and its synthesizable sequential/FSM idiom is single-edge `always_seq` + explicit
+  enum-state case; multi-`yield` cycle-slicing is convertible-only, not RTL-synthesizable. **But the
+  companion check ("no async-based synthesizable Rust HDL since") surfaced Prost (LATTE '26)** — a
+  coroutine-based HDL that independently states contribution 1's core thesis (locals=registers,
+  suspension=cycle, procedural multi-cycle algorithm → synthesizable Verilog, Rust-`async`-inspired,
+  same loop-must-wait rule). **Consequence: contribution 1 must re-scope** — novelty is the embedded
+  *reuse of rustc's own async lowering* + verified same-source sim/synth equivalence + third-party
+  hardware anchoring, none of which Prost has (bespoke language+compiler, 3-page vision paper, no
+  eval). Recorded in `paper/related_work.md`, `paper/00_claims_audit.md` (LEAD #1),
+  `paper/intro_contributions.md`. **Open decision: exact contribution-1 re-wording (user's call).**
+- **G5 — Write the exact provable claim per item before coding (novelty; decision). DONE.** Every
+  item's claim is now pinned to a *named artifact that proves it* — see the **Provable claims
+  register** below. No item ships a novelty claim without its proof artifact named up front.
+- **G6 — Prove c2's dependency structure on a vertical slice first (feasibility). DONE — c2 is
+  feasible; c1 stays closed.** The open unknown ("can the `copper-macros` proc-macro depend on the
+  shared analysis crate without circular/compile-time problems?") is answered **yes**. New crate
+  `copper-analysis` (deps: **`copper-core` + `syn` only** — both already macro deps, so ~zero new
+  transitive cost) is consumed by **both** `copper-macros` (`hardware` sequential arm) and
+  `copper-codegen` (`transpile_source`); the full workspace builds with **no cycle** (`copper-core`
+  is a leaf). Register inference driven end-to-end on `mac_fsm` and **structurally reg-matched
+  against the independent `tests/fixtures/timing_probe_sv/mac_fsm.sv`** ({stage, product, c_latch,
+  result}) — also a live demonstration of G2's structural-match method.
+  **Sub-decisions settled by the slice:**
+  - *Where the shared analysis lives* → a **new light crate `copper-analysis`**, not an extension of
+    heavy `copper-codegen` (which cannot be a proc-macro dependency without bloating every build).
+  - *Analysis input* → **`syn::ItemFn`** — the representation BOTH front-ends already hold (the macro
+    receives it; `transpile_source` builds it via `parse_file`, and `capture_frontend_ir` already
+    keys off `&syn::ItemFn`). So there is **no front-end-unification problem for the analysis**; FIR
+    stays codegen's downstream lowering IR (a FIR-based entry `registers_from_fir` is stubbed for
+    item 2 if a richer CFG is wanted).
+  - *Extend `control_extract` vs new pass* → **new pass in `copper-analysis` that codegen consumes**;
+    `control_extract` can later be refactored to consume the shared CFG rather than owning its own.
+  NOTE: `infer_registers` here is the **minimal** control-flow criterion (pre-loop state reassigned
+  inside the loop); item 2 generalizes it to full backward liveness (registers born inside the loop
+  and live across an interior await, e.g. `mac_pipeline`). The slice's calls are read-only (log
+  only); item 2/3 route real facts through them. **The three sub-decisions above are USER-APPROVED
+  (2026-07-29) as the item-2 foundation.**
+
+## Provable claims register (G5)
+
+Each item's novelty/correctness claim, paired with the **named artifact** that proves it and the
+paper contribution it supports. The rule (G5): no item ships a claim without its proof artifact
+existing and green — this is what keeps the claims *evidence-backed* rather than asserted.
+
+| Item | Provable claim | Proof artifact (the thing that must be green) | Paper | Status |
+|---|---|---|---|---|
+| 2 | The synthesizable **register set is inferred from control flow** (not read off rustc's over-capturing `Future` layout) — *and it is correct* | **Structural reg-match vs independent hand-written SV** (G2), **wired into `tests/common::EquivalenceTest`** for 4 independent references: `mac_fsm` (name-exact), `det_010`/`det_110101`/`lfsr` (storage-equivalent). **Reconciled with codegen** — `copper-codegen/tests/register_reconciliation.rs` proves, over the fixture corpus (24 clocked modules, `sequential` + `synchronizer`), that codegen's emitted flip-flops equal the shared inference (+ only the synthetic phase/pc counter). So the shared analysis is now the authoritative *spec* for codegen's register set. | C1 | **DONE** — and strengthened 2026-08-21. Both proof artifacts were sequential-scoped, which hid an under-approximation on `#[hardware(synchronizer)]` modules (the 2-FF synchronizer's `ff2` is defined post-tick and read pre-tick, crossing the loop back edge but no tick). `Cfg::registers` now has a **back-edge clause** alongside the tick clause; `register_reconciliation.rs` covers `synchronizer` permanently; and the fix is validated against the differential oracle — **41/41 clocked modules agree with codegen's emitted flip-flops** across a wider sweep (`tests/fixtures` + `examples` + `src`, i.e. beyond the 24 the reconciliation test itself scans), nothing newly over-reported. Codegen *consuming* the set directly (retiring `split_at_ticks`) is a behavior-neutral follow-up, now on firmer ground (the sets agree corpus-wide, synchronizers included) |
+| 2 | Every path through a hardware loop **reaches a tick** (reachability well-formedness), enforced not accidental | A **constructed malformed loop is rejected** with a spanned compile error + regression that uneven-per-branch-tick designs pass — `copper-analysis` unit tests (`tickless_fallthrough_rejected`, `uneven_but_both_tick_accepted`, …) + corpus test (`tests/real_examples.rs`: 38 modules pass); enforced in both front-ends; caught the real `det_010_awaits` tickless spin | C1 | **DONE** |
+| 3 | **No runtime timing oracle** — read-timing is compile-time-static; timing is correct against *hardware* | Sim trace ≡ **expanded independent hardware anchor set** (G1 matrix); `det_010_awaits_matches_independent_verilog` vs `pattern_detector_010.sv` **un-ignored & passing**; `synced_read.rs` deleted; whole anchor set + G3 golden traces (no re-bless) + poll-order fuzzer green | C1/C2 | **DONE** (2026-07-30) |
+| 4 | A dual-clock design is **one coherent hierarchical component**, correct across clock interleavings | **DONE** — `tests/two_domain_hierarchy_cdc.rs` proves, under a custom **dual-clock** Verilator TB, that both the transpiled `two_domain_top` hierarchy AND an **independent hand-written reference** (`examples/cdc/sv/two_domain_hierarchy.sv`) match the Copper sim trace cycle-for-cycle; `examples/cdc/two_domain_hierarchy.rs` checks the rate-independent CDC invariant across 2:1/3:1/1:1 — fills the G1 pattern-5 (CDC) gap at hierarchy scale — the *primitive* was additionally anchored on 2026-08-21 by `examples/cdc/sv/sync_2ff_ref.sv` + `tests/cdc_synchronizer_anchor.rs`, which measures `copper::sync_2ff` in isolation (one destination cycle of observable latency, rate-independent, two flops). (Transpile-only structural parent; sim-as-unit deferred. Async-FIFO is an optional stronger anchor.) | C1/C4 | **DONE** (2026-07-30; primitive anchor 2026-08-21) — but see the ⚠️: the *hierarchy* agreement is currently COINCIDENTAL. Two silent sim≠SV divergences cancel inside the chain (pre-tick register forwarding in `fast_counter`, one cycle early; Deferred-read passthrough in `slow_consumer`, one cycle late). Independent hardware sides with codegen on the first. Pinned in `tests/sequential_forwarding_divergence.rs`; correcting either requires re-blessing `two_domain_hierarchy_cdc.rs`. The *primitive* (`sync_2ff`) anchor is unaffected and sound. |
+| 5 | The formal semantics (CFG model, liveness rule, reachability, cross-domain interleave independence) are *stated*, construction-independent | `SYNCHRONOUS_SEMANTICS.md` rewrite with the `control_extract.rs:208-210` finding as a worked example | — | pending item 5 |
+| 6 | Levelized (topo-once) scheduling gives the **same settled values** as iterate-to-fixpoint, and makes poll-order independence *structural* | Suite green under levelized scheduler + the **poll-order fuzzer becomes moot** (canonical order) | C4 | pending item 6 |
+| cross | **Poll-order independence** — a well-formed design simulates identically under any poll order | **Poll-order fuzzer** (G3): `tests/poll_order_fuzz.rs` (insertion ≡ reversed ≡ seeded) | C1/C2 | DONE |
+| cross | **No silent behavioral drift** across the refactor | **Frozen golden traces** (G3): `tests/golden_traces.rs` + committed `*.trace` snapshots | — | DONE |
+| cross | Sim/synth same-source correspondence is **non-circular** — anchored to third-party hardware | Sim ≡ **BaseJump STL** Verilog (`examples/basejump/`), independent of the transpiler | C2 | DONE (standing) |
+
+Paper key: C1 = `async`-as-FSM (re-scoped for Prost, see G4); C2 = verified same-source correspondence;
+C4 = staged transpilation pipeline. See `paper/00_claims_audit.md` and `paper/intro_contributions.md`.
+
+## Implementation items (sequenced)
+
+### 1. Per-domain state keying (DONE — commit `8e66144`)
+
+`PollPhase`/`POLL_PHASE` (`copper-sim/src/lib.rs:24-41`), `TICK_RESOLVING`
+(`copper-core/src/types.rs:934-953`), and `CALL_ID` (`copper-sim/src/synced_read.rs`) were
+process-global `thread_local`s — ticking one clock domain flipped a flag every other domain's
+futures consulted. Now keyed per clock-domain instance. Fixed a latent bug in
+`examples/cdc/two_domain_counter.rs` and is a prerequisite for items 2–4.
+
+### 1b. Executor/macro hygiene (DONE — commit `3452d38`)
+
+Panic if a `#[hardware]` future returns `Ready(())` (a hardware coroutine is a `loop {}` that
+should never complete); made untracked `spawn()` explicit/test-restricted; removed dead waker
+registration. **Still to investigate** (not yet planned concretely): "restore phase after tick
+resolution" — confirm whether it's a live bug or a superseded note against current
+`tick_clock`/`ClockTick::poll`.
+
+### 2. Reachability/liveness CFG + register inference + FSM report (DONE — analysis + well-formedness)
+
+Replace shape-restriction soundness with a real analysis. **Under c2 this CFG must be factored as
+the shared analysis both the transpiler and the sim macro consume (see G6).** **Status (2026-07-30):
+the CFG and its analyses are landed, enforced in both front-ends, and verified — see the per-bullet
+markers below and the top-of-file Progress summary.** The single remaining open thread is *feature*
+depth in codegen (nested-loop synthesis), not the item-2 analysis, which is complete.
+
+- **DONE** — Model each loop as a CFG (`E_comb` vs `E_tick` edges, tick edges labeled by actual
+  clock receiver identity). Landed as `copper-analysis/src/cfg.rs` (`Cfg::build` over `syn::ItemFn`).
+  `tick_clock` preserves the receiver identity that `control_extract.rs`'s method-name-only
+  `is_tick_await` loses — the groundwork item 4's clock tagging needs.
+- **DONE** — Well-formedness: deleting all `E_tick` edges must leave the reachable subgraph acyclic
+  (every cycle crosses a tick) — a DFS back-edge check (`Cfg::check_reachability`). Exposed as
+  `copper_analysis::check_reachability`, now a **hard, spanned compile error** enforced in *both*
+  `copper-macros` (sim) and `copper-codegen` (transpile). Nested loops are folded rejection-soundly
+  in v1 (a tick-containing `for`/`while`/`loop` counts as tick-crossing, so designs that only tick
+  inside a nested loop — `uart_tx`, `rv32i_cpu` — are not falsely rejected).
+- **DONE (guarded)** — The silent fallthrough at `control_extract.rs:208-210` (emits `pc_assign(0)`
+  unconditionally) is now *unreachable for malformed input*: the reachability check runs at the
+  macro/transpile entry, before `control_extract`, so a zero-tick branch is rejected first. (The
+  fallthrough line itself is left in place; deleting it is safe cleanup once `control_extract` is
+  refactored to consume the shared CFG.)
+- **DONE (codegen, 2026-07-29)** — Generalized `lower_into`'s branch duplication from `If` only to
+  `Match` arms (`control_extract.rs`): `as_match_with_tick` + a match case mirroring the `if` case
+  over N arms (continuation inlined into every arm; a mid-arm tick allocates a fresh `pc` state),
+  and `find_tick_in_expr` now descends into `Match` (a match-nested tick previously *panicked* at
+  the "gate guarantees at least one tick" `expect`). Verified STRUCTURALLY (the convention for
+  control-extraction, immune to the output-timing reconciliation): `tests/control_extraction_*`'s
+  new `match_tick` extracts to byte-identical SV as the hand-written explicit `match pc` FSM
+  `match_tick_explicit`, incl. a mid-arm tick. Register reconciliation extends to it (19 modules).
+- **DONE** — Generalize register promotion to a real **backward liveness** over the CFG
+  (`Cfg::registers`): a local is a register iff it is *defined inside the loop* and *live across a
+  tick edge*. Generalizes the G6 slice's pre-loop-only criterion to registers born inside the loop
+  and live across an *interior* await (`mac_pipeline`'s pipeline regs) and to tuple-assign targets
+  (`traffic_light`'s `(phase, timer)`). This is the T1 answer — the synthesizable register set,
+  computed independently of rustc's over-capture. **Reconciled with codegen** (2026-07-29):
+  `copper-codegen/tests/register_reconciliation.rs` proves, over the fixture corpus (24 clocked modules) that
+  codegen's emitted flip-flops (`chir_lower` pre-loop `let mut` ∪ `shir_lower::find_promoted_wires`)
+  equal this shared set, plus only codegen's synthetic phase/pc counter — so the analysis is the
+  authoritative *spec* and any future drift fails the test. `shir_lower.rs`'s linear `split_at_ticks`
+  is not yet *retired* (codegen still recomputes rather than consuming the shared set), but that is
+  now a behavior-neutral refactor since the two provably agree.
+- **definite-assignment DONE (re-scoped); comb-loop DEFERRED → item 6.** Building this surfaced a semantics
+  correction (verified, not argued): a **sequential** `Out` legitimately *holds* when unwritten — a
+  partial/conditional `.write()` is an **enabled register**, confirmed `sim ≡ BaseJump` on
+  `bsg_dff_en`. So "assign on all paths" is **not** valid for sequential modules (it would reject
+  `bsg_dff_en`). It *is* valid for **`#[hardware(combinational)]`** modules (no clock/state to hold
+  ⇒ a partial output is a real latch). Shipped there: `Cfg::build_combinational` +
+  `Cfg::check_definite_assignment` (`MAY − MUST` at the body exit), exposed as
+  `copper_analysis::check_definite_assignment` and **enforced in the macro's combinational arm** —
+  so the *sim* now rejects the latch at compile time, matching the transpiler's own late
+  `vlir_lower::check_no_latches` (`any − all`). Corpus: all 11 real combinational modules pass; a
+  constructed partial one is rejected with "would infer a latch". **Structural combinational-loop
+  detection — DEFERRED to item 6** (2026-07-29 finding, user-approved): it is *not* an item-2
+  intra-CFG add. Intra-module comb loops are essentially unexpressible (a `let a = b; let b = a;`
+  cycle is a use-before-def Rust rejects). The meaningful case is **cross-module** (X.out→Y.in→X, or
+  a submodule-wiring cycle) — which needs the **inter-module producer→consumer wiring DAG** item 6
+  builds (the executor holds `DirtyHandle`s, not edges), so the item-2 intra-module control CFG
+  cannot see it. Meanwhile the sim already catches it at runtime (executor `consecutive_dirty` →
+  `OSCILLATION_THRESHOLD` panic, `copper-sim/src/executor.rs:210`). See item 6.
+- **DONE (minimal)** — A **per-module FSM report** falls out of the CFG (`Cfg::fsm_report`: tick
+  boundaries, clock receivers, inferred registers). A richer states/transitions dump can grow from
+  the same `nodes`.
+- **v1 scope:** full multi-await FSM lowering (not narrowed to one-await-per-loop). Match-arm
+  generalization ships in v1.
+- **Nested-loop CFG construction — DONE for reachability (2026-07-29).** Each *tick-containing*
+  nested `for`/`while`/`loop` now also gets a real sub-CFG (`Builder::nested_loop_cfg`, with
+  `break`→exit-sink / `continue`→head modeled) that `Cfg::check_reachability` recurses into — so a
+  tickless cycle *inside* a nested loop is rejected (unit-tested; e.g. `loop { loop { if c { tick } } }`),
+  where v1 folded it opaquely and missed it. The parent graph still folds the nested loop
+  conservatively (a possible 0-iteration exit must not false-reject the outer loop — `uart_tx`,
+  `rv32i_cpu` stay well-formed and still simulate 10/10), so this *tightens* detection without new
+  false positives. Tick-free nested loops are combinational (unrolled) and not checked. Note this is
+  **sim-only value**: codegen rejects nested loops outright (`while`/nested-`loop` are
+  `UnsupportedConstruct`), so nested-loop *register* precision has no consumer — the win is a
+  compile-time reachability error instead of a runtime oscillation hang.
+
+### 3. Retire `synced_read` via CFG-derived compile-time timing facts (DONE — 2026-07-30)
+
+The shared CFG classifies each read site statically (which edge registers its result / tick
+distance), and the macro bakes that classification into the generated *plain-Rust* sim code,
+replacing the runtime `block = wrapped_since && (same_call || …)` predicate. At runtime there is
+then no timing oracle — just Rust. Also removes the `det_010`-class fragility (static dataflow the
+heuristic structurally lacks). **Prerequisite:** because c2 makes sim-vs-transpiler *timing*
+agreement true-by-construction, timing correctness rests entirely on the hardware anchor — **expand
+the anchor set (G1) before this item.** Datapath equivalence (sim-vs-transpiler) is unaffected and
+stays a genuine cross-check.
+
+**What shipped.** The **edge-phase tag** form was chosen (user decision, 2026-07-30) over a
+tick-distance integer — the sim needs only the phase-alignment decision. New in `copper-analysis`:
+`ReadTiming{Deferred, Immediate}` + `classify_reads(&ItemFn) -> Vec<ReadTiming>` (`cfg.rs`), a
+per-`In`-read classifier in source order. **The rule:** a read is `Deferred` (sample at the next
+pre-edge — the registering edge) iff a tick occurs *after* it within the loop iteration's control
+flow (a leading/pre-tick read); otherwise `Immediate` (a trailing/post-tick read that consumes the
+value the just-past edge produced). The macro (`ReadRewriter`, `copper-macros`) consumes the tags by
+index and emits, per site, `{ pre_edge_barrier::<D>().await; port.read() }` (Deferred) or a plain
+`port.read()` (Immediate). **The runtime oracle is deleted:** `copper-sim/src/synced_read.rs` is
+gone, along with the wrap counter, per-site `ReadTracker`, per-domain `CALL_ID`/`bump_call_id`, and
+the `leading_pre_edge_call_id` machinery — item 2's reachability check already subsumes the old
+`same_call` anti-spin guard (a tickless loop is now a compile error, so a deferred read can only
+suspend across a real tick, never busy-spin).
+
+**Empirical adjudication (the discipline).** All hardware anchors stay green under Verilator —
+`mac_pipeline` (loop-top defers), `sipo_block` (BaseJump mid-phase reads), `traffic_light` (trailing
+post-tick read fires immediately), `counter`/`lfsr`/`shift_register`/`pattern_detector`, `dual_port_ram`
+(same-cycle double read), the CDC synchronizer path (`two_domain_counter`, `flag_crossing`,
+foreign-domain reads via the `tick_domain_of` fallback), and the nested-loop `rv32i_cpu`/`uart_system`.
+The **G3 frozen golden traces pass without re-blessing** — bit-for-bit no behavioral drift on the
+covered modules, i.e. the static classification reproduces the old heuristic exactly where it was
+already correct. The **poll-order fuzzer** stays green. **Provable claim closed:**
+`det_010_awaits_matches_independent_verilog` is **un-ignored and passing** against the independent
+`pattern_detector_010.sv` — the static classification makes the variable-iteration
+`while in_i.read() == 0 { tick }` machine detect on the correct cycles (5, 9, 13), which the runtime
+heuristic could not.
+
+**One finding worth recording (the two axes are separate).** With correct read timing, `det_010_awaits`
+detects on the right cycles but its *output* was clobbered: it drives `out_o.write(One)` *before* a
+tick, and the next iteration's leading `out_o.write(Zero)` overwrote it in the same `tick_clock`'s
+post-edge. That is the **output-timing axis** — `det_010_awaits`'s output is a write-before-tick Moore
+output and must be `RegOut` (the plain `Out` was a latent bug the old read mis-timing had masked).
+Switching it to `RegOut` (the sanctioned mechanism, already verified on `sipo_block`) makes it match
+the golden. Read timing (item 3) and output timing (`RegOut`) are orthogonal; the classifier gets the
+sampling cycle right independently of the output register.
+
+### 4. Hierarchical clocked submodule instantiation (the multi-clock enabler) — DONE (transpile-only structural parent; 2026-07-30)
+
+**Status: landed as a new `#[hardware(structural)]` module category (transpile-only;
+sim-as-unit deferred by decision — the sim already simulates dual-clock designs correctly
+hand-wired, so a parent-runs-in-sim capability is pure ergonomics, not correctness).** What
+shipped, end-to-end:
+- **New structural module category** through the whole pipeline: `HardwareMode::Structural` +
+  `FrontendClassification::StructuralFn` (`frontend_ir`, `parser.rs`); `CHIRBody::Structural` →
+  `SHIRBody::Structural` → `VLIRBody::Structural` → `emit.rs::structural_body`. A structural parent
+  is a pure hierarchy — clocks in, no `always_ff`/loop/tick — that instantiates clocked children.
+- **Port-connection submodule model** (replacing the single-output expression model at structural
+  call sites): `CHIR/SHIR/VLIRSubmoduleInst` gained `clocks` (`.clk(parent_sig)`), `port_nets`
+  (named in/out connections, multi-output), and `output_port`. Clocks are threaded, not filtered.
+  Surface syntax: `let n = wire::<T,D>(init);` declares an internal net; children reference `n.0`
+  (driver) / `n.1` (observer) → one SV net (the FIR `LocalStmt` can't hold a tuple pattern).
+- **Multi-module co-emission**: `transpile_source_hierarchy()` (+ CLI `--hierarchy`) emits the
+  parent plus every transitively-instantiated child, deepest-first — a self-contained design.
+- **Call-site CDC check** at the transpiler (text-based, so it re-derives the rule the phantom
+  types already enforce for compiled code, mirroring the `check_reachability` precedent): each
+  connected signal's clock domain must equal the child port's declared domain, so a foreign net
+  wired into a regular child is rejected while a `#[hardware(synchronizer)]` child passes.
+- **Macro acceptance**: `#[hardware(structural)]` compiles (emitted unchanged; not spawned in sim;
+  requires ≥1 clock).
+- **Anchor (fills G1 pattern-5 CDC gap)**: `examples/cdc/two_domain_hierarchy.rs` (structural parent
+  over fast_counter/flag_sync/slow_consumer) + independent hand-written reference
+  `examples/cdc/sv/two_domain_hierarchy.sv`. `tests/two_domain_hierarchy_cdc.rs` uses a **custom
+  dual-clock Verilator testbench** (the built-in harness is single-clock) to prove BOTH the
+  transpiled hierarchy AND the independent reference match the Copper sim trace cycle-for-cycle. The
+  example checks the rate-independent CDC invariant (monotone + eventually-asserts) across 2:1/3:1/1:1.
+  Tests: `copper-codegen/tests/structural_hierarchy.rs` (5) + `tests/two_domain_hierarchy_cdc.rs` (3).
+#### Item 4 follow-ups (deferred — tracked, not on any critical path)
+
+Both are explicit *decisions to defer*, not gaps in what shipped. The structural parent is a
+correct, verified transpilation construct today; these only extend it.
+
+- **4a — Parent-runs-in-sim (executor auto-spawn/auto-wire).** Teach the executor to run a
+  `#[hardware(structural)]` parent as a unit: its body's `wire::<T,D>(..)` net declarations and
+  child instantiation calls become real spawned+wired tasks, so one source form drives *both* the
+  sim and the transpiler (today the macro emits the structural parent unchanged and does **not**
+  spawn it — the sim hand-wires the children in the testbench, as `two_domain_hierarchy.rs`'s `main`
+  does). **Priority: low / ergonomics only** — the sim is already correct hand-wired
+  (`two_domain_counter`/`two_domain_hierarchy` pass), so this buys convenience and a single-source
+  story, not correctness. **Cost:** new executor/macro machinery to turn the parent body into
+  spawned wired tasks (the macro currently emits it inert); nothing in item 4 touched `copper-sim`.
+  Revisit only if the one-source convenience is wanted. See [[copper_item4_hierarchy_decision]].
+- **4b — Async-FIFO independent reference (stronger anchor).** The landed anchor
+  (`tests/two_domain_hierarchy_cdc.rs`) checks the counter+2FF-synchronizer+consumer hierarchy
+  against an independent hand-written SV (`examples/cdc/sv/two_domain_hierarchy.sv`). A genuine
+  **dual-clock async FIFO** (gray-coded rd/wr pointers each crossing through a `sync_2ff`, full/empty
+  flags) is the canonical CDC design and a stronger G1 pattern-5 anchor. **Priority: optional** —
+  the current anchor already fills the pattern-5 gap; the FIFO would broaden it (multi-bit pointer
+  crossing, gray-code, backpressure) and is the shape the original plan named. Reuses the exact
+  structural mechanism already built (parent instantiates `wr_side`/`rd_side`, each with its own
+  `sync_2ff`); the new work is the FIFO datapath + an independent hand-written FIFO SV reference.
+
+Original task notes (now realized as the structural category rather than by mutating the existing
+single-output submodule path):
+
+- `chir_lower.rs::lower_hardware_call` (2556-2616): stop filtering out `Clock<...>` args (2573-2578)
+  — thread the clock argument into `CHIRSubmoduleInst`.
+- `CHIRSubmoduleInst`/`SHIRSubmoduleInst`/`VLIRSubmoduleInst`
+  (`chir.rs`/`shir_lower.rs:194-198`/`vlir_lower.rs:438-441`): add a clock/domain field.
+- `emit.rs::submodules()` (216-236): emit an actual `.clk(...)` port connection (today only wires
+  data ports + a conventional `.out(...)`; clock wiring flagged unbuilt).
+- `copper-macros/src/lib.rs::check_cdc` (111-157): extend the port-signature-only foreign-domain
+  check to submodule-instantiation call sites — a child receiving a foreign-domain clock/signal
+  must go through a `#[hardware(synchronizer)]` child, same discipline at the call site.
+- Verify a "pure hierarchy, no native clock, no loop" parent is legal under
+  `validate_hardware_fn`/`has_top_level_loop` (`copper-macros/src/lib.rs:348-357, 722-792`); relax
+  if they hard-require a loop/clock.
+
+Resulting dual-clock shape (async FIFO): a parent with no ticks, instantiating `wr_side` (on
+`wr_clk`) and `rd_side` (on `rd_clk`); each child instantiates its own `sync_2ff` on its native
+domain to pull in the other side's pointer — no new syntax, no multiple-driver problem, reuses the
+synchronizer exemption at a new call site.
+
+### 5. Update `SYNCHRONOUS_SEMANTICS.md` with the formal semantics — DONE (2026-07-30)
+
+`SYNCHRONOUS_SEMANTICS.md` rewritten: the draft bullet notes and the stale "FSM IR is the semantic
+core" musings are gone, replaced by grounded sections — **Execution model (c2 + "just Rust")**; **the
+clock tick phases** (pre-edge settle → edge → post-edge settle → observation, with the post-edge
+continuation convention and per-domain phase keying, cited to `HardwareExecutor::tick_clock`);
+**cycle boundaries / FSM states**; **`Out` vs `RegOut`** output timing; **static input read timing**
+(item 3's `Deferred`/`Immediate` `classify_reads`); and **poll-order generalized to cross-domain
+interleave independence** (fixed-schedule bit-identity vs across-rate functional-correctness, with the
+`two_domain_hierarchy` worked example). The CFG model / liveness / reachability / nested-loop sections
+(from item 2) are retained. Every claim is grounded in cited code and exercised by the suite.
+
+Original scope notes:
+
+Replace the draft bullet notes with: the CFG model; cycle-boundary/FSM-state definitions (stated
+independent of any construction); the generalized liveness rule; the reachability well-formedness
+condition (with the `control_extract.rs:208-210` finding as a worked example of why
+shape-restriction soundness isn't enough); and poll-order independence generalized to cross-domain
+interleave independence — **a well-formed multi-clock design must simulate identically under any
+relative tick-interleaving/rate of independently-ticking domains, provided every crossing goes
+through a synchronizer** (real independent clocks have no defined phase relationship). Also record
+the c2 + just-Rust decision as the execution model.
+
+### 6. Levelized dependency-graph scheduling (gated on item 3)
+
+> **Scoped (2026-07-30) — see `design_docs/LEVELIZED_SCHEDULING_SCOPE.md`.** Item-3 gate confirmed
+> clear (no within-phase re-poll requirement remains: `PreEdgeBarrier` is phase-constant within a
+> settle). Graph-acquisition decision: **additive spawn API** (`In::wire_id()`; spawn takes input
+> wire-ids; ~49 spawn-site sweep) — chosen over port instrumentation for precision. Key risk:
+> comb-vs-sequential edge classification (plain `Out` = comb sink, `RegOut` = phase source) to avoid
+> false cycles on legal sequential feedback. **Correctness-first migration (non-negotiable):** a
+> differential equivalence harness runs every design under BOTH schedulers and asserts identical
+> settled values at every phase; both schedulers stay in-tree permanently (fixpoint = oracle); static
+> comb-loop detection rejects only what the runtime already catches (no false positives). Phased:
+> (1) wire-id + read/write registration, behavior-neutral; (2) DAG + topo behind an opt-in scheduler
+> mode + the differential harness corpus-wide; (3) SCC handling (bias to iterate over erroring);
+> (4) gate on differential harness + G3 golden traces + fuzzer + BaseJump, flip default, retire
+> fuzzer; (5) static comb-loop detection. Not yet started.
+
+Replace the naive iterate-to-fixpoint settle (`poll_tasks` polls every module repeatedly until no
+dirty flag) with a **static inter-module dependency graph**, topo-sorted so each module is polled
+once per phase in dependency order — the compiled/levelized model of modern fast simulators
+(Verilator; cycle-based), vs the dynamic event-queue model of classic kernels (VCS/Questa/Xcelium).
+
+- **A *scheduler* change, not option (b).** It decides the order and count of polls; each module is
+  still executed as plain Rust. Orthogonal to the run-Rust-vs-interpret-IR axis.
+- **Performance + robustness, not correctness.** Acyclic combinational graph → topo-order-once gives
+  the same settled values as iterate-to-fixpoint; cost drops ≈O(tasks × logic-depth) → ≈O(tasks) per
+  phase. Ranks after read-timing/register work.
+- **Gated on item 3.** `synced_read` defers via `Poll::Pending`, which *requires* polling again —
+  it relies on the iterate loop. A single-pass topo schedule has no "poll again." Only after item 3
+  removes the runtime deferral is levelized scheduling clean to adopt.
+- **Makes poll-order independence structural** (a canonical order replaces the discipline-maintained
+  invariant; the poll-order fuzzer becomes moot once the order is canonical).
+- **Costs:** new plumbing — the executor holds only `DirtyHandle`s, not producer→consumer edges; the
+  `wire()`/port layer must record which `In` reads which `Out`. Cycles don't vanish — SCCs still
+  need the fixpoint machinery + oscillation detection ("levelize the DAG, iterate only within SCCs").
+- **Distinct from the item-2 CFG:** this is the *inter-module wiring DAG* (scheduling); item 2 is
+  *intra-module control flow* (liveness across ticks). Same family, different graphs — don't
+  conflate.
+- **Home of structural combinational-loop detection** (moved here from item 2, 2026-07-29). Once the
+  producer→consumer wiring graph exists, a static comb-loop check falls out: reject an SCC of comb
+  edges that doesn't pass through a register / memory-latency / synchronizer. It could not live in
+  item 2 — intra-module comb loops are unexpressible (Rust rejects the use-before-def), so the only
+  real comb loops are cross-module, invisible to the intra-module CFG. Until then the sim's runtime
+  `OSCILLATION_THRESHOLD` panic (`copper-sim/src/executor.rs:210`) is the safety net.
+
+### 7. CHIR interpreter as a validation-only backend (OPTIONAL — never the default sim)
+
+Downgraded 2026-07-29 from the former "FSM-IR interpreter migration" (which was option b — see the
+architecture decision). What survives: a CHIR interpreter as a **second, optional,
+independently-selectable backend that NEVER becomes the default.** In this role it is compatible
+with c2 and *strengthens* evidence — a third, cross-checking view (interpret-CHIR vs run-Rust) that
+validates the CHIR lowering against the Rust execution semantics, while the raw-Rust executor stays
+primary and preserves independence. After items 1–4 (item 2's CFG is the CHIR this interprets).
+Build only if the extra cross-check earns its cost; not on the critical path.
+
+Standing preferences if built: **CHIR** as the interpretation authority (closed 10-variant
+expression set, no `Call` nodes, explicit `CHIRRegDecl` registers, explicit `AwaitTick`
+boundaries); **validation backend, never a cutover** — require it to reproduce the raw-Rust
+executor's results on the full suite and agree with independent hand-written Verilog; the raw-Rust
+executor **remains the default**. Reusing rustc's own async-fn coroutine as the interpreter target
+was investigated and **rejected** (unstable `rustc_private`/MIR-internal; post-borrowck,
+monomorphized, no port/type semantics left — the wrong abstraction level; CHIR read off the surface
+syntax is what's needed). Real costs: substantial copper-sim work (register file, dataflow
+evaluator, hierarchical submodule interpretation, memories); likely slower per-cycle than compiled
+native Rust; loses the ability to drop arbitrary host-side Rust in a hardware body during sim. Does
+not remove the need for independent BaseJump verification.
+
+## What does NOT change
+
+The executor's phase machinery — pre/post-edge settle, the delta-cycle poll-to-fixpoint loop (until
+item 6), the post-edge continuation convention, `RegOut` for the output-timing axis — is validated
+and stays. "The executor change" is the read-timing heuristic → static-facts migration (item 3),
+not a rewrite of `tick_clock`.
+
+## Verification
+
+- **Discipline:** never treat the transpiler as a correctness oracle for simulator semantics; anchor
+  new claims to independent hand-written Verilog (`examples/basejump/`).
+- **Register inference (G2):** structural reg-for-reg match of emitted SV against the independent
+  hand-written reference, not behavior alone.
+- **Reachability check:** a constructed malformed loop (a branch that structurally never ticks) must
+  be rejected with a clear compile error; regression tests confirm legitimate designs (uneven
+  per-branch tick counts) still pass, now *verified* rather than accidentally sound.
+- **Poll-order fuzzer (G3):** randomized/reversed `poll_tasks` order asserts identical results —
+  a pre-item-6 regression guard, superseded once item 6 makes the order canonical.
+- **Frozen golden traces (G3):** bit-exact snapshots of currently-passing examples guard against
+  silent behavioral drift across the refactor.
+- **Multi-clock:** a dual-clock example (async FIFO, or `two_domain_counter` extended into one
+  hierarchical component) — verify trace, transpile, Verilator equivalence, and agreement with an
+  independent hand-written async-FIFO Verilog reference. Plus a **clock-interleave fuzzer**: run the
+  design under ≥2 relative `tick_clock` interleavings/rates and assert equal observable results
+  (operationalizes item 5's generalized invariant).
+- `.claude/skills/run-copper/smoke.sh --test` and the full workspace suite stay green throughout;
+  per-step regressions triaged against the `#[ignore]` conventions (each ignore cites a design doc).
+
+## Out of scope / resolved
+
+- **Mid-phase read-timing is no longer a standing open bug.** The old "cocotb-vs-Esterel startup
+  semantics" question (a working note since deleted) is
+  effectively resolved against independent hardware (see *Empirical status* — `sipo_block` passes).
+  What remains is the `det_010`-class heuristic *fragility*, addressed by item 3's static timing.
+- **Reusing rustc's async-fn coroutine as an FSM-IR target** — investigated and rejected (item 7).
+
+## Open sub-decisions
+
+- ~~Where the shared analysis crate physically lives and how `copper-macros` depends on it without a
+  heavy compile-time cost~~ **SETTLED by G6:** new light crate `copper-analysis` (`copper-core` +
+  `syn` only); both `copper-macros` and `copper-codegen` depend on it; no cycle (`copper-core` is a
+  leaf); analysis input is `syn::ItemFn` (both front-ends already hold it).
+- ~~Whether item 2's CFG extends codegen's existing `control_extract` or is a new pass it consumes~~
+  **SETTLED by G6:** a **new pass in `copper-analysis`** that codegen consumes; `control_extract`
+  (in heavy `copper-codegen`) cannot be a proc-macro dependency, so the authoritative CFG lives in
+  the light shared crate and `control_extract` is later refactored to consume it.
+- ~~Exact form of the per-read timing fact the CFG emits (tick-distance integer vs edge-phase tag).~~
+  **SETTLED (item 3, 2026-07-30): edge-phase tag** (`ReadTiming{Deferred, Immediate}`) — the sim needs
+  only the phase-alignment decision, not a numeric distance; a distance integer was over-built for the
+  consumer.
+- Sequencing of item 4 (multi-clock) relative to item 3 (retire `synced_read`) — largely
+  independent; order by whichever capability is wanted first. *(open)*

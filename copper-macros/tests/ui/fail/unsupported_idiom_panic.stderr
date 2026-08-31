@@ -1,0 +1,19 @@
+error: `panic!` is not synthesizable in a hardware module — an unreachable/error condition must be an explicit output signal (e.g. an `illegal: Logic` port), not a panic.
+  --> tests/ui/fail/unsupported_idiom_panic.rs:11:9
+   |
+11 |         panic!("cannot happen");
+   |         ^^^^^
+
+warning: unused import: `copper_core::Logic`
+ --> tests/ui/fail/unsupported_idiom_panic.rs:1:5
+  |
+1 | use copper_core::Logic;
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `In` and `Out`
+ --> tests/ui/fail/unsupported_idiom_panic.rs:2:25
+  |
+2 | use copper_core::port::{In, Out};
+  |                         ^^  ^^^

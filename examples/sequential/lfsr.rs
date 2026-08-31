@@ -1,11 +1,13 @@
 use copper_core::types::{Bits, Logic, Clock, ClockDomain};
 use copper_core::port::{In, Out, wire};
+use copper_macros::hardware;
 use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
 // assuming width of 32 and initial value of 1
+#[hardware(sequential)]
 async fn lfsr (
     clk: Clock<MainClk>,
     reset_i: In<Logic, MainClk>,
@@ -40,9 +42,11 @@ fn main() {
     let (o_out, o_obs) = wire::<Bits<32>, MainClk>(Bits::from_u32(1));
 
     let dh = o_out.dirty_handle();
+    let reads = vec![reset_i_in.wire_id(), yumi_i_in.wire_id()];
     exec.spawn_wired(
         lfsr(clk.clone(), reset_i_in, yumi_i_in, o_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("lfsr")

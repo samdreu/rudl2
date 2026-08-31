@@ -36,7 +36,7 @@ fn hierarchical_verilog_pipeline_matches_expected_trace() {
         );
     }
 
-    let verified = verify_with_verilator("verilog/hybrid_pipeline.v", "hybrid_pipeline", &trace)
+    let verified = verify_with_verilator("tests/fixtures/reference_sv/hybrid_pipeline.sv", "hybrid_pipeline", &trace)
         .expect("Verilator verification should run successfully");
     assert!(verified, "Expected Verilator comparison to pass");
 }

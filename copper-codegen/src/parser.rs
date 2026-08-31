@@ -1,54 +1,60 @@
 use copper_core::frontend_ir::{
     ClockParamMeta, EnumVariant, ExprArray, ExprAssign, ExprAsync, ExprAwait, ExprBinary, ExprCall, ExprCast,
-    ExprField, ExprIf, ExprLet, ExprLit, ExprLoop, ExprMatch, ExprMatchArm, ExprMethodCall,
-    ExprRange, ExprReference, ExprRepeat, ExprReturn, ExprStmt, ExprType, ExprUnary, ExprWhile,
-    ExprYield, FrontendClassification, FrontendModuleIR, FrontendSignature, ItemConst, ItemEnum,
+    ExprBlock, ExprBreak, ExprConst, ExprContinue, ExprField, ExprIf, ExprIndex, ExprLet, ExprLit, ExprLoop,
+    ExprClosure, ExprMacro, ExprMatch, ExprTry,
+    ExprMatchArm, ExprMethodCall, ExprPath, ExprRange, ExprReference, ExprRepeat, ExprReturn, ExprStmt,
+    ExprForLoop, ExprStruct, ExprStructField, ExprTuple, ExprType, ExprUnary, ExprWhile, ExprYield, FrontendClassification,
+    FrontendFnIR, FrontendImplIR, FrontendModuleIR, FrontendSignature, FrontendTraitIR, GenericParamKind,
+    GenericParamMeta, HardwareMode, ItemConst, ItemEnum,
     ItemMacro, ItemOther, ItemStmt, ItemStruct, ItemType, LocalStmt, RawParam, RawStmt, RawStmtKind,
-    RawTypeRef, SourceSpan, StructField,
+    RawTypeRef, Receiver, SourceSpan, StructField,
 };
-use copper_core::{ModuleIR, Port};
-use copper_core::ir::Statement;
 use quote::{ToTokens, quote};
 use syn::spanned::Spanned;
 use syn::{BinOp, Expr, ItemFn, Stmt, UnOp};
 
+// Span-carrying, matching the CHIRLowerError/SHIRLowerError convention downstream
+// (copper-core/src/chir.rs, copper-core/src/shir.rs) so a location survives the
+// whole FIR -> CHIR -> SHIR -> VLIR pipeline instead of being dropped at Phase A.
 #[derive(Debug, Clone)]
 pub enum LowerError {
-    UnsupportedExpr(String),
-    UnsupportedStmt(String),
-    SignalNotFound(String),
-    MissingArgument(String),
+    UnsupportedExpr { description: String, span: SourceSpan },
+    UnsupportedStmt { description: String, span: SourceSpan },
+    SignalNotFound { name: String, span: SourceSpan },
+    MissingArgument { name: String, span: SourceSpan },
 }
 
 impl std::fmt::Display for LowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            LowerError::UnsupportedExpr(expr) => write!(f, "Unsupported expression: {}", expr),
-            LowerError::UnsupportedStmt(stmt) => write!(f, "Unsupported statement: {}", stmt),
-            LowerError::SignalNotFound(name) => write!(f, "Signal not found: {}", name),
-            LowerError::MissingArgument(arg) => write!(f, "Missing argument: {}", arg),
+            LowerError::UnsupportedExpr { description, span } =>
+                write!(f, "{}:{}: unsupported expression: {}", span.start_line, span.start_col, description),
+            LowerError::UnsupportedStmt { description, span } =>
+                write!(f, "{}:{}: unsupported statement: {}", span.start_line, span.start_col, description),
+            LowerError::SignalNotFound { name, span } =>
+                write!(f, "{}:{}: signal not found: {}", span.start_line, span.start_col, name),
+            LowerError::MissingArgument { name, span } =>
+                write!(f, "{}:{}: missing argument: {}", span.start_line, span.start_col, name),
         }
     }
 }
 
-pub struct IRBuilder;
-
-impl IRBuilder {
-    pub fn from_ast(_design_fn: &ItemFn, ports: Vec<Port>) -> Result<ModuleIR, LowerError> {
-        Ok(ModuleIR {
-            name: String::new(),
-            ports,
-            statements: Vec::<Statement>::new(),
-            submodules: Vec::new(),
-        })
-    }
-}
-
+// grabs the frontend IR from the parsed rust function and returns it
 pub fn capture_frontend_ir(design_fn: &ItemFn, hardware_fns: &std::collections::HashSet<String>) -> Result<FrontendModuleIR, LowerError> {
-    let signature = capture_signature(design_fn);
+    let signature = capture_signature(&design_fn.sig);
     let clocks = capture_clock_metadata(design_fn);
     let classification = classify_module(design_fn);
     let raw_statements = capture_raw_statements(design_fn, hardware_fns);
+
+    // Enums declared inside the function body. File-scope enums are injected by
+    // the caller (see `transpile_source`).
+    let enums = raw_statements
+        .iter()
+        .filter_map(|s| match &s.kind {
+            RawStmtKind::Item(ItemStmt::Enum(e)) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
 
     Ok(FrontendModuleIR {
         module_name: design_fn.sig.ident.to_string(),
@@ -56,14 +62,56 @@ pub fn capture_frontend_ir(design_fn: &ItemFn, hardware_fns: &std::collections::
         classification,
         clocks,
         raw_statements,
+        enums,
+        // The shared register authority (see the field's docs): the identical
+        // inference the sim macro consumes, computed on the identical input.
+        registers: copper_analysis::infer_registers(design_fn),
+        declared_mode: capture_hardware_mode(design_fn),
+        // File-scope items are injected by the caller (see `transpile_source`),
+        // just like `enums`; a bare `ItemFn` has none.
+        file_fns: Vec::new(),
+        file_structs: Vec::new(),
+        file_consts: Vec::new(),
+        file_impls: Vec::new(),
+        file_traits: Vec::new(),
         span: capture_source_span(design_fn),
     })
 }
 
-fn capture_signature(design_fn: &ItemFn) -> FrontendSignature {
+/// The mode written in `#[hardware(<mode>)]`, or `None` when the function has no
+/// such attribute. Unlike `classify_module` (which only inspects async-ness),
+/// this is the author's declared intent — the only way to tell `synchronizer`
+/// (async, but a CDC crossing point) apart from `sequential`. Unknown arguments
+/// are treated as absent rather than guessed; the `#[hardware]` proc-macro is
+/// the layer that rejects a bad mode, so the transpiler need not re-diagnose it.
+fn capture_hardware_mode(design_fn: &ItemFn) -> Option<HardwareMode> {
+    let attr = design_fn
+        .attrs
+        .iter()
+        .find(|a| a.path().segments.last().map(|s| s.ident == "hardware").unwrap_or(false))?;
+
+    // `#[hardware(sequential)]` parses its argument as a single path meta.
+    let mode = attr.parse_args::<syn::Path>().ok()?;
+    match mode.get_ident()?.to_string().as_str() {
+        "sequential" => Some(HardwareMode::Sequential),
+        "combinational" => Some(HardwareMode::Combinational),
+        "synchronizer" => Some(HardwareMode::Synchronizer),
+        "structural" => Some(HardwareMode::Structural),
+        _ => None,
+    }
+}
+
+// Captures the signature information from the design function
+// This includes the parameter names, types, and return type (if any).
+// (There should be no return types)
+/// Capture a signature from any `syn::Signature` — a `#[hardware]` module's, a
+/// free function's, or an impl/trait method's. A `self` receiver (present on
+/// methods) is a `FnArg::Receiver`, skipped here and captured separately by
+/// `extract_receiver`.
+fn capture_signature(sig: &syn::Signature) -> FrontendSignature {
     let mut params = Vec::new();
 
-    for input in &design_fn.sig.inputs {
+    for input in &sig.inputs {
         if let syn::FnArg::Typed(pat_type) = input {
             if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
                 let name = pat_ident.ident.to_string();
@@ -82,7 +130,7 @@ fn capture_signature(design_fn: &ItemFn) -> FrontendSignature {
         }
     }
 
-    let return_ty = match &design_fn.sig.output {
+    let return_ty = match &sig.output {
         syn::ReturnType::Default => None,
         syn::ReturnType::Type(_, ty) => Some(RawTypeRef {
             ty_text: ty.to_token_stream().to_string(),
@@ -90,11 +138,69 @@ fn capture_signature(design_fn: &ItemFn) -> FrontendSignature {
         }),
     };
 
-    FrontendSignature { params, return_ty }
+    let generics = sig
+        .generics
+        .params
+        .iter()
+        .map(capture_generic_param)
+        .collect();
+
+    let where_clause_text = sig
+        .generics
+        .where_clause
+        .as_ref()
+        .map(|w| w.to_token_stream().to_string());
+
+    FrontendSignature { params, generics, where_clause_text, return_ty }
+}
+
+/// Lower one `syn::GenericParam` to source-shaped FIR: `<const N: usize>`,
+/// `<SrcD: ClockDomain>`, `<T = u8>`, `<'a: 'b>`. Bounds and defaults are kept
+/// as raw token text (their internals are irrelevant to lowering, which only
+/// needs the name, the const type, and which bound marks a clock domain).
+fn capture_generic_param(param: &syn::GenericParam) -> GenericParamMeta {
+    let raw_text = param.to_token_stream().to_string();
+    let span = capture_source_span(param);
+    match param {
+        syn::GenericParam::Const(c) => GenericParamMeta {
+            kind: GenericParamKind::Const,
+            name: c.ident.to_string(),
+            const_ty: Some(RawTypeRef {
+                ty_text: c.ty.to_token_stream().to_string(),
+                span: capture_source_span(&c.ty),
+            }),
+            bounds: Vec::new(),
+            default: c.default.as_ref().map(|d| d.to_token_stream().to_string()),
+            raw_text,
+            span,
+        },
+        syn::GenericParam::Type(t) => GenericParamMeta {
+            kind: GenericParamKind::Type,
+            name: t.ident.to_string(),
+            const_ty: None,
+            bounds: t.bounds.iter().map(|b| b.to_token_stream().to_string()).collect(),
+            default: t.default.as_ref().map(|d| d.to_token_stream().to_string()),
+            raw_text,
+            span,
+        },
+        syn::GenericParam::Lifetime(l) => GenericParamMeta {
+            kind: GenericParamKind::Lifetime,
+            name: l.lifetime.ident.to_string(),
+            const_ty: None,
+            bounds: l.bounds.iter().map(|b| b.to_token_stream().to_string()).collect(),
+            default: None,
+            raw_text,
+            span,
+        },
+    }
 }
 
 fn classify_module(design_fn: &ItemFn) -> FrontendClassification {
-    if design_fn.sig.asyncness.is_some() {
+    // A structural parent is also async, so async-ness alone can't distinguish it —
+    // it is identified by the declared `#[hardware(structural)]` mode.
+    if capture_hardware_mode(design_fn) == Some(HardwareMode::Structural) {
+        FrontendClassification::StructuralFn
+    } else if design_fn.sig.asyncness.is_some() {
         FrontendClassification::AsyncSequentialFn
     } else {
         FrontendClassification::CombinationalFn
@@ -112,7 +218,9 @@ fn capture_clock_metadata(design_fn: &ItemFn) -> Vec<ClockParamMeta> {
             };
 
             let clock_ty = pat_type.ty.to_token_stream().to_string();
-            let ty_compact: String = clock_ty.chars().filter(|c| !c.is_whitespace()).collect();
+            // Qualified paths (`copper_core::Clock<D>`) compact to the bare form
+            // so they match the same textual rules as `Clock<D>`.
+            let ty_compact = crate::chir_lower::compact_type(&clock_ty);
             if !ty_compact.starts_with("Clock<") {
                 continue;
             }
@@ -136,8 +244,14 @@ fn capture_clock_metadata(design_fn: &ItemFn) -> Vec<ClockParamMeta> {
 }
 
 fn capture_raw_statements(design_fn: &ItemFn, hardware_fns: &std::collections::HashSet<String>) -> Vec<RawStmt> {
-    design_fn
-        .block
+    parse_block_stmts(&design_fn.block, hardware_fns)
+}
+
+// Lowers every statement in a `syn::Block` to `RawStmt`, preserving source order.
+// Shared by every expression form that carries a nested block (async, block, if/else,
+// loop, while) so the order/kind/text/span wiring lives in exactly one place.
+fn parse_block_stmts(block: &syn::Block, hardware_fns: &std::collections::HashSet<String>) -> Vec<RawStmt> {
+    block
         .stmts
         .iter()
         .enumerate()
@@ -155,12 +269,12 @@ fn classify_raw_stmt_kind(stmt: &Stmt, hardware_fns: &std::collections::HashSet<
         Stmt::Local(local) => parse_local_stmt(local, hardware_fns),
         Stmt::Item(item) => parse_item_stmt(item),
         Stmt::Expr(expr, semi) => parse_expr_stmt(expr, semi.is_some(), hardware_fns),
+        // A macro call in statement position (`println!(...);`, `emit!(v);`).
+        // Captured as a structured `ExprMacro`, matching the expression-position
+        // `Expr::Macro` arm, rather than an opaque literal.
         Stmt::Macro(stmt_macro) => RawStmtKind::Expr(ExprStmt {
-            expr: ExprType::Lit(ExprLit {
-                text: quote!(#stmt_macro).to_string(),
-                span: capture_source_span(stmt_macro),
-            }),
-            has_semi: true,
+            expr: ExprType::Macro(macro_to_expr(&stmt_macro.mac, capture_source_span(stmt_macro))),
+            has_semi: stmt_macro.semi_token.is_some(),
             span: capture_source_span(stmt_macro),
         }),
     }
@@ -191,24 +305,231 @@ fn parse_local_stmt(local: &syn::Local, hardware_fns: &std::collections::HashSet
     })
 }
 
+/// Capture enum definitions declared at **file scope**. These are not reachable
+/// from an `ItemFn` alone, so callers inject them into each module's
+/// `FrontendModuleIR::enums` (see `transpile_source`).
+pub fn capture_file_enums(file: &syn::File) -> Vec<ItemEnum> {
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Enum(e) => Some(ItemEnum {
+                name: e.ident.to_string(),
+                variants: e
+                    .variants
+                    .iter()
+                    .map(|v| EnumVariant {
+                        name: v.ident.to_string(),
+                        discriminant: v
+                            .discriminant
+                            .as_ref()
+                            .map(|(_, expr)| expr.to_token_stream().to_string()),
+                        span: capture_source_span(v),
+                    })
+                    .collect(),
+                attrs: e.attrs.iter().map(|a| quote!(#a).to_string()).collect(),
+                span: capture_source_span(item),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// File-scope items visible to every module in a file but not reachable from an
+/// `ItemFn` alone. Captured once per file by `capture_file_scope` and injected
+/// into each module's FIR by `transpile_source`, mirroring `capture_file_enums`.
+/// (Enums are captured separately, by `capture_file_enums`.)
+pub struct FileScope {
+    pub fns: Vec<FrontendFnIR>,
+    pub structs: Vec<ItemStruct>,
+    pub consts: Vec<ItemConst>,
+    pub impls: Vec<FrontendImplIR>,
+    pub traits: Vec<FrontendTraitIR>,
+}
+
+/// Capture the file-scope free fns, structs, consts, impls, and traits. Hardware
+/// modules (`hardware_fns`) are excluded from `fns` — they are transpiled as
+/// modules in their own right, not inlinable helpers. Nothing consumes the
+/// result yet; this only closes the capture gap (see `TRANSPILATION_TODO.md` #7).
+pub fn capture_file_scope(
+    file: &syn::File,
+    hardware_fns: &std::collections::HashSet<String>,
+) -> FileScope {
+    let mut scope = FileScope {
+        fns: Vec::new(),
+        structs: Vec::new(),
+        consts: Vec::new(),
+        impls: Vec::new(),
+        traits: Vec::new(),
+    };
+
+    for item in &file.items {
+        match item {
+            // Free functions, minus the hardware modules themselves.
+            syn::Item::Fn(f) if !hardware_fns.contains(&f.sig.ident.to_string()) => {
+                scope.fns.push(capture_fn_from_parts(
+                    &f.sig,
+                    Some(&f.block),
+                    hardware_fns,
+                    capture_source_span(f),
+                ));
+            }
+            syn::Item::Struct(s) => scope.structs.push(capture_item_struct(s)),
+            syn::Item::Const(c) => scope.consts.push(capture_item_const(c)),
+            syn::Item::Impl(imp) => scope.impls.push(capture_impl(imp, hardware_fns)),
+            syn::Item::Trait(t) => scope.traits.push(capture_trait(t, hardware_fns)),
+            _ => {}
+        }
+    }
+
+    scope
+}
+
+/// Lower a function's parts to `FrontendFnIR`. `block` is `None` for a bodyless
+/// trait-method declaration; its `raw_statements` are then empty.
+fn capture_fn_from_parts(
+    sig: &syn::Signature,
+    block: Option<&syn::Block>,
+    hardware_fns: &std::collections::HashSet<String>,
+    span: SourceSpan,
+) -> FrontendFnIR {
+    FrontendFnIR {
+        name: sig.ident.to_string(),
+        signature: capture_signature(sig),
+        receiver: extract_receiver(sig),
+        raw_statements: block
+            .map(|b| parse_block_stmts(b, hardware_fns))
+            .unwrap_or_default(),
+        span,
+    }
+}
+
+/// The `self` receiver of a method, if any. `Opcode::from_bits(op: Bits<7>)` and
+/// free functions have none.
+fn extract_receiver(sig: &syn::Signature) -> Option<Receiver> {
+    match sig.inputs.first() {
+        Some(syn::FnArg::Receiver(r)) => Some(if r.reference.is_none() {
+            Receiver::Value
+        } else if r.mutability.is_some() {
+            Receiver::RefMut
+        } else {
+            Receiver::Ref
+        }),
+        _ => None,
+    }
+}
+
+fn capture_impl(
+    imp: &syn::ItemImpl,
+    hardware_fns: &std::collections::HashSet<String>,
+) -> FrontendImplIR {
+    let methods = imp
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            syn::ImplItem::Fn(m) => Some(capture_fn_from_parts(
+                &m.sig,
+                Some(&m.block),
+                hardware_fns,
+                capture_source_span(m),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    FrontendImplIR {
+        self_ty: imp.self_ty.to_token_stream().to_string(),
+        trait_name: imp
+            .trait_
+            .as_ref()
+            .map(|(_, path, _)| path.to_token_stream().to_string()),
+        methods,
+        span: capture_source_span(imp),
+    }
+}
+
+fn capture_trait(
+    t: &syn::ItemTrait,
+    hardware_fns: &std::collections::HashSet<String>,
+) -> FrontendTraitIR {
+    let methods = t
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            // A trait method may be a bare signature or carry a default body.
+            syn::TraitItem::Fn(m) => Some(capture_fn_from_parts(
+                &m.sig,
+                m.default.as_ref(),
+                hardware_fns,
+                capture_source_span(m),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    FrontendTraitIR {
+        name: t.ident.to_string(),
+        methods,
+        span: capture_source_span(t),
+    }
+}
+
+/// Capture a `const` item (`const N: usize = 8;`). Shared by in-body items
+/// (`parse_item_stmt`) and file-scope capture (`capture_file_scope`).
+fn capture_item_const(const_item: &syn::ItemConst) -> ItemConst {
+    ItemConst {
+        name: const_item.ident.to_string(),
+        ty: RawTypeRef {
+            ty_text: const_item.ty.to_token_stream().to_string(),
+            span: capture_source_span(&*const_item.ty),
+        },
+        value_text: const_item.expr.to_token_stream().to_string(),
+        attrs: const_item.attrs.iter().map(|a| quote!(#a).to_string()).collect(),
+        span: capture_source_span(const_item),
+    }
+}
+
+/// Capture a `struct` item, named or tuple (unnamed fields become `field_0`,
+/// `field_1`, …). Shared by in-body and file-scope capture.
+fn capture_item_struct(struct_item: &syn::ItemStruct) -> ItemStruct {
+    let fields = match &struct_item.fields {
+        syn::Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|f| StructField {
+                name: f.ident.as_ref().unwrap().to_string(),
+                ty: RawTypeRef {
+                    ty_text: f.ty.to_token_stream().to_string(),
+                    span: capture_source_span(&f.ty),
+                },
+                span: capture_source_span(f),
+            })
+            .collect(),
+        syn::Fields::Unnamed(unnamed) => unnamed
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| StructField {
+                name: format!("field_{}", idx),
+                ty: RawTypeRef {
+                    ty_text: f.ty.to_token_stream().to_string(),
+                    span: capture_source_span(&f.ty),
+                },
+                span: capture_source_span(f),
+            })
+            .collect(),
+        syn::Fields::Unit => Vec::new(),
+    };
+    ItemStruct {
+        name: struct_item.ident.to_string(),
+        fields,
+        attrs: struct_item.attrs.iter().map(|a| quote!(#a).to_string()).collect(),
+        span: capture_source_span(struct_item),
+    }
+}
+
 fn parse_item_stmt(item: &syn::Item) -> RawStmtKind {
     let item_stmt = match item {
-        syn::Item::Const(const_item) => {
-            let name = const_item.ident.to_string();
-            let ty = RawTypeRef {
-                ty_text: const_item.ty.to_token_stream().to_string(),
-                span: capture_source_span(&*const_item.ty),
-            };
-            let value_text = const_item.expr.to_token_stream().to_string();
-            let attrs = const_item.attrs.iter().map(|a| quote!(#a).to_string()).collect();
-            ItemStmt::Const(ItemConst {
-                name,
-                ty,
-                value_text,
-                attrs,
-                span: capture_source_span(item),
-            })
-        }
+        syn::Item::Const(const_item) => ItemStmt::Const(capture_item_const(const_item)),
         syn::Item::Enum(enum_item) => {
             let name = enum_item.ident.to_string();
             let variants = enum_item
@@ -228,44 +549,7 @@ fn parse_item_stmt(item: &syn::Item) -> RawStmtKind {
                 span: capture_source_span(item),
             })
         }
-        syn::Item::Struct(struct_item) => {
-            let name = struct_item.ident.to_string();
-            let fields = match &struct_item.fields {
-                syn::Fields::Named(named) => named
-                    .named
-                    .iter()
-                    .map(|f| StructField {
-                        name: f.ident.as_ref().unwrap().to_string(),
-                        ty: RawTypeRef {
-                            ty_text: f.ty.to_token_stream().to_string(),
-                            span: capture_source_span(&f.ty),
-                        },
-                        span: capture_source_span(f),
-                    })
-                    .collect(),
-                syn::Fields::Unnamed(unnamed) => unnamed
-                    .unnamed
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, f)| StructField {
-                        name: format!("field_{}", idx),
-                        ty: RawTypeRef {
-                            ty_text: f.ty.to_token_stream().to_string(),
-                            span: capture_source_span(&f.ty),
-                        },
-                        span: capture_source_span(f),
-                    })
-                    .collect(),
-                syn::Fields::Unit => Vec::new(),
-            };
-            let attrs = struct_item.attrs.iter().map(|a| quote!(#a).to_string()).collect();
-            ItemStmt::Struct(ItemStruct {
-                name,
-                fields,
-                attrs,
-                span: capture_source_span(item),
-            })
-        }
+        syn::Item::Struct(struct_item) => ItemStmt::Struct(capture_item_struct(struct_item)),
         syn::Item::Type(type_item) => {
             let name = type_item.ident.to_string();
             let target_ty = RawTypeRef {
@@ -327,12 +611,12 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
 
         Expr::Async(e) => ExprType::Async(ExprAsync {
             is_move: e.capture.is_some(),
-            block: e.block.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
-                order,
-                kind: classify_raw_stmt_kind(stmt, hardware_fns),
-                text: quote!(#stmt).to_string(),
-                span: capture_source_span(stmt),
-            }).collect(),
+            block: parse_block_stmts(&e.block, hardware_fns),
+            span: capture_source_span(e),
+        }),
+
+        Expr::Block(e) => ExprType::Block(ExprBlock {
+            stmts: parse_block_stmts(&e.block, hardware_fns),
             span: capture_source_span(e),
         }),
 
@@ -363,12 +647,44 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             })
         }
 
+        Expr::Path(e) => ExprType::Path(ExprPath {
+            path_text: e.path.to_token_stream().to_string(),
+            span: capture_source_span(e),
+        }),
+
         Expr::Cast(e) => ExprType::Cast(ExprCast {
             expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
             target_ty: RawTypeRef {
                 ty_text: e.ty.to_token_stream().to_string(),
                 span: capture_source_span(&*e.ty),
             },
+            span: capture_source_span(e),
+        }),
+
+        Expr::Tuple(e) => ExprType::Tuple(ExprTuple {
+            elements: e.elems.iter().map(|elem| parse_expr_type(elem, hardware_fns)).collect(),
+            span: capture_source_span(e),
+        }),
+
+        Expr::Struct(e) => ExprType::Struct(ExprStruct {
+            path_text: e.path.to_token_stream().to_string(),
+            fields: e.fields.iter().map(|field| ExprStructField {
+                member: field.member.to_token_stream().to_string(),
+                expr: Box::new(parse_expr_type(&field.expr, hardware_fns)),
+                span: capture_source_span(field),
+            }).collect(),
+            rest: e.rest.as_ref().map(|rest| Box::new(parse_expr_type(rest, hardware_fns))),
+            span: capture_source_span(e),
+        }),
+
+        Expr::Break(e) => ExprType::Break(ExprBreak {
+            label: e.label.as_ref().map(|label| label.ident.to_string()),
+            expr: e.expr.as_ref().map(|expr| Box::new(parse_expr_type(expr, hardware_fns))),
+            span: capture_source_span(e),
+        }),
+
+        Expr::Continue(e) => ExprType::Continue(ExprContinue {
+            label: e.label.as_ref().map(|label| label.ident.to_string()),
             span: capture_source_span(e),
         }),
 
@@ -381,14 +697,19 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             span: capture_source_span(e),
         }),
 
+        Expr::Index(e) => ExprType::Index(ExprIndex {
+            base: Box::new(parse_expr_type(&e.expr, hardware_fns)),
+            index: Box::new(parse_expr_type(&e.index, hardware_fns)),
+            span: capture_source_span(e),
+        }),
+
+        // Parentheses carry no semantics — unwrap to the inner expression.
+        // (Emission re-parenthesizes fully, so grouping is never lost.)
+        Expr::Paren(e) => parse_expr_type(&e.expr, hardware_fns),
+
         Expr::If(e) => ExprType::If(ExprIf {
             condition: Box::new(parse_expr_type(&e.cond, hardware_fns)),
-            then_block: e.then_branch.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
-                order,
-                kind: classify_raw_stmt_kind(stmt, hardware_fns),
-                text: quote!(#stmt).to_string(),
-                span: capture_source_span(stmt),
-            }).collect(),
+            then_block: parse_block_stmts(&e.then_branch, hardware_fns),
             else_branch: e.else_branch.as_ref().map(|(_, expr)| {
                 Box::new(parse_expr_type(expr, hardware_fns))
             }),
@@ -407,12 +728,7 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
         }),
 
         Expr::Loop(e) => ExprType::Loop(ExprLoop {
-            body: e.body.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
-                order,
-                kind: classify_raw_stmt_kind(stmt, hardware_fns),
-                text: quote!(#stmt).to_string(),
-                span: capture_source_span(stmt),
-            }).collect(),
+            body: parse_block_stmts(&e.body, hardware_fns),
             span: capture_source_span(e),
         }),
 
@@ -433,6 +749,7 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             receiver: Box::new(parse_expr_type(&e.receiver, hardware_fns)),
             method: e.method.to_string(),
             args: e.args.iter().map(|a| parse_expr_type(a, hardware_fns)).collect(),
+            turbofish: capture_method_turbofish(e.turbofish.as_ref()),
             span: capture_source_span(e),
         }),
 
@@ -468,12 +785,14 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
 
         Expr::While(e) => ExprType::While(ExprWhile {
             condition: Box::new(parse_expr_type(&e.cond, hardware_fns)),
-            body: e.body.stmts.iter().enumerate().map(|(order, stmt)| RawStmt {
-                order,
-                kind: classify_raw_stmt_kind(stmt, hardware_fns),
-                text: quote!(#stmt).to_string(),
-                span: capture_source_span(stmt),
-            }).collect(),
+            body: parse_block_stmts(&e.body, hardware_fns),
+            span: capture_source_span(e),
+        }),
+
+        Expr::ForLoop(e) => ExprType::ForLoop(ExprForLoop {
+            pat_text: e.pat.to_token_stream().to_string(),
+            iter: Box::new(parse_expr_type(&e.expr, hardware_fns)),
+            body: parse_block_stmts(&e.body, hardware_fns),
             span: capture_source_span(e),
         }),
 
@@ -482,11 +801,152 @@ fn parse_expr_type(expr: &Expr, hardware_fns: &std::collections::HashSet<String>
             span: capture_source_span(e),
         }),
 
+        // `const { ... }` — a compile-time block (e.g. `const { assert!(...) }`).
+        // Captured as a real block so lowering can elide it explicitly rather
+        // than the block reaching CHIR as an opaque literal.
+        Expr::Const(e) => ExprType::Const(ExprConst {
+            stmts: parse_block_stmts(&e.block, hardware_fns),
+            span: capture_source_span(e),
+        }),
+
+        // `|i| <body>` — captured structurally so a memory preload's fill
+        // function can be lowered as an expression in its parameter.
+        Expr::Closure(e) => ExprType::Closure(ExprClosure {
+            params: e
+                .inputs
+                .iter()
+                .map(|p| p.to_token_stream().to_string().replace(' ', ""))
+                .collect(),
+            body: Box::new(parse_expr_type(&e.body, hardware_fns)),
+            span: capture_source_span(e),
+        }),
+
+        // `expr?` — the try operator.
+        Expr::Try(e) => ExprType::Try(ExprTry {
+            expr: Box::new(parse_expr_type(&e.expr, hardware_fns)),
+            span: capture_source_span(e),
+        }),
+
+        // `matches!(x, Pat)` desugars to `match x { Pat => true, _ => false }`,
+        // reusing match-as-value lowering. Other macros (`panic!`, `println!`, …)
+        // are captured structurally as `ExprMacro`.
+        Expr::Macro(e) => desugar_matches(&e.mac, hardware_fns, capture_source_span(e))
+            .or_else(|| desugar_vec(&e.mac, hardware_fns, capture_source_span(e)))
+            .unwrap_or_else(|| ExprType::Macro(macro_to_expr(&e.mac, capture_source_span(e)))),
+
         // Fallback for unsupported/unhandled expressions
         _ => ExprType::Lit(ExprLit {
             text: quote!(#expr).to_string(),
             span: capture_source_span(expr),
         }),
+    }
+}
+
+/// Desugar `matches!(scrutinee, pattern)` into an equivalent match-as-value
+/// (`match scrutinee { pattern => true, _ => false }`) so it lowers through the
+/// existing match machinery. Returns `None` for any other macro.
+fn desugar_matches(
+    mac: &syn::Macro,
+    hardware_fns: &std::collections::HashSet<String>,
+    span: SourceSpan,
+) -> Option<ExprType> {
+    if mac.path.segments.last().map(|s| s.ident != "matches").unwrap_or(true) {
+        return None;
+    }
+    use syn::parse::Parser;
+    let parse = |input: syn::parse::ParseStream| -> syn::Result<(syn::Expr, syn::Pat)> {
+        let scrutinee: syn::Expr = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+        Ok((scrutinee, pat))
+    };
+    let (scrutinee, pat) = parse.parse2(mac.tokens.clone()).ok()?;
+    let bool_arm = |value: bool, pattern_text: String| ExprMatchArm {
+        pattern_text,
+        guard: None,
+        body: Box::new(ExprType::Lit(ExprLit { text: value.to_string(), span })),
+        span,
+    };
+    Some(ExprType::Match(ExprMatch {
+        scrutinee: Box::new(parse_expr_type(&scrutinee, hardware_fns)),
+        arms: vec![
+            bool_arm(true, pat.to_token_stream().to_string()),
+            bool_arm(false, "_".to_string()),
+        ],
+        span,
+    }))
+}
+
+/// Desugar `vec![a, b, c]` into an array literal and `vec![x; n]` into a repeat,
+/// which is what they are for hardware purposes — a fixed list of values. Keeping
+/// them as an opaque `ExprMacro` would hide a memory preload's contents from every
+/// later phase. Returns `None` for any other macro.
+fn desugar_vec(
+    mac: &syn::Macro,
+    hardware_fns: &std::collections::HashSet<String>,
+    span: SourceSpan,
+) -> Option<ExprType> {
+    if mac.path.segments.last().map(|s| s.ident != "vec").unwrap_or(true) {
+        return None;
+    }
+    use syn::parse::Parser;
+
+    // `vec![x; n]` first — it would otherwise parse as a one-element list.
+    let repeat = |input: syn::parse::ParseStream| -> syn::Result<(syn::Expr, syn::Expr)> {
+        let value: syn::Expr = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        let len: syn::Expr = input.parse()?;
+        Ok((value, len))
+    };
+    if let Ok((value, len)) = repeat.parse2(mac.tokens.clone()) {
+        return Some(ExprType::Repeat(ExprRepeat {
+            expr: Box::new(parse_expr_type(&value, hardware_fns)),
+            len: Box::new(parse_expr_type(&len, hardware_fns)),
+            span,
+        }));
+    }
+
+    let list = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+    let elems = list.parse2(mac.tokens.clone()).ok()?;
+    Some(ExprType::Array(ExprArray {
+        elements: elems.iter().map(|e| parse_expr_type(e, hardware_fns)).collect(),
+        span,
+    }))
+}
+
+/// Shared lowering of a `syn::Macro` invocation to `ExprMacro`, used from both
+/// expression position (`Expr::Macro`) and statement position (`Stmt::Macro`).
+/// The macro's delimited tokens are kept verbatim; a macro body is not
+/// Rust-expression-shaped, so there is nothing structured to descend into.
+fn macro_to_expr(mac: &syn::Macro, span: SourceSpan) -> ExprMacro {
+    let name = mac
+        .path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    ExprMacro {
+        name,
+        tokens_text: mac.tokens.to_string(),
+        span,
+    }
+}
+
+/// Canonical token string per turbofish generic argument on a method call:
+/// `read_port::<0>()` → `["0"]`, `part_select::<3>(12)` → `["3"]`. Returns an
+/// empty vec when the call has no `::<...>`. Kept as raw arg strings (not parsed
+/// to numbers) because a turbofish arg may be a const expression or a type, not
+/// only a literal — later phases interpret it per method.
+fn capture_method_turbofish(
+    turbofish: Option<&syn::AngleBracketedGenericArguments>,
+) -> Vec<String> {
+    match turbofish {
+        Some(tf) => tf
+            .args
+            .iter()
+            .map(|arg| arg.to_token_stream().to_string())
+            .collect(),
+        None => Vec::new(),
     }
 }
 
@@ -549,21 +1009,16 @@ fn infer_local_type_hint_from_init(local: &syn::Local) -> Option<RawTypeRef> {
     let expr = &*init.expr;
 
     match expr {
-        // let x = Bits::<8>::from_u128(0)
-        syn::Expr::Call(call) => match &*call.func {
-            syn::Expr::Path(p) => Some(RawTypeRef {
-                ty_text: p.path.to_token_stream().to_string(),
-                span: capture_source_span(p),
-            }),
-            _ => None,
-        },
-
-        // let x = foo as T
+        // let x = foo as T — the cast target is a genuine type annotation.
         syn::Expr::Cast(cast) => Some(RawTypeRef {
             ty_text: cast.ty.to_token_stream().to_string(),
             span: capture_source_span(&*cast.ty),
         }),
 
+        // A constructor call like `Bits::from_u32(1)` is NOT a type: its callee
+        // path (`Bits::from_u32`) does not resolve as a type. Its width is
+        // inferred in CHIR from the constructor name / turbofish — see
+        // `chir_lower::infer_type_from_call`.
         _ => None,
     }
 }
@@ -575,14 +1030,35 @@ fn extract_local_name(local: &syn::Local) -> Option<String> {
             syn::Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
             _ => None,
         },
+        // A tuple destructuring `let (a, b, _) = …` keeps its binder list as
+        // `"(a, b, _)"`; the CHIR lowering splits it back into one binding per
+        // element. Anything fancier than plain idents/wildcards stays opaque.
+        syn::Pat::Tuple(t) => {
+            let names: Option<Vec<String>> = t
+                .elems
+                .iter()
+                .map(|p| match p {
+                    syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
+                    syn::Pat::Wild(_) => Some("_".to_string()),
+                    _ => None,
+                })
+                .collect();
+            names.map(|n| format!("({})", n.join(", ")))
+        }
         _ => None,
     }
 }
 
 fn capture_source_span(node: &impl Spanned) -> SourceSpan {
-    let _ = node;
-    // Stable fallback until span location conversion is wired up.
-    SourceSpan::default()
+    let span = node.span();
+    let start = span.start();
+    let end = span.end();
+    SourceSpan {
+        start_line: start.line,
+        start_col: start.column,
+        end_line: end.line,
+        end_col: end.column,
+    }
 }
 
 #[cfg(test)]
@@ -609,7 +1085,7 @@ mod tests {
             }
         };
 
-        let signature = capture_signature(&design_fn);
+        let signature = capture_signature(&design_fn.sig);
         assert_eq!(signature.params.len(), 2);
         assert_eq!(signature.params[0].name, "clk");
         assert_eq!(compact_ws(&signature.params[0].ty.ty_text), "Clock<MainClk>");
@@ -619,6 +1095,204 @@ mod tests {
             compact_ws(&signature.return_ty.expect("return type").ty_text),
             "u8"
         );
+        // Non-generic module: no generics, no where clause.
+        assert!(signature.generics.is_empty());
+        assert!(signature.where_clause_text.is_none());
+    }
+
+    #[test]
+    fn test_capture_signature_const_generics() {
+        // shift_register-shaped: `<const N: usize, const N_1: usize>`.
+        let design_fn: ItemFn = parse_quote! {
+            async fn m<const N: usize, const N_1: usize>(
+                clk: Clock<MainClk>,
+                out: Out<Bits<N>, MainClk>,
+            ) {}
+        };
+
+        let sig = capture_signature(&design_fn.sig);
+        assert_eq!(sig.generics.len(), 2);
+
+        assert_eq!(sig.generics[0].kind, GenericParamKind::Const);
+        assert_eq!(sig.generics[0].name, "N");
+        assert_eq!(
+            compact_ws(&sig.generics[0].const_ty.as_ref().expect("const ty").ty_text),
+            "usize"
+        );
+        assert!(sig.generics[0].bounds.is_empty());
+        assert!(sig.generics[0].default.is_none());
+
+        assert_eq!(sig.generics[1].name, "N_1");
+        assert_eq!(sig.generics[1].kind, GenericParamKind::Const);
+    }
+
+    #[test]
+    fn test_capture_signature_bounded_domain_generic() {
+        // sync_2ff-shaped: a type param bounded by ClockDomain, used as a domain.
+        let design_fn: ItemFn = parse_quote! {
+            async fn sync_2ff<SrcD: ClockDomain>(
+                clk: Clock<ClkSlow>,
+                d: In<Logic, SrcD>,
+                q: Out<Logic, ClkSlow>,
+            ) {}
+        };
+
+        let sig = capture_signature(&design_fn.sig);
+        assert_eq!(sig.generics.len(), 1);
+        assert_eq!(sig.generics[0].kind, GenericParamKind::Type);
+        assert_eq!(sig.generics[0].name, "SrcD");
+        assert!(sig.generics[0].const_ty.is_none());
+        assert_eq!(sig.generics[0].bounds, vec!["ClockDomain".to_string()]);
+    }
+
+    #[test]
+    fn test_capture_signature_where_clause_preserved() {
+        let design_fn: ItemFn = parse_quote! {
+            async fn m<T>(x: T) where T: ClockDomain {}
+        };
+
+        let sig = capture_signature(&design_fn.sig);
+        assert_eq!(sig.generics.len(), 1);
+        assert_eq!(sig.generics[0].name, "T");
+        // Unbounded at the param site; the bound lives in the where clause.
+        assert!(sig.generics[0].bounds.is_empty());
+        assert_eq!(
+            compact_ws(&sig.where_clause_text.expect("where clause")),
+            "whereT:ClockDomain"
+        );
+    }
+
+    // ── File-scope item capture (#7a) ────────────────────────────────────────
+
+    fn parse_file(src: &str) -> syn::File {
+        syn::parse_str(src).expect("valid Rust file")
+    }
+
+    #[test]
+    fn test_capture_file_scope_free_fns_and_consts() {
+        let file = parse_file(
+            r#"
+            const CLKS_PER_BIT: usize = 434;
+            fn sign_ext_i(instr: Bits<32>) -> Bits<32> { instr }
+            fn decode(instr: Bits<32>) -> Option<InstrDecoded> {
+                let opcode = Opcode::from_bits(instr.truncate::<7>())?;
+                Some(InstrDecoded { opcode })
+            }
+            #[hardware(sequential)]
+            async fn m(clk: Clock<MainClk>) {}
+            "#,
+        );
+        let hw: std::collections::HashSet<String> = ["m".to_string()].into_iter().collect();
+        let scope = capture_file_scope(&file, &hw);
+
+        // Const captured with its value.
+        assert_eq!(scope.consts.len(), 1);
+        assert_eq!(scope.consts[0].name, "CLKS_PER_BIT");
+        assert_eq!(scope.consts[0].value_text, "434");
+
+        // Both free fns captured; the hardware module `m` is excluded.
+        let fn_names: Vec<&str> = scope.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(fn_names, vec!["sign_ext_i", "decode"]);
+
+        // The `decode` body is captured structurally (return type, statements),
+        // not flattened to opaque text; it exercises `?` + struct-literal return.
+        let decode = scope.fns.iter().find(|f| f.name == "decode").unwrap();
+        assert!(decode.receiver.is_none());
+        assert_eq!(
+            compact_ws(&decode.signature.return_ty.as_ref().unwrap().ty_text),
+            "Option<InstrDecoded>"
+        );
+        assert!(!decode.raw_statements.is_empty());
+    }
+
+    #[test]
+    fn test_capture_file_scope_structs() {
+        let file = parse_file(
+            r#"
+            pub struct InstrDecoded { pub opcode: Opcode, pub rd: usize }
+            struct Packet(Logic, Bits<8>);
+            "#,
+        );
+        let scope = capture_file_scope(&file, &Default::default());
+        assert_eq!(scope.structs.len(), 2);
+
+        let decoded = &scope.structs[0];
+        assert_eq!(decoded.name, "InstrDecoded");
+        assert_eq!(decoded.fields.len(), 2);
+        assert_eq!(decoded.fields[0].name, "opcode");
+        assert_eq!(decoded.fields[1].name, "rd");
+
+        // Tuple struct fields become field_0, field_1.
+        let packet = &scope.structs[1];
+        assert_eq!(packet.fields[0].name, "field_0");
+        assert_eq!(packet.fields[1].name, "field_1");
+    }
+
+    #[test]
+    fn test_capture_file_scope_impl_methods() {
+        let file = parse_file(
+            r#"
+            impl Opcode {
+                pub fn from_bits(op: Bits<7>) -> Option<Self> { None }
+            }
+            impl ClockDomain for MainClk {}
+            "#,
+        );
+        let scope = capture_file_scope(&file, &Default::default());
+        assert_eq!(scope.impls.len(), 2);
+
+        // Inherent impl with an associated fn (no receiver).
+        let inherent = &scope.impls[0];
+        assert_eq!(inherent.self_ty, "Opcode");
+        assert!(inherent.trait_name.is_none());
+        assert_eq!(inherent.methods.len(), 1);
+        assert_eq!(inherent.methods[0].name, "from_bits");
+        assert!(inherent.methods[0].receiver.is_none());
+
+        // Empty marker trait-impl captures harmlessly with no methods.
+        let marker = &scope.impls[1];
+        assert_eq!(marker.self_ty, "MainClk");
+        assert_eq!(marker.trait_name.as_deref(), Some("ClockDomain"));
+        assert!(marker.methods.is_empty());
+    }
+
+    #[test]
+    fn test_capture_file_scope_traits_and_receivers() {
+        let file = parse_file(
+            r#"
+            pub trait ReadOp {
+                fn issue_read(&self, addr: usize);
+                fn read_data(&self) -> Bits<32>;
+                fn reset(&mut self);
+            }
+            "#,
+        );
+        let scope = capture_file_scope(&file, &Default::default());
+        assert_eq!(scope.traits.len(), 1);
+
+        let t = &scope.traits[0];
+        assert_eq!(t.name, "ReadOp");
+        assert_eq!(t.methods.len(), 3);
+        // Bodyless trait-method decls: empty statements, but receiver captured.
+        assert!(t.methods[0].raw_statements.is_empty());
+        assert_eq!(t.methods[0].receiver, Some(Receiver::Ref));
+        assert_eq!(t.methods[2].receiver, Some(Receiver::RefMut));
+    }
+
+    #[test]
+    fn test_capture_frontend_ir_has_empty_file_scope() {
+        // A FIR captured from an ItemFn alone carries no file-scope items;
+        // transpile_source injects them (like enums).
+        let design_fn: ItemFn = parse_quote! {
+            #[hardware(sequential)]
+            async fn m(clk: Clock<MainClk>) {}
+        };
+        let fir = capture_frontend_ir(&design_fn, &Default::default()).unwrap();
+        assert!(fir.file_fns.is_empty());
+        assert!(fir.file_structs.is_empty());
+        assert!(fir.file_consts.is_empty());
+        assert!(fir.file_impls.is_empty());
+        assert!(fir.file_traits.is_empty());
     }
 
     #[test]
@@ -629,7 +1303,7 @@ mod tests {
             }
         };
 
-        let signature = capture_signature(&design_fn);
+        let signature = capture_signature(&design_fn.sig);
         assert_eq!(signature.params.len(), 1);
         assert_eq!(signature.params[0].name, "input");
         assert_eq!(compact_ws(&signature.params[0].ty.ty_text), "Arc<Mutex<u8>>");
@@ -645,7 +1319,7 @@ mod tests {
             }
         };
 
-        let signature = capture_signature(&design_fn);
+        let signature = capture_signature(&design_fn.sig);
         assert_eq!(signature.params.len(), 1);
         assert_eq!(signature.params[0].name, "input");
         assert_eq!(compact_ws(&signature.params[0].ty.ty_text), "Arc<Mutex<u8>>");
@@ -672,6 +1346,45 @@ mod tests {
             classify_module(&sync_fn),
             FrontendClassification::CombinationalFn
         );
+    }
+
+    #[test]
+    fn test_capture_hardware_mode_reads_attribute_arg() {
+        let seq: ItemFn = parse_quote! {
+            #[hardware(sequential)]
+            async fn m(clk: Clock<MainClk>) {}
+        };
+        let comb: ItemFn = parse_quote! {
+            #[hardware(combinational)]
+            fn m(d: In<Logic, ()>) {}
+        };
+        let sync: ItemFn = parse_quote! {
+            #[hardware(synchronizer)]
+            async fn m(clk: Clock<Slow>) {}
+        };
+
+        assert_eq!(capture_hardware_mode(&seq), Some(HardwareMode::Sequential));
+        assert_eq!(capture_hardware_mode(&comb), Some(HardwareMode::Combinational));
+        // `synchronizer` is async like `sequential`, so only the attribute — not
+        // async-ness — can tell them apart. This is the whole point of the field.
+        assert_eq!(capture_hardware_mode(&sync), Some(HardwareMode::Synchronizer));
+    }
+
+    #[test]
+    fn test_capture_hardware_mode_absent_or_unknown_is_none() {
+        // No attribute at all (e.g. a bare fn handed to transpile_item_fn).
+        let bare: ItemFn = parse_quote! {
+            async fn m(clk: Clock<MainClk>) {}
+        };
+        // Attribute present but an argument we don't recognize — left to the
+        // proc-macro to diagnose, not guessed here.
+        let unknown: ItemFn = parse_quote! {
+            #[hardware(bogus)]
+            async fn m(clk: Clock<MainClk>) {}
+        };
+
+        assert_eq!(capture_hardware_mode(&bare), None);
+        assert_eq!(capture_hardware_mode(&unknown), None);
     }
 
     #[test]
@@ -737,9 +1450,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_stmt_infers_type_hint_from_init_when_no_explicit_type() {
+    fn test_parse_local_stmt_constructor_call_yields_no_type_hint() {
+        // A constructor call is not a type annotation: the parser must NOT
+        // extract the callee path as a type. Width is inferred later in CHIR.
         let local = parse_local_from_stmt(parse_quote! {
-            let mut count = Bits::<8>::from_u128(0);
+            let mut count = Bits::from_u32(1);
         });
 
         let kind = parse_local_stmt(&local, &Default::default());
@@ -747,8 +1462,11 @@ mod tests {
             RawStmtKind::Local(local_stmt) => {
                 assert!(local_stmt.is_mut);
                 assert_eq!(local_stmt.name, "count");
-                let ty = local_stmt.ty.expect("inferred type hint should be captured");
-                assert_eq!(compact_ws(&ty.ty_text), "Bits::<8>::from_u128");
+                assert!(
+                    local_stmt.ty.is_none(),
+                    "constructor call must not produce a type hint, got {:?}",
+                    local_stmt.ty
+                );
             }
             _ => panic!("expected local stmt"),
         }
@@ -1209,7 +1927,7 @@ mod tests {
         let expr: Expr = parse_quote!(x = 42);
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Assign(assign) => {
-                assert!(matches!(*assign.left, ExprType::Lit(_)));
+                assert!(matches!(*assign.left, ExprType::Path(_)));
                 assert!(matches!(*assign.right, ExprType::Lit(_)));
             }
             _ => panic!("expected assign"),
@@ -1249,9 +1967,19 @@ mod tests {
         let expr: Expr = parse_quote!(foo.await);
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Await(await_expr) => {
-                assert!(matches!(*await_expr.base, ExprType::Lit(_)));
+                assert!(matches!(*await_expr.base, ExprType::Path(_)));
             }
             _ => panic!("expected await"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_paren_unwraps_to_inner() {
+        // `(a >> 1)` must parse to the inner binary, not a raw `Lit` fallback.
+        let expr: Expr = parse_quote!((a >> 1));
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Binary(bin) => assert_eq!(bin.op, ">>"),
+            other => panic!("expected inner binary, got {other:?}"),
         }
     }
 
@@ -1261,8 +1989,8 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Binary(bin) => {
                 assert_eq!(bin.op, "+");
-                assert!(matches!(*bin.left, ExprType::Lit(_)));
-                assert!(matches!(*bin.right, ExprType::Lit(_)));
+                assert!(matches!(*bin.left, ExprType::Path(_)));
+                assert!(matches!(*bin.right, ExprType::Path(_)));
             }
             _ => panic!("expected binary"),
         }
@@ -1304,11 +2032,72 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_expr_path() {
+        let expr: Expr = parse_quote!(clk);
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Path(path) => {
+                assert_eq!(compact_ws(&path.path_text), "clk");
+            }
+            _ => panic!("expected path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_tuple() {
+        let expr: Expr = parse_quote!((a, b));
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Tuple(tuple) => {
+                assert_eq!(tuple.elements.len(), 2);
+                assert!(matches!(tuple.elements[0], ExprType::Path(_)));
+                assert!(matches!(tuple.elements[1], ExprType::Path(_)));
+            }
+            _ => panic!("expected tuple"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_struct() {
+        let expr: Expr = parse_quote!(Point { x: a, y: b });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Struct(strukt) => {
+                assert_eq!(compact_ws(&strukt.path_text), "Point");
+                assert_eq!(strukt.fields.len(), 2);
+                assert_eq!(strukt.fields[0].member, "x");
+                assert_eq!(strukt.fields[1].member, "y");
+            }
+            _ => panic!("expected struct"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_break() {
+        let expr: Expr = parse_quote!(break 'outer value);
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Break(brk) => {
+                assert_eq!(brk.label.as_deref(), Some("outer"));
+                assert!(brk.expr.is_some());
+            }
+            _ => panic!("expected break"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_continue() {
+        let expr: Expr = parse_quote!(continue 'outer);
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Continue(cont) => {
+                assert_eq!(cont.label.as_deref(), Some("outer"));
+            }
+            _ => panic!("expected continue"),
+        }
+    }
+
+    #[test]
     fn test_parse_expr_cast() {
         let expr: Expr = parse_quote!(x as u32);
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Cast(cast) => {
-                assert!(matches!(*cast.expr, ExprType::Lit(_)));
+                assert!(matches!(*cast.expr, ExprType::Path(_)));
                 assert_eq!(compact_ws(&cast.target_ty.ty_text), "u32");
             }
             _ => panic!("expected cast"),
@@ -1321,7 +2110,7 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Field(field) => {
                 assert_eq!(field.member, "field");
-                assert!(matches!(*field.base, ExprType::Lit(_)));
+                assert!(matches!(*field.base, ExprType::Path(_)));
             }
             _ => panic!("expected field"),
         }
@@ -1411,7 +2200,7 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Match(match_expr) => {
                 assert_eq!(match_expr.arms.len(), 3);
-                assert!(matches!(*match_expr.scrutinee, ExprType::Lit(_)));
+                assert!(matches!(*match_expr.scrutinee, ExprType::Path(_)));
                 assert!(!match_expr.arms[0].pattern_text.is_empty());
             }
             _ => panic!("expected match"),
@@ -1439,7 +2228,7 @@ mod tests {
             ExprType::MethodCall(method) => {
                 assert_eq!(method.method, "method");
                 assert_eq!(method.args.len(), 2);
-                assert!(matches!(*method.receiver, ExprType::Lit(_)));
+                assert!(matches!(*method.receiver, ExprType::Path(_)));
             }
             _ => panic!("expected method call"),
         }
@@ -1499,7 +2288,7 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref_expr) => {
                 assert!(!ref_expr.is_mut);
-                assert!(matches!(*ref_expr.expr, ExprType::Lit(_)));
+                assert!(matches!(*ref_expr.expr, ExprType::Path(_)));
             }
             _ => panic!("expected reference"),
         }
@@ -1511,7 +2300,7 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Reference(ref_expr) => {
                 assert!(ref_expr.is_mut);
-                assert!(matches!(*ref_expr.expr, ExprType::Lit(_)));
+                assert!(matches!(*ref_expr.expr, ExprType::Path(_)));
             }
             _ => panic!("expected reference"),
         }
@@ -1557,7 +2346,7 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::Unary(unary) => {
                 assert_eq!(unary.op, "-");
-                assert!(matches!(*unary.expr, ExprType::Lit(_)));
+                assert!(matches!(*unary.expr, ExprType::Path(_)));
             }
             _ => panic!("expected unary"),
         }
@@ -1680,8 +2469,8 @@ mod tests {
         match parse_expr_type(&expr, &Default::default()) {
             ExprType::If(if_expr) => {
                 assert!(if_expr.else_branch.is_some());
-                // The else branch is present and should be a literal
-                assert!(matches!(**if_expr.else_branch.as_ref().unwrap(), ExprType::Lit(_)));
+                // The else branch `else { 2 }` is parsed as a Block containing the literal
+                assert!(matches!(**if_expr.else_branch.as_ref().unwrap(), ExprType::Block(_)));
             }
             _ => panic!("expected if"),
         }
@@ -1780,6 +2569,50 @@ mod tests {
                 assert_eq!(bin.op, "<<");
             }
             _ => panic!("expected binary"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_const_block() {
+        // `const { assert!(...) }` — the compile-time check form used by
+        // shift_register/mux. Captured as a real block, not opaque text.
+        let expr: Expr = parse_quote!(const { assert!(N == 8) });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Const(c) => {
+                assert_eq!(c.stmts.len(), 1);
+                // The inner `assert!` is itself a macro statement.
+                match &c.stmts[0].kind {
+                    RawStmtKind::Expr(es) => match &es.expr {
+                        ExprType::Macro(m) => assert_eq!(m.name, "assert"),
+                        other => panic!("expected assert! macro, got {other:?}"),
+                    },
+                    other => panic!("expected expr stmt, got {other:?}"),
+                }
+            }
+            other => panic!("expected const block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_try_operator() {
+        // `expr?` — used inside decode()'s `Opcode::from_bits(...)?`.
+        let expr: Expr = parse_quote!(Opcode::from_bits(x)?);
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Try(t) => assert!(matches!(*t.expr, ExprType::Call(_))),
+            other => panic!("expected try, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_macro_invocation() {
+        // `panic!(...)` in expression position (rv32i_cpu decode arm).
+        let expr: Expr = parse_quote!(panic!("bad instr 0x{:x}", w));
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::Macro(m) => {
+                assert_eq!(m.name, "panic");
+                assert!(m.tokens_text.contains("bad instr"), "tokens: {}", m.tokens_text);
+            }
+            other => panic!("expected macro, got {other:?}"),
         }
     }
 
@@ -1905,10 +2738,55 @@ mod tests {
             ExprType::MethodCall(method) => {
                 assert_eq!(method.method, "process");
                 assert_eq!(method.args.len(), 2);
-                assert!(matches!(method.args[0], ExprType::Lit(_)));
+                assert!(matches!(method.args[0], ExprType::Path(_)));
                 assert!(matches!(method.args[1], ExprType::Cast(_)));
+                // No `::<...>` on this call.
+                assert!(method.turbofish.is_empty());
             }
             _ => panic!("expected method call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_method_call_captures_turbofish() {
+        // Memory port index: `memory.read_port::<0>()` — the `0` must survive.
+        let expr: Expr = parse_quote!(memory.read_port::<0>());
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::MethodCall(method) => {
+                assert_eq!(method.method, "read_port");
+                assert!(method.args.is_empty());
+                assert_eq!(method.turbofish, vec!["0".to_string()]);
+            }
+            _ => panic!("expected method call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_method_call_turbofish_and_args_are_distinct() {
+        // `instr.part_select::<3>(12)` — width `3` is turbofish, offset `12` is an arg.
+        let expr: Expr = parse_quote!(instr.part_select::<3>(12));
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::MethodCall(method) => {
+                assert_eq!(method.method, "part_select");
+                assert_eq!(method.turbofish, vec!["3".to_string()]);
+                assert_eq!(method.args.len(), 1);
+                assert!(matches!(method.args[0], ExprType::Lit(_)));
+            }
+            _ => panic!("expected method call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expr_for_loop_captured_structurally() {
+        // `for i in 0..N { ... }` is captured as ExprForLoop, not opaque text.
+        let expr: Expr = parse_quote!(for i in 0..N { o[i] = a[i]; });
+        match parse_expr_type(&expr, &Default::default()) {
+            ExprType::ForLoop(f) => {
+                assert_eq!(compact_ws(&f.pat_text), "i");
+                assert!(matches!(*f.iter, ExprType::Range(_)), "iter should be a range");
+                assert_eq!(f.body.len(), 1);
+            }
+            other => panic!("expected for-loop, got {other:?}"),
         }
     }
 
@@ -2296,9 +3174,9 @@ mod tests {
     // ========== Recognized Hardware Pattern Tests ==========
 
     #[test]
-    fn test_emit_macro_captured_as_lit_stmt() {
-        // emit!(value) as a top-level statement is captured via Stmt::Macro path
-        // → RawStmtKind::Expr(ExprStmt { expr: ExprType::Lit { text: "emit ! (value)" } })
+    fn test_macro_statement_captured_as_expr_macro() {
+        // A macro call in statement position is captured via the Stmt::Macro path
+        // as a structured ExprType::Macro { name, tokens_text }, not opaque text.
         let design_fn: ItemFn = parse_quote! {
             async fn counter(clk: Clock<MainClk>, input: Arc<Mutex<u8>>) {
                 emit!(42u8);
@@ -2308,13 +3186,13 @@ mod tests {
         assert_eq!(stmts.len(), 1);
         match &stmts[0].kind {
             RawStmtKind::Expr(expr_stmt) => {
+                assert!(expr_stmt.has_semi);
                 match &expr_stmt.expr {
-                    ExprType::Lit(lit) => {
-                        // text should contain "emit" and the argument
-                        assert!(lit.text.contains("emit"), "expected 'emit' in: {}", lit.text);
-                        assert!(lit.text.contains("42"), "expected '42' in: {}", lit.text);
+                    ExprType::Macro(m) => {
+                        assert_eq!(m.name, "emit");
+                        assert!(m.tokens_text.contains("42"), "tokens: {}", m.tokens_text);
                     }
-                    _ => panic!("expected Lit for emit! macro statement, got {:?}", expr_stmt.expr),
+                    _ => panic!("expected Macro for emit! statement, got {:?}", expr_stmt.expr),
                 }
             }
             _ => panic!("expected Expr stmt for emit!"),
@@ -2332,8 +3210,8 @@ mod tests {
                     ExprType::MethodCall(method) => {
                         assert_eq!(method.method, "tick");
                         assert_eq!(method.args.len(), 0);
-                        // receiver should be the clk variable (Lit path)
-                        assert!(matches!(*method.receiver, ExprType::Lit(_)));
+                        // receiver should be the clk variable (Path)
+                        assert!(matches!(*method.receiver, ExprType::Path(_)));
                     }
                     _ => panic!("expected MethodCall as await base, got {:?}", await_expr.base),
                 }
@@ -2390,7 +3268,7 @@ mod tests {
         let design_fn: ItemFn = parse_quote! {
             async fn counter(clk: Clock<MainClk>, data: Arc<Mutex<u8>>) { }
         };
-        let sig = capture_signature(&design_fn);
+        let sig = capture_signature(&design_fn.sig);
         let data_param = &sig.params[1];
         assert_eq!(data_param.name, "data");
         let compact: String = data_param.ty.ty_text.chars().filter(|c| !c.is_whitespace()).collect();

@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `Out<T, D>` in the current scope
+  --> tests/ui/fail/out_not_clone_single_driver.rs:15:30
+   |
+15 |     let _second_driver = out.clone(); // error: `Out<Logic>` is not `Clone`
+   |                              ^^^^^ method not found in `Out<copper_core::Logic>`

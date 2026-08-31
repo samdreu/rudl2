@@ -1,15 +1,25 @@
-# Verilator build artifacts
+# Verilator build artifacts (per-invocation work dirs live under target/verilator/)
 obj_dir/
-*.v
+obj_dir_*/
 tb_*.cpp
+# Generated Verilog (hand-written references are tracked as .sv under
+# tests/fixtures/reference_sv/ and examples/*/sv/)
+*.v
 
 # Rust build artifacts
 target/
 **/*.rs.bk
-Cargo.lock
 
 # Generated files
 *.d
 
 # macOS system files
 .DS_Store
+
+# Generated simulation waveforms
+waveforms/
+
+# Local agent/editor config
+.claude/
+smoke-failure.log
+regression-failure.log

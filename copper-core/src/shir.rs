@@ -1,4 +1,4 @@
-use crate::chir::{CHIRBinOp, CHIRType, CHIRUnOp};
+use crate::chir::{CHIRBinOp, CHIRType, CHIRUnOp, ModuleLocalParam, ModuleParam, Width};
 use crate::frontend_ir::SourceSpan;
 
 // ── Module ────────────────────────────────────────────────────────────────────
@@ -6,6 +6,11 @@ use crate::frontend_ir::SourceSpan;
 #[derive(Debug)]
 pub struct SHIRModule {
     pub name: String,
+    /// Module-level parameters (const generics), carried through from CHIR to
+    /// VLIR emission (M2).
+    pub params: Vec<ModuleParam>,
+    /// Module-level constants (`localparam`s) carried through from CHIR.
+    pub localparams: Vec<ModuleLocalParam>,
     pub ports: Vec<SHIRPort>,
     pub body: SHIRBody,
     pub span: SourceSpan,
@@ -16,6 +21,9 @@ pub struct SHIRPort {
     pub name: String,
     pub direction: SHIRPortDir,
     pub kind: SHIRPortKind,
+    /// Registered output port (`RegOut<T,D>`) — driven from `always_ff`. See
+    /// `CHIRPort::registered`.
+    pub registered: bool,
     pub span: SourceSpan,
 }
 
@@ -28,7 +36,6 @@ pub enum SHIRPortDir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SHIRPortKind {
     Clock,
-    /// Reuses CHIRType — widths and signedness are already resolved by Phase B.
     Data { ty: CHIRType },
 }
 
@@ -38,25 +45,26 @@ pub enum SHIRPortKind {
 pub enum SHIRBody {
     Combinational(SHIRCombBody),
     Sequential(SHIRSeqBody),
+    Structural(SHIRStructuralBody),
+}
+
+/// Pure-hierarchy parent body — internal nets + clocked submodule instances.
+/// 1:1 with `CHIRStructuralBody` (no timing regions to lower).
+#[derive(Debug)]
+pub struct SHIRStructuralBody {
+    pub nets: Vec<(String, CHIRType)>,
+    pub submodules: Vec<SHIRSubmoduleInst>,
 }
 
 // ── Combinational body ────────────────────────────────────────────────────────
 
+/// Combinational body as a flat list of statements.
+/// Statements are either `Wire` (intermediate value) or `PortDrive` (output),
+/// preserving their source order and conditional structure.
 #[derive(Debug)]
 pub struct SHIRCombBody {
-    /// `#[hardware]` submodule instances carried through from CHIR unchanged.
     pub submodules: Vec<SHIRSubmoduleInst>,
-    /// Intermediate combinational values (blocking assign / wire in Verilog).
-    pub wires: Vec<SHIRWire>,
-    /// Drives the output port continuously.
-    pub output_expr: SHIRExpr,
-}
-
-#[derive(Debug)]
-pub struct SHIRWire {
-    pub name: String,
-    pub ty: CHIRType,
-    pub value: SHIRExpr,
+    pub stmts: Vec<SHIRStmt>,
 }
 
 // ── Sequential body ───────────────────────────────────────────────────────────
@@ -64,22 +72,15 @@ pub struct SHIRWire {
 #[derive(Debug)]
 pub struct SHIRSeqBody {
     pub clock: String,
-
-    /// State registers — all live across tick boundaries.
     pub registers: Vec<SHIRReg>,
-
-    /// `#[hardware]` submodule instances.
-    /// Outputs are combinational wires visible in all phases.
+    /// `Memory<..>` instances — 1:1 with `CHIRSeqBody::memories`.
+    pub memories: Vec<SHIRMemory>,
     pub submodules: Vec<SHIRSubmoduleInst>,
-
-    /// One entry per phase.
-    /// Single-tick modules have exactly one entry (phase_idx = 0).
-    /// Multi-tick modules have one entry per tick.
+    /// One entry per phase (tick boundary).
+    /// Single-tick modules have exactly one phase (phase_idx = 0).
     pub phases: Vec<SHIRPhase>,
-
-    /// How the output port is driven — see output drive model below.
-    /// `None` if the module has no output port.
-    pub output_drive: Option<SHIROutputDrive>,
+    // Output port drives are embedded in each phase's pre_edge as
+    // SHIRStmt::PortDrive, possibly inside If/Match for conditional drives.
 }
 
 #[derive(Debug)]
@@ -89,8 +90,35 @@ pub struct SHIRReg {
     pub init: Option<SHIRLit>,
 }
 
-/// A `#[hardware]` submodule instance — passed through unchanged from CHIR.
-/// The `output_wire` name is a combinational wire available in all timing regions.
+/// A memory array instance. Mirrors `CHIRMemoryDecl` minus the span.
+#[derive(Debug)]
+pub struct SHIRMemory {
+    pub name: String,
+    pub elem_ty: CHIRType,
+    pub depth: usize,
+    pub read_ports: usize,
+    pub write_ports: usize,
+    /// Port latencies — see `CHIRMemoryDecl`.
+    pub read_lat: usize,
+    pub write_lat: usize,
+    /// Preloaded contents — see `CHIRMemInit`.
+    pub init: Option<SHIRMemInit>,
+    /// Read-during-write ordering — see `CHIRMemoryDecl::write_mode`.
+    pub write_mode: crate::memory::WriteMode,
+    /// See `CHIRMemoryDecl::received` — a `Memory<…>` PARAMETER, lowered to bus
+    /// ports with the array on the owner's side.
+    pub received: bool,
+}
+
+/// 1:1 with `CHIRMemInit`, over `SHIRExpr`.
+#[derive(Debug)]
+pub enum SHIRMemInit {
+    Fill { var: String, value: SHIRExpr },
+    Words(Vec<SHIRExpr>),
+}
+
+/// A `#[hardware]` submodule instance. The output_wire is a combinational
+/// wire available in all timing regions.
 #[derive(Debug)]
 pub struct SHIRSubmoduleInst {
     pub inst_name: String,
@@ -98,84 +126,120 @@ pub struct SHIRSubmoduleInst {
     pub inputs: Vec<(String, SHIRExpr)>,
     pub output_wire: String,
     pub output_ty: CHIRType,
+    /// `(child_clock_port, parent_clock_signal)` — see `CHIRSubmoduleInst::clocks`.
+    pub clocks: Vec<(String, String)>,
+    /// `(child_port, net_name)` — see `CHIRSubmoduleInst::port_nets`.
+    pub port_nets: Vec<(String, String)>,
+    /// Child output port name for the expression form — see `CHIRSubmoduleInst::output_port`.
+    pub output_port: Option<String>,
 }
 
 // ── Phase ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct SHIRPhase {
-    /// 0-indexed phase number within the loop.
     pub phase_idx: usize,
-
-    /// Statements that produce combinational values before the clock edge.
-    /// These become blocking assigns in `always_comb` or intermediate wires.
+    /// Combinational statements before the clock edge.
+    /// Includes Wire (intermediate values) and PortDrive (output port drives).
     pub pre_edge: Vec<SHIRStmt>,
-
-    /// Register next-value updates that take effect at the clock edge.
-    /// These become non-blocking assigns in `always_ff`.
+    /// Register next-value updates — take effect at the clock edge.
     pub post_edge: Vec<SHIRRegUpdate>,
 }
 
-/// A register's next-value assignment — always non-blocking in Verilog.
 #[derive(Debug)]
 pub struct SHIRRegUpdate {
-    /// Must be a name declared in `SHIRSeqBody::registers`.
     pub target: String,
-    /// The next value expression. Conditional updates are expressed as `Mux`
-    /// or `Case` — NOT as nested `SHIRStmt` trees.
     pub next_value: SHIRExpr,
-}
-
-// ── Output drive model ────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub enum SHIROutputDrive {
-    /// Single-tick, `emit!()` fires before the tick (Pattern A).
-    /// Emits: `assign out = <expr>;`
-    PreEdge(SHIRExpr),
-
-    /// Single-tick, `emit!()` fires after the tick (Pattern B).
-    /// Emits: `assign out = <expr>;` (usually a register reference).
-    PostEdge(SHIRExpr),
-
-    /// Multi-tick: output depends on which phase is active.
-    /// Phase C generates: `assign out = (phase_r == K) ? expr_K : ...`
-    PhaseConditional {
-        arms: Vec<SHIRPhaseOutputArm>,
-        /// Hold value when no phase emits (e.g. a register holding last output).
-        /// `None` if there is no default (design-time error if reachable).
-        default: Option<Box<SHIRExpr>>,
-    },
-
-    /// Combinational module — output is always active.
-    Continuous(SHIRExpr),
-}
-
-#[derive(Debug)]
-pub struct SHIRPhaseOutputArm {
-    pub phase_idx: usize,
-    pub value: SHIRExpr,
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
 
-/// Statements that appear in `SHIRPhase::pre_edge` — always combinational.
 #[derive(Debug)]
 pub enum SHIRStmt {
-    /// A combinational wire declaration (wire/logic in Verilog).
+    /// Combinational wire declaration (intermediate value).
     Wire {
         name: String,
         ty: CHIRType,
         value: SHIRExpr,
     },
+    /// Drive an output port. May appear flat or inside If/Match for
+    /// conditional drives (e.g. Moore FSM output from match on state register).
+    ///
+    /// Carries the drive in BOTH forms, because which one is correct depends on
+    /// where the drive is finally emitted — a decision `vlir_lower` makes, later
+    /// than this IR is built:
+    ///
+    /// * `value` — read as a continuous `assign`, i.e. AFTER the clock edge, when
+    ///   the registers this segment assigns already hold their new values;
+    /// * `edge_value` — the same drive written in PRE-edge terms (registers this
+    ///   segment assigns are substituted for the values it assigns them, and its
+    ///   `let` wires are inlined where that matters), for a drive that becomes a
+    ///   non-blocking assignment inside `always_ff` and is therefore sampled BEFORE
+    ///   the edge.
+    ///
+    /// The two are equal unless the segment assigns a register the drive reads.
+    /// Carrying both is what stops this stage from having to PREDICT the
+    /// registration decision — `vlir_lower` chooses at `split_output_reg`, the one
+    /// point where a drive actually becomes edge-sampled. Predicting it here was
+    /// tried and is not sound: `hoist_moore_output_defaults` un-registers some
+    /// outputs after the fact, so the answer is not a function of this IR alone.
+    /// See `TODO` causes L, L-1 and L-2.
+    PortDrive {
+        port_name: String,
+        value: SHIRExpr,
+        edge_value: SHIRExpr,
+    },
+    /// A branch carries its test in BOTH forms, for exactly the reason
+    /// [`SHIRStmt::PortDrive`] carries its value in both: the drives inside it may
+    /// be split between a continuous `assign` and an `always_ff` non-blocking
+    /// assignment, and the two copies read the segment's registers in different
+    /// windows. `vlir_lower::split_output_reg` already makes that split; it now
+    /// picks the matching test for each half.
+    ///
+    /// A test that reads a register this segment has ALREADY assigned is the case
+    /// that separates them — `c = c + 1; if c == 3 { … }` means the incremented
+    /// `c` in the simulator, and an `always_ff` copy testing the unforwarded `c`
+    /// silently fires a cycle late (or, with `c` reset inside the branch, never at
+    /// all). See `TODO` cause N.
     If {
         condition: SHIRExpr,
+        /// `condition` in pre-edge terms — see the note above.
+        edge_condition: SHIRExpr,
         then_stmts: Vec<SHIRStmt>,
         else_stmts: Option<Vec<SHIRStmt>>,
     },
+    /// See [`SHIRStmt::If`] for why the scrutinee is carried twice.
     Match {
         scrutinee: SHIRExpr,
+        /// `scrutinee` in pre-edge terms — see [`SHIRStmt::If`].
+        edge_scrutinee: SHIRExpr,
         arms: Vec<SHIRMatchArm>,
+    },
+    /// `for <var> in <start>..<end>` (exclusive), emitted as an SV `for`.
+    ForLoop {
+        var: String,
+        start: SHIRExpr,
+        end: SHIRExpr,
+        body: Vec<SHIRStmt>,
+    },
+    /// `base[index] = value;` — single-bit assignment.
+    IndexAssign {
+        base: String,
+        index: SHIRExpr,
+        value: SHIRExpr,
+    },
+    /// Stage a read address on a memory read port — see `CHIRStmt::MemRead`.
+    MemRead {
+        mem: String,
+        port: usize,
+        addr: SHIRExpr,
+    },
+    /// Stage a write on a memory write port — see `CHIRStmt::MemWrite`.
+    MemWrite {
+        mem: String,
+        port: usize,
+        addr: SHIRExpr,
+        value: SHIRExpr,
     },
 }
 
@@ -186,17 +250,20 @@ pub struct SHIRMatchArm {
     pub stmts: Vec<SHIRStmt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SHIRPattern {
     Lit(SHIRLit),
     Wildcard,
     Tuple(Vec<SHIRPattern>),
     EnumVariant { name: String, inner: Option<Box<SHIRPattern>> },
+    /// A named constant (`localparam` / parameter) as a case label — see
+    /// [`crate::chir::CHIRPattern::Const`].
+    Const(String),
 }
 
 // ── Expression model ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SHIRExpr {
     Var(String),
     Lit(SHIRLit),
@@ -214,26 +281,44 @@ pub enum SHIRExpr {
         then_val: Box<SHIRExpr>,
         else_val: Box<SHIRExpr>,
     },
-    /// Case-as-expression. In sequential post_edge contexts (SHIRRegUpdate::next_value),
-    /// Phase D lifts this into a VLIRFFStmt::Case block.
     Case {
         scrutinee: Box<SHIRExpr>,
         arms: Vec<SHIRCaseArm>,
-        /// Required — every Case in SHIR must have a default (hold or explicit value).
         default: Box<SHIRExpr>,
     },
     Concat(Vec<SHIRExpr>),
+    /// Signedness reinterpretation — see `CHIRExpr::SignCast`; passes through
+    /// this stage unchanged.
+    SignCast {
+        signed: bool,
+        expr: Box<SHIRExpr>,
+    },
     Slice {
         expr: Box<SHIRExpr>,
         high: usize,
         low: usize,
     },
-    /// Used in `PhaseConditional` output drives to compare `phase_r`.
-    /// Phase D emits this as `phase_r == <idx>`.
+    /// Single-bit select at a dynamic index — `base[index]`.
+    DynBit {
+        base: Box<SHIRExpr>,
+        index: Box<SHIRExpr>,
+    },
+    /// Width-cast — `width'(expr)`.
+    Resize {
+        expr: Box<SHIRExpr>,
+        width: Width,
+    },
+    /// Compares phase_r == idx. Used in multi-phase post_edge conditions.
     PhaseEq(usize),
+    /// `mem.read_port::<port>().data()` — the read port's output value.
+    MemData { mem: String, port: usize },
+    /// `mem.read_port::<port>().is_ready()` — the read port's output-valid flag.
+    MemValid { mem: String, port: usize },
+    /// Combinational memory-array word read — see `CHIRExpr::MemIndex`.
+    MemIndex { mem: String, addr: Box<SHIRExpr> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SHIRCaseArm {
     pub pattern: SHIRPattern,
     pub guard: Option<SHIRExpr>,
@@ -250,49 +335,38 @@ pub struct SHIRLit {
 
 #[derive(Debug)]
 pub enum SHIRLowerError {
-    /// `AwaitTick` appeared inside an `If` or `Match` arm — only allowed at flat loop top-level.
+    /// `AwaitTick` appeared inside an `If` or `Match` arm.
     TickInsideBranch { span: SourceSpan },
-
-    /// `emit!()` appeared inside an `If` or `Match` arm — only flat top-level emits are
-    /// supported in Milestone 1.
-    EmitInsideBranch { span: SourceSpan },
-
-    /// Multiple `emit!()` calls in the same timing segment.
-    MultipleEmits { span: SourceSpan },
-
-    /// Sequential module has no `AwaitTick` — should have been caught in Phase B.
+    /// Sequential module has no `AwaitTick`.
     NoTick { span: SourceSpan },
-
-    /// `AwaitTick` references a different clock than declared in `CHIRSeqBody::clock`.
+    /// `AwaitTick` references a different clock than declared.
     CrossClockTick { expected: String, found: String, span: SourceSpan },
-
-    /// `emit!()` called in a module with no output port.
-    EmitWithoutOutput { span: SourceSpan },
-
-    /// Module has an output port but no `emit!()` in any segment.
-    OutputWithoutEmit { span: SourceSpan },
-
-    /// A construct is not supported at Phase C level.
+    /// A construct not supported at Phase C level.
     UnsupportedConstruct { description: String, span: SourceSpan },
+}
+
+impl SHIRLowerError {
+    pub fn span(&self) -> &SourceSpan {
+        match self {
+            SHIRLowerError::TickInsideBranch { span } => span,
+            SHIRLowerError::NoTick { span } => span,
+            SHIRLowerError::CrossClockTick { span, .. } => span,
+            SHIRLowerError::UnsupportedConstruct { span, .. } => span,
+        }
+    }
 }
 
 impl std::fmt::Display for SHIRLowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let span = self.span();
+        write!(f, "{}:{}: ", span.start_line, span.start_col)?;
         match self {
             SHIRLowerError::TickInsideBranch { .. } =>
                 write!(f, "clk.tick().await inside a conditional branch is not supported"),
-            SHIRLowerError::EmitInsideBranch { .. } =>
-                write!(f, "emit!() inside a conditional branch is not supported in Milestone 1"),
-            SHIRLowerError::MultipleEmits { .. } =>
-                write!(f, "multiple emit!() calls in the same timing segment"),
             SHIRLowerError::NoTick { .. } =>
                 write!(f, "sequential module has no clk.tick().await"),
             SHIRLowerError::CrossClockTick { expected, found, .. } =>
                 write!(f, "tick on clock '{}' but module uses clock '{}'", found, expected),
-            SHIRLowerError::EmitWithoutOutput { .. } =>
-                write!(f, "emit!() used but module has no output port"),
-            SHIRLowerError::OutputWithoutEmit { .. } =>
-                write!(f, "module has output port but no emit!() found"),
             SHIRLowerError::UnsupportedConstruct { description, .. } =>
                 write!(f, "unsupported construct: {}", description),
         }

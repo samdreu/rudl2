@@ -1,3 +1,10 @@
+// Adapted from BaseJump STL — bsg_misc/bsg_lfsr.sv
+//   https://github.com/bespoke-silicon-group/basejump_stl
+//   Solderpad Hardware License v0.51 (Apache-2.0-based). Copyright 2016
+//   Michael B. Taylor / BaseJump STL contributors.
+// Adapted for self-contained Verilator use (bsg_defines/macros stripped, clk_i->clk
+// for the equivalence harness); the LFSR logic is unchanged.
+//
 // note XOR mask starts at bit 0; which may
 // be shifted from mathematician's notation.
 

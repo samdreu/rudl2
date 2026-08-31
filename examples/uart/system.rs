@@ -14,23 +14,31 @@
 // Bytes written by the caller come back out on the RX side after one 8N1 frame.
 
 use copper_core::{Bits, Clock, ClockDomain, Logic};
-use copper_core::port::{wire, In, Out};
+use copper_core::port::{registered_wire, wire, In, Out, RegOut};
+use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
 struct MainClk;
 impl ClockDomain for MainClk {}
 
 const CLKS_PER_BIT: usize = 434; // 50 MHz / 115200 baud
+const CLKS_PER_HALF_BIT: usize = CLKS_PER_BIT / 2;
 
 // ── TX ────────────────────────────────────────────────────────────────────────
 // Serializes one 8N1 frame (start + 8 data bits LSB-first + stop) each time
 // tx_start pulses high. tx_busy is high for the duration of the frame.
+#[hardware(sequential)]
 async fn uart_tx(
     clk: Clock<MainClk>,
     tx_byte:   In<Bits<8>, MainClk>,
     tx_start:  In<Logic, MainClk>,
-    tx_serial: Out<Logic, MainClk>,
-    tx_busy:   Out<Logic, MainClk>,
+    // REGISTERED. Both are driven on both sides of a `clk.tick().await`, and which
+    // phase a segment runs in is not pinned unless an input read precedes it — a
+    // plain `Out` lets the simulator run one of them a phase early and disagree
+    // with the synthesized hardware. `RegOut` commits at the edge, so the phase is
+    // unobservable.
+    tx_serial: RegOut<Logic, MainClk>,
+    tx_busy:   RegOut<Logic, MainClk>,
 ) {
     loop {
         tx_serial.write(Logic::One);
@@ -62,26 +70,42 @@ async fn uart_tx(
 // ── RX ────────────────────────────────────────────────────────────────────────
 // Same module as examples/uart/rx.rs. Duplicated here because Cargo examples
 // are standalone binaries; in the Copper module system these would be imports.
+#[hardware(sequential)]
 async fn uart_rx(
     clk: Clock<MainClk>,
     rx_serial: In<Logic, MainClk>,
-    rx_dv:     Out<Logic, MainClk>,
-    rx_byte:   Out<Bits<8>, MainClk>,
+    // REGISTERED — a one-cycle pulse written before the tick that publishes it, so
+    // it is driven in two phases; see `uart_tx` above and `examples/uart/rx.rs`.
+    rx_dv:     RegOut<Logic, MainClk>,
+    rx_byte:   RegOut<Bits<8>, MainClk>,
 ) {
+    // MIGRATED 2026-08-27 to `examples/uart/rx.rs`'s anchored body (its 2026-08-25
+    // rewrite): each sampling iteration READS FIRST AND DELAYS LAST. The old
+    // delay-then-read ordering is a post-tick `In` read — the mid-phase read
+    // seam, outside the language by design (see rx.rs's comment) — and was this
+    // module's real transpile blocker once cause H stopped masking it. The
+    // sampled instants are unchanged: a full-bit advance moves from the start
+    // bit's centre to data bit 0's centre, and the eighth iteration's trailing
+    // delay lands on the stop bit's centre where the separate stop wait used to.
+    // `rx_byte` is RegOut like rx.rs's, so dv and byte publish on the same edge.
     loop {
         while rx_serial.read() == Logic::One { clk.tick().await; }
-        for _ in 0..CLKS_PER_BIT / 2 { clk.tick().await; }
+        for _ in 0..CLKS_PER_HALF_BIT { clk.tick().await; }
         if rx_serial.read() != Logic::Zero { continue; }
 
-        let mut byte_val = 0u8;
-        for i in 0..8 {
-            for _ in 0..CLKS_PER_BIT { clk.tick().await; }
-            if rx_serial.read() == Logic::One { byte_val |= 1 << i; }
-        }
         for _ in 0..CLKS_PER_BIT { clk.tick().await; }
 
+        let mut byte_val: Bits<8> = Bits::zero();
+        for _ in 0..8 {
+            byte_val = byte_val >> 1;
+            if rx_serial.read() == Logic::One {
+                byte_val = byte_val | Bits::from_u8(0x80);
+            }
+            for _ in 0..CLKS_PER_BIT { clk.tick().await; }
+        }
+
         rx_dv.write(Logic::One);
-        rx_byte.write(Bits::from_u8(byte_val));
+        rx_byte.write(byte_val);
         clk.tick().await;
         rx_dv.write(Logic::Zero);
     }
@@ -108,29 +132,33 @@ struct UartPorts {
 fn spawn_uart(exec: &mut HardwareExecutor, clk: Clock<MainClk>) -> UartPorts {
     // Internal wire: TX serial output → RX serial input.
     // Starts high (UART idle line is Logic::One).
-    let (serial_out, serial_in) = wire::<Logic, MainClk>(Logic::One);
+    let (serial_out, serial_in) = registered_wire::<Logic, MainClk>(&clk, Logic::One);
 
     // TX caller-side ports
     let (tx_byte_port,  tx_byte_in)  = wire::<Bits<8>, MainClk>(Bits::zero());
     let (tx_start_port, tx_start_in) = wire::<Logic, MainClk>(Logic::Zero);
-    let (tx_busy_out,   tx_busy_in)  = wire::<Logic, MainClk>(Logic::Zero);
+    let (tx_busy_out,   tx_busy_in)  = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
 
-    // RX caller-side ports
-    let (rx_dv_out,   rx_dv_in)   = wire::<Logic, MainClk>(Logic::Zero);
-    let (rx_byte_out, rx_byte_in) = wire::<Bits<8>, MainClk>(Bits::zero());
+    // RX caller-side ports (both registered — RegOut on the module side)
+    let (rx_dv_out,   rx_dv_in)   = registered_wire::<Logic, MainClk>(&clk, Logic::Zero);
+    let (rx_byte_out, rx_byte_in) = registered_wire::<Bits<8>, MainClk>(&clk, Bits::zero());
 
     let dh_serial  = serial_out.dirty_handle();
     let dh_busy    = tx_busy_out.dirty_handle();
     let dh_rx_dv   = rx_dv_out.dirty_handle();
     let dh_rx_byte = rx_byte_out.dirty_handle();
 
+    let tx_reads = vec![tx_byte_in.wire_id(), tx_start_in.wire_id()];
+    let rx_reads = vec![serial_in.wire_id()];
     exec.spawn_wired(
         uart_tx(clk.clone(), tx_byte_in, tx_start_in, serial_out, tx_busy_out),
         vec![dh_serial, dh_busy],
+        tx_reads,
     );
     exec.spawn_wired(
         uart_rx(clk.clone(), serial_in, rx_dv_out, rx_byte_out),
         vec![dh_rx_dv, dh_rx_byte],
+        rx_reads,
     );
 
     UartPorts {
@@ -165,6 +193,9 @@ fn send_and_wait(
     received
 }
 
+// Excluded under cfg(test) so an integration test can `include!` this file without
+// its harness `main` clashing (see examples/cpu/rv32i_cpu.rs for the rationale).
+#[cfg(not(test))]
 fn main() {
     let mut clk  = Clock::<MainClk>::new();
     let mut exec = HardwareExecutor::new();

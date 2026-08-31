@@ -1,3 +1,10 @@
+// Adapted from BaseJump STL — bsg_misc/bsg_mux.sv
+//   https://github.com/bespoke-silicon-group/basejump_stl
+//   Solderpad Hardware License v0.51 (Apache-2.0-based). Copyright 2016
+//   Michael B. Taylor / BaseJump STL contributors.
+// Adapted for self-contained Verilator use (bsg_defines/macros stripped, concrete
+// parameter defaults); the mux logic is unchanged.
+//
 // Defaults (width_p=8, els_p=4) are set for Verilator testing.
 // In a real design, override these at instantiation.
 module bsg_mux #(

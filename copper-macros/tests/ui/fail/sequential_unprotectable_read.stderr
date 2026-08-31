@@ -1,0 +1,19 @@
+error: this `In<T, D>` parameter is used in a way #[hardware(sequential)] can't verify is protected against stale/premature reads — only `<param>.read()`, called directly on the parameter with no intervening `.clone()`, reassignment, or indirection, is supported. Read it directly at each place it's needed instead.
+  --> tests/ui/fail/sequential_unprotectable_read.rs:17:22
+   |
+17 |         let input2 = input.clone();
+   |                      ^^^^^
+
+warning: unused imports: `Bits` and `Clock`
+ --> tests/ui/fail/sequential_unprotectable_read.rs:1:19
+  |
+1 | use copper_core::{Clock, ClockDomain, Bits};
+  |                   ^^^^^               ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `In` and `Out`
+ --> tests/ui/fail/sequential_unprotectable_read.rs:2:25
+  |
+2 | use copper_core::port::{In, Out};
+  |                         ^^  ^^^

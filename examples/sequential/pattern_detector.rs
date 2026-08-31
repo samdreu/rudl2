@@ -1,5 +1,6 @@
 use copper_core::types::{Bits, Logic, Clock, ClockDomain};
 use copper_core::port::{In, Out, wire};
+use copper_macros::hardware;
 use copper_sim::{HardwareExecutor, HardwareTest, SimulationTrace, make_cycle};
 
 struct MainClk;
@@ -16,6 +17,7 @@ enum State {
     S110101 = 6,
 }
 
+#[hardware(sequential)]
 async fn det_110101 (
     clk: Clock<MainClk>,
     rstn: In<Logic, MainClk>,
@@ -57,9 +59,11 @@ fn main() {
     let (out_out,  out_obs) = wire::<Logic, MainClk>(Logic::Zero);
 
     let dh = out_out.dirty_handle();
+    let reads = vec![rstn_in.wire_id(), in_in.wire_id()];
     exec.spawn_wired(
         det_110101(clk.clone(), rstn_in, in_in, out_out),
         vec![dh],
+        reads,
     );
 
     let mut test = HardwareTest::new("det_110101")

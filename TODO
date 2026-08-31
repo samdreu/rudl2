@@ -1,0 +1,2602 @@
+DOCUMENTATION:
+  ☐ Semantics documentation
+  ☐ Update code documentation
+  ☐ Create README file
+  ☐ Add usage examples (with explaination)
+  ☐ Add API documentation
+  ☐ Add diagrams or flowcharts to explain complex logics
+  ☐ Automatically generate an FSM report for each module (states, inferred
+    registers, transitions, output logic — a byproduct of the CFG built for
+    the reachability/liveness analysis, not a hand-written doc)
+
+TRANSPILATION:
+  ☐ Figure out TODOs
+
+  ── compile_fail DOCTESTS -> trybuild, TRANCHE 1 DONE 2026-08-26 ────────────
+  `compile_fail` asserts only that a snippet FAILED TO COMPILE — for any reason. A
+  typo, a renamed API or a missing `use` satisfies it exactly as well as the
+  guarantee it names. trybuild pins the compiler's own message in a .stderr, so it
+  asserts WHY. copper-core/tests/ui/fail/ + tests/cdc_ui.rs; 7 cases; the six CDC
+  rules and `Out` is not `Clone`. Codes now pinned: E0308 for a domain crossing,
+  E0382 for the single-driver move, E0599 for RegOut/Out not being Clone — none of
+  which the doctests ever checked. Mutation-verified (swap E0382 for E0499 -> FAIL).
+  The doc prose keeps every example, as ```ignore with a pointer to its case.
+  IT IMMEDIATELY FOUND A DOCTEST THAT NEVER TESTED ITS CLAIM. `Bits::from_lit`'s
+  compile_fail had no `use copper_core::Bits;`, so it failed on
+  `E0412: cannot find type Bits` and never reached the width guard it documents.
+  Fixed in place. This is the argument for the migration, made by the migration.
+  AND A REAL LIMIT ON trybuild, measured: it compiles CHECK-STYLE, and `cargo check`
+  does NOT evaluate a post-monomorphization `const` assert. `Bits::from_lit`'s guard
+  is one — `cargo check` passes, `cargo build` fails — so that case CANNOT move to
+  trybuild and stays a doctest, which builds fully. Do not "finish the migration" by
+  moving it; the comment at the site says so.
+  REMAINING (need trybuild runners in two more crates): src/lib.rs, src/sync.rs,
+  copper-sim/src/executor.rs::HardwareModule.
+
+  ── SHRINKING THE SURFACE: THE ADMISSIBLE GRAMMAR, STARTED 2026-08-26 ───────
+  MEASURE FIRST, and it corrected the plan. `cargo run -q -p copper-codegen --bin
+  surface-audit` walks every #[hardware] module and counts what they contain:
+    - only **6 of 33** FIR expression variants are unused (Array, Async, Let,
+      Return, Yield, Try). The audit's "constructs that can never be hardware"
+      list was wrong about Closure (7 uses, memory `from_fn`), Macro (10, `vec![]`),
+      Range (41, `for` bounds) and Reference (4). Deleting the dead six is worth a
+      few hundred lines, not thousands.
+    - **126 of 135 modules transpile.** The sim/transpiler language gap is NINE
+      modules, not a chasm: 2 Vec ports, 2 uart file-level, 1 Memory param, 1 width
+      inference through a tuple helper, 1 const match pattern, and 2 deliberate
+      semantic refusals (mp_rom, tick_first_waiter).
+  SO THE TAX IS NOT DEAD SURFACE. It is that the language is defined by
+  SUBTRACTION — everything Rust can say, minus whatever each pass rejects when it
+  gets there: 108 sites, 76 sharing one variant, 60 never fired.
+  WHAT LANDED: `copper_analysis::check_admissible`, a POSITIVE grammar, enforced by
+  the macro for all modes. Rule 1 is the TYPE surface — a port payload and an
+  annotated `let` must be Logic / Bits<N> / bool / an integer / a fixed array of
+  those. Measured before writing it: no module that transpiles names a type outside
+  that set.
+  THE DISCIPLINE, and it is the whole reason this is safe to build incrementally:
+      admissible(m) == Err  =>  transpile(m) == Err      ENFORCED
+      transpile(m) == Err   =>  admissible(m) == Err      the GOAL, reported
+  `copper-codegen/tests/admissible_calibration.rs` asserts the first over the whole
+  corpus and PRINTS the second as a progress count. A rule that overreaches breaks
+  a working design, and that failure is silent until someone hits it — so it is a
+  standing test, not a review step.
+  NEXT RULES, in evidence order: the `Memory<…>` parameter (cause P) is admissible
+  to the macro but has no port ABI, so it belongs behind an explicit opt-out rather
+  than in the grammar; then unannotated struct/tuple locals (needs inference, so it
+  is rule 2 not rule 1); then the file-level `spawn_uart` rule, which is about a
+  FILE not a module and may not belong in this grammar at all.
+  (The KNOWN entry about `examples/cpu/old/` is retired: the scratch copies are
+  DELETED as of 2026-08-27. The `old/`-exclusion in build.rs and regression.sh
+  stays as the convention for any future set-aside scratch.)
+
+  ── A REASSIGNED WIRE IS NOT A REGISTER — FIXED 2026-08-26 ──────────────────
+  `shir_lower::extract_updates_from_stmts` turned EVERY `CHIRStmt::Assign` into a
+  `SHIRRegUpdate`, without asking whether the target was a register. A reassigned
+  combinational wire therefore got TWO DRIVERS — an `always_comb` defining it and
+  an `always_ff` holding it (MULTIDRIVEN, illegal per IEEE 1800 9.2.2.2) — and held
+  last cycle's value where the source re-initialises it every iteration.
+  THE DIAGNOSIS I STARTED WITH WAS WRONG, and the correction is the useful part.
+  It looked like "codegen has a rival register inference" — lib.rs:324 does call
+  `copper_analysis::infer_registers` and only LOG it, and chir_lower.rs:1295 does
+  decide `let mut` → register syntactically. But that declaration rule AGREES with
+  the shared inference on every module in the corpus; `register_reconciliation.rs`
+  passing is the measurement. The defect was one arm that never consulted the
+  register set it had already been handed.
+  TWO HALVES, and either alone is broken:
+    1. `extract_updates_from_stmts` emits an update only when `reg_names` contains
+       the target. Alone, a wire reassignment SILENTLY DISAPPEARS.
+    2. `lower_pre_edge_stmts` now collects its segment's wire types instead of
+       passing an empty map, so the reassignment lowers as another blocking assign.
+       That map was empty on the premise that "an Assign in the sequential path is
+       a register update" — true only because of the bug in (1).
+  RESULT: default-then-override in one `always_comb`, the idiom the transpiler
+  already emitted for its own memory control nets.
+  MEASURED: corpus sweep 112 -> 113 passing, 24 -> 23 ignored, nothing else moved.
+  Both CPU examples 13/13. All crate suites green. held_temp_trap's SKIP entry and
+  the register_reconciliation WITNESS entry are both DELETED — and the staleness
+  assertion on that witness fired on its own first ("listed as a reconciliation
+  witness but now AGREES"), which is the check working as designed.
+  tests/fixtures/aggregate_locals_dut.rs stays as the pin. `held_temp_trap` and
+  `enabled_register` are syntactically identical at the assignment and differ only
+  in liveness across a tick; a regression that made either look like the other
+  breaks that file first.
+
+  ── THREE-WAY ANCHORING, INFRASTRUCTURE LANDED 2026-08-26 ───────────────────
+  The sweep's ordinary check is simulator vs the SV the transpiler emitted — two
+  implementations of ONE source. That proves CONSISTENCY. A misconception shared
+  between the executor and the lowering is invisible to it. A third implementation
+  nobody derived from either closes that gap.
+  WHAT LANDED: `EquivalenceTest::with_hand_written_reference`, a `REFERENCE` table
+  in build.rs next to PARAMS/RESET/SKIP, and guard **G-E** in regression.sh, which
+  prints how many swept modules are anchored and how many are not (printed, not
+  enforced — blocking on it would help nobody while the remainder is the whole
+  corpus). Proven end to end on `ram_read_first`, including a MUTATION check:
+  flipping the reference to write-first makes it fail on the exact semantic.
+  BASELINE: 1 anchored, 133 not.
+  THE GAP IS NOT WHERE YOU WOULD GUESS. Every hand-written reference the repo had
+  is for an ORDINARY design — combinational logic, counters, shift registers, the
+  BaseJump modules. Measured by family:
+      timing/phase (RegOut, pre-tick, trailing) ... 10 fixture files, 0 anchored
+      control-flow lowering (extraction, waits) ...  8 fixture files, 0 anchored
+      memory (latency, write-first, preload) ......  6 fixture files, 0 anchored
+      the data-surface ledger .....................  5 fixture files, 0 anchored
+      ordinary designs ............................ 11 of 24 anchored
+  So the anchoring is strongest exactly where Copper is least novel and absent
+  exactly where its semantics are its own.
+  WHO WRITES THEM: the USER writes the pairs (Copper fixture + Verilog reference).
+  Decided 2026-08-26, and it is the better arrangement on the merits — a reference
+  written independently of the Copper module is worth more than one written
+  alongside it by the same hand. Do NOT write these unasked.
+  WHAT IS THERE TO WRITE AGAINST: design_docs/ANCHORING_A_MODULE.md — the contract
+  (module name = Copper module, clock port literally `clk`, emitted port names,
+  -Wall is FATAL, params mirrored, no `initial` needed because Verilator zero-fills
+  and so does the transpiler), the three-step recipe, provenance guidance, and how
+  to check a reference has teeth. build.rs validates each REFERENCE row at build
+  time: a mistyped module name would otherwise anchor nothing while every test kept
+  passing, so it panics with near-miss suggestions.
+  reference_sv/ram_read_first.sv is the worked example, hand-written and labelled
+  as such. Timing/phase and control extraction have NO third-party counterpart —
+  they are Copper's own abstractions — so those will have to be hand-written with
+  the weaker claim stated; memory has real counterparts in BaseJump STL
+  (`bsg_mem_1r1w_sync` and relatives) if the stronger form is wanted there.
+
+  ── THE CLAIM LEDGER, ADDED 2026-08-26 ──────────────────────────────────────
+  tests/fixtures/{bits_ops,signedness,aggregate_locals,match_selector,out_phase,
+  mem_address_width}_dut.rs — 24 modules, one per claim about what the transpiler
+  supports, each broken one paired with the working twin in the same file. The
+  sweep picks them up automatically, so a fix shows up as a build.rs SKIP entry
+  that can be DELETED rather than as a test nobody wrote.
+  WHY, in one number: of the 15 things this session turned up, a probe that only
+  asks "does it transpile" catches 6. Verilator's -Wall adds 5. Only running both
+  sides adds the last 3 — and one of those (`as i32` dropped) emits SystemVerilog
+  that lints perfectly clean and computes the wrong answer. The gate is the whole
+  value; the size of the test is incidental.
+  IT CORRECTED TWO OF MY OWN CLAIMS ON FIRST RUN, which is the argument for
+  fixtures over scratch probes in one line:
+    - "a `match` on a `usize` emits 64-bit case labels" was too narrow. The width
+      comes from the LITERAL: `match_on_literals` scrutinises a `u32` and still
+      emits `op == 64'd55`. It was written as a control expected to PASS.
+    - the memory-address fixtures first failed for a second, unrelated reason
+      (they had the out_phase bug baked in), and the "narrow index" control failed
+      on UNUSEDSIGNAL — which turned into its own finding, `wide_index_sole_
+      consumer`: a `usize` index local whose ONLY consumer is a memory address has
+      a dead upper half, because `10'(i)` reads `i[9:0]`. rv32i_cpu_transpilable
+      escapes it because its indices are range-checked.
+  NEW, NOT PREVIOUSLY RECORDED ANYWHERE: `!` on a `Bits<N>` emits SystemVerilog
+  `!` (LOGICAL) rather than `~` — silently, and it reached the JALR alignment mask
+  in rv32i_cpu_pipelined, where it turns every jump target into 0. `!` on a bool
+  is correct, and `bit_not_bool` pins that so a fix cannot overshoot.
+  A FOURTH GATE FOUND IT TOO, and diagnosed it better than any of the others:
+  `copper-codegen/tests/register_reconciliation.rs` reported `held_temp_trap` as
+  "codegen has non-synthetic registers the shared inference missed: [u, v]".
+  So `infer_registers` is RIGHT — those are not registers — and CODEGEN REGISTERS
+  THEM ANYWAY. That is a c2 front-end disagreement, which is exactly what
+  copper-analysis exists to prevent, and it names the fix precisely. That test has
+  no exclusion list on purpose (its header records that excluding synchronizers
+  once hid a real bug), so `held_temp_trap` is listed as a NAMED WITNESS with its
+  mechanism, and the check now ASSERTS the witness still diverges — a witness that
+  quietly started agreeing would otherwise sit there claiming a fixed bug.
+  WHAT A LEDGER STILL WILL NOT CATCH: composition. The commit-order bug in
+  rv32i_cpu_transpilable (pipeline latches committed in forward order, so each
+  stage read a source already overwritten) has no atomic form — it exists only
+  once four latches chain. That is what the CPU-scale sweep is for, and it is why
+  both halves are worth having.
+
+  ── TRANSPILER COVERAGE, RE-MEASURED 2026-08-25 (after N, M) ────────────────
+  STOP RE-MEASURING THIS BY HAND — that is how it went stale before. Run
+  `tools/transpile_coverage.sh`, which probes every #[hardware] module in
+  examples/ through the copper-transpile CLI and prints the tally and the
+  remaining causes. (It measures ACCEPTANCE, not correctness — see "LINT-CLEAN IS
+  NOT THE SAME AS TRANSPILES" below.)
+  19/34 → A+B 20/34 → E 21/34 → D-a 23/34 → I 24/34 → D-b 26/34 → C 28/34 →
+  K 28/34 → M 28/34 → O 28/34 (each no change, each predicted) → **uart/rx
+  REWRITTEN 29/34**. Three causes in a row peeled one blocker off uart/rx and
+  found another underneath; the last one was not a missing feature at all but a
+  post-tick `In` read, refused BY DECISION. Rewriting the example to sample
+  BEFORE each delay — same instants, same behaviour, all five self-check sections
+  unchanged — is what finally moved the counter. See the write-up below.
+  AND IT DID NOT TRANSPILE CORRECTLY AT FIRST: acceptance is not correctness, and
+  the `for`/`continue` work had three real defects behind it that only a design
+  this dense could reach — a `pc` too narrow for its own state count, a back edge
+  that cost a cycle, and a state count of 788 where 11 was right. All three fixed
+  and pinned; read the uart/rx entry. L / L-1 / L-2 / N and the hoisted-default bug were
+  wrong-CODE bugs, not rejections, so they move no counter either — which is the
+  point: coverage was never going to show them, and two of them were silent.
+  The 5 still failing, by ROOT CAUSE, as measured on 2026-08-25 (P added 2026-08-26):
+    (F is GONE as of 2026-08-27 — its last instances were the two
+    `examples/cpu/old/` pre-subset copies, now deleted. No tracked module has a
+    `Vec` port; the admissible grammar refuses the construct outright.)
+    (P is FIXED as of 2026-08-27 — received memories get a bus port ABI, see
+    design_docs/RECEIVED_MEMORY_ABI.md. rv32i_cpu_pipelined then surfaced its
+    OWN blockers; the struct latches / conditional struct+tuple lets / block
+    bindings / `arithmetic_shift_right` all landed 2026-08-27
+    (tests/fixtures/struct_pipeline_dut.rs), leaving exactly two, both known
+    causes — of which const match patterns CLOSED the same day: they lower as
+    the name-carrying `CHIRPattern::Const`, emitting the localparam name in the
+    case label / comparison; the stale WRONG-WIDTH skips for match_on_usize and
+    match_on_literals fell with it (labels have been scrutinee-sized since
+    `size_patterns_to_scrutinee`), so all of match_selector_dut sweeps.)
+    P-remaining: NONE as of 2026-08-27 — rv32i_cpu_pipelined TRANSPILES AND
+        LINTS CLEAN (-Wall). The register file landed as word-indexed ARRAY
+        REGISTERS: `let mut regs = [Bits<W>; N]` lowers as an internal memory
+        (WRITE_LAT 2 — a post-tick write is visible the NEXT cycle, measured)
+        with combinational word reads (`CHIRExpr::MemIndex`); a read after the
+        write statement muxes against the write's own staging nets, giving the
+        WB->ID same-cycle write-through the sim's statement order defines.
+        tests/fixtures/regfile_dut.rs pins both orderings differentially. The
+        extraction counter renames to `pc_1` when a module already names `pc`
+        (the CPU does), and `Bits::<W>::zero()`-style turbofish ctors now infer
+        their width — which un-refused six sim-test counters straight into the
+        sweep (all green). What the CPU still lacks is a SWEEP lane: it
+        receives its Memory as a parameter, which the harness cannot supply —
+        anchoring it behaviourally needs a Verilated parent owning the memory
+        (the received_memory_abi.rs pattern, scaled up).
+        LANE BUILT 2026-08-27: tests/rv32i_pipelined_verilator.rs — all 13
+        architectural programs, sim vs Verilated-under-owner, cycle-for-cycle
+        (pc, halted, a0) through the halt, ALL GREEN. What it took, each with
+        a fixture or measured in the lane: pre-loop actions move into the
+        extracted FSM's state 0 (the first fetch was silently dropped); memory
+        staging takes the EDGE form — values AND the guards of staging-only
+        branches (enable and data fired one EX/MEM generation apart);
+        ff-position array reads mux the committing write stage
+        (forward_ff_mem_index — a0 at halt read the pre-commit array);
+        MemIndex-bearing wires substitute into edge forms, which needed the
+        WIRE branch-merge in extract_updates (a conditionally-assigned wire
+        forwards the mux of its branch values, generalizing cause L-2);
+        literal overrides in branches survive hoist_branch_local_defaults
+        (`if_id.valid = true` was silently deleted — nothing ever decoded);
+        halted/a0_out became RegOut like program_counter (held plain Outs emit
+        registered, one cycle after the sim's same-cycle write); deep dead-wire
+        pruning; RegOut port types seed the symbol table.
+        extracted_dut.rs pins the extracted regfile and reg-then-wire shapes.
+    (Q is FIXED as of 2026-08-26 — see below. rv32i_cpu_transpilable now SWEEPS.)
+    (J-b is FIXED as of 2026-08-27 — the tuple-destructuring `let` lowering
+    inlines the helper and projects per element. ripple_carry_adder SWEEPS.)
+    (uart/rx is no longer here — see UART/RX, REWRITTEN below)
+    (H is FIXED as of 2026-08-27 — `has_hardware_signature` now requires a
+    signature that COULD be a module: at least one port param, EVERY param a
+    port type, no return. `spawn_uart(exec: &mut HardwareExecutor, …) ->
+    UartPorts` is harness code and no longer condemns its file; a genuinely
+    forgotten attribute — all ports, no return — is still caught. uart_tx
+    transpiled immediately; uart_rx then surfaced its REAL blocker, the
+    delay-then-read sampling loop — the MID-PHASE READ SEAM, outside the
+    language by design — and was migrated to rx.rs's anchored read-first body
+    (same sampled instants; rx_byte became RegOut like rx.rs's). BOTH sweep.
+    TRANSPILER COVERAGE IS 34/34 — every example module transpiles; no live
+    causes remain.)
+  Full history of every cause, live and retired:
+    A ✔ FIXED — `[Logic::Zero; N]` array locals (bit-width inference)
+    B ✔ FIXED — fully-qualified type paths (`copper_core::Clock<MainClk>`)
+    C ✔/☐ SPLIT — `while` was TWO features, and the two modules filed here needed
+        different ones. Third cause in this file grouped by error MESSAGE rather
+        than mechanism (after D and J); worth reading as a pattern.
+        C-a ✔ FIXED — `while <cond> { … tick; }` is a data-dependent WAIT, and is
+            exactly `loop { if !<cond> { break; } … }`: test first, tick last,
+            the supported ordering. Desugared before control extraction
+            (`control_extract::desugar_tick_waits`), so it lands on machinery
+            already verified end to end rather than adding control flow.
+            UNBLOCKED det_010_awaits — which was NOT the module filed here, and
+            was recorded under "tick inside a conditional branch". Its `while`
+            made `contains_unflattenable_control` decline the whole body, so the
+            tick-in-branch fell through to the linear path and reported the error
+            there. Another first-error-masking-the-second.
+        C-b ☐ a `while` with NO tick is combinational: it must fully unroll, which
+            needs a trip count known at compile time. `while` only implies that;
+            `for` states it. Left refused, but the diagnostic now names `for`
+            instead of advising "add a tick", which is the wrong fix for a
+            combinational module. bsg_gray_to_binary was the only instance and is
+            now written as a `for` — its own test fixture already used that
+            spelling, so the `while` form had never been transpiled.
+        STILL BLOCKED, on its own causes: uart/rx — now cause M (a tick inside a
+        counted `for`), re-measured 2026-08-25. K WAS recorded here as its first
+        blocker; K is fixed and uart/rx did not move, which is consistent with
+        K's own entry. Behind M sit `continue` in a nested loop (pinned as
+        refused), `|=`, and a bare integer local.
+    D-a ✔ FIXED — file-scope `const` items now lower to `localparam`s.
+        Unblocked bsg_encode_one_hot AND bsg_adder_one_hot. See the write-up below.
+    D-b ✔ FIXED — array-typed ports lower as PACKED 2-D. Unblocked mux and
+        bsg_mux_one_hot. Scoped first in design_docs/ARRAY_PORT_ABI.md (three
+        options, measured); see the write-up below.
+    E ✔ FIXED — `Memory` now transpiles ......... dual_port_ram. Both CPUs stay
+        blocked, but on their OWN causes (re-measured): rv32i_cpu on G,
+        rv32i_cpu_pipelined on F — not on memory.
+    Q ✔ FIXED (2026-08-26) — **THE MEMORY ADDRESS NET IS NARROWER THAN THE INDEX.**
+        Address nets are `clog2(depth)` (10 bits for 1024 words); an address is
+        almost always derived from a `usize`, which is 32. The narrowing was
+        implicit, so Verilator's `-Wall` — fatal, verification.rs:405 — rejected
+        every such module however well the design guarded its own index.
+        `vlir_lower::lower_mem_stmt` now wraps the address in `VLIRExpr::Resize` at
+        the address-net width, emitting `10'(idx)`.
+        UNCONDITIONAL, both directions: `W'(x)` on an already-W-bit expression is a
+        no-op and a narrower address zero-extends, which is what the implicit
+        assignment did anyway and which silences the mirror-image WIDTHEXPAND.
+        Conditional would mean re-deriving the expression's width at the assignment
+        — a second width calculation to drift from the first.
+        THE SEMANTICS WERE NEVER IN QUESTION and the comment at that site already
+        said so ("a design that reaches this truncation has already failed in
+        simulation", because the simulator panics on an out-of-range address). What
+        was missing was telling Verilator. Measured before changing anything: no
+        source spelling avoids it — `Bits::<10>::from_u32(…)` declares the local at
+        the right width but leaves a 32-bit RHS, `truncate` / `part_select` do not
+        lower, and masking moves the mismatch rather than removing it.
+        WHAT IT UNBLOCKED: `rv32i_cpu_transpilable` lints clean and its SKIP entry
+        is gone, so **a full RV32I 5-stage pipelined CPU is now in the differential
+        sweep** — 200 cycles of seeded random stimulus, sim vs the SV it transpiles
+        to, under Verilator. The first CPU-scale design in the corpus.
+        AND THE SWEEP IMMEDIATELY EARNED ITS KEEP. Two one-cycle divergences on
+        `program_counter`, neither of which any existing check catches, both now
+        written up at the port and at its write site in the example:
+          1. a plain `Out` driven from a register BEFORE the commit leads the
+             simulator by a cycle. D1's guard exempts the segment because an `In`
+             read precedes the write.
+          2. reaching for `RegOut` does not fix it — in a SINGLE-TICK loop the
+             trailing statements share the head's phase, so the transpiler folds a
+             trailing `RegOut` write into this edge while the simulator commits it
+             on the next. Same lead, opposite cause.
+        The shape that agrees is a plain `Out` written AFTER the commit. Worth a
+        rule of its own; filed here rather than guessed at.
+    F ☐ `Vec` ports ....................... rv32i_cpu
+        (rv32i_cpu joined this cause once the G panic stopped masking it;
+        rv32i_cpu_pipelined left it on 2026-08-26 — see P)
+    P ☐ A **RECEIVED `Memory<…>` PARAMETER** has no port ABI. `#[hardware]` accepts
+        one as of 2026-08-26 — a module may be HANDED its storage instead of
+        declaring it, the same disposition `Clock<D>` has always had ("received,
+        never constructed") — and the simulator runs it, but `resolve_type` has no
+        arm for it, so the module stops at `cannot resolve type 'Memory < … >'`.
+        That is a HONEST refusal with a span, not a silent wrong answer, but the
+        message names the type rather than the gap; a diagnostic naming the gap is
+        the cheap half and was deliberately left undone rather than folded into an
+        unrelated change.
+        THE REAL QUESTION IS NOT THE TYPE, IT IS WHAT A RECEIVED MEMORY *IS* in
+        SystemVerilog. A declared memory lowers to an array inside the module. A
+        received one is either (a) a set of address/data/we PORTS on the module,
+        with the array living in the parent — which needs a port ABI decision of
+        the same weight as ARRAY_PORT_ABI.md — or (b) a hierarchy edge, which is
+        item 4's structural-module territory. Do not pick one by accident while
+        fixing something else.
+        WHAT WAS TAUGHT ALONGSIDE THE MACRO, and had to be, because each of the
+        three would have gone QUIET rather than wrong:
+          - `copper_analysis::cfg::memory_locals` — collects Memory-typed
+            PARAMETERS as well as `let`-declared ones. Without it every memory rule
+            (one-access-per-bus-per-cycle, read-staged-before-its-tick, the
+            unrolled-nested-loop rule) simply stops examining a received memory.
+            Pinned both ways by `a_received_memory_is_checked_like_a_declared_one`
+            and `a_well_formed_received_memory_is_accepted`.
+          - `build.rs::classify` — returns `Some` for `Memory`, and `skip_reason`
+            gives a memory-taking module an `#[ignore]` WITH A REASON. `classify`
+            returning `None` is propagated by `Module::from_item`'s `?`, so the
+            first version of this change deleted rv32i_cpu_pipelined from the
+            corpus sweep outright. `every_corpus_module_has_a_generated_case`
+            caught it, because it scans for `#[hardware]` by ATTRIBUTE and never
+            goes through `classify` — the two-independent-scans design earning its
+            keep. Same bug class as the attribute-parser note in CLAUDE.md.
+          - `cdc_check::check_cdc` — a memory carries its clock domain in its 4th
+            generic argument, so a foreign-domain one is a real crossing and is now
+            rejected with a memory-specific remedy (a memory cannot be brought
+            across by a synchronizer). Pinned by ui/fail/cdc_memory_parameter.rs.
+        **`examples/cpu/rv32i_cpu_transpilable.rs` (2026-08-26) is the answer to
+        "can the CPU be written so it transpiles?" — YES.** Same design, same 13
+        programs, IDENTICAL cycle counts, and it emits 33 KB of SystemVerilog. It
+        declares its memory in-module and takes the program through a boot port
+        rather than receiving a `Memory`, which is also what makes it resettable.
+        Everything else it spells differently is a workaround for a transpiler gap,
+        each one named in its header comment; the only one still open is cause Q.
+        Read that header as the standing list of what the subset work has to make
+        unnecessary.
+    K ✔ FIXED (2026-08-24) — **A LOOP WHOSE BODY ENDS IN ANOTHER TICK-BEARING
+        LOOP** now flattens. It does NOT by itself unblock uart_tx / uart_rx /
+        uart/rx: those need the counted `for` as well (see below — the ordering
+        recorded here was backwards, and why is worth reading).
+        `control_extract::tick_is_last_statement` required a DIRECT
+        `clk.tick().await` as the last statement of a nested loop's body, so a
+        loop whose clock boundary came from a loop INSIDE it was declined and the
+        module fell through to the linear path. It is now
+        `body_ends_at_a_clock_boundary`, which admits a second spelling: the
+        body's last statement may be another tick-bearing loop.
+        THE FLATTENER ALREADY HANDLED THE SHAPE. Measured before changing
+        anything: `lower_into`'s nested-loop path takes the outer back edge from
+        the inner loop's `break` continuation, which is exactly what the old note
+        below said "the fix has to establish". Only the gate refused it. The two
+        real pieces of work were the two things the gate had been masking:
+        1. `find_tick_in_expr` DID NOT DESCEND INTO A NESTED `loop`. Control
+           extraction ends by reusing a real tick node from the source; that
+           search and the gate must agree about where a tick can live, and they
+           had drifted. It went unnoticed while every flattenable module also had
+           a tick at the top level of its own loop. Cause K is the first shape
+           whose ONLY tick is inside a nested loop: the pass declined silently and
+           the linear path blamed an unrelated construct. Same
+           two-halves-disagree bug class as the panic that G fixed.
+        2. REACHABILITY ACCEPTED A PROGRAM THE SIMULATOR LIVELOCKS ON — the
+           serious one, filed as its own entry under SEMANTICS below.
+        ALSO FIXED: THE DIAGNOSTIC. `chir_lower::nested_loop_error` now sorts the
+        three reasons a nested loop lands there (no tick at all / a tick in
+        statement position but not last / ticks only inside branches) instead of
+        printing the tick-ORDERING rule for all of them — unfollowable advice for
+        two of the three. It also descends to the innermost loop at fault, so a
+        well-formed outer loop is not named for an inner loop's problem.
+        THE ORDERING IN THE OLD NOTE WAS BACKWARDS, and the reason is structural,
+        not incidental: it said to verify against "a hand-written nested-wait DUT
+        (no `for` involved)" before counted delays. NO SUCH WELL-FORMED DUT
+        EXISTS. A nested loop's tick must be LAST, so any inner loop that can exit
+        tests before it ticks and can therefore exit having ticked zero times; an
+        outer loop whose only boundary is one of those is a zero-time cycle. So
+        with `loop` alone, cause K's BACK EDGE is not writable at all. The counted
+        `for` is what breaks the deadlock — `for _ in 0..N { tick }` always ticks
+        AND terminates without an exit test — which makes counted repetition the
+        prerequisite for K's remaining half, not the other way round.
+        WHAT IS PINNED NOW: `tests/nested_boundary_equivalence.rs` (sim ≡
+        Verilator on the ENTRY path — entering the outer loop costs no cycle) and
+        `copper-codegen/tests/unsupported_constructs.rs` (the shape transpiles;
+        the livelock shape is refused; the branch-only shape gets its own
+        message). The back edge is checkable once `for` lands.
+        The UART shape that still needs `for`:
+            for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS { tick } }
+    M ✔ FIXED (2026-08-25) — **A TICK INSIDE A COUNTED `for`** is counted
+        REPETITION, and now desugars to a counter-driven `loop`.
+        `control_extract::desugar_counted_loops` rewrites
+
+            for <var> in <start>..<end> { <B>; clk.tick().await; }
+          ⟶ let mut <var>: u32 = <start>;
+            loop {
+                if <var> >= <end> { break; }      // empty range + the loop's test
+                <B>
+                <var> = <var> + 1;
+                if <var> >= <end> { break; }      // leave BEFORE the last tick
+                clk.tick().await;
+            }
+            clk.tick().await;                     // …which is this one
+
+        A desugar rather than a new state shape, for the same reason C-a was: the
+        result lands on `lower_into`'s nested-loop path, already verified end to
+        end. `<var>` becomes a register and the loop is ONE state — a UART bit
+        period is 434 cycles, so unrolling was never an option.
+        Both shapes cause M was filed for are covered, which is why it is
+        REPETITION and not delay:
+            for _ in 0..CLKS_PER_BIT { clk.tick().await; }              // timing
+            for i in 0..8 { tx.write(byte[i]); for _ in 0..CLKS { tick } }  // data
+        The second nests, and `i` is a counter REGISTER, so `byte[i]` lowers to a
+        dynamic bit select (`CHIRExpr::DynBit`) rather than an unrolled slice.
+
+        **WHY THE LAST TICK IS HOISTED OUT OF THE LOOP — the part that is not
+        obvious, and the reason the first attempt was reverted.** The naive shape
+        (one test at the top, tick last, nothing after the loop) transpiles and is
+        WRONG BY A CYCLE. Measured on `for _ in 0..3 { tick }`: the simulator
+        rewrote the output every 3rd cycle, the transpiled module every 4th.
+        Breaking out of a nested loop is not a clock boundary — `lower_into`
+        inlines the enclosing loop's continuation into the breaking path and
+        carries on in the same cycle. But when that continuation contains no
+        boundary of its own, the lowering falls off the end and emits
+        `pc = <enclosing head>`, and the FSM spends a cycle on the transition.
+        With the tick left inside the loop, a counted delay's continuation IS
+        empty, so every pass cost one cycle more than the source asks for.
+        THAT IS CAUSE K'S BACK EDGE. K's own entry records it as unverified —
+        "the back edge is checkable once `for` lands" — because no well-formed
+        hand-written program could reach it. This is the first thing that could,
+        and it was broken. Hoisting the final tick into the ENCLOSING statement
+        list means a break always continues into a real clock boundary, so the
+        shape is never produced: the divergent form is made unwritable rather
+        than the flattener taught to special-case it, the same disposition as the
+        tick-ordering rule. The second exit test is what pays for it — the loop
+        leaves before the final tick and the hoisted one supplies it — and `<B>`
+        is not duplicated.
+        THE ALTERNATIVE, REJECTED WITH ITS REASON: teach `lower_into` to INLINE
+        the enclosing head's body at a zero-time back edge instead. That is the
+        principled fix and would also unblock `continue` (cause O — the same
+        problem: `continue` is a zero-time jump to the head). It needs the head's
+        LOWERED body at a point where it is still being lowered, so it means a
+        second pass that splices marked `pc = H` assignments after every state
+        body exists — surgery on the most timing-sensitive pass in the codebase,
+        for a shape the desugar can simply avoid producing. Left undone
+        deliberately; cause O is where it would be paid for.
+
+        `>=` RATHER THAN `==`: `for i in 5..3` yields nothing in Rust, and `i == 3`
+        would spin forever. A statically empty range is dropped outright, since the
+        hoisted tick would otherwise be a cycle the source does not have.
+        ☐ KNOWN GAP, and it is the same one the analysis already has: when the
+        bounds are not literals (`0..CLKS_PER_BIT`), emptiness is not decidable in
+        the desugar, and an empty one would produce that spurious cycle.
+        `copper_analysis::may_exit_without_tick` has the identical hole for the
+        identical reason (it treats a `for` as a guaranteed boundary, which an
+        empty range is not). Both need const evaluation to close, and they should
+        be closed together.
+
+        THE DIAGNOSTIC HALF, also fixed, and it was not about lowering at all.
+        uart/rx used to report the well-formed repeating wait on line 55 for
+        having its tick in the wrong place. Declining a module is deliberate — the
+        linear path usually diagnoses better than the flattener could — but it only
+        sees what it REACHES, so a construct that stopped the flattening elsewhere
+        left it blaming whatever it met first. `control_extract::unflattenable_reason`
+        now names that construct, `transpile_fir` prefers it over the downstream
+        error, and uart/rx reports `continue` at 64:12 with its own span. A
+        MALFORMED NESTED LOOP is deliberately NOT named this way —
+        `chir_lower::nested_loop_error` splits that three ways and points at the
+        innermost loop at fault, and duplicating that reasoning in the gate is
+        exactly the two-halves-drift bug this file keeps recording.
+
+        WHAT IT UNBLOCKED: nothing in examples/, as cause M's own entry predicted.
+        uart/rx is behind `continue` (cause O) and uart_tx/uart_rx behind the
+        file-level `spawn_uart` rejection (cause H). The anchors are therefore
+        purpose-built DUTs, which is the right shape for this anyway:
+          - tests/counted_delay_equivalence.rs — `for _ in 0..3 { tick }`, sim ≡
+            Verilator, with a distinct byte per cycle so an off-by-one period
+            shows as a different value rather than the same one later. THIS TEST
+            FAILED on the naive desugar and is what measured the wasted cycle.
+          - tests/counted_repetition_equivalence.rs — the nested serialiser shape,
+            plus an INDEPENDENT property (the line must carry the byte LSB-first
+            at two cycles per bit), so the FSM has to be right and not merely
+            self-consistent.
+          - copper-codegen/tests/unsupported_constructs.rs — the counter is a
+            counter and not an unroll, the empty range costs nothing, a tick that
+            is not last is refused with a `for`-specific message, and a module
+            declined for one construct is not reported against another.
+
+        A FRONT-END DISAGREEMENT IT SURFACED, worth recording as its own thing:
+        `register_reconciliation` failed, because codegen now emits a register for
+        `i` that `copper_analysis::infer_registers` did not name. The analysis was
+        right to be asked and wrong in its answer — `DefinedInLoop` collected `let`
+        bindings and assignment targets but not a `for`'s pattern binding, so
+        `for i in 0..8 { …; tick; }` produced no register at all in the shared
+        inference while the language's central rule says it must. Fixed in
+        `copper-analysis` (gated on the body actually ticking; a tick-free `for`
+        unrolls and its variable is an elaboration index, not state). The
+        synthesized `__copper_ctr<N>` is genuinely nameless in the source — `_`
+        binds nothing — so it joins `pc` on the test's synthetic list.
+        THE GUARD EARNED ITS KEEP: it caught the disagreement the same day it was
+        introduced, which is what it exists for.
+
+    O ✔ FIXED (2026-08-25) — **`continue`** in the module's top-level loop.
+        It is a back edge that costs NO clock cycle, and the extracted FSM has no
+        way to say that: its shape is `loop { match pc { … }; clk.tick().await; }`,
+        so every `pc` transition spends exactly one cycle. The only way to spend
+        none is to be in the same state body — i.e. to INLINE the target. That is
+        the rule `break` already follows (it inlines the enclosing loop's
+        continuation rather than transitioning to it); cause O applies it to the
+        back edge.
+        `lower_into` cannot do the inlining itself — at the point it lowers a
+        `continue`, the head's body is the thing being lowered further up its own
+        call stack. So it emits `__copper_goto = H` and
+        `control_extract::splice_zero_time_gotos` substitutes state H's statements
+        once every body exists. That is the "second pass that splices state bodies
+        into marked zero-time transitions" cause M's entry describes.
+        ORDER MATTERS: the splice runs AFTER `hoist_cross_state_locals`. Splicing
+        first would copy the target's `let`s into another state, and a temporary
+        local to one state would then look cross-state and be promoted to a
+        flip-flop nobody asked for.
+        A GOTO CYCLE — a chain of zero-time transitions returning to its start —
+        makes `extract_control` DECLINE the module rather than emit anything, and
+        the marker name is checked to have vanished before the arms are built. A
+        leaked `__copper_goto` would otherwise become an assignment to an
+        undeclared name downstream, which is the quiet kind of failure this pass
+        must not produce.
+
+        **THE ANALYSIS HOLE THAT HAD TO BE CLOSED FIRST — the serious half.**
+        `copper_analysis` modelled a top-level `continue` as a FALL-THROUGH to the
+        next statement, which is the one thing it does not do. `loop_ctx` is empty
+        in a top-level loop (a hardware loop never `break`s), so `continue` took
+        the fallback target. `loop { if c { continue; } clk.tick().await; }` then
+        appeared to reach the tick on every path and PASSED reachability, while the
+        real program returns to the head having ticked zero times — a zero-time
+        cycle the simulator livelocks on.
+        Nothing exercised it because codegen refused `continue` outright; emitting
+        one without fixing this would have shipped exactly the failure cause K
+        recorded as "REACHABILITY ACCEPTED A PROGRAM THE SIMULATOR LIVELOCKS ON".
+        `Builder::top_head` now routes it to the loop head, in BOTH front-ends
+        (the macro re-runs the same check), and the two analysis tests pin both
+        directions: the tickless `continue` is rejected, and one reached only
+        after a counted `for` has ticked is not.
+        RECORD THE CLASS: a fallback (`map_or(next, …)`) standing in for a case the
+        code had no target for. It is not a wrong answer, it is a MISSING one
+        wearing a default's clothes — and it read as deliberate for as long as
+        nothing could reach it.
+
+        TWO SMALLER THINGS IT NEEDED, both silent:
+          - `expr_diverges` did not count `continue`. `if halt { continue; }`
+            contains no tick and no `break`, so it was pushed through as an
+            ordinary combinational statement and the `continue` inside it was never
+            lowered at all. It belongs there for exactly the reason `break` does.
+          - `loop_needs_extraction` did not fire on a `continue`, so an otherwise
+            linear body (`loop { tick; if c { continue; } … tick; }`) fell through
+            to the phase FSM, which cannot express a mid-body re-entry.
+
+        NESTED `continue` IS STILL REFUSED, and the reason is the rotation, not
+        effort: a nested loop's head state holds `C ; W` — the post-tick tail
+        wrapped onto the pre-tick prefix — so re-entering it would run the
+        statements the source places AFTER the tick this `continue` never reached.
+        The correct target is the start of `W`, which is not a state at all; it is
+        inlined into whatever precedes the loop. Note such a `continue` is also
+        hard to write well-formed: the enclosing loop's own tick must be LAST, so
+        the tick on the `continue`'s path has to come from a loop nested inside it.
+
+        WHAT IT UNBLOCKED, measured: nothing in examples/ — 28/34 unchanged.
+        uart/rx moved to a NEW blocker, and it is one already decided rather than
+        one to build: the `for i in 0..8` at 69:8 delays first and samples
+        `rx_serial` after, so its tick is not the body's last statement. That is a
+        post-tick `In` read — the seam CLOSED AS REFUSED BY DESIGN on 2026-08-24
+        (see THE MID-PHASE READ SEAM). The module is writable in the language, by
+        aligning 1.5 bit periods and then sampling BEFORE each delay, but that is a
+        rewrite of the example's design and not a transpiler change. Behind it sit
+        `|=` and a bare integer local.
+        NOTE THE CONSERVATISM, so it is not mistaken for the rule: the desugar
+        refuses ANY `for` whose tick is not last, including one that only touches
+        REGISTERS afterwards — which the seam measured as correct. It matches the
+        existing nested-`loop` gate rather than being more permissive than it; if
+        that gate is ever relaxed to key on the post-tick READ instead of the
+        position, both should move together.
+
+        CAUSE M'S HOISTED TICK COULD NOW BE REMOVED with this machinery — the
+        wasted back edge M works around is a zero-time fall-through, and the
+        splice handles exactly that. DELIBERATELY NOT DONE: M is verified green
+        against Verilator, and rewriting its desugar to depend on the newer pass
+        is churn with real risk for no behavioural gain. Worth doing only if a
+        third caller needs it.
+
+        → tests/continue_equivalence.rs (sim ≡ Verilator; the reference model is
+          written from the SOURCE and encodes the zero-cycle back edge, so a
+          `continue` lowered as `pc = 0` fails it — verified by reverting),
+          copper-codegen/tests/unsupported_constructs.rs (transpiles, no marker
+          leaks, the tickless form is still rejected, nested is still refused),
+          copper-analysis/tests/analysis_semantics.rs (both reachability
+          directions).
+
+    ✔ FIXED (2026-08-25) — RESERVED PORT NAMES. Was: Verilator rejects a port named
+        `abort` (`SYMRSVDWORD` — a C++ common word) and the harness runs `-Wall`, so
+        the build fails. Both halves of the legalizer's list were incomplete, and the
+        SystemVerilog half was worse: `examples/cdc/flag_crossing.rs` has a port
+        named `event` — a SystemVerilog KEYWORD — and emitted SystemVerilog that
+        will not parse ("syntax error, unexpected event"). It shipped because that
+        example is checked against hand-written Verilog and nothing had ever
+        Verilated what it transpiles to; the corpus differential sweep found it on
+        its first run. `is_reserved` now carries the full IEEE 1800-2017 keyword set
+        plus the C++ reserved words, and a reserved name still gets `_sig` appended.
+        Measured blast radius: exactly ONE name in the whole corpus changed (`event`
+        → `event_sig`), and nothing hand-instantiates that module.
+        Pinned by vlir_lower::e2e_tests::a_reserved_port_name_is_legalized.
+        NOTE for the sweep generator: the testbench addresses the Verilated model by
+        the EMITTED name, so a generated harness needs the rust→SV name mapping.
+
+    G ✔ FIXED — the transpiler no longer PANICS on any example. rv32i_cpu now
+        reports a clean error, and it turns out to be cause F (a `Vec<Bits<32>>`
+        port at rv32i_cpu.rs:190), not a memory or control-flow limit — the panic
+        was masking the module's actual first blocker. See the fix write-up below.
+    H ☐ no structural parent module .............. uart/system (uart_tx, uart_rx)
+        spawn_uart is a plain sim-wiring fn, so the UART has no hierarchy module
+        to transpile. two_domain_top shows the pattern already works.
+    I ✔ FIXED — a branch-local `let` with a COMPUTED initializer read as a latch.
+        Unblocked bsg_counter_up_down. See the write-up below.
+    J ✔/☐ SPLIT — the two modules filed here share an error MESSAGE, not a cause.
+        Measured directly rather than read off the message, which is what the
+        earlier "bare integer local" framing got wrong:
+        J-a ✔ FIXED — an integer local from a CONST EXPRESSION had no inferable
+            width. `let mut k = WIDTH - 1;` (bsg_gray_to_binary) asked both sides
+            of the subtraction for a type: `WIDTH` is not a signal so it was not
+            in the symbol table, and `1` is a bare literal — both ambiguous, so
+            the module was rejected. Parameters and file-scope consts are now
+            seeded into the symbol table as 32-bit, which is what they emit as
+            (`parameter int`/`localparam int`) and the width a `for`-loop
+            variable already got. Pinned by transpile_inference_gaps.rs::
+            an_integer_local_from_a_{const_expression,generic_const_param}_infers_a_width.
+            THIS UNBLOCKED NOTHING BY ITSELF: bsg_gray_to_binary now reports its
+            real remaining blocker, a `while` loop (cause C). Same
+            first-error-was-masking-the-second pattern as rv32i_cpu and D-a.
+        J-b ✔ FIXED (2026-08-27) — ripple_carry_adder (27:8) was the
+            TUPLE-RETURNING HELPER gap, not a width gap at all — `let (s, c) =
+            full_adder(…)`. Closed by the tuple-destructuring `let` lowering
+            (the call inlines via #7b, then projects per element); the pin in
+            transpile_inference_gaps.rs is now the positive assertion
+            `tuple_returning_helper_transpiles`, and ripple_carry_adder sweeps
+            differentially (its build.rs SKIP entry is deleted).
+  NO LONGER BLOCKED (verified by the 2026-08-25 sweep, absent from the failing
+  list): det_010_awaits, which C-a unblocked. It had been filed under C, then
+  re-filed as "tick inside a conditional branch (65:8)" — and neither was its own
+  cause. Its `while` made `contains_unflattenable_control` decline the whole body,
+  so the tick-in-branch fell through to the linear path and was reported there.
+
+  ── UART/RX, REWRITTEN TO SAMPLE BEFORE THE DELAY (2026-08-25) ───────────────
+  ✔ 28/34 → 29/34, and the first coverage gain that came from the EXAMPLE rather
+  than the transpiler. Worth reading for that reason: three causes in a row (M,
+  `continue`, then this) each unblocked uart/rx and each revealed another blocker,
+  and the last one was not a missing feature. Its data loop read `rx_serial`
+  AFTER a bit-period delay — a post-tick `In` read, the seam CLOSED AS REFUSED BY
+  DESIGN on 2026-08-24.
+  THE REWRITE, and why it is not a behaviour change: pre-load ONE bit period after
+  the start-bit check, then have each iteration SAMPLE FIRST and DELAY LAST. The
+  instants sampled are identical (centre of data bit i, for i in 0..8), the eighth
+  iteration's trailing delay lands on the centre of the stop bit where the
+  separate stop-bit wait used to leave it, and all five self-check sections in the
+  example's own `main()` pass with the same bytes. Two smaller changes came with
+  it, each removing a recorded blocker:
+    - a SHIFT REGISTER instead of `byte_val |= 1 << i` over a bare integer. The
+      byte is assembled across eight clock boundaries, so it is a register, and a
+      `[Logic; 8]` filled one element per iteration is assigned on some paths and
+      not others — measured: "would infer a latch". Shifting right and inserting
+      at the top is what a real receiver builds anyway. This is also the corpus's
+      first register READ AFTER ITS OWN UPDATE in one segment
+      (`byte_val = byte_val >> 1;` then `byte_val = byte_val | 0x80`), i.e. the
+      first real exercise of cause N.
+    - `CLKS_PER_HALF_BIT` as a named `const` rather than `CLKS_PER_BIT / 2` at the
+      use site. `/` is a real divider in a HARDWARE expression and is refused
+      there; a file-scope const is elaboration-time arithmetic and already lowers
+      to `localparam int … = CLKS_PER_BIT / 2`. The two paths are right to differ.
+
+  IT TRANSPILED AND WAS WRONG — the part worth keeping. Acceptance is not
+  correctness (this file's own "LINT-CLEAN IS NOT THE SAME AS TRANSPILES", one
+  step further along), and the module reached Verilator only because an
+  equivalence test was written for it. `examples/uart/rx.rs` runs the SIMULATOR
+  only; nothing had ever checked its SystemVerilog.
+
+  ✔ FIXED — **`pc` WAS ALWAYS `u8`, AND NOTHING CHECKED THE STATE COUNT.**
+     uart/rx flattens to 788 states, so `pc = 256` wrapped onto `0` and the emitted
+     `case` had overlapping arms — well-formed SystemVerilog that runs the wrong
+     state. Verilator's CASEOVERLAP caught it; with that lint off it would simply
+     have executed the wrong arm. `pc_ty(states)` now picks `u8`/`u16`/`u32`, at
+     the one point where the count is final. The type and the `match`-arm literal
+     suffix are ONE decision (a mismatch is a WIDTHEXPAND on the case items), which
+     is why they were a pair of constants and are now a pair of returns.
+     RECORD THE CLASS: a fixed-width encoding with no bound check on what it
+     encodes. It held for as long as nothing generated 256 states, and the first
+     design that did was silently miscompiled rather than refused.
+
+  ✔ FIXED — **A ZERO-TIME BACK EDGE STILL COST A CYCLE**, and this is the case
+     cause M's entry recorded as deliberately not fixed ("cause M's hoisted tick
+     could now be removed with this machinery"). It was not merely cosmetic.
+     `lower_into` ends a body that ran off its end with `pc = <head>`, and that is
+     right for a NESTED loop — the rotation removed the body's trailing tick, so
+     the fall-through stands for it — but wrong for the module's own loop, whose
+     body genuinely ends with statements after its last tick. Minimal repro:
+         loop { for _ in 0..3 { tick } dv.write(One); tick; dv.write(Zero); }
+     The simulator repeats every 4 cycles, the FSM every 5: `dv.write(Zero)`
+     belongs to the next iteration's first cycle (an `Out` HOLDS until rewritten)
+     and was given a state of its own. Note the LINEAR path REJECTS trailing
+     statements after the last tick (`trailing_combinational_statements_in_a_
+     multi_tick_loop_are_rejected`) while control extraction accepted them and
+     mis-timed them — the two paths disagreeing again, and silently.
+     FIX: `FallThrough` on `LoopCtx`. `ZeroTime` emits cause O's goto marker and
+     the splice inlines the head; `AfterTick` keeps `pc = head`. It is a property
+     of the CONTEXT, not the call site, which is what makes a `break` come out
+     right: its continuation is lowered in the ENCLOSING context, and whether that
+     continuation's end stands for a removed tick depends on which loop it belongs
+     to rather than on where the `break` was written.
+     So cause O's machinery paid for itself twice, and the deferral in cause M's
+     entry was the wrong call — the shape was reachable, not hypothetical.
+
+  ✔ FIXED (2026-08-25) — THE GUARDRAIL HOLE, and the answer was a SECOND RULE
+     rather than a wider one. Read this before touching either rule.
+     The shape: a plain `Out` driven on BOTH sides of a tick (a one-cycle pulse).
+     It diverges by exactly one cycle, uniformly, and `RegOut` is immune —
+     measured both ways. `unprotected_pretick_out_write` did not flag it because
+     it examines only head → first tick (plan Q5) AND requires the segment to
+     assign a register, which a pulse segment does not.
+     ✘ WIDENING D1 PAST THE HEAD SEGMENT — MEASURED AND REJECTED. It flags 36 of
+       120 corpus modules, ~30 with passing equivalence tests (det_010,
+       mac_pipeline, dual_port_ram, bsg_dff_en, every memory fixture). Writing a
+       plain `Out` after a tick is the ORDINARY multi-phase pattern and is right.
+     ✔ THE ACTUAL RULE WAS ALREADY IN THE LANGUAGE. `shir_lower` refuses "output
+       port `p` is driven in more than one phase … hold it in a register" — but
+       only when it can SEE the phases, and control extraction rewrites the body
+       into a single-tick `match pc` FSM first, so the check counts one tick and
+       passes while the `pc` states are exactly the phases it meant to count. The
+       same blind spot swallows the trailing-statement rule.
+       `copper_analysis::multi_phase_out_write` applies it to the source, where
+       the ticks are still visible, in BOTH front-ends, with the same `RegOut`
+       remedy and the same `allow_pretick_alignment` opt-out. 9 corpus modules
+       flagged, six of them the synthetic witnesses; the three real ones
+       (rv32i_cpu, uart/system.rs's uart_tx and uart_rx) migrated to `RegOut`
+       with their self-checks unchanged — the CPU still sorts and sums.
+     WITNESSES, each flipping ONE condition (tests/sequential_forwarding_divergence.rs,
+     which is the designated home for a pinned divergence and already had the
+     Verilator plumbing): plain `Out` diverges with both traces pinned exactly;
+     `RegOut` agrees; the clear moved OUT of the trailing segment still diverges
+     (so it is not the trailing segment); plain ticks are refused by the linear
+     path outright (which is what identified the real rule).
+     GATE: a second exact-set corpus test in pretick_alignment_corpus.rs, failing
+     in both directions.
+     RECORD THE CLASS: a check that counts a syntactic feature (`clk.tick().await`)
+     rather than the thing it means (a clock phase), placed downstream of a pass
+     that legitimately removes that feature. D1's own rule is unchanged and still
+     head-segment-only, deliberately — the two are complementary the way D1 and
+     `multi_write_collapse` are.
+
+  ✔ FIXED (2026-08-25) — **788 STATES FOR A UART RECEIVER, NOW 11.** 16,479 lines
+     of SystemVerilog became 260, and `pc` went back to 8 bits.
+     The diagnosis came from the number not moving: 434 and 8 cycles per bit both
+     gave 788, so it was duplication and not unrolling. `lower_into` RE-LOWERED a
+     nested loop's break continuation at every `break` site, allocating a fresh set
+     of states for every tick in it. The desugared counted `for` has two `break`s,
+     each lowered again by the rotation's entry copy, so each nesting level roughly
+     doubled — and uart/rx is the first design nested deeply enough for that to
+     matter.
+     FIX: `LoopCtx::lowered_break`, a lazily-filled cache of the LOWERED
+     continuation, cloned at each `break`. Exactly the trick the tick-in-branches
+     path already used on the body ("cloning the lowered form rather than
+     re-lowering the source matters: the two copies then share the sub-states their
+     ticks allocated") — the break path simply never got it. Sharing is not an
+     approximation: every `break` out of one loop continues with the same
+     statements in the same context, and where control came from is already
+     recorded by which state it came from. Lazy so a loop whose body never breaks
+     allocates nothing.
+     WHY IT WAS INVISIBLE UNTIL NOW: the corpus had no design with a nested
+     tick-bearing loop inside another one. Cause K's entry predicted exactly this
+     ("no well-formed hand-written instance exists" until the counted `for` landed),
+     and every purpose-built test for M, N and O is one or two levels deep.
+     → tests/control_extraction_structural.rs::
+       a_deeply_nested_design_does_not_blow_up_the_state_count — a BUDGET (≤ 24)
+       rather than an exact count, so an exponential blow-up fails loudly while a
+       legitimate lowering change can still shift the number by one or two. It also
+       asserts a FLOOR, so a collapse to a handful of states cannot pass either.
+       Measured: 11 with the cache, 788 without.
+     RECORD THE CLASS: an optimisation applied on one path of a pass and not its
+     sibling, where the two do the same thing for the same reason. The comment
+     explaining WHY it mattered was sitting ten lines above the code that lacked it.
+
+  → tests/uart_rx_equivalence.rs — the receiver at an 8-cycle bit period (434 is
+    trace, not coverage), decoding three frames. It is the densest module in the
+    corpus: a data-dependent `while` wait, a `continue` that must cost no cycle,
+    four counted `for` delays (one nested inside a `for` whose body does work), a
+    shift register across eight clock boundaries, and a register read after its
+    own update. Causes M, N and O all meet in it, which is why it found two bugs
+    that none of their own purpose-built tests did.
+
+  ── AUDIT: WHAT CONTROL EXTRACTION HIDES (2026-08-25) ────────────────────────
+  Prompted by two checks in a row turning out to be invisible to extracted
+  modules (the trailing-statement rule and `MultiplyDrivenOutput`). Method:
+  enumerate every check keyed on tick or phase COUNT, then probe each with a
+  linear/extracted pair. Extraction rewrites any module whose ticks live inside
+  branches or loops into a SINGLE-tick `match pc` FSM, so anything counting ticks
+  sees one phase where there are several.
+
+  ✔ `MultiplyDrivenOutput` (vlir_lower) — hidden, and FIXED this session by
+    `copper_analysis::multi_phase_out_write`, which checks the source instead.
+
+  ◐ TRAILING COMBINATIONAL STATEMENTS (shir_lower) — hidden, but the check is NOT
+    the semantic rule it looks like. Measured, linear vs extracted:
+      - `loop { for _ in 0..2 { tick } o.write(CONST); }` — extraction ACCEPTS
+        (the linear path refuses) and it AGREES with its SV. This is `uart/rx`'s
+        `rx_dv.write(Zero)`, which is verified correct. So the linear path's
+        refusal is a limitation of ITS lowering ("an output written there would be
+        silently dropped"), not a property of the language.
+      - `loop { for _ in 0..2 { tick } n = n + 1; o.write(n); }` — DIVERGES. That
+        is D1's canonical shape in the trailing segment, and it is a real gap in
+        the D1 RULE rather than in this check. Pinned and written up under §5.4 of
+        design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md, with both attempted widenings
+        and their corpus costs (25 and 10 false positives) so neither is re-tried.
+    So: nothing to hoist here. The finding is that the linear path is over-strict
+    and D1 is under-strict, which are different bugs from the one being looked for.
+
+  ✔ FIXED (2026-08-25, with user sign-off on the widening) — THE MEMORY FALSE
+    POSITIVE. `chir_lower`'s memory rules reasoned about the SEGMENTS the lowered
+    loop body splits into at `clk.tick().await`; extraction collapses them, so a
+    legal design was refused. Measured — this transpiles:
+        loop { rom.read(addr); tick; data.write(rom.data()); }
+    and appending `for _ in 0..2 { tick }` (which changes nothing about the
+    staging) made it fail with "`rom...data()` is read before the `clk.tick().await`
+    that produces it". Any memory design that also needed control extraction was
+    unwritable.
+    → `copper_analysis::check_memory_staging`, on the source, called from
+      `transpile_target` beside `check_reachability` / `multi_phase_out_write`.
+      `validate_memory_usage` is DELETED, not duplicated: one rule, one place.
+    WHAT REPLACES SEGMENT ORDER is tick-free REACHABILITY, which is what segment
+    order was approximating. An observation is early iff every staging of its port
+    reaches it without crossing a tick edge; two accesses share a bus cycle iff one
+    reaches the other the same way. The walk goes THROUGH the loop head, because
+    re-entering the body costs no cycle — the segment-index form got the
+    head/trailing pairing wrong in both directions, which is a second bug the
+    rewrite fixes (`a_trailing_staging_and_a_head_observation_share_a_cycle`).
+    THE ONE-BUS RULE WIDENED with it, deliberately and with sign-off. Counting
+    sites per phase says `rv32i_cpu`'s seven regfile writebacks are seven drivers;
+    they sit in exclusive `match` arms, no path joins two of them, and each drives
+    the bus in its own state — which is exactly what the emitted `always_comb`
+    does. Anchored by `exclusive_arm_writes_sim_matches_transpiled_verilog`
+    (sim ≡ model ≡ Verilator), not by argument. Straight-line double-drive is
+    still refused. Keeping the count would have moved rv32i_cpu's reported cause
+    off F for no gain; it now reports F again.
+    TWO FOLDED-LOOP SUBTLETIES, both measured on real modules:
+      - A nested loop is opaque in the parent graph, so only the accesses before
+        its FIRST tick belong to the cycle that reaches it (`Cfg::entry_cycle_mem`).
+        Attributing all of them read `rv32i_cpu`'s `read(addr); loop { tick; if
+        is_ready { break } }` — the standard wait — as a same-cycle observation.
+      - Existence ("something stages this port") looks through the folds instead,
+        since it does not depend on position (`Cfg::staged_ports`).
+    IT OPENED A HOLE, WHICH IS CLOSED. `MemoryResultDrivesPlainOutput` (vlir_lower)
+    gives up on `phases.len() < 2`, and an extracted module has exactly ONE lowered
+    phase however many clock phases its source has — so that rule was
+    unreachable-by-accident, held up only by the false positive above rejecting
+    every extracted memory design first. Removing the false positive would have
+    made it unreachable in fact: measured, the plain-`Out` form diverges by exactly
+    one cycle, uniformly, with Verilator agreeing with the emitted SV and not with
+    the simulator. `copper_analysis::memory_result_drives_plain_out` states it on
+    the source (following the drive through same-cycle locals — a value that
+    survives an edge is a register, so excluding registers keeps the taint inside
+    one phase). `vlir_lower`'s copy stays for the non-extracted path it can see.
+    ALSO FIXED, found by Verilating the first extracted memory module ever built:
+    a comb `case` with no wildcard arm emitted no `default`, which is CASEINCOMPLETE
+    under `-Wall` and fails the build. An extracted `match pc` whose comb work lives
+    in only some states is the routine instance. Now emits an empty `default`, which
+    is what the missing arm already meant (every net is assigned its default at the
+    top of the `always_comb`).
+    STILL OPEN, found the same way: a memory address written as a LITERAL emits a
+    64-bit constant into a narrow bus — `mem.write_port::<0>().write(0, d.read())`
+    gives `mem_wr0_addr = 64'd0`, WIDTHTRUNC under `-Wall`. A width-inference gap,
+    not a memory one; the fixture uses a port for the second address instead.
+
+  RECORD THE CLASS, since it is now five for five: **a check that counts a
+  syntactic feature (`clk.tick().await`) rather than the thing it means (a clock
+  phase), placed downstream of a pass that legitimately removes that feature.**
+  Every check in CODEGEN that reasons about phases is suspect by construction;
+  the ones in `copper-analysis` are not, because they run on the source.
+
+  ── RE-MEASUREMENT OF EVERY REMAINING CAUSE, 2026-08-24 ─────────────────────
+  Prompted by four causes in a row turning out to be masking (D, J, C, and
+  det_010_awaits). Method: remove the REPORTED blocker in a scratch copy and see
+  what is actually behind it. Three of the four rows were wrong.
+
+  ✔ REAL — ripple_carry_adder / tuple-returning helper. Inlining the tuple
+    (`let ab = a[i]^b[i]; sum_bits[i] = ab^carry; carry = …`) makes the module
+    transpile outright. The recorded cause is the only cause.
+
+  ✘ MASKING — uart_tx, uart_rx were filed under "no structural parent module".
+    STILL THE LIVE CAUSE, re-verified 2026-08-25: both still fail at FILE level on
+    `spawn_uart`, before either module is looked at. That row conflates two
+    different things:
+      - transpiling the two LEAF modules, which the parent has nothing to do
+        with. They failed only because `spawn_uart` has a hardware-looking
+        signature with no `#[hardware]`, which `prepare_source` rejects at FILE
+        level before any module is looked at. With `spawn_uart` removed from the
+        file they get further, and fail on their OWN content (below).
+      - transpiling the SYSTEM as a hierarchy, which is a genuine separate
+        feature and is what the row was presumably about.
+    Keep them separate; the leaf modules are not blocked on hierarchy.
+
+  ◐ UNDERSTATED — **now filed as cause M**, which supersedes this note; kept for
+    the measurement. The UART family (uart_tx, uart_rx, uart/rx) is blocked on
+    "a tick inside a `for` loop", which is BROADER than the recorded "counted
+    delay". Both `for _ in 0..CLKS_PER_BIT { tick }` (bit timing) AND
+    `for i in 0..8 { … tick … }` (the data-bit loop) are instances — removing
+    only the former leaves the module rejected. The class is counted REPETITION,
+    not just delay, so a fix has to cover a loop whose body does work as well as
+    one that only waits.
+    NOTE the reported error names the wrong construct: control extraction
+    declines because of the `for`, and the linear path downstream then reports
+    the desugared `while` as a nested-loop ordering problem. Same
+    error-message-is-not-the-cause pattern, now visible INSIDE one module.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — CONTROL EXTRACTION DROPPED A LOCAL
+    THAT LIVES ACROSS A TICK. Found while re-measuring uart_tx, minimal repro:
+        loop {
+            while go.read() == Zero { clk.tick().await; }   // forces extraction
+            let captured = d.read();
+            clk.tick().await;
+            o.write(captured);                              // undefined variable
+            clk.tick().await;
+        }
+    → "undefined variable 'captured' referenced in hardware expression".
+    The SAME body without the wait — so without extraction — transpiles fine and
+    `captured` becomes a register, which is the core of the whole timing model
+    ("every value live across an await becomes a register"). So the two paths
+    disagree about the defining rule of the language.
+    Not silent: it is a clean error, and the emitted-vs-dropped question never
+    arises. But the diagnostic is poor (the variable is plainly defined two lines
+    up), and this is a hard blocker for any extracted body that captures a value
+    — which is most real sequential designs, not just the UART.
+    FIX: `hoist_cross_state_locals` moves a local DEFINED in one state and READ in
+    another out to a pre-loop `let mut`, leaving a plain assignment where the
+    `let` was — the same treatment `pc` itself gets, so it lands on the existing
+    register path rather than a new one. A local read only within its own state
+    stays put; hoisting every local would turn state-local temporaries into
+    flip-flops nobody asked for.
+    Verified: tests/cross_state_local_equivalence.rs (sim ≡ transpiled SV under
+    Verilator, with `d` changing BETWEEN the capture and the read so a value that
+    tracked instead of holding would diverge, plus an independent assertion that
+    every value the output takes is one that was actually captured).
+    CONFIRMS THE RE-MEASUREMENT: with this fixed, uart_tx transpiles in full once
+    its counted delays are removed by hand — so the counted delay really is its
+    last remaining blocker, which could not be established before.
+
+  ◐ STALE — rv32i_cpu / rv32i_cpu_pipelined. The first blocker is still the
+    `Vec<Bits<32>>` port, confirmed. The four-item chain recorded behind it was
+    measured 2026-08-24 BEFORE D-a, I, D-b, J-a and C-a landed, so items 2-4 are
+    hypotheses now, not measurements. Re-measure before acting on them. The
+    conclusion that a synthesizable CPU is a REWRITE rather than a flip does not
+    depend on those items and still stands.
+
+  ── COUNTED DELAYS: ATTEMPTED, REVERTED, DIAGNOSED (2026-08-24) ─────────────
+  `for … in 0..N { … clk.tick().await; }` is N CLOCK CYCLES, not a repetition to
+  unroll (a UART bit period is 434). Attempted as a DESUGAR rather than a new
+  state shape, rewriting it into the repeating-wait form control extraction
+  already flattens:
+      let mut ctr = <start>;
+      loop {
+          if ctr == <end> { break; }      // exit test at the TOP
+          <body without its trailing tick>
+          ctr = ctr + 1;
+          clk.tick().await;
+      }
+  The test has to be at the top: the body then runs for ctr = start..end-1 and
+  ticks once per iteration, then re-enters, sees `ctr == end` and breaks in the
+  SAME cycle (break is not a clock boundary). Testing after the tick would both
+  lose a tick and put the test in the window the language refuses.
+
+  REVERTED — it transpiles but is WRONG, and the equivalence tests written for it
+  caught the divergence (sim said 6, Verilator said 5). Diagnosis, from the
+  emitted FSM for a 3-cycle delay:
+      8'd0: __copper_ctr0 <= ((32'd0 == 32'd3) ? …);   // folded to the literal
+      8'd0: if ((__copper_ctr0 == 32'd3)) o <= n;      // NOT folded — reads the reg
+  The entry state carries BOTH a literal-substituted copy of the loop test and a
+  register-reading copy of it. Entering must not cost a cycle, so the flattener
+  clones the lowered head into the entry point (the same trick the wait uses) —
+  but the counter's first value is only knowable as a literal there, since the
+  register does not commit until the edge. One of the two copies got the literal
+  and the other did not, and the register is uninitialised at that point.
+
+  ✘ THAT DIAGNOSIS WAS WRONG, and knowing why matters more than the bug did.
+  It reads as "entry specialisation" — a problem with how the desugar and the
+  clone-into-entry trick interact. It is not. The two lines above come from two
+  DIFFERENT code paths in `shir_lower`: the register update from
+  `extract_updates_from_stmts`, which forwards a segment's own assignments, and
+  the `if` condition from `lower_stmt_list`, which did not forward at all. The
+  entry state was not special; NO branch condition anywhere read a register its
+  own segment had just assigned. That is cause N (2026-08-25), it is reachable
+  with no `for` in sight — `c = c + 1; if c == 3 { … }` — and with the counter
+  also reset inside the branch it silently produced a dead output.
+  With N fixed the entry test reads `<start>` with no special casing, and the
+  degenerate `0..0` falls out: the test is at the top, so the loop breaks before
+  ticking. The real remaining problem was somewhere else entirely (the wasted
+  back edge — see cause M).
+  RECORD THE CLASS: a diagnosis inferred from the SHAPE of the emitted code
+  ("one copy got the literal and the other did not") named the pass it was
+  looking at rather than the pass that produced each copy. Both copies were
+  wrong-by-construction from one missing call, and the fix was five lines in a
+  stage the note never mentions.
+
+  ✔ RESOLVED (2026-08-25) — this entry said counted delays "AND IT IS NOT
+    SUFFICIENT ANYWAY", because each UART loop's body ENDS IN another tick-bearing
+    loop:
+        for i in 0..8 { tx_serial.write(byte[i]); for _ in 0..CLKS_PER_BIT { tick } }
+    That was cause K, and it is FIXED — `body_ends_at_a_clock_boundary` admits the
+    shape, and the diagnostic complaint recorded here is fixed too
+    (`chir_lower::nested_loop_error`).
+    THE ORDER OF WORK RECORDED HERE WAS BACKWARDS, and the reason is structural
+    rather than a mis-estimate. It said: nested-loop-tail FIRST, counted delays
+    second, "doing them the other way round unblocks nothing". In fact K on its
+    own unblocks nothing EITHER, and cannot: the tick-last rule means every
+    hand-written inner `loop` can exit having ticked zero times, so an outer loop
+    whose only boundary is one of them is a zero-time cycle that
+    `check_reachability` now rejects. The example above — with a `for` inside — is
+    the FIRST writable instance of the shape. Counted repetition is therefore the
+    prerequisite, not the sequel. See cause M, which is now the next piece of work.
+
+  ✔ KEPT from the attempt — `hoist_cross_state_locals` dropped the TYPE
+    ANNOTATION when hoisting (`ty: None`), so a hoisted local whose init has no
+    inferable width of its own (a bare `0`) failed. Latent in the committed hoist;
+    fixed independently of the reverted work.
+
+  ── THE CORPUS DIFFERENTIAL SWEEP (phases 1-2 landed, 2026-08-25) ────────────
+  design_docs/CORPUS_DIFFERENTIAL_SWEEP.md. Why it exists: `tools/transpile_coverage.sh`
+  measures ACCEPTANCE, and correctness was measured only where somebody hand-wrote a
+  harness AND a reference model — so the correctness gap grew silently while the
+  coverage number sat still. The observation that fixes it is that the reference
+  model is NOT REQUIRED: simulator vs Verilated emitted-SV is already an oracle (two
+  independent implementations of one source), so a case needs nothing per-module
+  from a person, and can therefore be GENERATED.
+
+  ✔ Phase 1 — tests/corpus_equivalence.rs, hand-written, the `examples/` modules
+    that transpile and had no sim ≡ emitted-SV check. Found TWO defects on its first
+    run: the D1 constant-write divergence (see the entry above) and `event_source`
+    emitting SystemVerilog that would not parse (a port named `event`).
+  ✔ Phase 2 — build.rs generates one case per `#[hardware]` module in
+    tests/fixtures/: 59 generated + 11 ignored-with-reason, 200 random cycles each,
+    53s wall clock, ALL GREEN on the first run. Nothing new found, which is itself
+    the result — the fixture corpus and its emitted SV agree under stimulus nobody
+    chose. Skips live in build.rs's SKIP table with a reason each, and a skipped
+    module still gets an `#[ignore]`d test so it stays visible.
+    THE GUARD IS THE LOAD-BEARING PART: `every_fixture_module_has_a_generated_case`
+    re-scans the directory at test time and compares against the generated manifest,
+    so a generator that quietly stops covering something FAILS rather than shrinking
+    the sweep. Negative-controlled (drop one module → it fails naming it).
+  ✔ Phase 3 — the generator now covers examples/ too: 83 cases running, 21
+    ignored-with-reason, 81s. Nothing new found (the corpus agrees with its emitted
+    SV under stimulus nobody chose), and phase 1's hand-written file is deleted
+    because the generator emits the same wiring. `copper_codegen::legalized_port_name`
+    is public so the sweep and the transpiler share ONE naming rule; the wrapper
+    supplies imports/domains only for files that declare none (fixtures) and never
+    for standalone examples; generated bodies use `__`-aliased imports so nothing can
+    collide with the included file.
+    G-D IN tools/regression.sh: the coverage guard must have run, and at least one
+    differential case must have. The sweep is the only check that says the emitted
+    SystemVerilog agrees with the simulator, so it silently covering nothing is the
+    expensive failure — the same reason G-A/G-B/G-C exist.
+  ✔ Phase 4 — generic modules (they transpile to PARAMETRIC SV, so they only need
+    `-G` widths; `PARAMS` in build.rs records the same monomorphization the
+    hand-written test uses, because the parameters are usually constrained and a
+    guess is a compile error), array ports (a `RandStim` impl for `[T; N]` using the
+    element-major layout the hand-written array tests already record), and reset
+    sequencing. 93 cases running, 11 ignored — and every remaining skip is a recorded
+    transpiler cause, a structural module, or a deliberate divergence. NONE is "the
+    generator cannot do this".
+    WHAT IT FOUND: `shift_register` initialises its register to `Bits::x()`, so its
+    output is undefined until reset — the simulator carries X, Verilator's 2-state
+    model reads 0, and they legitimately disagree. The fix is a RESET table entry
+    (assert on cycle 0, random after), not a skip: comparing undefined behaviour
+    against undefined behaviour is a test of nothing.
+
+  ── LINT-CLEAN IS NOT THE SAME AS TRANSPILES ────────────────────────────────
+  A module can pass the CLI and still fail the equivalence harness, which runs
+  Verilator under `-Wall`. TWO modules unblocked above are in exactly that state,
+  both for the same reason — a bare `usize` local:
+    bsg_encode_one_hot (D-a): `let mut addr = 0usize;` emits `logic [63:0] addr`;
+      the 3-bit `assign addr_o = addr` is WIDTHTRUNC, plus UNUSEDSIGNAL on
+      `addr[63:3]`.
+    bsg_counter_up_down (I): `let mut count: usize = 0;` emits `logic [31:0]`;
+      `assign count_o = count` is WIDTHTRUNC, and `up = (up_i == 1'b1)` is
+      WIDTHEXPAND (a 1-bit RHS into a 32-bit target).
+  ✔ THE WIDTH DISAGREEMENT BETWEEN THEM IS FIXED (2026-08-24). It read 64 bits
+  for `0usize` and 32 for `: usize = 0` — two spellings of one Rust type reaching
+  different inference paths. `usize` gets a width in THREE places in chir_lower:
+  `resolve_type` (:127, the annotation path), `infer_type_from_suffix` (:969) and
+  `strip_int_suffix` (:3675, both the literal-suffix path). History settles which
+  was intended: both 64s are first-draft code (d48dcb7, 5a55011), while the 32
+  was a deliberate later decision (78d91f7, 2026-07-24 — "matches SV `int` loop
+  var, keeps index arithmetic width-consistent"), and that commit also added
+  `from_usize` → 32 to mirror it. It updated the TYPE table and missed the two
+  LITERAL tables for the same type. Now aligned at 32, with `isize` added to both
+  (it was in resolve_type at 32 and absent from the suffix tables entirely).
+  Worse than cosmetic while it lasted: nothing stopped the two meeting in one
+  expression, where the mismatch is a silent width conversion, not an error.
+  Pinned by transpile_inference_gaps.rs::both_spellings_of_usize_give_the_same_width.
+
+  ✔ BOTH MODULES NOW LINT AND HAVE EQUIVALENCE TESTS (2026-08-24, user's call).
+  The `usize` alignment above did NOT unblock them — measured, both still failed
+  `-Wall`, just at 32 bits instead of 64/32, because a wide integer local driving
+  a NARROW port is a separate blocker independent of what `usize` resolves to.
+  Resolved by narrowing the examples rather than by inference: `usize` is not a
+  hardware type, and an accumulator typed at its real width is what the design
+  means. `bsg_encode_one_hot`'s `addr` → `Bits<ADDR_W>`; `bsg_counter_up_down`'s
+  `count` → `Bits<PTR_W>`, which also let the `(count + MOD - down + up) % MOD`
+  dance go — that existed only to keep a `usize` from underflowing, and `Bits<3>`
+  wraps on its own. What is left is BaseJump's own recurrence, `count - down + up`.
+  Both still pass their sim ≡ BaseJump self-check, and both gained
+  sim ≡ transpiled-SV: tests/bsg_encode_one_hot_equivalence.rs and
+  tests/bsg_counter_up_down_equivalence.rs, `include!`ing the example rather than
+  copying it, so the two checks cannot drift (same structure as sipo_block).
+  That chains the anchors — the GENERATED SystemVerilog is now transitively tied
+  to hardware neither Copper nor its transpiler wrote.
+
+  ☐ STILL OPEN, and now the standing question rather than a blocker: should a bare
+  integer local get its width from its TYPE (today: `usize` → 32) or from its USES?
+  Nothing in the corpus needs the answer any more, so this is a language-design
+  call, not a bug. J-a sharpened it rather than settling it: a 32-bit integer
+  local used purely as an INDEX into a narrow vector lowers correctly but draws a
+  Verilator `UNUSEDSIGNAL` on its upper bits (measured on `let k = WIDTH - 1;`
+  indexing a `Bits<8>` — `k[31:3]` unused). Verilator's own `for (int k = …)` does
+  not trip this because a loop variable is declared inside the block, not as a
+  module-level signal. A context-derived width would fix that class; narrowing at
+  the source (what the BaseJump accumulators did) sidesteps it. (The related footgun found while narrowing — `Bits::one()`
+  returning ALL ONES rather than the value 1 — is ✔ FIXED: renamed `all_ones()`,
+  2026-08-24. `Bits::zero()` reads as the value 0 and IS 0, so the pair invited
+  exactly the wrong guess; `Bits::from_lit::<1>()` is the value. Hard rename, no
+  deprecated alias — leaving `one()` reachable would leave the trap reachable.)
+  The transpile count above is "the CLI emits SystemVerilog", not "it lints".
+
+  ✔ FIXED (2026-08-24, with user sign-off) — D-b: array-typed ports
+    (`In<[Bits<W>; ELS], D>`) had no lowering. Chosen ABI: a **packed 2-D**
+    SystemVerilog vector, `[ELS-1:0][W-1:0]`. Full option analysis with the
+    measurements in design_docs/ARRAY_PORT_ABI.md; the three reasons, in order:
+      1. Both independent BaseJump references declare exactly that, so a Copper
+         module stays drop-in interchangeable with the hardware it is checked
+         against.
+      2. It needs NO width arithmetic. `Width` is `Concrete | Param` with no
+         operators, and BOTH blocked modules are symbolic in both dimensions
+         (`mux` is generic; `bsg_mux_one_hot`'s consts are localparams), so the
+         flat `[ELS*W-1:0]` alternative could not have avoided adding a product
+         variant — ~11 match sites plus the exhaustiveness errors behind them.
+      3. Indexing stays a direct element select, so the body reads like the
+         reference instead of an indexed part-select.
+    MEASURED FIRST, and it is what collapsed the decision: Verilator gives packed
+    2-D and flat 1-D the IDENTICAL C++ interface (`VL_IN(&x,31,0)` for both), so
+    the two are bit-identical and harness-identical — the testbench generator
+    needed no change, and the "element 0 at the LSBs" flattening the mux example
+    already used stays correct. The same measurement rules OUT an unpacked array,
+    which appears in C++ as a member array that `top->d = value` cannot assign.
+    ARRAY LOCALS NEEDED THE SAME SHAPE, and this is the bug worth remembering:
+    `let d = data_i.read();` was declared at the ELEMENT width, so the array
+    silently truncated into one element and every `d[i]` became a bit-select. The
+    emitted module compiled and was wrong. Found on bsg_mux_one_hot; the outer
+    dimension is now carried on wire declarations too, pinned by
+    array_ports.rs::a_local_holding_an_array_keeps_both_dimensions.
+    ALSO FIXED IN PASSING: a bare literal compared against a module parameter was
+    sized at the 64-bit default (`ELS_P == 64'd1`), a WIDTHEXPAND error under
+    `-Wall`. `balance_binop_literals` existed for exactly this but could not see a
+    parameter's width, since a parameter is not a signal. Parameters and
+    localparams emit as `int`, so they are 32 bits — consistent with the `usize`
+    resolution and the SV `int` loop variable.
+    Both examples' accumulators were also narrowed to `Bits<N>` (same reason as
+    bsg_encode_one_hot/bsg_counter_up_down), which for the one-hot module also
+    replaced `acc |= …` with the reference's own mask-and-OR shape.
+    Tests: copper-codegen/tests/array_ports.rs (5 — the concrete declaration, the
+    symbolic one with an assertion that NO width product appears, direct-index
+    emission, the array-local declaration, and nested arrays refused) plus
+    tests/mux_equivalence.rs (dynamic index, symbolic dimensions) and
+    tests/bsg_mux_one_hot_equivalence.rs (constant index, array local). The pinned
+    unsupported_constructs.rs::array_typed_port_is_unsupported was removed, as its
+    own message demanded: promoted to positive coverage, not relaxed.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — I: a branch-local `let` with a
+    COMPUTED initializer was reported as a latch. Minimal repro:
+      if r { count = 0 } else { let up = up_i.read(); if up == One { … } }
+    → "would infer a latch: up assigned on some control paths but not all".
+    `up` is written and read entirely inside the one branch — Rust SCOPES it
+    there, so nothing outside can observe it and it cannot latch.
+    `vlir_lower::hoist_branch_local_defaults` already handled exactly this shape,
+    but only when the initializer was a LITERAL: it moved the whole assignment to
+    the top, which is sound only for a constant. A computed initializer cannot
+    move (it would be evaluated on paths the source never runs it on), so it now
+    leaves a zero DEFAULT at the top and stays where it was written.
+    THE RULE IS ONLY SAFE BECAUSE OF WHAT IT LEAVES ALONE. A conditionally-driven
+    REGISTER is indistinguishable from a latch by the "not assigned on all paths"
+    test, but it is the implicit-HOLD idiom (verified against BaseJump's
+    `bsg_dff_en` — see the `Out` holds-when-unwritten entry). An unconditional
+    default would clear it on every untaken path: a silent, cycle-accurate wrong
+    answer rather than a compile error. Registers and registered outputs are
+    therefore passed in as an explicit exempt set rather than being distinguished
+    by inspection, and a test pins that they never receive a blocking default.
+    Tests: `copper-codegen/tests/branch_local_defaults.rs` (3 — the default plus
+    kept computation, the register-never-defaulted invariant, and the unchanged
+    literal path) and `tests/branch_local_temp_equivalence.rs` (sim ≡ transpiled
+    SV under Verilator for a DUT that carries BOTH shapes at once, with hold
+    cycles in the stimulus that would fail if the register were defaulted).
+
+  ✔ FIXED (2026-08-24, with user sign-off) — D-a: file-scope `const` items had
+    no lowering. `const WIDTH: usize = 8;` sitting next to a module is visible to
+    that module's body and port types but is not reachable from the `ItemFn`, so
+    the transpiler reported `undefined variable 'WIDTH'`. `capture_file_scope`
+    had been collecting these into `FrontendModuleIR::file_consts` all along —
+    its own doc said "Nothing consumes the result yet" — so the fix consumes an
+    existing capture path rather than adding one, alongside the file-scope ENUM
+    injection that already worked the same way.
+    FIRST, THE EARLIER FRAMING WAS WRONG. This entry used to read "generic const
+    params in loop bounds". It is not that: `shift_register` is generic over
+    `const N` and has always transpiled, emitting `parameter int N` and using it
+    in loop bounds AND indices. Two of the four modules filed under D were file
+    consts; the other two are array ports, which is a different problem (D-b).
+    THREE DECISIONS, each measured rather than argued:
+      - `localparam`, NOT `parameter`. A Rust `const` is a fixed value, not a
+        knob; an overridable parameter would let a synthesized module elaborate
+        at a width no Copper simulation ever ran.
+      - IN THE PARAMETER PORT LIST, not the module body. A const can appear in a
+        port width (`In<Bits<WIDTH>, D>` → `[WIDTH-1:0]`), and a body declaration
+        is not in scope there. SystemVerilog permits `local_parameter_declaration`
+        inside a `parameter_port_list` — VERIFIED lint-clean against Verilator
+        5.044 before writing any code, because the whole design hinged on it.
+      - THE SOURCE EXPRESSION IS PRESERVED, not evaluated: `const MOD = 1 << PTR_W`
+        emits `localparam int MOD = 1 << PTR_W`, and `PTR_W` is pulled in with it,
+        ahead of it (SV resolves the list left to right). No const evaluator is
+        needed — SystemVerilog evaluates it.
+    THE SET MUST BE EXACT, NOT A SUPERSET. Verilator's UNUSEDPARAM makes an
+    unreferenced `localparam` a hard error under `-Wall` (measured; this is why
+    "just emit every const in the file" is not an option). So the emitted set is
+    computed at emission from the RENDERED port list + body, closed transitively
+    over the initializers. Deriving it from the IR instead would mean a second
+    traversal that has to stay in step with every future statement and expression
+    variant — the "a check that cannot see a construct reports green on it" class
+    this file already records twice.
+    A const with no SystemVerilog form (a `const fn` call — `mux.rs`'s
+    `safe_clog2(ELS_P)` — or a non-integer type) is NOT emitted, and referencing
+    it stays the ordinary "undefined variable" error with the reason appended, so
+    it does not read as a typo.
+    Code: `copper-codegen/src/file_consts.rs` (new), threaded CHIR→SHIR→VLIR as
+    `localparams`, emitted by `emit::emit_param_header`.
+    Tests: `copper-codegen/tests/file_scope_consts.rs` (7 — port width + loop
+    bound, localparam-not-parameter, unused-not-emitted, dependency order and
+    expression preservation, both rejection diagnostics, and the substring guard
+    that keeps `WIDTH` out when only `WIDTH_P` is used) and
+    `tests/file_scope_const_equivalence.rs` (sim ≡ transpiled SV under Verilator
+    for a const-parameterised one-hot encoder, against an independently written
+    reference model).
+
+  ✔ FIXED (2026-08-24) — A: `[Logic::Zero; N]` array locals.
+    An array local now lowers to the packed vector its repeat length describes —
+    element k at bit k, the SAME layout Bits<N> already has in copper-core
+    (`Bits { bits: [Logic; N] }`). Because the layouts coincide,
+    `Bits::from_slice`/`from_array` move no bits and lower to IDENTITY.
+      copper-codegen/src/chir_lower.rs: `ExprType::Repeat` arm in
+      infer_type_from_expr (+ `repeat_len`, `chir_type_width`), `lower_repeat`,
+      and `identity_pack_call`.
+      Symbolic lengths work (`[Logic::Zero; N]` → `logic [N-1:0]`): repeating a
+      ZERO is zero at any width, so it emits as a context-width literal the way
+      Bits::zero() does. `[Bits<8>; N]` stays a clean error — Width has no product
+      form, so it is refused rather than silently mis-sized.
+      VERIFIED BEHAVIORALLY, not by shape: tests/logic_array_pack_equivalence.rs
+      (+ fixtures/logic_array_pack_dut.rs) — sim ≡ transpiled SV ≡ an INDEPENDENT
+      Rust golden under Verilator, sweeping all 16 values of each nibble field.
+      copper-codegen/tests/transpile_inference_gaps.rs: the array half is now a
+      POSITIVE assertion (per that file's own instruction — promote, do not relax).
+
+  ✔ FIXED (2026-08-24) — B: fully-qualified type paths.
+    Every port/clock test in chir_lower.rs is TEXTUAL (`starts_with("Clock<")`,
+    `"In<"`, `"Out<"`), so `copper_core::Clock<MainClk>` failed all of them and
+    was reported unresolvable. sipo_block was the one example written that way.
+      New `compact_type()` / `strip_path_qualifier()` choke point; the 9 type-text
+      compaction sites in chir_lower.rs + the one in parser.rs route through it.
+      Only the HEAD path is stripped, so a qualifier inside a generic argument
+      (`In<Bits<8>, some_mod::Dom>`) is untouched. Literal, path and pattern texts
+      deliberately do NOT go through it — a qualifier is meaningful there
+      (`Logic::One`, `Opcode::LUI`).
+
+  ✔ FIXED (2026-08-24, with user sign-off) — E: `Memory` had NO transpiled path.
+    Not one construct being rejected — an entire first-class feature that existed
+    only in the simulator. The IRs had no memory node at all (`grep -i memory`
+    over chir/shir/vlir/frontend_ir: zero hits), so every memory guarantee was
+    sim-only and the central claim (one source simulates AND synthesises, provably
+    in agreement) did not extend to any design using memory.
+      SCOPE, chosen with the user: single-cycle (READ_LAT = WRITE_LAT = 1)
+      ReadFirst, N read + M write ports, no preload. Everything else is a CLEAN
+      error naming the construct — never a silent mis-lowering — and every one of
+      those boundaries is pinned in copper-codegen/tests/unsupported_constructs.rs
+      against a baseline DUT that DOES transpile, so a pin can only fail for the
+      construct it names.
+      THE LOWERING IS MECHANICAL because the sim API is already the hardware
+      staging pattern (this is why the OUTDATED MEMORY_DESIGN.md indexing API was
+      NOT adopted — the transpiler lowers the API the examples actually use):
+        Memory::<T,R,W,D,1,1>::new(clk, N)  → logic [W-1:0] mem [0:N-1];
+        pre-tick  wp::<j>().write(a,d)      → if (en) mem[a] <= d;   in always_ff
+        pre-tick  rp::<i>().read(a)         → en/addr comb nets
+        post-tick rp::<i>().data()          → assign rd_data = mem[rd_addr];
+        post-tick rp::<i>().is_ready()      → the enable net (LAT=1: ready ⟺ staged)
+      ReadFirst falls out of non-blocking assignment for free — the continuous
+      read sees the array before the edge commits the write — which is exactly
+      what the hand-written reference does (`if (enb) dob <= ram[addrb];`).
+      IR: CHIRMemoryDecl + CHIRStmt::MemRead/MemWrite + CHIRExpr::MemData/MemValid,
+      mirrored through SHIR, into VLIRMemDecl + VLIRFFStmt::MemAssign. The net
+      names are reserved in the legalizer from the DECLARATION, so a user signal
+      cannot collide with a synthesized one.
+      WHY THE NETS ARE COMB WIRES, not registers: the post-tick `data()` read
+      observes what the edge PRODUCED. Lowering it to a pipeline register would
+      read the register's pre-edge value inside always_ff and lag the design by a
+      cycle. Feeding the register update from a continuous read of the array
+      collapses to `if (en) q <= mem[addr]` — the reference's own shape.
+      VERIFIED BEHAVIOURALLY: tests/dual_port_ram_equivalence.rs — sim ≡ transpiled
+      SV under Verilator over 11 cycles including a deliberate read-during-write at
+      the same address (the one cycle where a wrong lowering is otherwise
+      invisible), PLUS a shape assertion, PLUS an independent Rust reference model.
+      The example's own sim ≡ hand-written-SV check still passes, so the generated
+      SV is transitively anchored to a memory neither Copper nor its transpiler
+      wrote. Example `include!`d, not copied — one source of truth.
+      ALSO REMOVED: dual_port_ram declared a `data_out_a` output it never drove.
+      Harmless in simulation, a Verilator UNDRIVEN error once it transpiled. The
+      hand-written reference has no `doa` either (it is commented out), so the
+      interfaces now match. NOTE the open language question this exposes: Copper
+      does not reject an undriven `Out` at compile time — the transpiler found it.
+
+  ✔ FIXED (2026-08-24) — G: the transpiler PANICKED on `examples/cpu/rv32i_cpu.rs`.
+      thread 'main' panicked at control_extract.rs:95: gate guarantees at least one tick
+    ROOT CAUSE: the two halves of control extraction disagreed about where a
+    `clk.tick().await` can live. The GATE (`expr_contains_tick`) descends into
+    `loop` / `while` / `for`; the FLATTENER's search (`find_tick_in_expr`) descends
+    only into `if` / `block` / `match`. A module whose tick sits inside a nested
+    `loop` — the "wait until ready" idiom the CPU uses ~15 times — passed the gate
+    and then hit an `.expect`. No span, no construct named, nothing to act on.
+    FIX, in three parts:
+      1. The gate now also requires that every tick sit somewhere the flattener can
+         actually handle (`contains_unflattenable_tick`). A tick under a repeating
+         construct means DECLINE — leave the module alone so the linear path
+         downstream reports the real construct with its own span. Note the
+         flattener was never going to handle these: `lower_into` has no `loop` case
+         at all, so had the panic not fired it would have embedded a nested
+         ticking loop inside a state body.
+      2. The `.expect` became a graceful bail, as defence in depth: if the two
+         halves ever drift apart again the pass declines instead of crashing.
+      3. chir_lower gained real diagnostics for the loop family. A nested `loop`
+         used to fall through to a generic handler that printed
+         `0:0: expression type not supported in hardware: Discriminant(14)` — no
+         span, no name. Now: a nested loop WITH a tick says it is a repeating wait
+         and that control extraction does not build the self-looping state yet; one
+         WITHOUT a tick says it would never terminate; `break`/`continue` are named
+         too. `ExprType` gained `kind_name()` and `span()` so the generic
+         fall-through names the construct and points at it instead of printing a
+         discriminant.
+    GUARD: copper-codegen/tests/no_transpiler_panics.rs sweeps every #[hardware]
+    module in examples/ and asserts each one transpiles OR returns a clean Err —
+    a panic is the failure MODE this pins, not a coverage claim. Verified by
+    reverting the fix: the guard failed naming examples/cpu/rv32i_cpu.rs::rv32i_cpu.
+    Construct-level pins in unsupported_constructs.rs cover the nested-loop shapes,
+    including which check owns which (the shared REACHABILITY guarantee owns a
+    module with no tick at all, and its message is the better one).
+
+  ✔ A+B UNBLOCKED sipo_block THROUGH THE FRONT END, WHICH IMMEDIATELY EXPOSED THE
+     multi-phase RegOut codegen bug — and, verifying that, a second one in the
+     same family for plain `Out`. BOTH now FIXED (see above). sipo_block is now
+     sim ≡ transpiled SV ≡ BaseJump on all five outputs.
+
+  ☐ BUG/GAP (found 2026-08-03 while writing equivalence tests), HALF FIXED:
+    the standalone `transpile_source` path rejected two constructs the macro-sim
+    accepts, both with "cannot infer bit width":
+      - `[Logic::Zero; N]` array locals — ✔ FIXED 2026-08-24, see A above
+      - tuple-returning plain-Rust helper fns called from hardware bodies
+        (e.g. `let (s, c) = full_adder(...)`; inlining the expression works)
+        → STILL OPEN, still pinned in transpile_inference_gaps.rs
+    examples/combinational/ripple_carry_adder.rs still does NOT round-trip — it
+    is blocked on the TUPLE half, not the array half (measured: with A fixed it
+    now fails at the `let (s, c) = full_adder(...)` line). Its equivalence test
+    keeps the Bits-indexing rewrite until the tuple gap closes.
+  ✔ FIXED (2026-08-03): Moore output decoded from a state `case` was lowered into
+    `always_ff` (REGISTERED, `out <= …`) instead of `always_comb`, lagging the
+    simulator one cycle (verilator FAIL / trace PASS).
+      TRUE ROOT CAUSE (my first "single-register" hypothesis was wrong): the trigger
+      is a NON-EXHAUSTIVE state `case` — a register whose encoding leaves unreachable
+      values (6 states in a 3-bit reg; a `u8` pc with 2 states). ports_driven_all_paths
+      refused to count ANY output as fully driven on a case with no default that isn't
+      exhaustive, so an output written on every explicit arm still looked "conditional"
+      and got moved to always_ff. traffic_light is immune only because 4 states = 2^2
+      is exactly exhaustive. (Nothing to do with register count.)
+      FIX: copper-codegen/src/vlir_lower.rs `hoist_moore_output_defaults` — for an
+      output that is currently conditional AND driven on every explicit arm, hoist a
+      top-of-`always_comb` default (`out = <first-arm value>;`) and give the case an
+      empty `default` (Verilator CASEINCOMPLETE is an error). Narrow by design:
+      exhaustive cases (traffic_light) are byte-identical; a genuine enabled-register
+      hold driven in only some arms (bsg_dff_en) is untouched and stays `always_ff`
+      (both verified). seq6 → full equivalence (tests/fsm_six_state_equivalence.rs).
+      RESIDUAL (separate, still open): see the Mealy-output item directly below.
+  ✔ RESOLVED-BY-RESTRICTION (entry was STALE, corrected 2026-08-24): the MEALY
+    output sim-vs-SV divergence flagged 2026-08-03 is no longer open, but note it
+    was NOT fixed — it was ruled out of the language. The multi-write-around-a-tick
+    guardrail rejects a plain (combinational) `Out` in that shape and points at
+    `RegOut`, which reconciles with the transpiled `always_ff`. So the divergent
+    program can no longer be written, rather than the divergence being repaired.
+      EVIDENCE the entry was stale: tests/nested_tick_equivalence.rs and
+      tests/fsm_six_state_equivalence.rs both run FULL sim ≡ transpiled-SV
+      equivalence now; the only `sim_only` occurrences left in either file are
+      historical comments. This entry still said "Meanwhile ... runs sim_only".
+      PAPER NOTE: cite this as a scope restriction, not a repair — it belongs with
+      contribution 5 (the `Out`/`RegOut` pair), not with the Moore-output fix.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — RegOut written UNCONDITIONALLY in a
+    multi-phase loop was emitted as a continuous `assign`, not a flip-flop.
+      ROOT CAUSE: vlir_lower::lower_flat_stmts turned EVERY top-level
+      SHIRStmt::PortDrive into a module-level VLIRContinuousAssign. Those assigns
+      are collected separately from the phase's statements and never passed
+      through split_output_regs — so the port's `registered` flag was silently
+      ignored for unconditional writes, and the phase guard was lost with it. The
+      output then followed a phase-gated combinational value and collapsed to 0
+      on the cycles where that phase was inactive.
+      WHY mac_fsm WAS ALWAYS FINE: it writes its RegOut INSIDE a conditional,
+      which lowers to a PortAssign in the phase statements — which
+      split_output_regs does see. Only the unconditional shape was broken.
+      FIX: one arm in lower_flat_stmts — a PortDrive targeting a registered
+      output becomes a PortAssign instead of a continuous assign, so the existing
+      split moves it into always_ff under the phase guard. lower_flat_stmts now
+      takes `registered_outs`; the combinational caller passes an empty set (a
+      comb module has no clock, so no registered outputs).
+      THE SIM WAS THE CORRECT SIDE: it matches BaseJump's own sipo_block.sv,
+      which registers data_o in an always_ff.
+      REGRESSION COVER: tests/regout_multiphase_equivalence.rs — a behavioural
+      sim ≡ SV check PLUS a shape assertion (`word_o <=` present, `assign word_o`
+      absent), because the behavioural check alone could pass by luck on the
+      sampled cycles.
+      NEW COVERAGE UNLOCKED: tests/sipo_block_equivalence.rs — sipo_block now has
+      sim ≡ transpiled SV on top of the example's existing sim ≡ BaseJump check,
+      so the generated SV is transitively anchored to third-party hardware. It
+      `include!`s the example (with #[cfg(not(test))] on its main) rather than
+      copying it, so there is one source of truth. All five outputs compared once
+      the plain-Out fix below landed.
+
+  ✔ FIXED (2026-08-24, with user sign-off) — a PLAIN `Out` written in only SOME
+    PHASES of a multi-phase loop was emitted as an unguarded continuous assign, so
+    it dropped to 0 outside its phase instead of holding.
+      SAME MECHANISM as the RegOut bug above (top-level PortDrive → unguarded
+      continuous assign over a phase-gated wire defaulting to '0), different port
+      kind. Sim gave 1,1,3,3; the SV gave 0,2,0,4.
+      THE SIM WAS THE CORRECT SIDE: a sequential plain `Out` HOLDS when unwritten
+      (the enabled-register idiom, verified against BaseJump's bsg_dff_en), so a
+      write in one phase is EFFECTIVELY conditional and must become an
+      implicit-hold register — the same treatment a write on some-but-not-all
+      PATHS already got.
+      WHY THE RegOut PATCH ALONE WAS NOT ENOUGH: conditional_output_ports decides
+      conditionality by finding writes nested in a conditional. A phase-top-level
+      write is unconditional WITHIN its phase, so routing it to a PortAssign left
+      it unrecognised. lower_seq therefore also computes
+      `phase_scoped_output_ports` from the SHIR. It has to be done at SHIR level:
+      the VLIR-level ports_driven_any_path cannot see an unconditional drive,
+      because that has already been moved out of the statement list. The two sets
+      are unioned into one `hold_outs`, so RegOut and phase-scoped plain Out share
+      one mechanism.
+      ⚠️ THE RULE KEYS ON THE DRIVEN VALUE, NOT ON PHASE COVERAGE — AND THE FIRST
+      ATTEMPT GOT THIS WRONG. "Written in some phases but not all" LAGGED
+      mac_pipeline's output by one cycle (expected 10 got 0, expected 37 got 10);
+      caught by the full regression, tests/mac_pipeline_equivalence.rs is the
+      measured witness. A top-level drive lowers to an UNGUARDED continuous
+      assign, so it reads its RHS every cycle; correctness depends on what the RHS
+      is OUTSIDE the writing phase:
+        - mac_pipeline: `out.write(sum)` reads the inferred REGISTER sum_r, which
+          RETAINS its value → `assign out = sum_r` is already correct, and
+          registering it again just adds a cycle.
+        - sipo_block / the fixture: the drive reads a PHASE-LOCAL COMBINATIONAL
+          WIRE that always_comb defaults to '0 → the assign propagates zeros.
+      Only the second needs the hold. Helpers: shir_expr_vars,
+      shir_phase_local_wires, shir_port_drives.
+      DELIBERATELY NARROW ON TWO COUNTS: a port written in EVERY phase is excluded
+      (driven every cycle), and so is a port whose value is register-backed.
+      Widening either lags an output by a cycle — do not widen without a measured
+      witness.
+      REGRESSION COVER: tests/plain_out_multiphase_equivalence.rs — behavioural
+      sim ≡ SV plus a shape assertion (`seen_o <=` present, `assign seen_o`
+      absent).
+      COVERAGE UNLOCKED: tests/sipo_block_equivalence.rs now compares ALL FIVE
+      outputs (data_o + the four wN_dbg), not just data_o. The wN_dbg ports expose
+      the module's per-cycle internal capture, which is exactly what the
+      mid-phase-read question sipo_block was built to answer.
+
+  ✔ CONTROL EXTRACTION INCREMENT B — repeating waits  [DONE 2026-08-24]
+     `loop { <test>; clk.tick().await; }` nested inside the module's own loop, left
+     by `break`. Increment A flattened ticks nested in `if`/`match` by inlining each
+     continuation into the branches; a nested loop adds the one thing that model
+     lacked — a state that loops back to ITSELF.
+     THE LOWERING: the loop gets a head state H; its body is lowered once with H as
+     the back-edge target, so the body's trailing tick emits `pc = H` (stay another
+     cycle) and `break` INLINES the loop's continuation (leave, in the same cycle —
+     breaking is not a clock boundary). Entering must not cost a cycle either, so
+     the already-lowered body is CLONED into the entry point. Cloning the lowered
+     form rather than re-lowering the source is what keeps it cheap: the two copies
+     share the sub-states their ticks allocated, so a wait costs ONE extra state,
+     not a doubling. (The state-count worry recorded when this was proposed turned
+     out not to bite, for that reason.)
+     `if ready { break; }` also forces a split increment A would not have made: the
+     branch holds no tick, but control still leaves it, so the continuation must be
+     inlined per-branch anyway. "Contains a tick" became "diverges" as the splitting
+     rule.
+     → tests/wait_loop_equivalence.rs (4 tests): a single wait, TWO SEQUENTIAL
+       waits with a tick between them, a shape pin that one wait costs one extra
+       state, and the refused ordering. Stimulus uses uneven runs (2, 1, 3 cycles)
+       so a wait that held for a FIXED number of cycles could not pass.
+     BOTH NEGATIVE CONTROLS MEASURED: making the back edge target state 0 instead of
+     the loop head broke the two-wait handshake (a single wait cannot tell the two
+     apart — which is why the handshake test exists); making `break` jump to a new
+     state instead of inlining broke all three.
+
+  ── THE MID-PHASE READ SEAM, MEASURED 2026-08-24 ────────────────────────────
+  Went looking for one thing and found three. The refusal of
+  `loop { clk.tick().await; <test> }` was blamed on a read-timing seam; that blame
+  was PARTLY WRONG, and taking it apart turned up a silent miscompilation that had
+  nothing to do with control flow.
+
+  ✔ FIXED — A REGISTER REWRITTEN INSIDE ONE BRANCH LOST EVERY WRITE BUT THE FIRST.
+     `shir_lower::extract_updates_from_stmts` merges a branch's register updates
+     into one muxed next-value, and looked each register's value up with `.find()`
+     — the FIRST update in the branch. A register written twice kept the earlier
+     write:
+         t <= (t + 4'd1);          // emitted
+         //   `if t == 3 { t = 0; }` — GONE
+     That is the mod-N counter idiom, i.e. how anyone writes a clock divider, and
+     it silently produced a free-running counter that wrapped at its full width.
+     Silent because the surviving value is perfectly well-typed.
+     WHY IT SURVIVED THIS LONG: outside a branch the merge does not happen — the
+     updates emit as separate non-blocking assignments and SV's last-write-wins
+     makes the result right anyway. So it needed a register rewritten INSIDE an
+     `if` or a `match` arm, and nothing in the corpus had one: every FSM arm here
+     assigns each register once.
+     FIX: `last_update_for` — take the branch's LAST assignment. One line, plus a
+     name and a comment so the next reader knows why order matters.
+     → tests/rewritten_register_equivalence.rs (3 tests: a `match`-arm divider, a
+       rewrite inside a nested `if`, and a shape pin). All three fail with the fix
+       reverted; the `if` case needed the two writes in the SAME branch, since a
+       top-level write plus a branch write does not reproduce it.
+     RECORD THE CLASS, not just the bug: a merge that silently keeps ONE of several
+     candidates keeps the wrong one for as long as nothing produces two.
+
+  ✔ THE SEAM IS NOT ABOUT CONTROL FLOW, and it is narrower than it looked.
+     With the miscompilation fixed, `loop { clk.tick().await; <test> }` is CORRECT
+     when the test reads a REGISTER — measured, sim ≡ SV over a divide-by-three
+     wait. So the flattening (and the body rotation it needs — the head state is
+     the one the tick ENTERS) was right all along.
+     What still diverges is exactly one thing: an `In` read in the post-tick window.
+
+  ✔ THE REMAINING SEAM — CLOSED AS REFUSED BY DESIGN  [2026-08-24, user's call]
+     A post-tick `In` read is sampled by the SIMULATOR at the START of the window
+     (`Immediate`, per SYNCHRONOUS_SEMANTICS.md: "consumes the value the just-past
+     edge produced") and by the EMITTED HARDWARE at the END of it (a flip-flop
+     samples just before its own edge). Under the harness convention "drive, then
+     clock", those are different input values, one cycle apart.
+     NOT a "which of two adjacent samples" question: holding each stimulus value
+     for TWO cycles does not reconcile them, because the two models read in
+     different WINDOWS, not at different points of the same one.
+     DISPOSITION: the ordering `loop { clk.tick().await; <test> }` is OUTSIDE THE
+     LANGUAGE. Not "unimplemented" — decided. The supported ordering
+     (`loop { <test>; clk.tick().await; }`) expresses the same designs and is what
+     one would write anyway, so the restriction costs nothing that works.
+     THIS IS THE SAME DISPOSITION AS D1 (pre-tick alignment): the divergent program
+     is made unwritable rather than the divergence adjudicated. Copper does not
+     choose between the two samplings; it declines to let a design depend on which.
+     PAPER NOTE: cite as a SCOPE RESTRICTION, not a repair — alongside D1 and the
+     Mealy-output item, which are the same move. The honest framing of all three is
+     "Copper infers the register/combinational boundary that other HDLs make
+     explicit, and where inference cannot decide, the language narrows."
+     WHY THE COST IS LOW, measured: the divergence needs an input that CHANGES
+     MID-CYCLE. An `In` driven by a clocked module in the same domain is stable
+     across the window, so both models read the same value. It is a
+     testbench-observable difference — which is exactly why it could not be left
+     in, since sim ≡ SV under a testbench is this project's bar.
+     REJECTED ALTERNATIVES, recorded so they are not re-tried:
+       - register the input at the entering edge so the hardware reproduces the
+         simulator. Exact under any stimulus, and it would have allowed the
+         ordering — but it silently inserts a flip-flop the user did not write and
+         delays the input a cycle relative to the plain reading of the source.
+       - declare the simulator normative only for edge-aligned inputs and require
+         harnesses to hold inputs across the boundary. Changes no hardware and no
+         language surface, but weakens the central check: sim ≡ SV would no longer
+         hold under the testbench convention every existing test uses.
+     WHAT IT DOES *NOT* UNBLOCK — measured 2026-08-24, correcting an earlier
+     overstatement in this file ("settling it is what would put the CPU's control
+     flow within reach"). The seam was the FOURTH thing standing between
+     examples/cpu/rv32i_cpu.rs and transpilation, not the first:
+       1. `program: In<Vec<Bits<32>>, MainClk>` — a `Vec` input port. A
+          variable-length vector is not a wire bundle; this is not a missing
+          feature so much as a value that is not a signal.
+       2. `let flat = { let mut v = program.read(); v.resize(1024, …); v };` —
+          host-side Rust running at construction.
+       3. `from_contents(clk, flat.clone())` for imem AND dmem — a run-time
+          computed preload, refused because there is nothing to emit.
+       4. the 17 tick-then-test waits — the seam.
+     Items 1-3 are one thing: the program image arrives as a host-side Rust value,
+     which is how the example is WRITTEN (to be simulated with a program handed in
+     by the testbench), not a transpiler gap. A synthesizable CPU takes its program
+     from a fixed image (`from_fn`, or `from_contents` with literals — both work
+     now) or fetches it over a bus port.
+     ALSO WORTH KNOWING before assuming the CPU's waits could just be flipped to
+     the supported ordering: of the 17, EIGHT wait on a *write* port's
+     `is_ready()`, which the simulator always returns true for — they are "tick
+     exactly once" written in a general form, and
+     `loop { if wp.is_ready() { break; } tick; }` would never tick at all, which
+     the reachability guarantee rejects. Only the nine read-port waits (READ_LAT=2)
+     are genuine variable waits. So a transpilable CPU is a REWRITE, not a flip.
+     Pinned by unsupported_constructs.rs::ticking_before_the_test_in_a_wait_is_unsupported.
+
+  ☐ `RegOut` IS NOT IMMUNE TO SEQUENTIAL FORWARDING, contrary to
+     PRETICK_ALIGNMENT_GUARDRAIL.md, which lists it as the first remedy and calls
+     it "immune: it commits at the edge, so *when* the write executes is
+     unobservable". Measured: with a `RegOut` written AFTER a register update in
+     the same segment, codegen emits `out <= n` — the register's OLD value — while
+     the simulator forwards the update and writes the new one. The D1 compile error
+     exempts `RegOut`, so this shape passes the guardrail and diverges anyway.
+     The immunity claim holds for the PHASE question it was written about (when the
+     segment runs); it does not extend to forwarding WITHIN the segment.
+     THIS ENTRY WAS STALE and is corrected 2026-08-25: the FORWARDING was repaired
+     (causes L / L-1 / L-2) — a drive sampled at the edge is emitted from pre-edge
+     register values, via `SHIRPortDrive`'s `edge_value` and
+     `vlir_lower::split_output_reg` — and the `RegOut` exemption stands, because the
+     rule is the EMISSION CONTEXT, not the port type (a conditionally-written plain
+     `Out` becomes an implicit-hold register and had the identical lag). All four
+     `regout_forwarding_dut` witnesses now agree with their emitted SV under 200
+     cycles of random stimulus in the corpus sweep. The guardrail's §5.2 correction
+     block records the resolution; this entry had not been updated, and was cited as
+     an open item as late as this session's planning.
+
+  ✔ DONE (2026-08-25) — THE STRUCTURAL GUARD FOR THE FIVE-TIMES CLASS.
+     `copper-codegen/tests/phase_sensitive_checks.rs` pins every function in the
+     transpiler that BOTH reasons about clock phases AND can produce an error, each
+     with the reason it is allowed to: a LIMITATION of this lowering path (a statement
+     about the code generator — legitimate) or a RULE about the language (which
+     belongs in copper-analysis, on the source, where extraction has not yet collapsed
+     the phases). A new site fails the test with exactly that question, and the three
+     checks that already had to move are named as precedent.
+     It found two sites a hand-written scan missed: one in an `impl` block, and one
+     `Display` impl whose MESSAGE names phases (excluded — text, not logic).
+     It also names the one OPEN instance: shir_lower's trailing-statement refusal,
+     filed as a limitation and audited as a rule. Negative-controlled (adding a
+     phase-counting check to shir_lower fails it by name).
+
+  ✔ FIXED (2026-08-25) — D1's TRAILING-SEGMENT GAP. D1's shape past the last tick
+     (`loop { for _ in 0..2 { tick } n = n + 1; o.write(n); }`) diverges by a cycle
+     and the head rule cannot see it (it examines head → first tick). 5.4 records two
+     widenings measured and REJECTED at 25 and 10 false positives; the open question
+     was the discriminator between that DUT and `rom_from_fn`, structurally identical
+     and AGREEING.
+     THE ANSWER IS HOW MANY CLOCK EDGES THE BODY CROSSES PER ITERATION, found with a
+     flipping witness: identical trailing body, single-tick loop AGREES (that is
+     `rom_from_fn`'s shape), multi-tick loop DIVERGES. In a single-tick loop the
+     trailing statements share the head's phase — nothing to be misaligned against —
+     which is why widening #2 cost ten false positives, all single-tick memory modules.
+     NOT the Comb-component count: the divergent DUT has one component too, its extra
+     edges being inside a folded nested loop. `crosses_more_than_one_tick` counts tick
+     nodes and treats a folded tick-bearing loop as more than one.
+     Three other hypotheses were measured and discarded in one run each — the update's
+     conditionality, the write's conditionality, and loading the register from an input
+     (all four variants diverge identically, so none separates anything).
+     CORPUS COST: one real module — rv32i_cpu_pipelined's `program_counter` → `RegOut`,
+     the remedy its scalar sibling already had. Pinned by a third exact-set test in
+     pretick_alignment_corpus.rs.
+
+  ✔ FIXED (2026-08-25) — D1's CONSTANT-WRITE EXEMPTION WAS UNSOUND for a
+     conditionally-written `Out` (found 2026-08-25 by the corpus differential sweep, on random stimulus).
+     `unprotected_pretick_out_write` exempts a write of a constant because "a
+     constant is idempotent across the phase shift". True only if the write happens
+     EVERY cycle. Where an arm of a `match pc` writes the port and another does not,
+     the alternative is the port's HELD value, so *when* the write lands is
+     observable — measured, the simulator leads the emitted SV by exactly one cycle,
+     on every cycle when the other arm writes a different constant.
+     Sharpest form: `branch_merge` and `branch_merge_explicit` transpile to
+     BYTE-IDENTICAL SystemVerilog; the async twin agrees with it for 200 random
+     cycles and the explicit twin does not. The simulator disagrees with ITSELF
+     depending on how the same hardware is spelled — which makes this a witness for
+     the timing-model root cause, not just a rule gap.
+     Pinned: sequential_forwarding_divergence.rs::{a_write_in_a_state_arm_leads_the_hardware_by_one_cycle,
+     the_state_arm_lead_is_systematic_not_a_first_cycle_artifact}; written up in
+     PRETICK_ALIGNMENT_GUARDRAIL.md 5.5; the corpus instance is ignored-with-reason
+     in the corpus sweep. NARROWED THE SAME DAY, and it is the first widening of this
+     rule to pass R1: a constant write is exempt only where the output is written on
+     EVERY path (`Cfg::written_on_all_paths`). Measured corpus cost — THREE modules,
+     all three the measured divergences, ZERO false positives; 26/26 examples and 93
+     differential cases unaffected. 5.4's two rejected widenings cost 25 and 10.
+     The discriminator was the write's CONDITIONALITY, not the value: a constant is
+     idempotent across the phase shift only if it lands on every path.
+
+  ☐ `continue` inside a nested loop. Jumping to the loop head mid-cycle needs the
+     head's LOWERED body at a point where it is still being lowered. `break` avoids
+     this because its target (the loop's continuation) is plain source. Refused with
+     a spanned diagnostic; pinned.
+
+  ── LATENT HOLES SURFACED BY THE MEMORY WORK, 2026-08-24 ────────────────────
+  Each of these was invisible until a memory design happened to walk into it.
+  None was caught by a failing example; two were caught by a corpus guard and one
+  by Verilator's linter. Recorded here because the CLASS matters — a check that
+  cannot see a construct reports green on it.
+
+  ✔ FIXED — copper-analysis counted a MEMORY ARRAY as a flip-flop.
+     `reference_sv_registers` strips bracket groups before scanning for `<=`
+     targets, so a memory write `mem[a] <= d` reduced to `mem <= d` and was
+     reported as a register named `mem`. No source-level inference can ever produce
+     that name (`infer_registers` names locals live across a tick; a `Memory<..>`
+     binding is not one), so `register_reconciliation` failed the moment a fixture
+     contained a memory write.
+     THE HOLE WAS ALREADY THERE, unrelated to codegen: the same miscount applies to
+     any HAND-WRITTEN reference SV containing a RAM, which is the G2 path —
+     examples/memory/sv/dual_port_ram.sv declares `reg [15:0] ram [1023:0]` and
+     writes `ram[addra] <= dia`. Anyone calling `with_reference_registers` on a
+     memory design would have compared against a register set with a phantom entry.
+     FIX: unpacked-array declarations are excluded in `reference_sv_registers`, with
+     unit tests BOTH ways — a memory is not a register, and a bit-assigned register
+     (`q[3] <= …`) still is one.
+     Related, same file, same shape of blind spot: the memory read PIPELINE
+     registers (`<mem>_rd<N>_q` / `_v`) are synthesized by lowering and have no
+     source-level name, so register_reconciliation now treats them like the
+     phase/pc counter it already excluded.
+
+  ✔ DECIDED AND IMPLEMENTED (2026-08-25) — TRAILING STATEMENTS. Was: multi-tick loops
+     silently dropped combinational statements after the last tick, then refused them
+     loudly, with "DECIDING where those statements belong is a real semantics question
+     … it needs sign-off rather than a default".
+     THE ANSWER WAS ALREADY IN design_docs/SYNCHRONOUS_SEMANTICS.md: "a clock cycle is
+     a maximal tick-free region of an execution". The trailing segment and the next
+     iteration's head are one such region — falling off the end of the body costs no
+     clock — so the trailing statements are IN THE HEAD'S CYCLE. Their combinational
+     logic now lowers into phase 0 on every path (the single-tick path always did;
+     `control_extract`'s path accepted them and agreed with its SV; only the multi-tick
+     path refused, so acceptance depended on whether an unrelated part of the module
+     triggered extraction).
+     Written up under "Trailing statements" in the semantics doc, with the two
+     consequences that are not obvious: emission order within the merged cycle is
+     TRAILING-then-HEAD (execution order — observable for a local flowing from one to
+     the other), and the trailing register updates SHARE A FORWARDING MAP with the
+     preceding phase, since both commit at the same edge and the trailing statements
+     run after it. Both lowering paths claimed that sharing in a comment and NEITHER
+     did it; `r = a.read(); tick; w = r + 1;` emitted `w` from the pre-edge `r`, a
+     cycle behind the simulator. Found by a differential fixture written for the
+     decision, not by the change itself.
+     Also recorded: an `Out` written ONLY in the trailing segment differs from its
+     emitted continuous `assign` for the first cycle or two (the simulator holds its
+     initial value until the statement first runs) and agrees thereafter — a property
+     of an output first driven late, pinned as a reasoned skip in the sweep.
+     Fixtures: tests/fixtures/trailing_statements_dut.rs, swept differentially.
+
+  ☐ (superseded, kept for the history) Multi-tick loops SILENTLY DROP combinational statements after the LAST tick.
+     `shir_lower::lower_seq_body`'s multi-tick path never passes the trailing
+     segment through `lower_pre_edge_stmts` — only the single-tick path does (where
+     the trailing segment shares the one phase). Its REGISTER updates do flow, so
+     the loss is partial and quiet: an `out.write(x)` after the last tick simply
+     vanished, leaving an undriven port. Measured on a two-tick module with two
+     outputs: the second had no driver at all in the emitted SV.
+     NOW LOUD, not fixed — it is a clean error, pinned by
+     unsupported_constructs.rs::trailing_combinational_statements_in_a_multi_tick_loop_are_rejected.
+     DECIDING where those statements belong is a real semantics question (the
+     trailing segment runs in the NEXT iteration's phase-0 window, but the existing
+     model attributes its register updates to the LAST phase's edge), so it needs
+     sign-off rather than a default. Note the two halves currently disagree, which
+     is worth resolving at the same time.
+
+  ☐ Copper does not reject an UNDRIVEN `Out` — only Verilator does.
+     examples/memory/dual_port_ram.rs shipped a `data_out_a` port it never wrote.
+     Harmless in simulation (the wire just keeps its initial value) and invisible
+     until the module transpiled, where it is a fatal UNDRIVEN warning under -Wall.
+     The port was removed, but the language gap stands: an output a module never
+     drives is a design error the front end could catch with the analysis it
+     already has (`ports_driven_all_paths` and friends live in vlir_lower).
+     Care needed on the sequential side: a plain `Out` HOLDS when unwritten (the
+     enabled-register idiom, verified against BaseJump's bsg_dff_en), so the rule
+     is "never written on ANY path", not "not written on all paths".
+
+
+  ── TWO BUGS THE CAUSE-K GATE HAD BEEN MASKING (found 2026-08-24) ──────────
+
+  ✔ FIXED — REACHABILITY ACCEPTED A PROGRAM THE SIMULATOR LIVELOCKS ON.
+    `Cfg::build` folded a tick-bearing nested loop into ONE node with a **Tick**
+    out-edge, unconditionally. The comment justified the optimism as
+    "rejection-sound: a possible 0-iteration exit must not make the outer loop
+    look tickless", citing uart_tx / rv32i_cpu. That is right for a counted `for`
+    — it runs its body, so it ticks — and WRONG for a `loop`/`while` that can
+    break before its first tick, where the zero-tick exit is a real path.
+    An outer loop whose ONLY boundary is such a nested loop therefore returns to
+    its top in zero time. MEASURED, not argued: with the cause-K gate relaxed,
+        loop { loop { if a { break; } loop { if b { break; } tick; } } }
+    transpiled to an FSM running one cycle per iteration while the SIMULATOR SPUN
+    FOREVER — 99.5% CPU, 5m28s, no progress, with a low and b high. A false PASS
+    of the worst kind: the transpiler inventing a clock edge the source has no
+    right to.
+    FIX: `Node::may_exit_without_tick`, set when folding a nested `loop`/`while`
+    whose body can break before its first tick, and read ONLY by
+    `check_reachability` — which now walks that node's Tick edge as a zero-time
+    edge. The edge STAYS `Tick`, because liveness needs it: the loop does cross a
+    clock edge on its other paths and values live across it are still registers.
+    Conflating the two would have silently changed register inference.
+    A nested loop that ALWAYS ticks stays a boundary (`ticks_before_any_break`,
+    mutually recursive with `may_exit_without_tick`), which is what keeps
+    `loop { <work>; for _ in 0..N { tick } }` — the shape cause K exists for —
+    well-formed. Corpus impact measured: zero, nothing newly rejected.
+    KNOWN GAP, recorded rather than relied on: a `for` over an EMPTY constant
+    range would still read as a boundary. Seeing that needs const evaluation, and
+    copper-analysis is syntax-level (`syn`-only) by design.
+    Pinned by 5 tests in `copper-analysis/src/cfg.rs` and one in
+    `copper-codegen/tests/unsupported_constructs.rs`.
+
+  L ✔ FIXED (2026-08-24) — **A `RegOut` WRITE OF A REGISTER ALREADY ASSIGNED IN
+    THE SAME SEGMENT EMITTED THE PRE-EDGE VALUE.** Pre-existing, not a
+    control-flow bug, and it reproduced with no nested loop at all — found while
+    building cause K's DUT.
+        loop { n = n + step.read(); acc.write(n); clk.tick().await; }
+    emitted `acc <= n; n <= (n + step);` — so `acc` lagged `n` by a cycle, and the
+    two ORDERINGS of the same three statements emitted the SAME module. Measured
+    sim ≢ SV: the simulator gave 4, 6, 14, 17 where Verilator gave 0, 4, 6, 14.
+    THE RULE IS THE EMISSION CONTEXT, NOT THE SOURCE ORDER — this took two wrong
+    attempts to find, both caught by existing oracles rather than by argument:
+      - forwarding every read on the pre-edge path broke `branch_local_counter`;
+      - keying on pre-tick vs post-tick SEGMENT broke `lfsr`.
+    Both are plain-`Out` modules, and that is the point:
+      * a `RegOut` drive becomes `acc <= <expr>` inside `always_ff`, evaluated with
+        PRE-edge register values → it must be forwarded;
+      * a plain `Out` drive becomes a continuous `assign o = <expr>`, observed
+        AFTER the edge when the flop already holds the assigned value → forwarding
+        it applies the update twice.
+    FIX: `shir_lower::Forwarding`, keyed on `CHIRPort::registered`. Advancing the
+    map is DELEGATED to `extract_updates_from_stmts` — the same walk that computes
+    the registers' own next-state expressions — rather than reimplemented, so the
+    `if`/`match` branch-merge rule has exactly one definition. It gets the mod-N
+    counter idiom right for free:
+        acc <= (((t + 8'd1) == 8'd5) ? 8'd0 : (t + 8'd1))
+    Pinned by `tests/regout_forwarding_equivalence.rs`, whose sharpest assertion is
+    that the two orderings do NOT emit the same module — that identity WAS the bug.
+    WHY THE CORPUS NEVER CAUGHT IT: every existing module writes its `RegOut`
+    BEFORE mutating (the write-before-tick Moore idiom `waiter`, `handshake` and
+    the BaseJump modules all use), which is the one ordering the bug did not touch.
+
+  L-1 ✔ FIXED (2026-08-25) — **A CONDITIONALLY-DRIVEN PLAIN `Out` HAD THE SAME
+    LAG.** `vlir_lower` turns a conditionally-driven `Out` into an implicit-hold
+    register in `always_ff` (`conditional_output_ports`), so it is sampled at the
+    edge exactly like a `RegOut` despite its port type. Repro:
+        loop { n = n + step.read(); if enable { o.write(n); } tick; }
+    emitted `if (enable) o <= n;` where it must be `o <= (n + step)`. MEASURED with
+    `enable` alternating: simulator 3, 3, 11, 11, 18, 18 vs Verilator 0, 0, 4, 4,
+    13, 13.
+
+  L-2 ✔ FIXED (2026-08-25) — **A `let` WIRE READ AFTER A REGISTER ASSIGN AND FED
+    TO A `RegOut` LAGGED TOO.** The wire lowers to a continuous `assign` over the
+    flop, so a drive sampling it at the edge missed the assignment entirely:
+        loop { n = n + step.read(); let t = n + 1; acc.write(t); tick; }
+    emitted `t = (n + 8'd1); acc <= t;` — the `+ step` never reached `acc`.
+    MEASURED: simulator 4, 5, 12, 14, 19, 23 vs Verilator 1, 4, 5, 12, 14, 19.
+    `extract_updates_from_stmts` now records `let` wires in the forwarding map, so
+    the same fix covers a REGISTER whose next value reads such a wire.
+
+  ── CAUSE N: A BRANCH DID NOT READ ITS OWN SEGMENT'S UPDATE (2026-08-25) ──────
+  ✔ FIXED. `shir_lower::lower_stmt_list` runs every `PortWrite` through
+  `Forwarding::at_edge` — that is the cause-L fix, and it is what makes
+  `n = n + step; acc.write(n)` mean what it says. An `if` CONDITION and a `match`
+  SCRUTINEE did not get the same treatment, despite a comment three lines above
+  the code claiming they did. So a segment that updates a register and then
+  branches on it emitted the pre-edge value:
+
+      c = c + 1;                     if ((c == 8'd3)) begin      // pre-edge c
+      if c == 3 { o.write(n); }  →       o <= n;
+                                     end
+                                     c <= (((c + 8'd1) == 8'd3) ? …)  // forwarded
+
+  Both copies of the same test, one forwarded and one not — which is exactly the
+  evidence the reverted counted-delay attempt recorded and misdiagnosed (see
+  COUNTED DELAYS above; the correction is written up there).
+  SILENT, AND WORSE THAN A CYCLE LATE. The simulator runs the segment with Rust's
+  own sequencing, so the guard fires on the INCREMENTED `c`. The transpiled module
+  fired a cycle late — and with `c` also reset inside the branch, i.e. the mod-N
+  counter idiom, the pre-edge `c` never reaches 3 at all, the arm never fires and
+  the output is DEAD. The emitted module is perfectly well-typed.
+  WHY THE CORPUS WAS GREEN: `two_domain_counter` tests `count` BEFORE its update.
+  Nothing in examples/ reads a register after assigning it in the same segment.
+  THE FIX FOLLOWS L-1 AND FOR ITS REASON — whether a drive is edge-sampled is
+  decided a stage later, by `vlir_lower`, so predicting it in SHIR would be a
+  second implementation to keep in step. `SHIRStmt::If`/`Match` carry BOTH forms
+  through `VLIRStmt`, and `split_output_reg` — which already splits a branch into
+  an `always_comb` copy and an `always_ff` copy — takes the matching one for each.
+  The `always_comb` copy keeps the UNFORWARDED test on purpose: a continuous
+  assign is read after the edge, when the registers already hold their new values.
+  `pattern_detector`'s Moore output depends on that and must not move.
+  Both forms count as reads in `collect_vlir_reads_stmt` and `collect_read_uses`,
+  so `drop_unread_wires` cannot delete a wire only the surviving form uses — the
+  dead-wire consequence L-2 recorded.
+  → tests/branch_on_updated_reg_equivalence.rs (the `if` half) and
+    tests/match_hold_default_arm_equivalence.rs (the `match` half). Both fail
+    against Verilator with the fix reverted.
+  RECORD THE CLASS: a doc comment asserted the invariant, the code did not
+  implement it, and no test asked. The comment made the hole *look* closed to
+  every reader since — including the one who wrote the counted-delay diagnosis.
+
+  ── A WILDCARD ARM THAT DRIVES NOTHING LOST ITS HOLD (2026-08-25) ─────────────
+  ✔ FIXED, found by the `match` half of cause N's test rather than looked for.
+  `vlir_lower::hoist_moore_output_defaults` gives a Moore output decoded from a
+  state `case` a default at the top of the block, so an encoding the state register
+  can never reach does not make the output look conditional and get wrongly
+  registered. It decided "driven on every path" by intersecting the EXPLICIT arms
+  only — and a `default` written in the source is the one fall-through that is
+  actually reachable.
+  So `match s { One => o.write(n), _ => {} }` — the enabled-register idiom, whose
+  whole point is that `o` HOLDS on the cycles the arm does not fire (see "Out holds
+  when unwritten", verified against bsg_dff_en) — got an unconditional `o <= n`
+  hoisted over it and was driven every cycle. Measured sim ≢ Verilator: the
+  simulator wrote on the even cycles, the transpiled module on all of them.
+  The distinction the pass needs is between two kinds of fall-through:
+  `default: None` is the case it EXISTS for (no source wildcard, only unreachable
+  encodings); `default: Some(_)` is a path the author wrote, and the port is only
+  fully driven if that path drives it too. An empty `_ => {}` intersects to
+  nothing. `traffic_light` and `bsg_dff_en` are untouched — the narrowness the
+  pass documents is preserved.
+  RECORD THE CLASS, again: an "all paths" check that enumerates only the paths it
+  finds convenient. Same shape as `last_update_for` keeping the FIRST of several
+  updates — a set operation that quietly omits one member is right until something
+  produces that member.
+
+  ── HOW L-1 AND L-2 WERE FIXED, AND WHY THE FIRST ATTEMPT COULD NOT WORK ──────
+    The cause-L fix keyed forwarding on `CHIRPort::registered` in `shir_lower`.
+    That is not sound, and L-1 is the counterexample: whether a drive is sampled at
+    the edge is decided a STAGE LATER, by `vlir_lower`, from
+      registered `RegOut` ∪ phase-scoped `Out` ∪ conditionally-driven `Out`
+    and an output that looks conditional can be un-registered again by
+    `hoist_moore_output_defaults`. It is not a function of the SHIR, so predicting
+    it upstream would be a second implementation to keep in step with the real one
+    — the failure mode that produced cause L in the first place.
+    SO THE DECISION WAS NOT MOVED, THE DATA WAS. `SHIRStmt::PortDrive` now carries
+    BOTH forms — `value` (read after the edge, unforwarded) and `edge_value`
+    (sampled before it, forwarded) — through `VLIRStmt::PortAssign`, and
+    `split_output_reg` picks. That is the one point where a drive actually becomes
+    a non-blocking assignment, so no stage has to predict another's decision.
+    THE DEAD-WIRE CONSEQUENCE, worth knowing about: inlining a `let` wire into the
+    edge form can leave the wire with no readers, and the equivalence harness runs
+    Verilator under `-Wall`, where `UNUSEDSIGNAL` FAILS THE BUILD. So a correct
+    lowering was being rejected for a lint. `vlir_lower::drop_unread_wires` removes
+    them, iterating to a fixpoint. It lives in VLIR and not SHIR for the same
+    reason as the choice itself: liveness is only exact once each drive has
+    committed to one form — a wire read solely by the discarded form still looks
+    live at SHIR level, and the pass was tried there first and did not fire. Its
+    collectors match every enum EXHAUSTIVELY (no `_` arm) so that a variant added
+    later fails to compile rather than silently causing a live wire to be deleted.
+    Pinned by `tests/regout_forwarding_equivalence.rs` (6 tests), including a shape
+    pin that the inlined wire is gone.
+
+SIMULATOR:
+  ☐ Add tests for semantic corner cases
+     ✔ Back to back tick awaits            → tests/slow_counter_equivalence.rs (Verilator-checked)
+     ☐ Nested tick awaits
+     ☐ Multiple tick awaits in a single expression
+     ☐ Pre-edge not resolving tick
+     ☐ Post-edge output observation        (partial: tests/regout_postedge_probe.rs)
+     ✔ Combinational chain convergence      → tests/simulator_corner_cases.rs
+     ✔ Combinational oscillation detection  → tests/simulator_corner_cases.rs
+     ◐ Untracked outputs warning / error   (behavior PINNED in tests/executor_guardrails.rs:
+        an untracked producer output leaves a downstream consumer STALE for one
+        settle, silently — the warning/error itself is still unimplemented)
+     ✔ Module completion panics             → tests/executor_guardrails.rs
+  ✔ Panic if hardware future returns        → tests/executor_guardrails.rs (asserts the poll_task_once is_pending guard)
+  ☐ Make untracked spawning explicit
+  ☐ Duplicate or remove waker registration
+  ☐ Restore phase after tick resolution
+  ◐ Add randomized/reversed poll-order testing  (reversed/seeded: tests/poll_order_fuzz.rs;
+     randomized FUNCTIONAL stimulus: tests/randomized_{combinational,sequential}_equivalence.rs)
+  ☐ Think more about how to handle multiple clocks
+  ✔ Define multiple driver behavior         → compile-time PREVENTED: `Out` is !Clone
+     (one writer per wire); compile_fail doctest on `Out` in copper-core/src/port.rs
+
+
+MACRO:
+  ☐ Require direct tick await
+  ✔ Ban shadowing of hardware parameters
+    - DONE: check_no_param_shadowing (all modes) — a `let` binding (incl. tuple
+      patterns) that reuses a port name is a spanned compile error. Unit tests +
+      ui/fail/param_shadowing.rs.
+  ✔ Require only one top-level loop shape
+    - DONE: check_single_top_level_loop (sequential-like) — exactly one top-level
+      `loop`, and it must be the final statement (a second loop / trailing code is
+      unreachable). "No loop at all" was already rejected. Unit tests +
+      ui/fail/multiple_top_level_loops.rs.
+  ☐ Warn on persistent state mutation before tick
+  ✔ Check all combinational outputs are assigned on all paths
+    - DONE: copper_analysis::check_definite_assignment, enforced in the macro's
+      combinational arm (sequential Out HOLDS when unwritten = enabled register,
+      so this applies to combinational modules only; see design doc item 2)
+  ☐ Reject stateful constructs in combinational modules
+    - Maybe allow stuff that can be unrolled into combinational logic (e.g. for loops with constant bounds)
+
+OTHER:
+  ☐ IR-level dependency graph analysis to detect combinational loops  [DEFERRED to item 6]
+    - reject combinational loops that dont pass through a register, memory latency, synchronizer, or other stateful primative
+    - NOT an item-2 intra-CFG add: intra-module comb loops are unexpressible
+      (Rust rejects the use-before-def); the real case is cross-module, needing
+      item 6's inter-module producer->consumer wiring DAG. Runtime oscillation
+      detection (executor OSCILLATION_THRESHOLD panic) covers it meanwhile.
+
+
+================================================================================
+TESTING — COMPREHENSIVE PLAN
+================================================================================
+Consolidated, prioritized test backlog (drafted 2026-08-03). Convention: ✔ = done
+(file noted), ◐ = partial, ☐ = to write. "Equiv" = sim ≡ transpiled SystemVerilog
+under Verilator via tests/common (the project correctness bar). "Oracle" = sim (or
+transpiled SV) checked against an independent Rust reference. Verilator-dependent
+tests are slower; oracle-only tests are pure `cargo test`.
+
+Shared harness reference: tests/common/mod.rs (EquivalenceTest), fixture pattern
+= tests/fixtures/*_dut.rs (`include!` for sim + `include_str!` for transpile).
+
+--------------------------------------------------------------------------------
+P0 — highest value / least effort (do first)
+--------------------------------------------------------------------------------
+  ✔ Randomized / property-based differential testing  [DONE 2026-08-03]
+     ✔ Seeded PRNG helper (SplitMix64) in tests/common/mod.rs (`Rng`).
+     ✔ Combinational random differential (sim vs Rust ref AND vs Verilator, 500/module):
+       ripple_carry_adder, one_bit_comparator, rotate_right, gray_to_binary,
+       priority_encode → tests/randomized_combinational_equivalence.rs
+     ✔ Sequential random-stimulus differential (400/module): up_down_counter,
+       accumulator_en, shift_register → tests/randomized_sequential_equivalence.rs
+     ☐ FOLLOW-UPS still open:
+        ☐ mux (array-input) — needs array-port support; untested anywhere
+        ☐ lfsr / det_010 / traffic_light random streams (need FSM reference models)
+
+  ✔ Tracked regression for the transpiler bit-width-inference GAP  [DONE 2026-08-03]
+     ✔ `[Logic; N]` array-local + tuple-returning helper → assert transpile_source
+       ERRORS with "cannot infer bit width" → copper-codegen/tests/transpile_inference_gaps.rs
+       (expect_err flips loudly the day inference is fixed — see file header).
+
+  ✔ Executor guardrail panics  [DONE 2026-08-03 → tests/executor_guardrails.rs]
+     ✔ Module-completion panic: a module future returning Poll::Ready → panic.
+     ✔ Multiple-driver behavior: PREVENTED at compile time (`Out` is !Clone);
+       compile_fail doctest on `Out` (copper-core/src/port.rs). Contract = single writer.
+     ◐ Untracked-output: behavior PINNED (stale-for-one-settle); the warning/error
+       itself remains unimplemented (finding surfaced, see SIMULATOR section above).
+     ✔ Combinational chain convergence / oscillation detection → tests/simulator_corner_cases.rs
+
+--------------------------------------------------------------------------------
+P1 — macro compile-time guardrails (trybuild; pattern in copper-macros/tests/ui)
+--------------------------------------------------------------------------------
+  ✔ Combinational latch (partial Out) rejected        → ui/fail/combinational_latch.rs
+  ✔ Tick-free sequential loop rejected                → ui/fail/tickless_loop.rs
+  ✔ Partial-tick path (CFG reachability) rejected     → ui/fail/partial_tick_path.rs
+  ✔ Ban shadowing of hardware parameters              → NEW check_no_param_shadowing;
+     ui/fail/param_shadowing.rs + unit tests (tuple-pattern shadow caught too).
+  ✔ Require a single top-level loop shape (2 loops / trailing code) → NEW
+     check_single_top_level_loop; ui/fail/multiple_top_level_loops.rs + unit tests.
+     (loop-in-branch / no-loop already rejected by the has_top_level_loop gate.)
+  ✔ CDC: domain A into a domain-B port outside a synchronizer → ui/fail/cdc_crossing.rs
+     (trybuild UI case over the pre-existing check_cdc; complements cdc.rs doctests).
+  ✔ CDC: a module CONSTRUCTING a clock → ui/fail/clock_construction.rs (over the
+     pre-existing check_no_clock_construction).
+  ✔ Unsupported idiom (panic!/Option/`?`) rejected    → ui/fail/unsupported_idiom_panic.rs
+  ✔ Pass boundary case (pre-loop reg + single loop + non-colliding local) → ui/pass/single_loop_local_ok.rs
+  ☐ Reject stateful constructs in combinational modules; allow const-bound-unrollable
+     [DEFERRED — needs a "what stays legal" definition; design-fuzzy, see MACRO]
+  ☐ Warn on persistent-state mutation before the first tick
+     [DEFERRED — it's a WARNING; trybuild asserts on errors, so needs a different
+     test path (or promotion to an error). Design call pending.]
+  ☐ Require direct tick await (reject aliased/wrapped `clk` tick)  [DEFERRED]
+  ✔ LANDED (2026-08-03): reject a combinational `Out` written on both sides of ONE
+     bare tick after a leading input read (`… inp.read() …; out.write(x); tick;
+     out.write(y)`). The coroutine executor collapses such multi-write-around-a-tick
+     outputs to the last write (silent sim ≠ SV). Rejected at the macro, pointing at
+     `RegOut` (registered) or explicit per-state writes — the MyHDL "restrict the
+     synthesizable subset" discipline; keeps every accepted program sim ≡ SV.
+     - Detection = `copper_analysis::multi_write_collapse` (copper-analysis/src/cfg.rs).
+       The naive "written in >1 phase" rule OVER-FLAGGED uart/rv32i/sipo_block; the
+       landed rule needs all THREE conditions (bare tick, both-sides write, leading In
+       read comb-reaching the pre-tick write) — empirically pinned + corpus-clean (flags
+       ONLY the two control-extraction probes, now converted to RegOut).
+     - Wired into copper-macros (sequential arm); trybuild ui/fail/multi_write_collapse.rs
+       + ui/pass/multi_write_regout_ok.rs; 8 analysis unit tests. Fixtures if_tick/
+       match_tick → RegOut (nested_tick upgraded sim_only → full Verilator equivalence).
+     - Now recurses into nested ticking loops (a straddle inside a `for`/`while` that
+       ticks is caught in its sub-CFG). Whole corpus clean (0 flags). Nested serializer
+       stays clean (writes once per iteration).
+     - DYNAMIC backstop CONSIDERED then DROPPED: a runtime "Out written in both settle
+       passes" check FALSE-FIRED on legitimate combinational modules (a comb output
+       re-settles in both phases — confirmed on copper-sim's own wired_passthrough test).
+       A precise dynamic version would need per-task tick-resolution tracking; instead we
+       extended the STATIC rule to nested loops (above), keeping everything compile-time,
+       all-paths, and false-positive-free. Decision: static checks over dynamic ones.
+
+--------------------------------------------------------------------------------
+P2 — equivalence coverage per language construct (sim ≡ SV; fill the matrix)
+--------------------------------------------------------------------------------
+  Already covered: counter, up_down_counter, accumulator_en, slow_counter, lfsr,
+  det_010, mac_fsm, mac_pipeline, traffic_light, shift_register, pattern_detector,
+  priority_encode, rotate_right, one_bit_comparator, ripple_carry_adder, gray_to_binary.
+  Construct SUPPORT probed empirically via the copper-transpile CLI (2026-08-03):
+    SUPPORTED → equivalence-tested: wide datapaths, `*`, `-`/neg, `<<`/`>>`, `%`,
+      `==`, statement `match`. UNSUPPORTED → pinned in
+      copper-codegen/tests/unsupported_constructs.rs: array-typed ports, `/`,
+      `arithmetic_shift_right` (and `lt_logic`/`zero_extend` methods, noted there).
+      NOTE the `/` vs `%` asymmetry: `%` transpiles, `/` does not.
+  ✔ Wide datapath (Bits<16>) + multiply + multi-output fan-in → ONE DUT covers all
+     three: tests/wide_datapath_equivalence.rs (datapath16: sum/prod/diff, 500 random).
+  ✔ Multiply datapath — covered by datapath16 (`*`).
+  ✔ Multi-output combinational fan-in — covered by datapath16 (3 Out, shared reads).
+  ✔ Nested match / enum FSM with >4 states → tests/fsm_six_state_equivalence.rs (seq6,
+     6 enum states) — FULL sim≡SV equivalence, unblocked by the Moore-output codegen
+     fix (see TRANSPILATION).
+  ☐ Array-typed ports: mux (`In<[Bits<W>; ELS]>`) — UNSUPPORTED, pinned as a gap
+     (unsupported_constructs.rs::array_typed_port_is_unsupported); needs codegen work.
+  ✔ Wide Bits<32>/Bits<64> → tests/wide_and_mod_datapath_equivalence.rs (wide_alu).
+  ☐ Signed arithmetic / arithmetic_shift_right — asr UNSUPPORTED, pinned as a gap.
+  ✔ Modulo `%` datapath → tests/wide_and_mod_datapath_equivalence.rs (mod8, zero-guard).
+     `/` remains UNSUPPORTED (pinned).
+  ◐ Nested tick awaits (tick inside a branch) → tests/nested_tick_equivalence.rs
+     (if_tick vs if_tick_explicit). Runs sim_only: the branch-nested form matches the
+     hand-written pc-FSM IN THE SIM. Moore-output codegen bug is now FIXED, but the
+     Verilator half stays parked on a SEPARATE issue — if_tick's output is Mealy
+     (`sel ? 1 : 0` in pc=0), an open output-timing reconciliation (see TRANSPILATION).
+  ☐ RegOut Moore output (write-before-tick) equivalence, standalone (already covered
+     indirectly by mac_fsm / sipo_block / pattern_detector_2 equivalence tests)
+
+--------------------------------------------------------------------------------
+P3 — CDC / multi-clock (TODO flags "how to handle multiple clocks" as unsettled)
+--------------------------------------------------------------------------------
+  ◐ Existing: cdc_crossing.rs, two_domain_hierarchy_cdc.rs
+  ✔ sync_2ff (stdlib src/sync.rs) → directed latency test  [DONE 2026-08-21]
+     → tests/cdc_synchronizer_anchor.rs. First cargo-test coverage of the library
+     primitive at all (it was example-only; two_domain_hierarchy_cdc.rs used a
+     private copy of the body). Four arms on one primitive: library generic in sim,
+     concrete fixture (tests/fixtures/sync_2ff_dut.rs) asserted identical in sim,
+     that fixture transpiled under Verilator, and an INDEPENDENT hand-written
+     reference examples/cdc/sv/sync_2ff_ref.sv under Verilator.
+     NOTE the ☐ above said "delays by 2 receiver ticks" — MEASURED, that is wrong:
+     the primitive's observable latency is ONE destination cycle (d standing at
+     edge n appears on q after edge n+1), while holding two flip-flops. Both the
+     independent Verilog and the transpiled SV agree. The "2 cycles" in
+     examples/cdc/two_domain_counter.rs's prose counts the full path from a
+     fast-domain register's output, including the producer's own registered delay.
+     Also covered: rate-independence (1:1/2:1/3:1/5:1/8:1 give identical
+     destination-cycle traces), 2-flop-vs-1-flop behavioral distinction, and
+     pulse-at-edge captured vs pulse-between-edges dropped.
+  ✔ Independent two-clock design: other-domain tasks quiescent under one tick
+     → cdc_synchronizer_anchor.rs::source_domain_ticks_do_not_advance_the_synchronizer
+     (20 source ticks with d toggling every one; q must not move).
+  ✔ G1 TIMING_COVERAGE_MATRIX pattern 5 (CDC/synchronizer latency) — CLOSED.
+     All 6 timing patterns are now anchored to independent hardware.
+  ✔ BUG FIXED (found + fixed 2026-08-21, with user sign-off): infer_registers
+     under-reported the 2-FF synchronizer — ONE flip-flop where the sim's behavior,
+     the independent Verilog, and codegen all have TWO.
+     ROOT CAUSE: Cfg::registers keyed only on "live across a TICK edge". `ff2` is
+     defined post-tick (`ff2 = ff1`) and read pre-tick (`q.write(ff2)`), so walking
+     backwards from the use, its own definition kills it before the tick is reached —
+     its live range crosses the loop BACK EDGE, not a tick. It is nonetheless a real
+     flop: `ff2 = ff1` reads ff1's PRE-edge value (the next line overwrites it), which
+     a wire cannot reproduce — `assign ff2 = ff1` tracks the post-edge value and
+     collapses the two stages into one flop (the exact failure src/sync.rs's own
+     comment warns about).
+     FIX: one line — Cfg::registers now unions live_out[head] (the loop head is an
+     empty node, so its live-out IS the set carried across the back edge) with the
+     across-tick set. General principle documented on the fn: a local defined in a
+     post-tick segment had its defining expression evaluated against pre-edge values,
+     so if it survives to the next iteration it needs storage. A post-tick temp that
+     dies in its own segment is still excluded (D-input logic).
+     VALIDATED against a differential oracle, not by argument: inference vs codegen's
+     emitted flip-flops over every clocked module that transpiles in tests/fixtures +
+     examples + src — 41/41 AGREE (was 38/41), synchronizers included, nothing newly
+     over-reported. (register_reconciliation.rs itself scans only tests/fixtures: 24
+     clocked modules, all green.)
+     Both production call sites of infer_registers only log::debug! it, so no emitted
+     hardware changed.
+     REGRESSION COVER: register_reconciliation.rs no longer filters out
+     #[hardware(synchronizer)] (is_sequential → is_clocked), so the shape is pinned
+     corpus-wide; two new copper-analysis unit tests (post_tick_def_read_pre_tick_is_
+     a_register + post_tick_temp_dying_in_its_own_segment_is_not_a_register); and
+     cdc_synchronizer_anchor.rs::register_inference_matches_the_independent_reference
+     is now a real NameExact G2 match instead of a pinned gap.
+  ✔ D1 (pre-tick alignment) GUARDED 2026-08-21 — plan of record:
+     design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md (phases 0-3 done, gates G0-G3 met).
+     RULE: a plain combinational `Out` driven FROM A REGISTER in the pre-tick segment,
+     when that segment also assigns a register with NO `In` read preceding it.
+     `RegOut` is immune by construction (commits at the edge) — that was the
+     discriminator, found by changing ONLY the port type on otherwise-identical
+     modules. Keying on the OUTPUT WRITE rather than the register is what made the
+     rule shippable; an earlier register-keyed rule rejected mac_fsm (the G2
+     name-exact reference).
+     ADJUDICATED against independent hardware; every clause has a measured witness.
+     Opt-out `#[hardware(sequential, allow_pretick_alignment)]` for demonstration
+     fixtures only — silences the error, NOT the detection (the corpus test still
+     counts them, so an opted-out module cannot vanish quietly).
+     THREE candidate fixes tried and REJECTED with evidence, all recorded so they are
+     not re-tried: uniform pre-edge barrier (22/654 corpus damage), register-keyed
+     static rule (false-positived mac_fsm), Prost-style codegen lowering (fixes D1
+     exactly, breaks the barrier-protected majority exactly — and that symmetry is
+     the general result: no single lowering can match a simulator whose alignment is
+     incidental).
+     MIGRATED: fast_counter x3 → post-tick sticky update; slow_consumer x3 →
+     trailing read. two_domain_hierarchy_cdc.rs now passes FOR THE RIGHT REASON
+     (it previously passed because D1 and D2 cancelled).
+  ✔ D2 FIXED 2026-08-21 (in the simulator, not by restriction). A read feeding a
+     combinational `Out` in a segment that assigns NO register is now `Immediate`,
+     not `Deferred` — `copper_analysis::classify_reads`. The barrier does two jobs,
+     deferring the read AND pinning the segment's phase; only the second is ever
+     needed, and pinning a register-free segment makes a wire behave like a flop.
+     ADJUDICATED against independent hand-written Verilog first (a clocked producer
+     feeding a passthrough gives mid == out; sim gave mid/out = 1/0 2/1 3/2 before,
+     1/1 2/2 3/3 after).
+     FIRST ATTEMPT REJECTED: keying on the MODULE ("no registers anywhere") broke 3
+     currently-passing tests including det_010_awaits_matches_independent_verilog — a
+     HARDWARE-ANCHORED test. Cause: det_010_awaits and if_tick have no data registers
+     but read inside control flow whose TICK COUNT depends on the sampled value, so
+     their phase genuinely matters. The narrowed per-read rule excludes condition
+     positions and fixes that.
+     CORPUS: 666/667, the single failure being the test that pinned the old behavior.
+     The CDC designs' trailing-read workaround was REVERTED — the natural
+     `loop { out.write(in.read()); tick; }` idiom is correct again.
+  ✔ Q5 ANSWERED 2026-08-21 — AND THE PREMISE WAS WRONG. The guardrail examines only
+     the pre-tick segment, recorded as a known false negative citing the multi-tick
+     `accum_2`. **accum_2 does not diverge.** Its test was #[ignore]d as "sim and
+     transpiler disagree by one cycle ... adjudication pending" but it PASSES — and
+     passes WITHOUT the D2 fix (checked by reverting cfg.rs alone), so earlier
+     read-timing work had repaired it and the ignore went stale. Nobody noticed
+     because an ignored test prints nothing. UN-IGNORED; stable over 3 runs.
+     So the rule has NO known false negative — the middle-segment gap is theoretical.
+     Measure an instance before widening it.
+     ALSO: probe_registered_timing and probe_mem_latency are eprintln! DIAGNOSTICS
+     with no assertions — passing means nothing. Their ignore reasons now say so
+     instead of "temp investigation", which read like a deferred check.
+     REMAINING IGNORED: probe_fsm_sim_matches_verilog only — correctly, it is the D1
+     demonstration and still diverges by design.
+  ✔ Q5 ANSWERED 2026-08-21 — AND THE PREMISE WAS WRONG. The guardrail examines only
+     the pre-tick segment, recorded as a known false negative citing multi-tick
+     `accum_2`. **accum_2 does not diverge.** Its test was #[ignore]d as "sim and
+     transpiler disagree by one cycle ... adjudication pending" but it PASSES — and
+     passes WITHOUT the D2 fix (checked by reverting cfg.rs alone), so earlier
+     read-timing work had repaired it and the ignore went stale. Nobody noticed
+     because an ignored test prints nothing. UN-IGNORED; stable over 3 runs.
+     So the rule has NO known false negative — the middle-segment gap is theoretical.
+     Measure an instance before widening it.
+     ALSO: probe_registered_timing and probe_mem_latency are eprintln! DIAGNOSTICS
+     with no assertions — passing means nothing. Their ignore reasons now say so
+     instead of "temp investigation", which read like a deferred check.
+     REMAINING IGNORED: probe_fsm_sim_matches_verilog only — correctly, it is the D1
+     demonstration and still diverges by design.
+  ✔ two_domain_counter → behavioral test  [DONE 2026-08-21]
+     → tests/two_domain_counter_behavioral.rs (5 tests). The example self-checked only
+     the BOUNDARY (flag high from slow cycle 5, one ratio, last signal in the chain) —
+     which passes equally well when stages are individually wrong and cancel, exactly
+     what happened to two_domain_hierarchy_cdc.rs. This asserts the PER-STAGE
+     decomposition at 1:1/2:1/3:1: synchronizer costs exactly one slow cycle
+     (rate-independent), the passthrough consumer adds zero, the crossing is monotone,
+     the flag never leads the threshold it latches, counter advances at the source rate.
+     ALSO FIXED THE EXAMPLE: its "flag_raw" column displayed a PROXY (fast_count >= 8),
+     not the wire — showing the flag at slow 3 when the real wire asserts at 4. Now
+     reads the real intermediate wires (In is Clone), adds a sync_q column, drops the
+     dead raw_display/flag_raw vars (unused-variable warning), and the prose no longer
+     claims "2-slow-cycle synchronizer latency" — measured, it is 1 + 0.
+  ✔ flag_crossing → behavioral test (handoff semantics)  [DONE 2026-08-21]
+     → tests/flag_crossing_behavioral.rs (5 tests). The example asserted only
+     SELF-CONSISTENCY (recorded the sim's own output, compared it to itself, with a
+     comment saying outright there is no Verilog reference). Now asserted at three
+     ratios: a held flag crosses with exactly the synchronizer's latency (source and
+     sink are passthroughs, adding none), a crossed flag stays high, a pulse standing
+     at the edge crosses keeping its width, nothing crosses without a trigger.
+     PINNED AS A FEATURE: a pulse that falls before the destination edge is DROPPED.
+     That is the defining limitation of a bare 2-FF synchronizer and why a LEVEL
+     crossing is safe while an EVENT crossing needs a toggle or handshake. Recorded so
+     a later change cannot quietly "fix" it into something hardware cannot do.
+  ✔ Multi-driver ACROSS domains — DEFINED: it is UNREPRESENTABLE  [DONE 2026-08-21]
+     No behavior to define — the program cannot be written, and it fails on TWO
+     independent counts, either fatal alone:
+       1. a wire has exactly one write handle (`Out` and `RegOut` are !Clone), so a
+          second driver is E0382 use-of-moved-value;
+       2. domains are nominal, so a driver from another domain is E0308.
+     Made EXECUTABLE rather than asserted: three new compile_fail doctests in
+     copper-core/src/cdc.rs (the file whose doctests ARE the spec) — the moved-wire
+     count, the wrong-domain count, and RegOut's single-driver guarantee, which had no
+     doctest where `Out` already did. copper-core compile_fail doctests: 5 -> 8.
+
+
+--------------------------------------------------------------------------------
+P4 — Memory (first-class construct; MEMORY_DESIGN.md)
+--------------------------------------------------------------------------------
+  ◐ Existing: memory_new.rs, mem_latency_probe.rs, verilog_fifo_memory_new.rs
+  ✔ WRITE_LAT > 0 — ALREADY COVERED (this list was stale). copper-core/src/memory.rs
+     has write_lat1_commits_after_one_tick + write_lat2_commits_after_two_ticks.
+     Verified by reading the bodies, not the names: the LAT=2 test checks the write is
+     INVISIBLE at posedge 1 and visible at posedge 2.
+  ✔ Read-during-write, both modes — ALREADY COVERED (stale too):
+     read_first_sees_old_value_on_same_addr_write,
+     write_first_sees_new_value_on_same_addr_write, plus a different-address control.
+  ✔ Multi-port arbitration at scale  [DONE 2026-08-22]
+     → tests/memory_multiport_arbitration.rs (7 tests, 4R/4W). The existing two-port
+     test CANNOT pin the rule: "highest index wins", "second one wins" and "last
+     issued wins" all agree at two ports and disagree at four. One test therefore
+     issues the contest in DESCENDING source order — source-order would give 0xB0, and
+     the answer is 0xB3, so the rule is port INDEX priority. Also: partial contests,
+     uncontested parallel writes, 4 independent reads, all read ports agreeing on the
+     winner, and arbitration holding under WRITE_LAT=2.
+  ✔ Out-of-range address — DEFINED: DELIBERATE PANIC  [DONE 2026-08-22, user's call]
+     Was already a panic, but an INCIDENTAL one: raw "index out of bounds: the len is
+     4 but the index is 104" from inside advance_write_pipelines, at the CLOCK EDGE,
+     naming neither the memory nor the port. Now `copper-core::memory::out_of_range`
+     panics at the read()/write() CALL — so the backtrace points at the line supplying
+     the address — with a message naming the port kind+index, the address, the size
+     and the valid range.
+     Rejected alternatives: X (what SV does on an out-of-range read) and wrap (what
+     real address decoding does). Both silently substitute a value, turning an
+     addressing bug into a wrong-answer bug downstream. When this was decided there
+     was no transpiled Memory path to be faithful to, so no sim≡synth pressure and
+     the diagnostic was worth more than the fidelity. THAT PREMISE EXPIRED on
+     2026-08-24 — see the REVISIT item below.
+     Pinned by tests/memory_multiport_arbitration.rs::out_of_range (4 tests, incl. the
+     boundary address and "panics at the call, not at the edge").
+  ✔ Memory TRANSPILES  [DONE 2026-08-24, user-scoped]
+     Was: "Memory does not transpile AT ALL" — the largest single hole in the
+     project's central claim. Now: single-cycle (READ_LAT = WRITE_LAT = 1)
+     ReadFirst memories lower, and examples/memory/dual_port_ram.rs has
+     sim ≡ transpiled SV under Verilator (tests/dual_port_ram_equivalence.rs) on
+     top of its existing sim ≡ hand-written-SV check — so the generated SV is
+     transitively anchored to third-party hardware. Full write-up in the
+     TRANSPILATION section above (fix E).
+  ✔ Pipelined latency: READ_LAT / WRITE_LAT > 1  [DONE 2026-08-24]
+     The last Memory construct to reach the transpiled path. A read port becomes a
+     register chain — stage READ_LAT-1 is the output, stage 0 holds what the most
+     recent edge captured:
+         mem_rd0_q0 <= mem_rd0_data;   // capture
+         mem_rd0_q1 <= mem_rd0_q0;     // shift
+     Written as ONE always_ff block, non-blocking assignment gives every RHS its
+     pre-edge value — which IS the simulator's "shift toward the output, then
+     capture into stage 0". A write port's stage 0 needs no register (filled by the
+     write() call, consumed the same cycle), so WRITE_LAT yields WRITE_LAT-1 stage
+     registers and the commit reads the last one.
+     TWO EARLIER DECISIONS THAT LATENCY CHANGES, both silent-one-cycle-shift risks:
+       1. WHICH NET A SAME-EDGE CONSUMER READS. A register update latched at the
+          capture edge needs the value the output will hold AFTER that edge. At
+          LAT=1 that is the live array read; deeper it is stage READ_LAT-2, read at
+          its pre-edge value inside always_ff. ram_r3w1 (READ_LAT=3) exists so a
+          chain deeper than two cannot be right by accident.
+       2. WHICH WRITE THE WriteFirst MUX FORWARDS. It must be the write that
+          COMMITS at this edge — at WRITE_LAT=2 the pipeline stage, NOT the freshly
+          staged nets, which will not reach the array for another cycle.
+     → tests/pipelined_memory_equivalence.rs (5 tests): READ_LAT=2/WRITE_LAT=2,
+       READ_LAT=3/WRITE_LAT=1, READ_LAT=1/WRITE_LAT=2 WriteFirst, shape pins, and a
+       check that the configurations are DISTINGUISHABLE — otherwise all three
+       would pass against a transpiler that flattened every memory to one cycle.
+       The reference model is written from the CONTRACT (latency as delay,
+       read-during-write as which side of the commit a capture sees), not
+       transcribed from copper-core/src/memory.rs, and matched on the first run.
+     BOTH NEGATIVE CONTROLS MEASURED: making the same-edge form read stage LAT-1
+     failed r2w2 and r3w1 while leaving r1w2_wf green; forwarding the freshly
+     staged write instead of the committing stage failed only r1w2_wf. Each
+     sabotage broke exactly the test built for it.
+     NOTE the net names gained a stage index (`_q0`, `_v0`, `_wr0_s1_addr`), so the
+     earlier shape pins were updated — and register_reconciliation's synthetic-name
+     matcher now covers both pipeline shapes.
+     THE CPUs STILL DO NOT TRANSPILE (re-measured): rv32i_cpu uses READ_LAT=2
+     memories, but is blocked on the control_extract panic (cause G) and
+     rv32i_cpu_pipelined on `Vec<Bits<32>>` ports (cause F). Memory is no longer
+     what stops either.
+  ✔ Multi-phase memory access  [DONE 2026-08-24]
+     The address buses are combinational and PHASE-GATED, so outside its staging
+     phase a read port's address reads '0 — a result observed in a later phase
+     cannot be a continuous read of the array. The lowering now emits a read
+     pipeline stage:
+         always_ff @(posedge clk) begin
+             rom_rd0_q <= rom_rd0_data;   // UNGUARDED, deliberately
+             rom_rd0_v <= rom_rd0_en;
+         end
+     Unguarded is the faithful choice: advance_read_pipelines is a plain clock
+     listener in copper-core/src/memory.rs — the memory knows nothing about phases,
+     and its pipeline advances on every edge. Outside the staging phase the enable
+     is 0, so _v goes false, which is exactly is_ready() after a cycle with no
+     staged address. The captured word survives one cycle and no longer, in both.
+     TWO FORMS, and picking wrong shifts a cycle EITHER WAY:
+       - a consumer that latches at the SAME edge as the capture (a register update
+         in the staging phase) reads the COMBINATIONAL value — the pipeline
+         register has not updated yet at that edge;
+       - everything else reads the REGISTER.
+     Chosen per (phase, region) by vlir_lower::mem_binding.
+     ✔ BUG FOUND AND FIXED, in code shipped earlier the same day: a single-tick
+       loop whose post-tick segment drives an output straight from data() — no
+       mediating register — read the continuous array net, so it tracked the
+       address being staged for the NEXT edge. A full cycle early. It shipped
+       because every memory test up to then put a register in between.
+       Regression: tests/multiphase_memory_equivalence.rs::single_tick_direct_read.
+     ☐ STILL REFUSED (pinned, with the counterexample kept in the fixture as
+       `mp_rom`): a plain `Out` driven straight from a read result in a phase that
+       does not stage it. Neither emitted form is right — a continuous assign
+       tracks the pipeline into the phases that do not observe it, and the usual
+       implicit-hold conversion latches at the end of the OBSERVING phase, one edge
+       after the capture (measured: a full cycle late on every sampled value). The
+       error points at RegOut, which works — the same Out/RegOut distinction the
+       pre-tick alignment guardrail makes. Resolving it means reworking how
+       split_output_regs interacts with expression timing; that is a semantics
+       change to shared codegen machinery, not a memory detail.
+     → tests/multiphase_memory_equivalence.rs (5 tests): the single-tick direct
+       read, cross-phase into a register, cross-phase into a RegOut, shape pins for
+       BOTH forms (so a future change cannot collapse them back into one — which is
+       the bug above), and the rejection.
+  ✔ WriteFirst read-during-write  [DONE 2026-08-24]
+     ReadFirst needed no logic — the non-blocking write commits at the edge, so a
+     continuous read of the array already sees the pre-write contents. WriteFirst
+     cannot work that way (the array does not hold the new value until after the
+     edge), so the read port's output net becomes a same-address forwarding mux:
+         assign mem_rd0_data =
+             ((mem_wr0_en && (mem_wr0_addr == mem_rd0_addr)) ? mem_wr0_data
+                                                            : mem[mem_rd0_addr]);
+     MUX ORDER IS LOAD-BEARING: with several write ports aimed at one address, the
+     forwarded value must be the one the array ends up holding. The simulator
+     commits writes in ascending port order, so the HIGHEST index wins — the rule
+     tests/memory_multiport_arbitration.rs establishes at four ports, where "highest
+     index", "second one" and "last issued" finally disagree. The mux therefore
+     checks the highest index FIRST.
+     → tests/write_first_memory_equivalence.rs (5 tests). Two things could be wrong
+     and each has its own check:
+       1. forwarding missing — a WriteFirst that silently behaved like ReadFirst
+          would pass every WriteFirst-only check, since the modes agree on every
+          cycle EXCEPT a same-address read/write. So both modes run on identical
+          stimulus and must disagree on exactly those cycles.
+       2. mux order wrong — ram_wf_priority drives two write ports at one address
+          with different data.
+     BOTH NEGATIVE CONTROLS MEASURED, not argued: forcing ReadFirst made the
+     WriteFirst equivalence fail at cycles 2 and 5 (0xAA vs 0x55) while ReadFirst
+     stayed green; reversing the mux order made only the priority test fail
+     (0xB0 vs 0xB1). The single-port test correctly stayed green for the second —
+     priority is unobservable with one write port.
+     FALLOUT worth knowing: this surfaced a latent hole in copper-analysis.
+     `reference_sv_registers` strips bracket groups, so `mem[a] <= d` reduced to
+     `mem <= d` and a memory array was reported as a flip-flop named `mem`, which
+     no source-level inference can produce — register_reconciliation failed on the
+     new fixtures. Unpacked-array declarations are now excluded there (with two
+     unit tests, including one that a bit-assigned register `q[3] <= …` is STILL a
+     register). The same hole was latent for any hand-written reference SV with a
+     RAM — examples/memory/sv/dual_port_ram.sv declares `reg [15:0] ram [1023:0]`.
+  ✔ from_fn / from_contents preload equivalence through the transpiled path
+     [DONE 2026-08-24, user chose the `initial` block over `$readmemh`]
+     → tests/preloaded_memory_equivalence.rs — sim ≡ transpiled SV for BOTH
+     constructors, on ROMs (1 read port, 0 write ports) so nothing but the preload
+     can make the output right: a missing `initial` block reads as zeros instead of
+     hiding behind a write. Addresses are driven out of fill order, so a reversed
+     or off-by-one fill cannot pass either. Plus shape pins.
+     THE KEY DESIGN POINT: the transpiler does NOT evaluate the preload — it emits
+     the description. `from_fn(clk, N, |i| f(i))` becomes the fill LOOP:
+         initial begin
+             for (int i = 0; i < 16; i++) rom[i] = 16'(((i * 32'd3) + 32'd7));
+         end
+     That is what makes `from_fn` representable at all without running Rust, and it
+     is why the closure had to become a real FIR node (`ExprType::Closure`) rather
+     than falling into the parser's raw-text catch-all. `vec![…]` likewise now
+     desugars structurally to an Array/Repeat (`desugar_vec`, alongside the
+     existing `desugar_matches`) instead of staying an opaque ExprMacro — the
+     contents of a preload have to be visible to later phases.
+     COST OF THE FORM, stated plainly: `initial` is what Verilator runs at time 0
+     and what FPGA tools read to infer an initialized block RAM, but most ASIC
+     flows ignore it. A preloaded memory is a simulation-and-FPGA construct by
+     nature. That is a property of the construct, not of this lowering.
+     WIDTH GOTCHA worth remembering: a fill body like `i * 3 + 7` has no inferable
+     width, and an unresized assignment into the array is a Verilator width warning
+     — fatal under `-Wall`. Preload words therefore get an explicit `width'(…)`
+     cast whenever they are not already known to be element-width (stricter than
+     `resize_to_target`, which leaves unknown widths alone).
+     STILL REFUSED, each pinned in unsupported_constructs.rs:
+       - contents computed at run time — `from_contents(clk, flat.clone())`, which
+         is exactly what examples/cpu/rv32i_cpu.rs does. No source-level form to
+         emit; a zero-filled array would be a silently wrong design.
+       - a fill that is not an inline closure (a named fn / a bound closure)
+       - a preload that reads one of the module's own signals. The simulator
+         evaluates a captured port ONCE at construction; an `initial` block samples
+         it at time 0. Two different things that look alike in source.
+  ☐ Memory RULES — no longer unimplemented constructs, but shapes that must not
+     lower silently. Each pinned with its own diagnostic in
+     copper-codegen/tests/unsupported_constructs.rs, measured against
+     `single_cycle_readfirst_memory_is_supported`, the baseline that DOES transpile:
+       - two accesses to one port in a cycle (the sim keeps the last; one physical
+         address bus cannot)
+       - `data()` / `is_ready()` observed before the tick that produces them
+       - a plain `Out` driven straight from a read result across phases (use RegOut)
+       - contents computed at run time, a non-inline `from_fn` fill, or a preload
+         that reads one of the module's own signals
+       - READ_LAT / WRITE_LAT of 0
+  ☐ REVISIT out-of-range addressing now that a synthesised counterpart EXISTS.
+     The deliberate panic (copper-core/src/memory.rs::out_of_range) was decided on
+     diagnostic grounds precisely because there was nothing to be faithful to.
+     There is now: SystemVerilog reads X out of range, and the emitted address net
+     is clog2(depth) bits, so a wider address truncates in the SV where the
+     simulator panics. Not a divergence any passing test reaches (the sim panics
+     first), but it is a real sim-vs-synth difference that is now decidable.
+
+--------------------------------------------------------------------------------
+P5 — Large integration (flagship examples, currently ZERO cargo-test coverage)
+--------------------------------------------------------------------------------
+  ✔ rv32i_cpu: 10 known programs (addi..bubblesort) run to halt, assert final a0.
+     → tests/rv32i_integration.rs::scalar_cpu_matches_known_results.
+  ✔ rv32i_cpu_pipelined: same 10 + the pipeline-specific ones (RAW forwarding=3,
+     load-use stall=43, jal=7) → pipelined_cpu_matches_known_results; PLUS a direct
+     scalar-vs-pipelined differential on the common programs → scalar_and_pipelined_agree.
+     Structure: cfg(not(test)) on each example `fn main` + `include!` (scalar at crate
+     root, pipelined in `mod pl` with its harness `pub`). CPUs don't transpile (Vec
+     port + Memory + submodules), so this is a sim self-check, not a Verilator equiv.
+     NOTE (found probing, ✔ FIXED 2026-08-24): the standalone transpiler PANICKED
+     on rv32i_cpu ("gate guarantees at least one tick", control_extract.rs:95)
+     instead of returning a clean error. Fixed — see TRANSPILATION fix G. rv32i_cpu
+     now reports its real first blocker, a `Vec<Bits<32>>` port.
+  ✔ uart/system: tx→rx loopback self-check → tests/uart_integration.rs.
+     - uart_single_channel_loopback: 6 bytes (framing edges) round-trip tx→rx.
+     - uart_dual_channel_no_crosstalk: two channels transmit different bytes on the
+       same cycle; each arrives on its own channel (no cross-contamination).
+     Same cfg(not(test))-main + top-level `include!` structure (self-contained file,
+     so no `mod`/`pub` needed). Sim self-check, not a Verilator equiv.
+  ☐ uart/rx standalone example — its own testbench not yet lifted (system.rs, which
+     embeds tx+rx, is the integration path and IS covered above).
+
+--------------------------------------------------------------------------------
+P6 — reset / X-propagation / robustness
+--------------------------------------------------------------------------------
+  ✔ Uninitialized register reads X; X flows through a design  [DONE 2026-08-22]
+     → tests/x_propagation_and_reset.rs (8 tests). An X-initialised register DOES read
+     X and drive it to the output — but ONLY if it is not reloaded. In a design that
+     reloads every cycle (`r = d.read()` unconditionally) the initial value is gone
+     before any observation point, because the loop top re-runs during the post-edge
+     settle AFTER the load. So the test holds the register behind an enable; that is
+     what makes the initial X reachable at all. (I first wrote this test against a
+     reload-every-cycle design, misread a probe where the X actually came from the
+     INPUT I was driving, and had to re-measure.)
+  ✔ Reset drives registers to a known state  [DONE 2026-08-22]
+     Contaminate via the datapath, assert reset across an edge clears the unknown and
+     the register reads 0, then release reset and confirm normal loading resumes with
+     no unknowns. Plus reset_is_what_makes_a_design_verilator_checkable, which asserts
+     the PRECONDITION every equivalence-tested design in the corpus relies on: after
+     reset there are no unknowns in the observable output, so a comparison downstream
+     is meaningful. ("post-reset behavior matches SV" is what the existing equivalence
+     tests already do — shift_register, lfsr, det_010 all reset first.)
+  ✔ as_uint on X panics — reachable IN-CONTEXT  [DONE 2026-08-22]
+     x_on_a_control_input_panics drives X into a design's control input and gets the
+     documented "Cannot convert X to bool" from inside the executor, not from a bare
+     Logic. Plus as_uint_on_x_panics for the Bits counterpart.
+     ⚠️ SEMANTIC NOTE worth knowing: X splits into TWO REGIMES. Data is X-PESSIMISTIC
+     (X flows and contaminates; eq on an X operand is X). Control ABORTS (as_bool /
+     as_uint panic rather than propagating). So Copper does NOT explore both arms on
+     an unknown condition — it stops. That is a real difference from 4-state Verilog,
+     where `if (x)` simply takes the else branch.
+  ☐ X-pessimism end-to-end sim ≡ SV — NOT POSSIBLE; pinned with evidence
+     Two INDEPENDENT reasons, either fatal alone:
+       1. THE X INITIALISER IS DROPPED IN TRANSPILATION. `let mut r: Bits<8> =
+          Bits::x()` emits a bare `logic [7:0] r;` with no initial value — the unknown
+          is simply not represented in the generated SystemVerilog.
+       2. VERILATOR IS 2-STATE. `--x-assign` / `--x-initial` ASSIGN X AWAY to 0, 1 or
+          random; they do not model X propagation. There is no X in the reference to
+          compare against even in principle.
+     MEASURED: sim reports X at cycle 0 where Verilator reports 0.
+     PINNED by x_cannot_be_checked_against_verilator, which asserts the DIVERGENCE (and
+     that the SV carries no X initialiser), so it fails loudly if either half is fixed.
+     A 4-state reference simulator would be needed to close this.
+
+--------------------------------------------------------------------------------
+Already landed in this pass (2026-08-03) — for reference
+--------------------------------------------------------------------------------
+  ✔ copper-analysis/tests/analysis_semantics.rs   (19: registers, reachability,
+      definite-assignment, read-timing, reference-SV extraction, RegMatch, fsm_report)
+  ✔ copper-core/tests/port_and_type_edge_cases.rs (14: wire dirty/identity, type
+      width boundaries, concat/part_select, asr sign-fill, X-pessimistic eq)
+  ✔ tests/{one_bit_comparator,ripple_carry_adder,gray_to_binary,up_down_counter,
+      accumulator_en,slow_counter}_equivalence.rs  (6 new sim ≡ SV equiv tests)
+  ✔ tests/simulator_corner_cases.rs               (chain convergence, oscillation)
+  ✔ copper-macros/tests/ui/{fail/combinational_latch,fail/tickless_loop,
+      fail/partial_tick_path,pass/combinational_mux_valid}.rs

@@ -1,0 +1,5 @@
+error: output port `o`'s pre-tick region has a PATH-DEPENDENT boundary: an input read reaches the write on some paths but a register is assigned with no protecting read on another, so the write executes at the cycle's opening on one path and at the pre-edge on the other — no single synthesized emission can match both, and the simulator silently disagrees with the hardware (or, for a constant written on only some paths, the held value makes the phase shift observable). Make the boundary uniform (read the input on every path before the register update), declare `o` as `RegOut<…>` (registered, immune because it commits at the clock edge), or move the register update after the `clk.tick().await`. If this module exists to DEMONSTRATE the divergence, opt out explicitly with `#[hardware(sequential, allow_pretick_alignment)]`.
+  --> tests/ui/fail/pretick_alignment.rs:20:72
+   |
+20 | async fn mixed_alignment(clk: Clock<MainClk>, i: In<Bits<8>, MainClk>, o: Out<Bits<8>, MainClk>) {
+   |                                                                        ^
