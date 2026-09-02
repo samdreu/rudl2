@@ -1,18 +1,18 @@
 # The received-`Memory` port ABI
 
-**Status: DECIDED AND LANDED 2026-08-27** (user-directed; cause P in `TODO`).
-Verified end to end by `tests/received_memory_abi.rs` — the simulator running a
-real `Memory` object and the transpiled child instantiated under a hand-written
-owner both reproduce the trace derived from the memory windows.
+**Status: DECIDED AND LANDED 2026-08-27** (`0ef2b5a`; cause P in the repo `TODO`
+ledger). Verified end to end by `tests/received_memory_abi.rs` — the simulator
+running a real `Memory` object and the transpiled child instantiated under a
+hand-written owner both reproduce the trace derived from the memory windows.
 
 ## 1. The question, and the fork that was recorded
 
 `#[hardware]` accepts a `Memory<…>` **parameter** (2026-08-26): a module may be
 HANDED its storage instead of declaring it, and the simulator runs it — but the
 transpiler had no answer for what a received memory *is* in SystemVerilog. The
-recorded fork (do not pick by accident): **(a)** a set of address/data/enable
+recorded fork (not to be picked by accident): **(a)** a set of address/data/enable
 PORTS on the module with the array living in the parent, or **(b)** a hierarchy
-edge (item 4's structural-module territory). The user ruled for **(a)**.
+edge (item 4's structural-module territory). **Decision, 2026-08-27: (a).**
 
 ## 2. The cut, and why it is where it is
 
@@ -66,31 +66,45 @@ parameter named `m`:
 * **`WRITE_LAT` must be 1** for now: the bus carries the freshly-staged write
   nets, and at deeper write latency the committing value is a child-side
   pipeline register — exposing the committing stage is a straightforward
-  extension, refused honestly until built and verified. Any `READ_LAT ≥ 1`
-  works (the capture chain is child-side and feeds off the data input).
+  extension, refused honestly until built and verified
+  (`chir_lower::received_memory_decls` rejects `WRITE_LAT != 1` with a clean
+  diagnostic). Any `READ_LAT ≥ 1` works (the capture chain is child-side and
+  feeds off the data input).
 
 ## 4. Implementation notes
 
-* `chir_lower::received_memory_decls` parses the parameter type and pushes a
-  `CHIRMemoryDecl { received: true, … }`, so the body lowering (staging,
-  capture, checks — `copper_analysis::memory_locals` already collects
-  parameters) is byte-for-byte the declared path.
-* At VLIR: `lower_mem_decls` skips the array/preload/read-assign,
-  `mem_write_commits` skips the commit, `lower_to_vlir` synthesizes the bus
-  ports and the `M_ADDR_W` parameter, and `mem_net_defaults` sizes address
-  defaults parametrically (`'0`).
+* `chir_lower::received_memory_decls` (`copper-codegen/src/chir_lower.rs`)
+  parses the parameter type and pushes a `CHIRMemoryDecl { received: true, … }`
+  (`copper-core/src/chir.rs`), so the body lowering (staging, capture, checks —
+  `memory_locals` in `copper-analysis/src/cfg.rs` already collects parameters)
+  is byte-for-byte the declared path.
+* At VLIR (`copper-codegen/src/vlir_lower.rs`): `lower_mem_decls` skips the
+  array/preload/read-assign, `mem_write_commits` skips the commit,
+  `lower_to_vlir` synthesizes the bus ports and the `M_ADDR_W` parameter
+  (`addr_param_name`, default 1), and `mem_net_defaults` sizes address defaults
+  parametrically (`M_ADDR_W'd0`).
 * Two integration traps found while landing, both now handled: the emitter's
-  wire-declaration collector must not redeclare a bus net that is now a port
-  (double declaration), and `drop_unread_wires` must treat bus outputs as
-  **externally read** — the array and commit moved across the boundary, so the
-  dead-wire eliminator otherwise deletes the bus's `always_comb` defaults (it
-  did, on landing day).
+  wire-declaration collector (`copper-codegen/src/emit.rs`) must not redeclare a
+  bus net that is now a port (double declaration), and
+  `vlir_lower::drop_unread_wires` must treat bus outputs as **externally read**
+  — the array and commit moved across the boundary, so the dead-wire eliminator
+  otherwise deletes the bus's `always_comb` defaults (it did, on landing day).
 
 ## 5. What this did and did not unblock
 
 `rv32i_cpu_pipelined` no longer refuses on its `Memory` parameter (cause P is
-discharged); it now surfaces its own next recorded blockers (the struct-typed
-pipeline latches / tuple-returning EX stage — see its `build.rs` SKIP entry).
-The sweep still cannot generate a case for a memory-receiving module (the
-harness would have to synthesize an owner); `tests/received_memory_abi.rs` is
-the dedicated gate for the ABI itself.
+discharged), and every transpile cause after it closed the same day (the last,
+word-indexed array registers for the register file, in `b70f2a1`). The core is
+**anchored outside the sweep** by `tests/rv32i_pipelined_verilator.rs`: all 13
+architectural programs run on the simulator and on the transpiled core Verilated
+under a hand-written owner built exactly as §2 describes — with a **WriteFirst**
+collision policy, because `build_memory` calls `.write_first()` and the policy is
+the owner's — comparing `(program_counter, halted, a0)` cycle-for-cycle through
+the halt.
+
+The corpus sweep itself still cannot generate a case for a memory-receiving
+module: `build.rs` classifies the parameter as `Kind::Memory` and `skip_reason`
+ignores the module with a reason (the harness would have to invent the memory's
+size and contents, both design decisions). The CPU's `SKIP` row records the
+dedicated lane as its gate. `tests/received_memory_abi.rs` remains the gate for
+the ABI itself.

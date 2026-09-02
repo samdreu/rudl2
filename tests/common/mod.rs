@@ -159,10 +159,26 @@ impl<T: RandStim, const N: usize> RandStim for [T; N] {
 /// Transpile a DUT fixture and write the SystemVerilog to a temp file.
 ///
 /// `module` may be `None` when the fixture declares exactly one hardware module.
+///
+/// The file is keyed on `(module, pid, counter)`, never on the module name alone —
+/// the same rule as the Verilator work dirs. Thirteen module names occur twice in
+/// the swept corpus (an `examples/` copy and a `tests/fixtures/` copy), both run in
+/// the same test binary in parallel threads, and two of those pairs (`mac_pipeline`,
+/// `ripple_carry_adder`) emit DIFFERENT SystemVerilog. A name-keyed path let one
+/// case overwrite the other's SV between `for_module` and `finish`, so a test could
+/// Verilate its twin's design against its own stimulus — a false-PASS mechanism as
+/// well as a false-failure one.
 pub fn transpile_fixture(module_name: &str, src: &str, module: Option<&str>) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
     let sv = copper_codegen::transpile_source(src, module, &copper_codegen::EmitConfig::default())
         .unwrap_or_else(|e| panic!("transpiling '{module_name}' failed: {e}"));
-    let path = std::env::temp_dir().join(format!("copper_{module_name}.sv"));
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "copper_{module_name}_{}_{n}.sv",
+        std::process::id()
+    ));
     std::fs::write(&path, sv).expect("write generated sv");
     path
 }

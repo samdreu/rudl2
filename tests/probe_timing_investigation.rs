@@ -81,7 +81,7 @@ fn probe_timing_four_way() {
 /// agree" boundary is really "no phase-gated cross-tick read". Intentionally
 /// failing (verilator: FAIL); kept as an executable record of the finding.
 #[test]
-#[ignore = "demonstration: a phase-gated cross-tick (mid-phase) read still diverges from the transpiler by one cycle under post-edge — the same open case as read_timing_equivalence::accum_2. See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md"]
+#[ignore = "demonstration: a phase-gated cross-tick (mid-phase) read still diverges from the transpiler by one cycle — the pinned W4/probe_fsm path-dependent boundary (design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md §5.7; build.rs SKIP row `probe_fsm`). accum_2 was once cited as the same case; it was measured to AGREE and un-ignored on 2026-08-21, so this one stands alone"]
 fn probe_fsm_sim_matches_verilog() {
     let mut eq = EquivalenceTest::for_module("probe_fsm", DUT_SRC, Some("probe_fsm"));
     let mut clk = Clock::<MainClk>::new();

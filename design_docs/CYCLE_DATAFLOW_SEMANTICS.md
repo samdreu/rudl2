@@ -1,19 +1,22 @@
 # Cycle-dataflow semantics — the normative timing model for the async-await surface
 
-**Status: DERIVED, VALIDATED, AND PARTIALLY IMPLEMENTED (2026-08-26)** — phase 1
-complete; the paired implementation's phases A, B and D are **landed** with user
-sign-off (`PAIRED_IMPLEMENTATION_SCOPE.md` execution notes): opening-prefix
-plain-`Out` drives now emit their forwarded form (the V1 family is *legal and
-agreeing*, at zero live-module SV cost, byte-diff-gated), and D1 is narrowed to
-the derived path-dependent-boundary rule. Phases C (extracted-path trailing
+**Status: DERIVED, VALIDATED, AND IMPLEMENTED — residue recorded (status as of
+2026-09-01).** Phase 1 (the derivation table, `DERIVATION_TABLE.md`) is complete:
+every corpus module carries a derived disposition and all four owed measurements
+(m1–m4) confirmed their derivations on the first run — including one silent,
+unguarded divergence the model predicted from first principles (V8a, guarded
+2026-08-26 as the fifth pretick rule, `Cfg::pretick_out_write_before_update` in
+`copper-analysis/src/cfg.rs`). The paired implementation was scoped and executed
+the same day (`PAIRED_IMPLEMENTATION_SCOPE.md`, commit 7abfd98): phases A, B and D
+landed — opening-prefix plain-`Out` drives emit their forwarded form (the V1 family
+is *legal and agreeing*, measured at zero live-module SV cost), and D1 is narrowed
+to the derived path-dependent-boundary rule. Phases C (extracted-path trailing
 placement) and E (multi-phase mux) are deferred with recorded rationale; the
-trailing rule stays. The derivation table (`DERIVATION_TABLE.md`)
-covered every corpus module, and all four owed measurements (m1–m4) confirmed
-their derivations on the first run — including one silent, unguarded divergence
-the model predicted from first principles (V8a, since guarded as the fifth
-pretick rule with user sign-off). What remains is the **paired implementation**
-(§6): a semantics change to executor and codegen, which needs its own sign-off
-before any scoping. Originally decided with the user as:
+trailing rule stays, narrowed to the extracted class on 2026-08-27 (commit
+8ffade7). The executor was **not** changed — scoping showed it already implements
+the model (`PAIRED_IMPLEMENTATION_SCOPE.md` §0). The normative statement of the
+model now lives in `SYNCHRONOUS_SEMANTICS.md` (rebased 2026-08-27, commit c1bf21f);
+this document is the derivation record. Decided 2026-08-26 as:
 
 1. **The denotation is normative.** The per-cycle value function defined here is the
    semantics; the simulator and the transpiler are both *implementations* of it, each
@@ -38,20 +41,30 @@ simulator is not internally uniform (`PRETICK_ALIGNMENT_GUARDRAIL.md` §5.3's ge
 result), no single lowering can match it, and every silent divergence to date has been
 a patch surface over that non-uniformity.
 
+> *Dated note (2026-08-26, after F3's revision — `PAIRED_IMPLEMENTATION_SCOPE.md`
+> §0):* the paragraph above is the pre-validation framing. Scoping against the V8
+> measurements showed the read-site barrier **is** the region boundary the model
+> needs, so the executor's parking rule was never the defect; the defect was on the
+> emission side (unforwarded assigns for opening-prefix drives, fixed in phase B)
+> and the genuine non-uniformity is the *path-dependent* boundary, retained as
+> D1's residue.
+
 Companions: `SYNCHRONOUS_SEMANTICS.md` (the reference — **rebased onto this model
 2026-08-27**: denotation first, rules as derived residue), `PRETICK_ALIGNMENT_GUARDRAIL.md`
 (the measured evidence this document derives from).
 
 > **Phase 1 is COMPLETE: `DERIVATION_TABLE.md`** (mechanical columns regenerate via
-> `cargo run -q -p copper-codegen --bin derivation-audit`). Refinements this
-> document must absorb in its rebase: **anchoring is per *region* (pre-tick vs
-> trailing), not per Comb-component** — the trailing region always commits at its
-> opening edge and is opening-anchored, which is why §5.4's two regions could
-> never share a rule; §3's anchor classification counts **memory stagings,
-> `RegOut` writes, and the implicit `pc`** (a control-steering read) as commits;
-> and §4 gains the measured **commit-frontier taxonomy** (constants, committed
-> reads, write-after-update; the between-read-and-update position is divergent
-> and guarded). Validation record: F1 — the forwarded-emission dissolve set is
+> `cargo run -q -p copper-codegen --bin derivation-audit`, source
+> `copper-codegen/src/bin/derivation-audit.rs`, facts from
+> `Cfg::derivation_facts`). Three refinements the derivation produced, now stated
+> normatively in `SYNCHRONOUS_SEMANTICS.md` and recorded in §2 below as a dated
+> note: **anchoring is per *region* (pre-tick vs trailing), not per
+> Comb-component** — the trailing region always commits at its opening edge and is
+> opening-anchored, which is why §5.4's two regions could never share a rule; §3's
+> anchor classification counts **memory stagings, `RegOut` writes, and the implicit
+> `pc`** (a control-steering read) as commits; and §4 gains the measured
+> **commit-frontier taxonomy** (constants, committed reads, write-after-update; the
+> between-read-and-update position is divergent and guarded). Validation record: F1 — the forwarded-emission dissolve set is
 > **empty on the non-witness corpus**, so the paired fix changes no live module's
 > SV; F2 — the V8 battery, predicted then measured, now the fifth pretick rule;
 > F3 (as REVISED by the scoping, `PAIRED_IMPLEMENTATION_SCOPE.md` §0) — the
@@ -107,11 +120,16 @@ computation. Its meaning:
   on the identical input, the sim macro consumes — `transpile_fir` appends the
   names the FIR→FIR passes synthesize (`pc`, counters, hoisted locals, found by
   diffing the pre-loop `let mut` set across the passes), and `chir_lower`
-  **consults** that authority instead of deciding syntactically. The change was
-  byte-identical across all 195 corpus modules (sv-baseline), which is the proof
-  the old syntactic decider had only ever *coincided* with the inference;
-  `register_reconciliation.rs` remains the end-to-end oracle, now verifying
-  plumbing rather than a coincidence. (`held_temp_trap`, the historical
+  **consults** that authority instead of deciding syntactically
+  (`copper-codegen/src/parser.rs::capture_frontend_ir`, `transpile_fir` in
+  `copper-codegen/src/lib.rs`, the `let mut` arm of `copper-codegen/src/chir_lower.rs`;
+  commit d7b2483, 2026-08-27). The change was byte-identical across the whole
+  corpus under the `sv-baseline` snapshot/diff — measured once at commit d7b2483
+  (195 modules at that commit; the snapshot lives in `target/sv-baseline/` and is
+  not a regression gate) — which is the proof the old syntactic decider had only
+  ever *coincided* with the inference;
+  `copper-codegen/tests/register_reconciliation.rs::codegen_registers_match_shared_inference`
+  remains the end-to-end oracle, now verifying plumbing rather than a coincidence. (`held_temp_trap`, the historical
   disagreement this bullet used to cite, had already been repaired by the
   2026-08-26 reassigned-wire fix.) Four degenerate unit fixtures that pinned the
   rival's behavior on never-touched locals were re-blessed with genuinely-live
@@ -131,6 +149,18 @@ temporal anchors**: its commits belong to the closing edge, its comb drives to t
 opening one. The current system picks *one* execution instant per segment (decided by
 the incidental barrier) and patches the observable fallout. The model instead
 classifies segments and assigns obligations per anchor.
+
+> **Refinement absorbed from the derivation (2026-08-26, `DERIVATION_TABLE.md` §1;
+> normative wording in `SYNCHRONOUS_SEMANTICS.md`):** the unit of anchoring is the
+> *region*, not the segment. A segment divides at the read-site barrier into an
+> **opening prefix** (statements before the first leading `In` read — executes at
+> the opening instant on committed state) and a **closing suffix** (executes at the
+> pre-edge settle on closing-edge samples and forwarded values); the **trailing
+> region** (last tick → head) always commits at the edge that *opens* its cycle and
+> is opening-anchored. Commits include register locals, `RegOut` writes, memory
+> stagings, and the implicit state register a control-steering read feeds. That the
+> barrier site *is* the region boundary was validated, not assumed: a region-entry
+> barrier was proposed and falsified by V8c (`PAIRED_IMPLEMENTATION_SCOPE.md` §0).
 
 ## 3. Segment anchoring — derived, not incidental
 
@@ -175,6 +205,19 @@ Why each cell, from the write-window invariant:
   closing-anchored segments (broke the barrier-protected majority). The pairing is
   what neither single-sided fix could be.
 
+**Implementation (landed 2026-08-26, phase B of `PAIRED_IMPLEMENTATION_SCOPE.md`).**
+The executor cell needed no change — the read-site barrier already realizes the
+split (§0 there). The transpiler cell is the opening-prefix selection in
+`copper-codegen/src/shir_lower.rs`: the `Forwarding` walk tracks whether an `In`
+read has been seen in the segment (`forward_opening_drives` / `seen_in_read`), and
+a `CHIRStmt::PortWrite` before any read takes its `edge_value` (the forwarded form
+`SHIRPortDrive` already carried) as its continuous-assign form; trailing segments
+are excluded. Pinned by
+`tests/sequential_forwarding_divergence.rs::pre_tick_update_forwarding_agrees_end_to_end`
+(V1 sim ≡ SV end to end) and `::d_narrowing_battery_verdicts` (V5, V7 agree; W4
+diverges), and by the ui/pass case
+`copper-macros/tests/ui/pass/pretick_alignment_ok.rs::forwarded_opening_drive`.
+
 ## 4. The commit-frontier condition — D1's family, derived
 
 For a **closing-anchored** segment, a plain-`Out` write's value is computed from
@@ -208,6 +251,22 @@ means `assign o = r + 1`, and the "sticky flag" the engineer wanted is written
 description* maps to the registered form (§3.2's correction), not that forwarding is
 wrong — under the model the registered form is the write-then-update spelling.
 
+> **Landed 2026-08-26 (phase D).** D1 did not vanish; it *narrowed* to its residue.
+> `Cfg::unprotected_pretick_out_write` (`copper-analysis/src/cfg.rs`) now flags a
+> register-reading write only when a leading read comb-reaches it
+> (`leading_read_reaches`) — the path-dependent boundary (W4, `probe_fsm`) — and keeps
+> the conditional/constant hold clause (`written_on_all_paths`) unchanged. Exact set
+> pinned by
+> `copper-analysis/tests/pretick_alignment_corpus.rs::pretick_alignment_hazard_flags_exactly_the_known_divergent_modules`
+> (`EXPECTED_FLAGGED`: `probe_fsm`, `w4_mixed_alignment`, `branch_merge_explicit`,
+> `pc_arm_toggle`, `pc_arm_write` as of 2026-09-01); the macro diagnostic in
+> `copper-macros/src/lib.rs` describes the path-dependent boundary; ui cases
+> `copper-macros/tests/ui/fail/pretick_alignment.rs::mixed_alignment` (W4) and
+> `ui/pass/pretick_alignment_ok.rs::forwarded_opening_drive` (V1). The
+> `ref_fast_counter` adjudication was re-pointed at the corrected spelling
+> (`tests/sequential_forwarding_divergence.rs::independent_hardware_anchors_the_corrected_spelling`,
+> rationale R7 recorded in the test).
+
 ## 5. Re-derivation of the existing rules
 
 Each row must end up either **dissolved** (the shape acquires a defined meaning both
@@ -218,38 +277,51 @@ measurement before it is believed.
 
 | rule / divergence | status under the model | evidence |
 |---|---|---|
-| D1 `unprotected_pretick_out_write` | **dissolved** — opening-anchored segments get forwarded emission; the sim was the correct side | checked: V1 sim ≡ Prost SV (§5.3) |
-| D2 passthrough (fixed 2026-08-21) | **derived** — a segment with no commits is opening-anchored, so the read samples at the opening instant; the per-read `Immediate` fix is the partial implementation of exactly this | checked: the fix's own adjudication |
+| D1 `unprotected_pretick_out_write` | **dissolved for the V1 class, retained for the path-dependent boundary** — opening-prefix drives get forwarded emission; the sim was the correct side. LANDED 2026-08-26 (phase B + D, see the §4 note) | measured: `pre_tick_update_forwarding_agrees_end_to_end` (V1 sim ≡ SV), `d_narrowing_battery_verdicts` (V5, V7 agree; W4 diverges) in `tests/sequential_forwarding_divergence.rs` |
+| D2 passthrough (fixed 2026-08-21) | **derived** — a segment with no commits is opening-anchored, so the read samples at the opening instant; the per-read `Immediate` fix (`copper_analysis::classify_reads`) is the partial implementation of exactly this | checked: `tests/sequential_forwarding_divergence.rs::d2_is_fixed_and_d1_still_demonstrates_the_hazard` |
 | constant-write all-paths clause | **retained-derived** — §4's generation argument reproduces the exemption and its narrowing exactly | checked: `pc_arm_*`, `branch_merge_explicit` |
-| `unprotected_trailing_out_write` | **predict: dissolved** — a multi-tick trailing segment is (usually) opening-anchored at its own last edge; forwarded emission should define it. The single-tick/multi-tick discriminator (§5.4) should fall out of anchoring; must be re-derived explicitly and measured | predict |
-| `multi_phase_out_write` | **retained-derived, narrowed** — an `Out` written in several segments is a mux over FSM state *iff* every writing segment individually satisfies its anchor's condition; refusal remains for mixed cases. Whether the current rule's 9 flagged modules split this way is a measurement | predict |
+| `unprotected_trailing_out_write` | **MEASURED — prediction half right.** The *derivation* held: the sim already implements the model for the trailing region (m2: sim ≡ hand-lowered model emission, cycle-for-cycle). But the shape did **not** dissolve in the tree — codegen's control-extraction route still places trailing effects one state late (phase C deferred, `PAIRED_IMPLEMENTATION_SCOPE.md`), so the rule is **retained, narrowed 2026-08-27** (commit 8ffade7) to the extracted class via `has_nested_tick`; the linear class is exempt and agrees. The single-vs-multi-tick discriminator is restated by the per-region refinement (a single-tick loop's trailing region shares the head's phase, `DERIVATION_TABLE.md` §1); the residual refusal is a lowering limitation, not a semantics rule | measured: `m2_model_forwarded_lowering_matches_the_simulator_for_trailing_update`, `linear_trailing_probe` (agrees), `branch_trailing_probe` and `d1_in_the_trailing_segment_is_an_unguarded_gap` (diverge one edge late), all in `tests/sequential_forwarding_divergence.rs`; exact set `EXPECTED_TRAILING` (`trailing_update`, `branch_trailing`) in `copper-analysis/tests/pretick_alignment_corpus.rs` |
+| `multi_phase_out_write` | **retained-derived, narrowed (on paper only)** — an `Out` written in several segments is a mux over FSM state *iff* every writing segment individually satisfies its anchor's condition; refusal remains for mixed cases | **not measured as of 2026-09-01** — phase E deferred. The "9 flagged modules" of the 2026-08-25 measurement is historical; today's exact-set pin is one module, `pulse_plain` (`EXPECTED_MULTI_PHASE` in `copper-analysis/tests/pretick_alignment_corpus.rs`) |
 | `multi_write_collapse` | **retained-derived** — the pre-tick write's intended window contains observation N, but its execution instant (pre-edge N+1) is after it; no scheduling realizes the window. Same conclusion, now from window arithmetic | checked: mechanism matches the rule's own analysis |
 | post-entering-edge control read (refused ordering) | **retained-derived** — the value a control decision needs at the opening instant is defined at the closing settle; unrealizable by any implementation | checked: the two-window measurement (2026-08-24) |
 | RegOut forwarding (L/L-1/L-2, fixed) | **derived** — commits are computed from forwarded values (§2); the repair implemented the model's clause | checked: `regout_forwarding_equivalence.rs` |
 | trailing forwarding map (2026-08-25 fix) | **derived** — same clause at the trailing commit | checked: the differential case that found it |
-| `program_counter` divergence #1 (CPU sweep) | **assigned** — a leading read exempts D1 on *mechanism* grounds, but the write is not commit-frontier-expressible in a closing-anchored segment → per §4 it should be refused (or becomes legal if the segment is in fact opening-anchored and emission is fixed). Re-derive with the actual module | predict |
-| `program_counter` divergence #2 (trailing `RegOut`, single-tick) | **assigned** — the model says commits land at the segment's closing edge, which for a trailing statement is the edge that *opens* its cycle (`SYNCHRONOUS_SEMANTICS.md` trailing rules); one side folds it into the wrong edge. Determine which against the model | predict |
-| memory staging rules (4) | **retained-derived** — bus-per-cycle and observe-after-edge are window statements about the address/data nets; expected to restate cleanly | predict (paperwork, not risk) |
+| `program_counter` divergence #1 (CPU sweep) | **retained-derived, MEASURED and GUARDED** — the write sits between a leading read and the update of the register it reads: mixed generation, not frontier-expressible (§4). Predicted with exact traces, then measured (m1, the V8 battery), then guarded 2026-08-26 as `Cfg::pretick_out_write_before_update`; a trailing clause joined it 2026-08-27 (commit b439894) | measured: `v8a_write_between_leading_read_and_update_diverges_known_gap`, `v8b_…`, `v8c_…`, `v8d_…`, `v8t_trailing_stage_shape_verdict` in `tests/sequential_forwarding_divergence.rs`; exact set `EXPECTED_WRITE_BEFORE_UPDATE` (4 modules) in `copper-analysis/tests/pretick_alignment_corpus.rs`; ui/fail `write_before_update.rs` |
+| `program_counter` divergence #2 (trailing `RegOut`, single-tick) | **assigned on paper, not separately measured against the model as of 2026-09-01.** The model's clause is the per-region refinement (a trailing region's commits anchor to the edge that *opens* its cycle). What is pinned in the tree: the shared trailing-forwarding map (commit 062724f, 2026-08-25) put trailing statements in the head's cycle on the linear path; the pipelined CPU keeps `program_counter` as `RegOut` and matches its Verilated self cycle-exact on every program (`tests/rv32i_pipelined_verilator.rs::pipelined_cpu_matches_its_verilated_self_on_all_programs`); the uart trailing `RegOut` write agrees (m4). A minimal-pair measurement of this row's own shape is still owed | not pinned by a dedicated test as of 2026-09-01 |
+| memory staging rules (4) | **retained-derived, MEASURED** — bus-per-cycle and observe-after-edge are window statements about the address/data nets; the traces derived by hand from the model are reproduced by both the simulator and the transpiled SV (m3) | measured: `tests/cycle_dataflow_memory_derivation.rs::m3_rom_from_fn_matches_the_derived_denotation`, `::m3_dual_port_ram_matches_the_derived_denotation`; rules implemented in `Cfg::check_memory_staging` and `Cfg::memory_result_drives_plain_out` |
 | reachability, CDC, poll-order, comb-loop rules | **untouched** — orthogonal to segment anchoring | — |
 
 ## 6. What the paired implementation would be (since scoped and LANDED — see `PAIRED_IMPLEMENTATION_SCOPE.md`; this section is the pre-scoping sketch)
 
-Recorded so the shape is visible; **no code moves until §5's predict rows are
-measured** and the per-module impact table (§7) exists.
+Recorded so the shape is visible; written before §5's predict rows were measured
+and the per-module table (§7) existed. Each bullet carries what actually happened
+(2026-08-26, `PAIRED_IMPLEMENTATION_SCOPE.md` execution notes):
 
 - `copper-analysis`: `segment_anchor(cfg) -> {Opening, Closing}` per segment, from
   commit-input data dependence. Both front-ends consume it — the same c2 discipline
-  as every other shared fact.
+  as every other shared fact. **Not written** (neither `segment_anchor` nor the
+  scope's `region_anchor` exists in `copper-analysis/src/cfg.rs`): `edge_value`
+  already *is* the per-drive forwarded form, so the selection needed no new
+  analysis fact — execution note B. The reporting-only `Cfg::derivation_facts`
+  is the closest thing, and no rule keys on it.
 - executor / macro: barrier injection keyed on the anchor, not on leading-read
-  presence. Opening-anchored segments run barrier-free by definition.
+  presence. Opening-anchored segments run barrier-free by definition. **Not done,
+  and not needed**: the read-site barrier is the region boundary (F3 revised;
+  `PAIRED_IMPLEMENTATION_SCOPE.md` §0). The executor was not touched.
 - codegen: plain-`Out` emission keyed on the anchor — forwarded expression for
   opening-anchored segments, unforwarded commit-frontier expression for
   closing-anchored ones (`SHIRPortDrive` already carries both `value` and
-  `edge_value`; the selection point exists).
+  `edge_value`; the selection point exists). **Landed** as the opening-prefix
+  selection in `copper-codegen/src/shir_lower.rs` (§3's implementation note);
+  trailing segments excluded pending phase C.
 - the D1-family guards convert per §5: dissolved rules are deleted *with* their
   fixtures becoming positive differential cases; retained rules are restated as
   consequences (same detection sites, derived justification); the
-  `allow_pretick_alignment` opt-out shrinks accordingly.
+  `allow_pretick_alignment` opt-out shrinks accordingly. **Landed as a narrowing,
+  not a deletion**: D1 keeps its residue (§4 note); `add_then_write`, the
+  `fast_counter` witness, V5 and V7 dropped their opt-outs; the trailing rule was
+  kept (narrowed 2026-08-27); `pretick_out_write_before_update` and
+  `multi_phase_out_write` are unchanged.
 
 ## 7. Migration discipline (standing rules apply verbatim)
 
@@ -262,24 +334,38 @@ measured** and the per-module impact table (§7) exists.
   plus the independent anchors (BaseJump, `pattern_detector_010.sv`, the CDC
   reference) are the gate. Anchors get **re-verified, never re-blessed** — under a
   normative denotation they now test the model itself.
-- **Old path kept.** The anchor-keyed behavior goes behind a mode
-  (`COPPER_SEMANTICS=…` in the spirit of `COPPER_SCHEDULER`), with a lockstep
-  differential test against the current behavior for the modules the model predicts
-  are unchanged — which the derivation table says is the large majority.
+- **Old path kept.** *As written 2026-08-26:* the anchor-keyed behavior would go
+  behind a mode with a lockstep differential test against the current behavior for
+  the modules the model predicts are unchanged. **SUPERSEDED (2026-08-26, phase B
+  execution note):** no mode or env var was ever added — there is no
+  `COPPER_SEMANTICS` variable in the tree — because the `sv-baseline`
+  snapshot/diff (`copper-codegen/src/bin/sv-baseline.rs`, snapshot under
+  `target/sv-baseline/`, a manual tool and not a regression gate) gives the same
+  "exactly the declared modules changed" comparison without doubling the test
+  matrix. The prediction it checked — zero live modules change — held.
 
-## 8. Known open questions for the derivation phase
+## 8. Known open questions for the derivation phase (status as of 2026-09-01)
 
 1. The anchor definition's edge cases: a segment where an input feeds a commit on
    one path only; an input read whose result feeds *both* a commit and a plain `Out`
    (two sample instants for one binding — refuse, or split the read?). The V-battery
-   method applies: construct the minimal pair, measure both sides.
+   method applies: construct the minimal pair, measure both sides. — **Open as a
+   refinement.** The one-path case is the path-dependent boundary D1 retains
+   (W4, `probe_fsm`); the dual-consumer read has no divergent instance
+   (`DERIVATION_TABLE.md` §4b, the input-fed class).
 2. Trailing segments: re-derive §5.4's single-vs-multi-tick discriminator from
    anchoring; if it does not fall out, the model is missing a clause — that is a
-   finding, not a footnote.
+   finding, not a footnote. — **Answered.** It falls out of the per-region
+   refinement (§2 note): a single-tick loop's trailing region is the head's phase.
+   What the measurement then showed is that the *remaining* discriminator is the
+   lowering route, not the phase count — `has_nested_tick`, the source-level mirror
+   of control extraction (§5 trailing row).
 3. Startup: an `Out` first written in a late segment vs the continuous assign's
    time-0 value (the documented startup discrepancy). Under a normative model this
-   needs an initial-value rule, not a caveat.
+   needs an initial-value rule, not a caveat. — **Open.**
 4. Memory read results interact with anchoring (`is_ready`/`data` are
-   edge-produced): restate the four staging rules in window terms.
+   edge-produced): restate the four staging rules in window terms. — **Done**
+   (m3, `tests/cycle_dataflow_memory_derivation.rs`).
 5. Whether `multi_phase_out_write`'s current flag set splits into legal-mux /
-   refused-mixed as §5 predicts.
+   refused-mixed as §5 predicts. — **Open; not measured.** Phase E deferred; the
+   flag set today is `pulse_plain` alone.

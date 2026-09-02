@@ -1,22 +1,36 @@
 # The paired implementation — scope
 
-**Status: EXECUTED 2026-08-26 (phases A, B, D landed with user sign-off; C and E
-deferred — see below).** Execution notes, in the order things were learned:
+**Status: EXECUTED 2026-08-26, commit 7abfd98 (phases A, B, D landed; C and E
+deferred — see below; status markers reflect 2026-09-01).** Execution notes, in
+the order things were learned:
 
-* **A — DONE.** `sv-baseline` (snapshot/diff over all 189 corpus modules) landed
-  and immediately found the transpiler emitting **non-deterministically**
+* **A — DONE, as a tool rather than a gate.** `sv-baseline`
+  (`copper-codegen/src/bin/sv-baseline.rs`, `snapshot` / `diff` over every module
+  the corpus walk finds — 189 at landing, 207 on 2026-09-01) landed and
+  immediately found the transpiler emitting **non-deterministically**
   (`sipo_block`'s promoted-register declaration order came from a `HashSet`
-  iteration; fixed with a sort in `find_promoted_wires`). Baseline pinned.
-* **B — DONE, smaller than scoped.** No `region_anchor` plumbing was needed:
-  `edge_value` already *is* the per-drive forwarded form, so the change is a
-  per-drive selection in `shir_lower` (an opening-prefix drive — no `In` read
-  precedes it in its segment walk — uses `edge_value` as its continuous-assign
-  form; trailing segments excluded, their committed unforwarded form being m2's
-  target). Byte-diff: **exactly `add_then_write` + the `fast_counter` witness, 0
-  live modules** (F1 confirmed). Both flips re-blessed per their messages; the
-  `ref_fast_counter` adjudication re-pointed at the corrected spelling with the
-  R7 rationale recorded in the test. No transition flag was needed — the
-  snapshot/diff gives the same comparison without doubling the test matrix.
+  iteration; fixed with a sort in `copper-codegen/src/shir_lower.rs::find_promoted_wires`).
+  The snapshot is written to `target/sv-baseline/` — it is **not committed, no
+  test reads it, and `tools/regression.sh` does not run it**; byte-identity
+  claims in these docs are one-off measurements taken with it at the named
+  commit, not a standing gate. (The scope's A1 asked for a committed baseline —
+  superseded by this.)
+* **B — DONE, smaller than scoped.** No `region_anchor` plumbing was needed (the
+  function was never written; `copper-analysis` has no such symbol): `edge_value`
+  already *is* the per-drive forwarded form, so the change is a per-drive
+  selection in `copper-codegen/src/shir_lower.rs` — the `Forwarding` walk's
+  `forward_opening_drives` / `seen_in_read` state at the `CHIRStmt::PortWrite`
+  arm (an opening-prefix drive — no `In` read precedes it in its segment walk —
+  uses `edge_value` as its continuous-assign form; trailing segments excluded,
+  their committed unforwarded form being m2's target). Byte-diff at commit
+  7abfd98: **exactly `add_then_write` + the `fast_counter` witness, 0 live
+  modules** (F1 confirmed). Both flips re-blessed per their messages — the
+  divergence pin became `tests/sequential_forwarding_divergence.rs::pre_tick_update_forwarding_agrees_end_to_end`;
+  the `ref_fast_counter` adjudication
+  (`::independent_hardware_anchors_the_corrected_spelling`) re-pointed at the
+  corrected spelling with the R7 rationale recorded in the test. No transition
+  flag was needed — the snapshot/diff gives the same comparison without doubling
+  the test matrix.
 * **C — DEFERRED, with corrected scoping.** The scope's "localized to
   `shir_lower`" prediction was wrong: the **linear** path already commits
   trailing updates at the opening edge (the 2026-08-25 shared-map work); the
@@ -27,10 +41,13 @@ deferred — see below).** Execution notes, in the order things were learned:
   which `unprotected_trailing_out_write` keeps unwritable. Cost/benefit: the
   code change would only legalize the `trailing_update` witness. Deferred like
   E; the trailing rule is therefore **kept**, not retired.
-  **Narrowed instead (2026-08-27, user-approved):** the trailing rule now gates
-  on `has_nested_tick` — the linear class (measured agreeing) is exempt and
-  compiles clean; the extracted class (measured one-edge-late in both
-  spellings) stays refused. Retirement remains gated on phase C proper.
+  **Narrowed instead (2026-08-27, commit 8ffade7):** `Cfg::unprotected_trailing_out_write`
+  now gates on `has_nested_tick` — the linear class (measured agreeing,
+  `linear_trailing_probe`) is exempt and compiles clean; the extracted class
+  (measured one-edge-late in both spellings, `branch_trailing_probe` and
+  `d1_in_the_trailing_segment_is_an_unguarded_gap`) stays refused, exact set
+  `EXPECTED_TRAILING` in `copper-analysis/tests/pretick_alignment_corpus.rs`.
+  Retirement remains gated on phase C proper.
 * **D — DONE, evidence-first.** The V-battery was re-measured under B before the
   rule moved (`d_narrowing_battery_verdicts`): V5 **and V7** dissolved (V7's
   2026-08-21 verdict was stale even before B — the 2026-08-25 trailing
@@ -39,18 +56,22 @@ deferred — see below).** Execution notes, in the order things were learned:
   directions (W4 in; `add_then_write`, `fast_counter`, `ram_prewrite` out — the
   last with a no-behavioral-verdict note); dissolved witnesses dropped their
   opt-outs and compile clean; the ui/fail V1 case became a ui/pass case with W4
-  taking its place; the macro diagnostic now describes the path-dependent
-  boundary.
+  taking its place (`copper-macros/tests/ui/pass/pretick_alignment_ok.rs::forwarded_opening_drive`,
+  `ui/fail/pretick_alignment.rs::mixed_alignment`); the macro diagnostic in
+  `copper-macros/src/lib.rs` now describes the path-dependent boundary. Pins:
+  `pretick_alignment_hazard_flags_exactly_the_known_divergent_modules`
+  (`EXPECTED_FLAGGED`, 5 modules on 2026-09-01) and
+  `d_narrowing_battery_verdicts`.
 
 Original scope follows, kept for the record.
 
 ---
 
-Original status: SCOPE ONLY. User-requested scoping of the migration that
+Original status: SCOPE ONLY (2026-08-26). Scoping of the migration that
 realizes `CYCLE_DATAFLOW_SEMANTICS.md` (DERIVED AND VALIDATED, phase 1
-complete). Implementation starts only after the decision points in §6 are ruled
-on — each phase changes semantics-bearing code and falls under the standing
-consult-first constraint.
+complete). Implementation was to start only after the decision points in §6
+were ruled on — each phase changes semantics-bearing code. (They were ruled on
+the same day; the rulings are recorded in §6.)
 
 ---
 
@@ -117,10 +138,14 @@ pinned).
   transpiles every corpus module and diffs the emitted SV against a committed
   baseline. F1's prediction — *zero live modules change* — becomes an asserted
   gate instead of an observation. Gate: zero diffs on unchanged codegen.
+  *(As executed: the `sv-baseline` bin with a snapshot under `target/`, run by
+  hand per phase — not a committed baseline and not an asserted gate; see
+  execution note A.)*
 * **A2 — flip inventory.** The tests that pin today's divergences carry their
   own re-bless instructions in their failure messages; enumerate them so each
   phase's expected flips are declared before the phase lands:
-  `pre_tick_update_is_forwarded_in_sim_but_not_in_hardware_known_gap` and the
+  `pre_tick_update_is_forwarded_in_sim_but_not_in_hardware_known_gap` (flipped
+  in phase B and renamed `pre_tick_update_forwarding_agrees_end_to_end`) and the
   `fast_counter` adjudication tests (phase B);
   `d1_in_the_trailing_segment_is_an_unguarded_gap` and
   `m2_model_forwarded_lowering_matches_the_simulator_for_trailing_update`'s
@@ -131,7 +156,10 @@ pinned).
 
 * `copper-analysis`: `pub fn region_anchor` (the §1 classification, reusing
   `leading_read_reaches` / the commit set; unit-tested against the V8 battery
-  and the phase-1 rows).
+  and the phase-1 rows). *(Never written — execution note B: the selection
+  keys on the segment walk's "no `In` read seen yet" state in `shir_lower`,
+  which is the opening-prefix boundary by definition, so no shared fact was
+  needed.)*
 * `copper-codegen`: key the `value` / `edge_value` selection on the anchor at
   the `split_output_regs` decision (both lowering paths — linear and
   control-extracted; `phase_sensitive_checks.rs` polices where the fact is
@@ -153,8 +181,9 @@ pinned).
 
 ### Phase C — trailing lowering (m2's target)
 
-* **Decision evidence (2026-08-27, the two trailing probes in
-  `sequential_forwarding_divergence.rs`):** the LINEAR multi-tick lowering
+* **Decision evidence (2026-08-27, the two trailing probes
+  `linear_trailing_probe` and `branch_trailing_probe` in
+  `tests/sequential_forwarding_divergence.rs`):** the LINEAR multi-tick lowering
   already commits trailing updates at the correct edge (`linear_trailing`,
   measured agreeing), so phase C's change is scoped to the **extraction
   route** — which commits one edge late wherever the last tick sits, top-level
@@ -175,7 +204,8 @@ pinned).
 ### Phase D — rule and fixture housekeeping
 
 * `unprotected_trailing_out_write`: **retire** (its shape now agrees; the m2
-  pin becomes the regression test).
+  pin becomes the regression test). *(SUPERSEDED — phase C deferred; the rule
+  was kept and narrowed 2026-08-27, execution note C.)*
 * `unprotected_pretick_out_write` (D1): **narrow to the derived
   path-dependent-boundary rule** — flag only a region whose first leading read
   is not on every path to a commit it protects (`probe_fsm`, W4). V1-shapes are
@@ -187,8 +217,11 @@ pinned).
   hold-path shift is still real), `multi_write_collapse` (window arithmetic),
   the post-entering-edge control read (value unavailable at decision instant),
   `multi_phase_out_write` (except as phase E revisits it).
-* Docs: rebase `SYNCHRONOUS_SEMANTICS.md` §Output timing on the model;
-  retire the guardrail doc to a status note per its own §4c plan.
+* Docs: rebase `SYNCHRONOUS_SEMANTICS.md` §Output timing on the model *(done
+  2026-08-27, commit c1bf21f)*; retire the guardrail doc to a status note per
+  `PRETICK_ALIGNMENT_GUARDRAIL.md` §7 Phase 4 item 4c *(not done — that doc
+  remains current as the measured-evidence record and gained §5.7 for phases B
+  and D instead)*.
 
 ### Phase E — OPTIONAL, gated separately: multi-phase mux (`pulse_plain`)
 
@@ -225,8 +258,10 @@ plausible and unproven. Not part of this migration unless separately approved.
 
 Phase A is small (a script plus an inventory). Phase B is the substantive one:
 one analysis function, one selection-point change, two lowering paths, and the
-fast_counter anchor re-point. Phase C is localized to the trailing handling in
-`shir_lower` with a pinned target. Phase D is wide but mechanical (pins, ui
+fast_counter anchor re-point *(as executed: no analysis function — note B)*.
+Phase C is localized to the trailing handling in `shir_lower` with a pinned
+target *(wrong — the residual is in `control_extract`; note C)*. Phase D is wide
+but mechanical (pins, ui
 tests, opt-outs, docs). B and C are independently landable, each behind gates
 1–5; B-then-C is the natural order because C's flips are a superset check on
 B's machinery.
@@ -234,12 +269,17 @@ B's machinery.
 ## 6. Decision points before implementation starts
 
 1. **Go/no-go per phase** — B and C each change emitted SV for the witness
-   shapes; D retires/narrows two shipped rules.
+   shapes; D retires/narrows two shipped rules. *Ruled 2026-08-26: A, B, D go;
+   C deferred (note C); D narrows D1 and keeps the trailing rule.*
 2. **Transition flag or not.** Recommendation: a short-lived `EmitConfig` field
    (legacy vs cycle-dataflow emission) during B/C development so the byte-diff
    can compare both from one build, **removed in phase D** — not a permanent
    mode (a permanent flag doubles the test matrix for zero corpus benefit given
-   F1).
+   F1). *Ruled: no flag; the `sv-baseline` snapshot/diff was the comparison
+   (note B).*
 3. **`program_counter` back-migration** (RegOut → plain `Out` after C) — a
-   design-preference call on the CPU example, not a correctness one.
+   design-preference call on the CPU example, not a correctness one. *Not done:
+   C has not landed and `examples/cpu/rv32i_cpu_pipelined.rs` keeps
+   `program_counter: RegOut` as of 2026-09-01.*
 4. **Phase E inclusion** — recommendation: defer; derive and measure first.
+   *Ruled: deferred; not measured as of 2026-09-01.*

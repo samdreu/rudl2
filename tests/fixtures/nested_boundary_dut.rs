@@ -24,6 +24,11 @@
 /// `busy` is the outer body's prefix and `acc` the inner body's, and both must land
 /// in the SAME cycle: entering a nested loop must not cost a clock tick. If it did,
 /// cycle 0 would set `busy` alone and every `acc` value would be shifted by one.
+///
+/// The inner `loop` never exits, so the outer body runs exactly once — that IS the
+/// shape under test (a nested tick-bearing loop with no escape), not an accident, so
+/// clippy's deny-by-default `never_loop` is allowed on this item alone.
+#[allow(clippy::never_loop)]
 #[hardware(sequential)]
 async fn nested_boundary(
     clk: Clock<MainClk>,

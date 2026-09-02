@@ -40,9 +40,10 @@ output.
 
 > **Status: research prototype (v0.1.0).** The semantics are anchored and
 > regression-tested, but the language surface is deliberately narrow. Every
-> example module transpiles (34/34); see [Limitations](#limitations) for what
-> is refused **by design** and what is still a gap — the list is measured
-> rather than aspirational.
+> `#[hardware]` module under `examples/` transpiles (34 of 34 as of 2026-09-01;
+> `tools/transpile_coverage.sh` re-measures it); see [Limitations](#limitations)
+> for what is refused **by design** and what is still a gap — the list is
+> measured rather than aspirational.
 
 ---
 
@@ -101,21 +102,29 @@ module det_110101 (
     input  logic in_i,
     output logic out_o
 );
-    logic [2:0] state;          // inferred: `state` is live across the tick
+
+    logic [2:0] state;
 
     always_comb begin
-        if ((state == 3'd6)) out_o = 1'b1;
-        else                 out_o = 1'b0;
+        if ((state == 3'd6)) begin
+            out_o = 1'b1;
+        end else begin
+            out_o = 1'b0;
+        end
     end
 
     always_ff @(posedge clk) begin
-        state <= /* the match, lowered to a nested ternary on {state, in_i} */ ;
+        state <= ((rstn == 1'b0) ? 3'd0 : (({state, in_i} == 4'd1) ? 3'd1 : (({state, in_i} == 4'd3) ? 3'd2 : (({state, in_i} == 4'd4) ? 3'd3 : (({state, in_i} == 4'd7) ? 3'd4 : (({state, in_i} == 4'd8) ? 3'd5 : (({state, in_i} == 4'd11) ? 3'd6 : 3'd0)))))));
     end
+
 endmodule
 ```
 
-Nobody declared a register. `state` became one because it is assigned in the
-loop and read after the tick.
+That block is the CLI's output verbatim (`cargo run -q -p copper-codegen --bin
+copper-transpile -- examples/sequential/pattern_detector.rs`); the one long line
+is the `match` on `(state, in_i)` lowered to a nested ternary over the
+concatenation `{state, in_i}`. Nobody declared a register. `state` became one
+because it is assigned in the loop and read after the tick.
 
 ---
 
@@ -123,13 +132,16 @@ loop and read after the tick.
 
 | | |
 |---|---|
-| **Rust** | edition 2024 (rustc ≥ 1.85; developed on 1.92) |
+| **Rust** | every crate is `edition = "2024"`, which needs rustc ≥ 1.85 (no `rust-version` field pins it; developed on 1.92) |
 | **Verilator** | required for examples and equivalence tests — `brew install verilator` (developed on 5.044) |
+| **Icarus Verilog** | *optional* — `brew install icarus-verilog` (developed on 12.0). Used only by the simulator-throughput benchmark `tests/sim_throughput.rs` and by `tools/stats/simperf.py`; when `iverilog` is absent that test skips its Icarus leg (`iverilog_available`) and the stats script refuses to write a CSV |
 
 Verilator is not optional for a full regression run. A genuinely *absent*
-binary is skipped with an explicit marker; an installed-but-broken one fails
-loudly, by design — "the check silently didn't run" is a bug class this project
-takes seriously.
+binary is skipped with an explicit marker (`VERILATOR_NOT_INSTALLED` in
+`copper-sim/src/verification.rs`); an installed-but-broken one fails loudly, by
+design — "the check silently didn't run" is a bug class this project takes
+seriously. The same three-way split (absent / present / present-but-broken)
+applies to Icarus.
 
 ## Quick start
 
@@ -170,28 +182,36 @@ tools/regression.sh --no-examples    # build + CLI + tests, no Verilator
 tools/regression.sh --example lfsr   # one named example
 ```
 
-The driver also enforces four wiring guards, because "the check silently didn't
+The driver also enforces five wiring guards, because "the check silently didn't
 run" has been a recurring bug class here: every `examples/**.rs` is registered as
 a `[[example]]` (**G-A**), every registered example actually ran (**G-B**), every
-`tests/*.rs` produced a test binary that ran (**G-C**), and the corpus differential
-sweep covered every `#[hardware]` module and ran (**G-D**). It prints every
+`tests/*.rs` (root and per-crate) produced a test binary that ran (**G-C**), the
+corpus differential sweep covered every module in `examples/` and
+`tests/fixtures/` and ran with Verilator present (**G-D**), and — printed rather
+than enforced — how many of those swept modules are additionally anchored to an
+independent hand-written Verilog reference (**G-E**). It prints every
 `#[ignore]`d test on each run so a deliberately-skipped check stays visible.
 
 ### The corpus differential sweep
 
 `build.rs` generates one equivalence case per `#[hardware]` module in `examples/`
-and `tests/fixtures/`: seeded random stimulus into the simulator, and the
-SystemVerilog that module transpiles to Verilated against the same trace, 200
-cycles each. No reference model is needed — the simulator and the emitted SV are
-two independent implementations of one source, so comparing them is already an
-oracle — which is what makes a case cheap enough to have for *every* module
-rather than for whichever ones someone wrote a harness for.
+and `tests/fixtures/` (not `src/`, and not modules defined inline in a
+`tests/*.rs` file): seeded random stimulus into the simulator, and the
+SystemVerilog that module transpiles to Verilated against the same trace — 200
+cycles for a sequential module, 64 vectors for a combinational one (`SEQ_CYCLES`
+/ `COMB_VECTORS` in `build.rs`). No reference model is needed — the simulator
+and the emitted SV are two independent implementations of one source, so
+comparing them is already an oracle — which is what makes a case cheap enough to
+have for *every* module rather than for whichever ones someone wrote a harness
+for.
 
 A module the sweep cannot run gets an `#[ignore]` with its reason, never an
 omission, and G-D fails if the generator quietly stops covering something. Widths
-for generic modules, resets for designs whose state starts undefined, and the
-reason for each skip live in three tables in `build.rs`. See
-`design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`.
+for generic modules (`PARAMS`), resets for designs whose state starts undefined
+(`RESET`), the reason for each skip (`SKIP`), and an optional independent
+Verilog reference to check the module against as well (`REFERENCE`) live in four
+tables in `build.rs`. See `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md` and
+`design_docs/ANCHORING_A_MODULE.md`.
 
 ### Transpiling from the command line
 
@@ -207,10 +227,13 @@ cargo run -q -p copper-codegen --bin copper-transpile -- examples/sequential/pat
 | `--hierarchy` | also emit every submodule the target instantiates, deepest-first |
 | `--list` | list the hardware modules in the file, then exit |
 
-The CLI handles **concrete** (non-generic) modules only. Generic modules
-(`const WIDTH_P: usize`, `Bits<W>`, `Clock<D>`) are monomorphized at
-example-run time by the `#[hardware]` macro, so to see their SystemVerilog, run
-the example.
+A **generic** module (`const N: usize`, `Bits<N>`) transpiles to a *parametric*
+SystemVerilog module — `copper-transpile examples/combinational/rotate_right.rs`
+emits `module rotate_right #(parameter int N = 1, parameter int N_LOG = 1)`. The
+CLI cannot choose the widths for you: parameters are often constrained
+(`N_LOG == clog2(N)`, asserted inside the module), so concrete values are
+supplied only when the module is *Verilated* — `HardwareTest::with_params` in
+`copper-sim/src/testing.rs`, or the `PARAMS` table in `build.rs` for the sweep.
 
 ---
 
@@ -257,8 +280,9 @@ regresses.
 ports and `W` write ports on domain `D`, with configurable latencies and
 read-during-write mode (`ReadFirst` / `WriteFirst`), preloadable via `from_fn` /
 `from_contents`. It simulates and transpiles — see
-`examples/memory/dual_port_ram.rs`, checked against an independent hand-written
-RAM template.
+`examples/memory/dual_port_ram.rs`, checked against an independently written
+RAM reference (`examples/memory/sv/dual_port_ram.sv`, a textbook simple-dual-port
+block-RAM template that Copper had no hand in).
 
 ---
 
@@ -290,12 +314,18 @@ Rust #[hardware] fn
 ### The timing model
 
 A tick has four phases: **pre-edge settle → clock edge → post-edge settle →
-post-edge observation**. Simulation is **independent of Rust's async poll
-order** — a well-formed design simulates identically under any task ordering,
-which a dedicated poll-order fuzzer checks. The production scheduler is
-levelized (a topologically-ordered combinational DAG with Tarjan SCC
-condensation); a convergent combinational loop is iterated, a non-convergent one
-is a structural error rather than a hang.
+post-edge observation**. The production scheduler is `SchedulerMode::Levelized`
+(`copper-sim/src/executor.rs`): a topologically-ordered combinational DAG with
+Tarjan SCC condensation, evaluated in one canonical pass, so Rust's async poll
+order cannot influence the result. The older iterate-to-fixpoint delta-cycle
+scheduler is kept permanently as the differential oracle
+(`COPPER_SCHEDULER=fixpoint`), and *that* is what the poll-order fuzzer
+(`tests/poll_order_fuzz.rs`) exercises — a well-formed design must simulate
+identically under any `PollOrder` there, or the levelized-vs-fixpoint comparison
+loses its footing. A convergent combinational loop is iterated to a fixed point
+(`iterate_scc`); one that is still changing after `OSCILLATION_THRESHOLD` passes
+is a **panic** naming the offending SCC, not a hang and not a silent
+approximation.
 
 The full semantics live in
 [`design_docs/SYNCHRONOUS_SEMANTICS.md`](design_docs/SYNCHRONOUS_SEMANTICS.md).
@@ -322,27 +352,36 @@ Verilog, not merely against matching behavior.
 
 Current state, as of the last full regression run:
 
-- **1006 tests pass, 0 fail, 23 ignored** across 122 test binaries
+- **1010 tests pass, 0 fail, 21 ignored** across 123 test binaries
 - **26 of 26 examples pass**, Verilator equivalence included
-- **131 corpus differential cases pass**, 12 ignored with a recorded reason
+- **133 corpus differential cases pass**, 10 ignored with a recorded reason
 - the pipelined RV32I CPU matches its Verilated self **cycle-for-cycle on all
   13 architectural programs** (`tests/rv32i_pipelined_verilator.rs`)
-- all four wiring guards (G-A / G-B / G-C / G-D) clean
+- all five wiring guards (G-A / G-B / G-C / G-D / G-E) clean; G-E reports 2
+  swept modules anchored to an independent hand-written reference on top of the
+  sim-vs-emitted-SV check (`ram_read_first`, `bit_not_bits` — the `REFERENCE`
+  table in `build.rs`)
 
-Every ignored test prints its reason on each run. They are divergence witnesses,
-shapes refused by design, modules blocked on a recorded transpiler cause, and one
-documented startup transient — not silent skips.
+Every ignored test prints its reason on each run. They are pinned one-cycle
+divergence witnesses that keep `allow_pretick_alignment` on purpose, shapes
+refused by design, a structural parent with no simulatable body, the pipelined
+CPU (anchored in its own lane because the sweep cannot supply its `Memory`
+parameter), diagnostic printouts with no assertions, and one documented startup
+transient — not silent skips. `tools/regression.sh` prints the full list with
+reasons at the end of every run (the sweep's come from the `SKIP` table in
+`build.rs`; three more are hand-written under `tests/`).
 
 ---
 
 ## Limitations
 
 Measured, not guessed — **34 of 34** `#[hardware]` modules in `examples/`
-transpile (`tools/transpile_coverage.sh` prints the current number). The cause
-ledger that used to sit here — `Vec` ports, tuple-returning helpers, struct
-pipeline latches, const match patterns, the word-indexed register file, the
-whole-file `spawn_uart` rejection — is empty as of 2026-08-27; its full history
-lives in [`TODO`](TODO).
+transpile as of 2026-09-01 (`tools/transpile_coverage.sh` prints the current
+number). The cause ledger that used to sit here — `Vec` ports, tuple-returning
+helpers, struct pipeline latches, const match patterns, the word-indexed
+register file, the whole-file `spawn_uart` rejection — is empty as of
+2026-08-27; its full history lives in [`TODO`](TODO), the engineering journal
+and cause ledger (dated entries, not a curated open list).
 
 Transpiling is not the same as being *checked*: coverage counts acceptance, and
 the corpus sweep above is what says the emitted SystemVerilog agrees with the
@@ -368,25 +407,48 @@ counterexample rather than lowered to something plausible:
   evidence in
   [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md)
   so they are not re-tried.
-- A **wait loop that ticks before testing** its condition, and `continue`
-  inside such a wait — refused orderings, each with its own diagnostic.
-- **Zero-latency memories**, two accesses to one memory port in a cycle, and
-  run-time-computed memory preloads — memory shapes that would lower to
-  something subtly wrong.
+- A **wait loop that ticks before testing** its condition (a repeating wait must
+  be `loop { <test>; clk.tick().await; }`), and `continue` inside a nested loop
+  — refused orderings, each with its own diagnostic
+  (`copper-codegen/src/control_extract.rs`).
+- **Zero-latency memories** (`READ_LAT` and `WRITE_LAT` must both be at least
+  1), a memory port accessed more than once in one cycle
+  (`check_memory_staging`), a plain `Out` driven from a memory read result
+  across clock phases (`memory_result_drives_plain_out`), and memory preloads
+  that are not a closure written at the `from_fn` call site — memory shapes
+  that would lower to something subtly wrong.
 - **Two writes to one array register in a cycle**: `let mut regs = [Bits<W>; N]`
   lowers to storage with one write port; a second write statement in the same
   cycle is refused with the muxed-address rewrite suggested.
+- `while` loops (write `loop { …; clk.tick().await; }`), `..rest` struct
+  update, and or-patterns that bind a name — each a spanned "not supported"
+  error from `copper-codegen/src/chir_lower.rs`.
 
 **Gaps** — expressible in the simulator, not yet in the transpiler:
 
-- the division operator `/` (`%` works);
-- a behavioral module is **single-clock**; multi-clock designs compose clock
-  domains through `#[hardware(structural)]` parents (transpile-only today);
-- the CLI transpiles **concrete** modules only — generic ones are
-  monomorphized at example-run time;
+- the division operator `/` (`%` works — see `lower_binop` in
+  `copper-codegen/src/chir_lower.rs`);
+- a behavioral module is **single-clock** (the macro requires exactly one
+  `Clock<D>` parameter); multi-clock designs compose clock domains through
+  `#[hardware(structural)]` parents, which transpile but have no simulatable
+  body — the simulator wires the hierarchy by hand;
 - a module that *receives* a `Memory` parameter emits a bus the corpus sweep
   cannot drive by itself; anchoring one behaviorally takes a Verilated parent
   that owns the array (`tests/rv32i_pipelined_verilator.rs` is the pattern).
+
+**Pinned divergences** — shapes the simulator and the transpiler still disagree
+on by one cycle, kept as `#[ignore]`d sweep cases with the reason attached
+rather than papered over (`SKIP` in `build.rs`):
+
+- a `RegOut` written *after* the tick in a **single-tick** loop: the transpiler
+  folds the write into this edge, the simulator commits it on the next
+  (`regout_trailing_single_tick`) — reaching for `RegOut` does not fix the
+  trailing plain-`Out` shape the pre-tick rules refuse;
+- a phase-gated cross-tick read (`probe_fsm`, the W4 path-dependent boundary
+  from the guardrail doc);
+- an `Out` first written in the trailing segment drives from cycle 1 in the
+  simulator but from time 0 as a continuous `assign` — a **startup transient**,
+  identical from cycle 1 on (`trailing_constant`).
 
 One correctness rule is worth knowing when reading the generated Verilog: an
 output drive that is *sampled at the clock edge* is emitted from the values the
@@ -401,7 +463,9 @@ And X-propagation cannot be checked against Verilator even in principle
 (Verilator is 2-state), so Copper's 4-state behavior is pinned by its own tests
 instead.
 
-The everything-still-open list lives in [`TODO`](TODO).
+[`TODO`](TODO) is the engineering journal and cause ledger — dated entries
+recording what was measured, decided and closed, not a curated list of what is
+still open.
 
 ---
 
@@ -410,12 +474,15 @@ The everything-still-open list lives in [`TODO`](TODO).
 | | |
 |---|---|
 | [`design_docs/SYNCHRONOUS_SEMANTICS.md`](design_docs/SYNCHRONOUS_SEMANTICS.md) | the timing model — start here |
-| [`design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`](design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md) | the executor/analysis architecture and its sequenced items |
 | [`design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`](design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md) | the pre-tick alignment family — its five compile-time rules, and the rejected fixes with measured evidence |
 | [`design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`](design_docs/CORPUS_DIFFERENTIAL_SWEEP.md) | why every module gets a generated sim-vs-emitted-SV case, and how |
-| [`design_docs/TIMING_MODEL_UNIFICATION.md`](design_docs/TIMING_MODEL_UNIFICATION.md) | how far the simulator's and the transpiler's timing derivations actually diverge — measured |
+| [`design_docs/ANCHORING_A_MODULE.md`](design_docs/ANCHORING_A_MODULE.md) | how to add an independent Verilog reference to a swept module (the `REFERENCE` table) |
 | [`design_docs/LEVELIZED_SCHEDULING_SCOPE.md`](design_docs/LEVELIZED_SCHEDULING_SCOPE.md) | the levelized scheduler |
+| [`design_docs/ARRAY_PORT_ABI.md`](design_docs/ARRAY_PORT_ABI.md), [`design_docs/RECEIVED_MEMORY_ABI.md`](design_docs/RECEIVED_MEMORY_ABI.md) | the emitted port shapes for array-typed ports and for a `Memory` received as a parameter |
+| [`design_docs/CYCLE_DATAFLOW_SEMANTICS.md`](design_docs/CYCLE_DATAFLOW_SEMANTICS.md), [`design_docs/DERIVATION_TABLE.md`](design_docs/DERIVATION_TABLE.md), [`design_docs/PAIRED_IMPLEMENTATION_SCOPE.md`](design_docs/PAIRED_IMPLEMENTATION_SCOPE.md) | the cycle-dataflow denotation behind the pre-tick rules, and its derivation across the corpus |
+| [`design_docs/TIMING_MODEL_UNIFICATION.md`](design_docs/TIMING_MODEL_UNIFICATION.md) | how far the simulator's and the transpiler's timing derivations actually diverge — measured |
 | [`design_docs/TIMING_COVERAGE_MATRIX.md`](design_docs/TIMING_COVERAGE_MATRIX.md) | which timing patterns have an independent hardware anchor |
+| [`design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md`](design_docs/SYNCHRONOUS_SEMANTICS_IMPL_PLAN.md) | the historical implementation plan for the executor/analysis architecture — its status notes are dated; `SYNCHRONOUS_SEMANTICS.md` is normative where they disagree |
 | [`CLAUDE.md`](CLAUDE.md) | orientation for contributors (and for Claude Code) |
 
 `design_docs/OUTDATED/` is history, not authority.
@@ -426,10 +493,30 @@ The everything-still-open list lives in [`TODO`](TODO).
 
 The Copper source does not yet carry a license declaration.
 
-Third-party Verilog vendored as **independent references** under
-`examples/*/sv/` is adapted from
-[BaseJump STL](https://github.com/bespoke-silicon-group/basejump_stl) and is
-covered by the **Solderpad Hardware License v0.51** (Apache-2.0-based),
-Copyright 2016 Michael B. Taylor / BaseJump STL contributors. Each such file
-carries its own attribution header naming the upstream module and the
-adaptations made.
+The Verilog vendored as **independent references** under `examples/*/sv/` and
+`tests/fixtures/reference_sv/` comes from three sources, and each file's header
+is the record:
+
+- **BaseJump STL, under the Solderpad Hardware License v0.51**
+  (Apache-2.0-based), Copyright 2016 Michael B. Taylor / BaseJump STL
+  contributors — the seven files in `examples/basejump/sv/`, plus
+  `examples/combinational/sv/mux.sv`, `ripple_carry_adder.sv`,
+  `rotate_right.sv` and `examples/sequential/sv/lfsr.sv`. Each carries a header
+  naming the upstream module, the license, and the adaptations made
+  (BaseJump macros stripped, widths pinned, `clk_i` renamed).
+- **Hand-written for this repository**, and saying so in the header:
+  `examples/cdc/sv/sync_2ff_ref.sv`, `examples/cdc/sv/two_domain_hierarchy.sv`,
+  `examples/sequential/sv/pattern_detector_010.sv`,
+  `tests/fixtures/reference_sv/ram_read_first.sv`; the other files under
+  `tests/fixtures/reference_sv/` are test-specific reference models written for
+  the tests that name them.
+- **Adapted from third-party tutorial or template sources**:
+  `examples/sequential/sv/shift_register.sv` (chipverify.com, cited in its
+  header), `examples/combinational/sv/priority_encode.sv` (Greg Stitt, University
+  of Florida, cited in its header), and three whose headers record no provenance
+  — `examples/memory/sv/dual_port_ram.sv` (a textbook simple-dual-port block-RAM
+  template), `examples/sequential/sv/pattern_detector.sv`, and
+  `examples/combinational/sv/one_bit_comparator.sv`. No license is recorded for
+  any of these five.
+
+`examples/counter_enable.sv` is tracked but referenced by nothing in the tree.

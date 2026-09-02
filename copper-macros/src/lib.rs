@@ -517,8 +517,9 @@ struct TickAwaitVisitor<'a> {
     // NOTE: `visit_expr_await` currently records *every* `.tick().await` receiver
     // into `found` without checking it against `clock_names`. Either the visit
     // should filter to actual clock params (`clock_names.contains(..)`) — a latent
-    // correctness gap — or this field is vestigial. Flagged during run-copper
-    // setup; left in place pending that decision.
+    // correctness gap — or this field is vestigial. Noted in the 2026-08-26
+    // audit (now design_docs/OUTDATED/AUDIT_2026-08-26.md §4); left in place
+    // pending that decision.
     #[allow(dead_code)]
     clock_names: &'a HashSet<String>,
     found: HashSet<String>,

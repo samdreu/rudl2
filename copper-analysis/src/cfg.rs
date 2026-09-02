@@ -527,9 +527,17 @@ impl Cfg {
 
     /// Combinational `Out` ports whose value is exposed to the **pre-tick alignment
     /// hazard**: the pre-tick segment assigns a register on a path with **no `In`
-    /// read preceding it**, and drives a plain `Out` in that same segment. Returns
-    /// the offending ports, sorted; empty for a combinational module, a module with
-    /// no top-level loop, or one whose outputs are all `RegOut`.
+    /// read preceding it**, and drives a plain `Out` in that same segment whose
+    /// write is *observable across the phase shift* — it reads a register **and** an
+    /// `In` read comb-reaches it (the path-dependent region boundary, W4 /
+    /// `probe_fsm`), or it is not written on every path (the constant-write clause,
+    /// `pc_arm_*`). Since the 2026-08-26 narrowing (see the `NARROWED` note in the
+    /// body) a register-reading write that NO `In` read reaches is an opening-prefix
+    /// drive and is legal: forwarded continuous-assign emission gives it the
+    /// simulator's meaning. Returns the offending ports, sorted; empty for a
+    /// combinational module, a module with no top-level loop, or one whose outputs
+    /// are all `RegOut`. Exact corpus pin: `EXPECTED_FLAGGED` in
+    /// `copper-analysis/tests/pretick_alignment_corpus.rs`.
     ///
     /// # The hazard
     ///
@@ -977,9 +985,12 @@ impl Cfg {
     /// 120** corpus modules, ~30 of which have passing equivalence tests —
     /// `det_010`, `mac_pipeline`, `dual_port_ram`, `bsg_dff_en`, every memory
     /// fixture. Writing a plain `Out` after a tick is the ORDINARY multi-phase
-    /// pattern and is correct; writing it in *two* phases is not. This rule flags
-    /// 9 modules on the same corpus, six of them the synthetic witnesses that
-    /// establish it.
+    /// pattern and is correct; writing it in *two* phases is not. On landing
+    /// (commit `99290da`, 2026-08-25) this rule flagged its synthetic witnesses and
+    /// three real modules (`uart_tx`, `uart_rx`, the CPU's program counter), which
+    /// were migrated to `RegOut`; the exact-set corpus pin today is `pulse_plain`
+    /// alone (`EXPECTED_MULTI_PHASE` in
+    /// `copper-analysis/tests/pretick_alignment_corpus.rs`).
     ///
     /// # What a "phase" is here
     ///

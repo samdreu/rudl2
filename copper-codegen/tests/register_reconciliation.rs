@@ -2,12 +2,13 @@
 //! `copper_analysis::infer_registers` (item 2, "route regs into codegen").
 //!
 //! This makes the shared control/liveness analysis the *authoritative spec* for the
-//! synthesizable register set: codegen still computes registers via its own
-//! `chir_lower` (pre-loop `let mut`) + `shir_lower::find_promoted_wires` (in-loop
-//! wires live across ticks), but that set is now pinned, corpus-wide, to equal the
-//! shared inference. Any future divergence — in either the analysis or the codegen
-//! heuristic — fails here. (Retiring the codegen heuristic to *consume* the shared
-//! set directly is a behavior-neutral follow-up, since this proves they agree.)
+//! synthesizable register set. Since 2026-08-27 (commit `d7b2483`) `chir_lower`
+//! CONSUMES `fir.registers` — the shared inference — for the pre-loop `let mut`
+//! registers rather than recomputing them; `shir_lower::find_promoted_wires` still
+//! promotes in-loop wires that are live across ticks on its own. This test pins,
+//! over every sequential fixture, that what codegen emits equals the shared
+//! inference, so a divergence in either the analysis or the promotion pass fails
+//! here.
 //!
 //! For each `#[hardware(sequential)]` module in the fixtures, transpile it and
 //! extract the flip-flops of the *generated* SV (`<=` targets minus outputs, via

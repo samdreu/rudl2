@@ -1,13 +1,27 @@
-//! **D1: guarded. D2: fixed.** Two silent sim ≠ synthesized-SV divergences, both from
-//! the pre-edge/post-edge alignment of the coroutine's loop segments. Every
-//! assertion here records *today's* behaviour so it flips loudly when either is
-//! fixed — do not "fix" this file by relaxing it.
+//! **D1: guarded (narrowed 2026-08-26). D2: fixed.** Two silent sim ≠
+//! synthesized-SV divergences, both from the pre-edge/post-edge alignment of the
+//! coroutine's loop segments. Every assertion here records *today's* behaviour so
+//! it flips loudly when either changes — do not "fix" this file by relaxing it.
 //!
 //! **Plan of record: `design_docs/PRETICK_ALIGNMENT_GUARDRAIL.md`** — the variant
-//! map, the hardware adjudication, the corpus status table, the two rejected fixes,
+//! map, the hardware adjudication, the corpus status table, the rejected fixes,
 //! the guardrail acceptance criteria, and the phased plan. Read
 //! `SYNCHRONOUS_SEMANTICS.md` §Output timing for context; this is a third member of
 //! the same family as the multi-write-around-a-tick collapse.
+//!
+//! **What changed after the sections below were written (2026-08-26, cycle-dataflow
+//! phases B and D — `design_docs/PAIRED_IMPLEMENTATION_SCOPE.md`).** The transpiler
+//! now emits a *forwarded* continuous assign for an opening-prefix drive (the D1
+//! shape with no `In` read reaching the write), which gives the SV the meaning the
+//! simulator always had — so the bare V1 shape, V5 and V7 AGREE today
+//! (`hazard_v1_assign_then_write_dissolved`, `pre_tick_update_forwarding_agrees_end_to_end`,
+//! `d_narrowing_battery_verdicts`), and the rule was narrowed to the READ-PRECEDED,
+//! path-dependent class (W4, `probe_fsm`) plus the constant-write clause
+//! (`pc_arm_*`, `branch_merge_explicit`). The independent `ref_fast_counter`
+//! reference anchors the *corrected spelling* the real designs migrated to (update
+//! after the tick), which is what "the simulator is wrong" below adjudicated. The
+//! "49 clocked modules / 8" figures are the 2026-08-21 sweep, kept as history; the
+//! current exact sets live in `copper-analysis/tests/pretick_alignment_corpus.rs`.
 //!
 //! # Divergence 1 — a pre-tick register update is forwarded to a same-segment read
 //!

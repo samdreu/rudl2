@@ -72,10 +72,6 @@ const SKIP: &[(&str, &str)] = &[
          cross-tick read still disagrees with the transpiler",
     ),
     (
-        "rv32i_cpu",
-        "does not transpile: cause F, a `Vec<Bits<32>>` port (TODO, TRANSPILER COVERAGE)",
-    ),
-    (
         "rv32i_cpu_pipelined",
         "ANCHORED OUTSIDE THIS SWEEP as of 2026-08-27: tests/rv32i_pipelined_verilator.rs \
          runs all 13 architectural programs on the simulator AND on the transpiled core \
@@ -92,25 +88,14 @@ const SKIP: &[(&str, &str)] = &[
     // KNOWN-WRONG lowering with a working twin in the same file that DOES sweep, so
     // a fix shows up as an entry that can be deleted. The failure mode named in each
     // reason is the one actually observed, not the one predicted.
-    (
-        "bit_not_bits",
-        "WRONG LOWERING, AND THE TRANSPILER'S: `!` on a `Bits<N>` emits SystemVerilog `!` \
-         (LOGICAL negation) rather than `~`, so the result collapses to one bit — Verilator \
-         reports WIDTHTRUNC on the LOGNOT. LOCALISED by an independent reference (`assign o = \
-         ~a`, tests/fixtures/reference_sv/bit_not_bits.sv, wired up in REFERENCE above): it \
-         AGREES with the simulator and disagrees with the emitted SV, so the simulator is \
-         right and the lowering is wrong. `bit_not_via_xor` is the working spelling and \
-         sweeps; `bit_not_bool` pins that `!` on a bool is correct, so a fix must not make \
-         `!` bitwise everywhere. Delete this entry when the lowering emits `~`; the anchor \
-         is already in place",
-    ),
-    (
-        "lit_width_in_ternary",
-        "WRONG WIDTH: a `Bits::<32>::from_lit` with no sibling operand to take its width \
-         from emits a 64-bit literal — WIDTHTRUNC into the 32-bit port. \
-         `lit_width_via_locals` is the same value through explicitly-typed `let` bindings \
-         and sweeps",
-    ),
+    //
+    // A row here CANNOT tell you when it has gone stale: the generated case's body is
+    // replaced by a `panic!`, so `--ignored` proves nothing. Two rows sat here after
+    // their lowerings were fixed (`bit_not_bits` — `!` on `Bits<N>` now emits `~` —
+    // and `lit_width_in_ternary` — the literal now takes the port's width), found only
+    // by a 2026-09-01 audit that re-transpiled them; the `bit_not_bits` REFERENCE
+    // anchor had been inert the whole time. Re-transpile the module before trusting
+    // a reason that names emitted text.
     (
         "out_from_reg_before_commit",
         "ONE-CYCLE DIVERGENCE, GUARDED as of 2026-08-27: the trailing clause of \
@@ -210,9 +195,9 @@ const PARAMS: &[(&str, &[(&str, i64)])] = &[
 /// many there are on every run — the gap is tracked rather than rediscovered.
 const REFERENCE: &[(&str, &str)] = &[
     ("ram_read_first", "tests/fixtures/reference_sv/ram_read_first.sv"),
-    // Anchored while still SKIPped, deliberately: the row is inert until the SKIP
-    // below is deleted, and it is what proved the `!` bug is the TRANSPILER's and
-    // not the simulator's. Ready the moment the fix lands.
+    // This reference is what proved the original `!`-on-`Bits<N>` bug was the
+    // TRANSPILER's and not the simulator's (it agreed with the sim and disagreed with
+    // the emitted SV). Live since the module's SKIP row was deleted on 2026-09-01.
     ("bit_not_bits", "tests/fixtures/reference_sv/bit_not_bits.sv"),
 ];
 
@@ -330,16 +315,37 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
 
+    // Validate the SKIP table the same way. A row whose module no longer exists is
+    // not a skip, it is a sentence nobody reads — `rv32i_cpu` sat here for days after
+    // the file it named was deleted (2026-08-26 → 2026-09-01), with its reason still
+    // describing a `Vec<Bits<32>>` port that was long gone.
+    {
+        let leaves: Vec<&str> =
+            covered.iter().map(|n| n.rsplit("::").next().unwrap_or(n)).collect();
+        for (module, _) in SKIP {
+            assert!(
+                leaves.contains(module),
+                "SKIP names `{module}`, which is not a module the sweep covers — the row is \
+                 dead. Delete it (or fix the name) so the table stays a list of reviewed \
+                 exclusions rather than a place stale reasons go to be believed"
+            );
+        }
+    }
+
     // The anchoring ledger. A module cross-checked only against the transpiler's own
     // output is verified for CONSISTENCY; one checked against an independent
     // reference is verified for SEMANTICS. Keeping the two counts apart is the point
     // — see REFERENCE above — and G-E in tools/regression.sh prints the remainder so
     // it stays visible instead of being rediscovered by an audit.
+    //
+    // A module that is both REFERENCE'd and SKIP'd is NOT counted as anchored: its
+    // reference leg never runs, so the row is inert. (`bit_not_bits` was exactly that
+    // for a week, and G-E over-reported by one the whole time.)
     let anchored = covered
         .iter()
         .filter(|n| {
             let leaf = n.rsplit("::").next().unwrap_or(n);
-            REFERENCE.iter().any(|(m, _)| *m == leaf)
+            REFERENCE.iter().any(|(m, _)| *m == leaf) && !SKIP.iter().any(|(m, _)| *m == leaf)
         })
         .count();
     let _ = writeln!(

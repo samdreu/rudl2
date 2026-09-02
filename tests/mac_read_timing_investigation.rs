@@ -49,4 +49,15 @@ fn mac_pipeline_sim_read_cadence() {
     eprintln!("  sim  samples a       : {samples:?}");
     eprintln!("  hand Verilog samples : [10, 13, 16]  (cycles 0,3,6)");
     eprintln!("  transpiler samples   : [10, 13, 16]  (phase-0 edges 0,3,6)");
+
+    // The check. Until 2026-09-01 this test only PRINTED the comparison, so it was
+    // green whatever the simulator sampled; the expectation lived in the comments
+    // above. The hardware schedule is `a` sampled at cycles 0, 3, 6 — one-cycle-early
+    // sampling would read 10, 12, 15 and register-lagged sampling would drop 16 off
+    // the end of the trace, both of which this rejects.
+    assert_eq!(
+        samples,
+        [10, 13, 16],
+        "mac_pipeline sampled `a` on the wrong cycles (hardware: 0,3,6); trace {trace:?}"
+    );
 }

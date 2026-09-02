@@ -91,20 +91,23 @@ pub struct HardwareExecutor {
 /// Which settling algorithm [`HardwareExecutor::poll_tasks`] uses within a phase
 /// (item 6 — levelized dependency-graph scheduling).
 ///
-/// [`SchedulerMode::Fixpoint`] is the default and the production behavior: poll
-/// every task repeatedly until a full pass produces no change (the delta-cycle
-/// loop). [`SchedulerMode::Levelized`] instead polls each task **once** in a
-/// topological order derived from the inter-module combinational dependency graph
+/// [`SchedulerMode::Levelized`] is the default and the production behavior
+/// (`COPPER_SCHEDULER=fixpoint` selects the other): it polls each task **once** in
+/// a topological order derived from the inter-module combinational dependency graph
 /// — a consumer is always polled after every producer whose *plain-`Out`* output
-/// it reads, so a single pass settles an acyclic combinational graph. It is
-/// **provably equivalent** to the fixpoint settle on any well-formed design and is
-/// validated differentially against it corpus-wide (`tests/levelized_differential.rs`).
+/// it reads, so a single pass settles an acyclic combinational graph.
+/// [`SchedulerMode::Fixpoint`] instead polls every task repeatedly until a full
+/// pass produces no change (the delta-cycle loop). Levelized is **provably
+/// equivalent** to the fixpoint settle on any well-formed design and is validated
+/// differentially against it on the hand-built topologies in
+/// `tests/levelized_differential.rs` and the golden-trace designs, which run under
+/// both modes.
 ///
 /// The fixpoint scheduler stays in the tree permanently as the differential oracle
-/// even after levelized becomes the default (like the [`PollOrder`] knob). A
-/// genuine combinational cycle becomes one multi-task strongly-connected component
-/// that is iterated to a fixpoint *within itself* while the acyclic remainder is
-/// still single-passed (item-6 phase 3).
+/// (like the [`PollOrder`] knob, whose fuzzer is pinned to it). A genuine
+/// combinational cycle becomes one multi-task strongly-connected component that is
+/// iterated to a fixpoint *within itself* while the acyclic remainder is still
+/// single-passed; a non-convergent one panics naming the whole SCC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SchedulerMode {
     /// Iterate-to-fixpoint delta-cycle loop — retained permanently as the
@@ -815,7 +818,7 @@ impl HardwareExecutor {
         // so the primitive constructs (flip-flop `q<=d`, enabled register,
         // synchronous-read RAM) match hand-written Verilog. Held/registered OUTPUT
         // ports that need one more cycle of latency use an explicit `RegOut`.
-        // See design_docs/EXECUTOR_CONVENTION_EXPERIMENT.md.
+        // See design_docs/OUTDATED/EXECUTOR_CONVENTION_EXPERIMENT.md.
         //
         // All three phase/resolution/call-id signals are keyed per clock domain
         // (`Domain`), so ticking this clock cannot perturb any other domain's

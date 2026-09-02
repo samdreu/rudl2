@@ -1,11 +1,11 @@
-//! Corpus differential sweep, **phase 2** — one generated case per `#[hardware]`
-//! module in `tests/fixtures/`.
+//! Corpus differential sweep — one generated case per `#[hardware]` module in
+//! `tests/fixtures/` and `examples/`.
 //!
 //! The cases are written by `build.rs`, not by hand: simulator vs Verilated
 //! emitted-SystemVerilog needs no reference model, so there is nothing per-module
 //! for a person to supply, and coverage stops depending on who got round to it.
-//! `tests/corpus_equivalence.rs` (phase 1) is the hand-written original of exactly
-//! this wiring, kept for the `examples/` modules the generator does not yet reach.
+//! (The hand-written phase-1 original, `tests/corpus_equivalence.rs`, was deleted
+//! on 2026-08-25 once the generator reached `examples/` too.)
 //!
 //! A module the sweep cannot run still gets a test, `#[ignore]`d with the reason —
 //! from `build.rs`'s `SKIP` table, or because it is generic. `tools/regression.sh`

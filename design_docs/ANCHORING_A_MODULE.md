@@ -16,6 +16,25 @@ many are not, every run. It does not fail — most of the corpus is unanchored a
 blocking on that would help nobody — but the gap stays visible instead of being
 rediscovered by an audit.
 
+**What G-E counts, precisely.** `build.rs` computes it: a module is *anchored* iff
+it is in the sweep's corpus (`examples/` + `tests/fixtures/`), has a `REFERENCE`
+row, **and** is not in `SKIP` — a `REFERENCE`'d module that is also `SKIP`'d never
+runs its reference leg, so the row is inert and is not counted (`bit_not_bits` was
+exactly that from 2026-08-26 until its stale `SKIP` row was deleted on 2026-09-01,
+and G-E over-reported by one the whole time). The result is written as the
+`ANCHORED` / `UNANCHORED` constants in the generated file and as a
+`cargo:warning=anchoring: …` line in the build log, which G-E greps. Verified
+2026-09-01: **2 anchored** (`ram_read_first`, `bit_not_bits`), both live.
+
+What the count does **not** include is every module anchored *outside* the sweep:
+the examples checked against `examples/**/sv/*.sv` through
+`HardwareTest::with_verilog` (their `main()`s and the `tests/*_equivalence.rs`
+that `include!` them), `tests/verilog_hybrid_pipeline.rs` and
+`tests/verilog_fifo_memory_new.rs` (`tests/fixtures/reference_sv/`),
+`tests/det_010_independent_golden.rs`, and `tests/cdc_synchronizer_anchor.rs`.
+G-E is the sweep's ledger, not the repo's; "141 cross-checked against the
+transpiler only" means *within the generated cases*.
+
 ## Adding one
 
 Three steps.
@@ -58,9 +77,14 @@ emits for the same reason. `reference_sv/bit_not_bits.sv` shows it.
 
 Two things that are *not* required, because both sides already agree on them:
 
-- **No `initial` block for memories.** Verilator zero-fills by default
-  (`--x-initial 0`) and the transpiler emits no `initial` either, so the two start
-  from the same state. A *preloaded* memory is a different fixture.
+- **No `initial` block for memories.** The harness passes no `--x-initial` flag
+  (`verify_with_verilator` in `copper-sim/src/verification.rs` runs Verilator with
+  `--cc --exe --build --top-module <name> --Mdir <dir> -Wall -Wno-DECLFILENAME`,
+  plus `-G<param>=<value>` per parameter and `--trace` when tracing) and the
+  generated testbench sets no `+verilator+rand+reset`, so Verilator's 2-state
+  default leaves every array and register at zero; the transpiler emits no
+  `initial` either, so the two start from the same state. A *preloaded* memory is
+  a different fixture.
 - **No reset**, unless the design genuinely has X state before one — in which case
   add a row to `RESET` in `build.rs` naming the reset port and whether it is
   active-low.
@@ -106,8 +130,10 @@ case, the way a guarded 32-bit address is essentially never in range for a
 
 ## Reading a failure
 
-Both legs always run before either is allowed to fail, and the panic names which
-combination you are in — because that *is* the diagnosis:
+Both legs always run before either is allowed to fail (`EquivalenceTest::finish`
+in `tests/common/mod.rs` Verilates the transpiled leg, then replays the same
+stimulus and expectations against the reference with the same `with_params`), and
+the panic names which combination you are in — because that *is* the diagnosis:
 
 | what failed | what it means |
 |---|---|
@@ -116,14 +142,18 @@ combination you are in — because that *is* the diagnosis:
 | both | the transpiler disagrees with the simulator, and both disagree with the reference |
 
 A reference-only failure is also how you localise a bug you already know about.
-`bit_not_bits` is the worked example: `assign o = ~a` agrees with the simulator and
-disagrees with the emitted SystemVerilog, which is what says the `!` lowering is
-wrong rather than the executor.
+`bit_not_bits` was the worked example: while `!` on a `Bits<N>` still lowered to
+logical `!`, `assign o = ~a` agreed with the simulator and disagreed with the emitted
+SystemVerilog, which is what said the lowering was wrong rather than the executor.
+The lowering is fixed and the row is live — it now guards the fix.
 
-Confirm the leg actually ran, too:
+Confirm the leg actually ran, too (`EquivalenceTest::finish` prints this line
+before Verilating the reference):
 
 ```bash
 cargo test --test corpus_generated ::<module>_differential -- --nocapture | grep "INDEPENDENT reference"
 ```
 
-A silently-skipped check is indistinguishable from a passing one.
+A silently-skipped check is indistinguishable from a passing one — and a
+`REFERENCE` row on a module that is also in `SKIP` is exactly that, which is why
+`build.rs` leaves it out of the anchored count.

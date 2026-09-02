@@ -1,18 +1,17 @@
 # Pre-Tick Segment Alignment — Divergence Analysis and Guardrail Plan
 
-> **Status (2026-08-27): the family is GUARDED — five rules, D2 fixed outright.**
-> (`pretick_out_write_before_update` — V8, with its trailing clause — joined on
-> 2026-08-27; the four below plus it each carry an exact-set corpus pin.)
-> Phases 0–3 complete, gates G0–G3 met. D1 is a compile error (the language is
-> restricted); D2 was adjudicated against independent hardware and fixed in the
-> simulator at no corpus cost. Three candidate fixes were tried and rejected with
-> measured evidence before the first shippable rule was found (§5.1–5.3), and two
-> further widenings of D1 were measured and rejected (§5.4) before the discriminator
-> that works was located. This doc is both the plan and the record of what was ruled
-> out and why.
->
-> **The rules, each with an exact-set corpus pin in
-> `copper-analysis/tests/pretick_alignment_corpus.rs`:**
+> **Status (verified against the tree 2026-09-01): the family is GUARDED — four
+> rule functions (one of them carrying a constant-write clause), four exact-set
+> corpus pins; D2 fixed outright.** `pretick_out_write_before_update` (V8) joined
+> on 2026-08-26 and gained its trailing clause on 2026-08-27. Phases 0–3 complete,
+> gates G0–G3 met. D1 is a compile error (the language is restricted); D2 was
+> adjudicated against independent hardware and fixed in the simulator. Three
+> candidate fixes were tried and rejected with measured evidence before the first
+> shippable rule was found (§5.1–5.3), and two further widenings of D1 were
+> measured and rejected (§5.4) before the discriminator that works was located.
+> This doc is both the plan and the record of what was ruled out and why. **Sections
+> §1–§4 and §7–§9 are the 2026-08-21 record and are annotated, not rewritten**;
+> §5.4–§5.7 and the tables in this header describe the rules as they stand.
 >
 > **NARROWED 2026-08-26 (cycle-dataflow phase D, §5.7):** phase B's forwarded
 > emission gave the no-read opening shapes their defined meaning (V1, V5, V7 and
@@ -22,16 +21,52 @@
 > (W4, `probe_fsm`). The hold/conditional-constant clause is unchanged
 > (`pc_arm_*` still diverge). The former ui/fail V1 case is a ui/pass case now.
 >
-> | rule | what it refuses | corpus cost when it landed |
+> **The rules.** All four live in `copper-analysis/src/cfg.rs` as methods on `Cfg`
+> (re-exported as free functions from `copper_analysis`). The corpus-cost column is
+> **history**: each figure was measured once, at the named commit, and is not
+> reproducible from the tree or checked by any test — the exact-set pins below are
+> what is enforced today.
+>
+> | rule | what it refuses | corpus cost when it landed (measured once, not a gate) |
 > |---|---|---|
 > | `unprotected_pretick_out_write` (D1, narrowed §5.7) | a plain `Out` written where an `In` read reaches the write on some path while a register is assigned unprotected on another (path-dependent boundary), or a conditional/constant write in such a segment | — |
-> | …its **constant-write** clause (§5.5) | the same, where the port is written on *some* paths only — a constant is idempotent across the phase shift only if it lands on every path | 3 modules, all measured divergences |
-> | `unprotected_trailing_out_write` (§5.4; narrowed 2026-08-27) | the same hazard past the *last* tick, when the body crosses more than one clock edge per iteration **and some tick sits inside control flow** (`has_nested_tick`, the source-level mirror of extraction's trigger) — the LINEAR class is exempt, measured agreeing; the extracted class is measured one-edge-late wherever the last tick sits | 1 real module (`rv32i_cpu_pipelined`, → `RegOut`) |
-> | `multi_phase_out_write` | a plain `Out` driven in more than one clock phase | 9 modules, six of them its own witnesses |
-> | `pretick_out_write_before_update` (§5.6, 2026-08-26; trailing clause 2026-08-27) | a plain `Out` written before the update of a register it reads — behind a leading read in the pre-tick segment, or anywhere in the trailing segment (whose updates commit at the opening edge) | 0 real modules at landing (caught a compile-only UI fixture); the trailing clause then caught THREE real sim-only-tested modules (`module_composition_hybrid`'s stages, measured divergent as `v8t_stage_publish_then_load`, migrated to the canonical write/read/tick/update spelling) |
+> | …its **constant-write** clause (§5.5; `written_on_all_paths`) | the same, where the port is written on *some* paths only — a constant is idempotent across the phase shift only if it lands on every path | 3 modules, all measured divergences (commit `348ddd0`) |
+> | `unprotected_trailing_out_write` (§5.4; narrowed 2026-08-27) | the same hazard past the *last* tick, gated on `crosses_more_than_one_tick` **and** `has_nested_tick` (the source-level mirror of extraction's trigger) — the LINEAR class is exempt, measured agreeing; the extracted class is measured one-edge-late wherever the last tick sits | 1 real module (`rv32i_cpu_pipelined`'s `program_counter`, → `RegOut`; commit `56233ce`) |
+> | `multi_phase_out_write` | a plain `Out` driven in more than one clock phase | 9 modules, six of them its own witnesses, three real (`rv32i_cpu` — since replaced by `rv32i_cpu_transpilable` — and `uart_tx`/`uart_rx`, → `RegOut`; commit `99290da`) |
+> | `pretick_out_write_before_update` (§5.6, 2026-08-26; trailing clause 2026-08-27) | a plain `Out` written before the update of a register it reads — behind a leading read in the pre-tick segment, or anywhere in the trailing segment (whose updates commit at the opening edge) | 0 real modules at landing (caught a compile-only UI fixture; commit `7abfd98`); the trailing clause then caught THREE real sim-only-tested modules (`tests/module_composition_hybrid.rs`'s stages, measured divergent as `v8t_stage_publish_then_load`, migrated to the canonical write/read/tick/update spelling; commit `b439894`) |
 >
-> **Pinned by:** `tests/sequential_forwarding_divergence.rs` (10 tests, green; each
-> flips loudly when the corresponding divergence is fixed).
+> **Where each is enforced, and the opt-out.** Every rule is a spanned compile
+> error in the `#[hardware(sequential)]` arm of `copper-macros/src/lib.rs`, and
+> every one is silenced — *detection unchanged* — by
+> `#[hardware(sequential, allow_pretick_alignment)]` (`ALLOW_PRETICK` in the
+> macro). `multi_phase_out_write` is additionally enforced by the transpiler in
+> `copper-codegen/src/lib.rs::transpile_target`, with the same opt-out read by
+> `opts_out_of_pretick_alignment`; the other three are macro-only (a module that
+> reaches the transpiler has already compiled through the macro). The opt-out is
+> for modules that exist to *demonstrate* a divergence and must never be reached
+> for in a real design.
+>
+> **The pins.** Each rule has three layers, all green as of 2026-09-01:
+>
+> | rule | unit tests (`cfg.rs` `mod tests`, positive / negative) | trybuild (`copper-macros/tests/ui/`) | exact-set corpus pin (`copper-analysis/tests/pretick_alignment_corpus.rs`) |
+> |---|---|---|---|
+> | `unprotected_pretick_out_write` | `hazard_w4_mixed_alignment_flagged`, `hazard_probe_fsm_flagged` / `hazard_v4_leading_read_not_flagged`, `hazard_v6_post_tick_assign_not_flagged`, `hazard_w8_regout_immunises_mixed_alignment`, `hazard_w9_regout_immunises_the_minimal_case`, `hazard_lfsr_shape_not_flagged`, `hazard_regout_only_module_not_flagged`, and the three DISSOLVED shapes `hazard_v1_assign_then_write_dissolved`, `hazard_v5_trailing_read_dissolved`, `hazard_v7_escape_across_tick_dissolved` | `fail/pretick_alignment.rs` (`mixed_alignment`), `pass/pretick_alignment_ok.rs` (`post_tick_update`, `registered_output`, `leading_read`, `constant_write`, `forwarded_opening_drive`) | `pretick_alignment_hazard_flags_exactly_the_known_divergent_modules`; `EXPECTED_FLAGGED` = {`tests/fixtures/probe_timing_dut.rs::probe_fsm`, `tests/sequential_forwarding_divergence.rs::w4_mixed_alignment`, `tests/fixtures/control_extraction_dut.rs::branch_merge_explicit`, `…::pc_arm_toggle`, `…::pc_arm_write`} |
+> | …constant-write clause | `a_conditional_constant_write_is_flagged` / `an_unconditional_constant_write_is_not_flagged` | `pass/pretick_alignment_ok.rs::constant_write` (no dedicated `fail/` case; the corpus pin carries the positives) | the last three entries of `EXPECTED_FLAGGED` above |
+> | `unprotected_trailing_out_write` | `trailing_folded_loop_flagged`, `trailing_branch_nested_tick_flagged` / `trailing_linear_class_exempt` | **none** — no `ui/fail` or `ui/pass` case exercises this rule through the macro | `trailing_out_write_flags_exactly_the_demonstration_modules`; `EXPECTED_TRAILING` = {`tests/sequential_forwarding_divergence.rs::trailing_update`, `…::branch_trailing`} |
+> | `multi_phase_out_write` | **none in `cfg.rs`**; the positive/negative pair is `tests/sequential_forwarding_divergence.rs::the_rule_flags_the_plain_form_and_not_the_registered_one` (`pulse_plain` flagged, `pulse_registered` clean) | **none** | `multi_phase_out_write_flags_exactly_the_demonstration_modules`; `EXPECTED_MULTI_PHASE` = {`tests/sequential_forwarding_divergence.rs::pulse_plain`} |
+> | `pretick_out_write_before_update` | `v8a_write_between_read_and_update_flagged`, `v8t_trailing_write_before_update_flagged` / `v8b_write_after_update_not_flagged`, `v8c_write_before_read_not_flagged`, `v8_constant_write_not_flagged`, `v8_regout_not_flagged`, `v8_unrelated_update_after_write_not_flagged`, `v8t_trailing_write_after_update_not_flagged` | `fail/write_before_update.rs` (`stale_publish`), `pass/pretick_alignment_ok.rs` (`v8b_publish_after_update`, `v8c_publish_before_read`), `pass/single_loop_local_ok.rs::accum` (reordered to V8c) | `write_before_update_flags_exactly_the_demonstration_modules`; `EXPECTED_WRITE_BEFORE_UPDATE` = {`tests/sequential_forwarding_divergence.rs::v8a_read_write_update`, `…::v8d_temp_renamed_update`, `tests/fixtures/out_phase_dut.rs::out_from_reg_before_commit`, `…::v8t_stage_publish_then_load`} |
+>
+> The four corpus pins scan every clocked (`sequential` / `synchronizer`) module
+> under `examples/`, `src/` and `tests/` and print the scanned count
+> (`cargo test -p copper-analysis --test pretick_alignment_corpus -- --nocapture`);
+> that printout, not any figure in this document, is the current corpus size. Every
+> pinned module carries `allow_pretick_alignment`, so the pins are also the proof
+> that the opt-out silences the error and not the detection.
+>
+> **Measured, not argued:** `tests/sequential_forwarding_divergence.rs` (19
+> `#[test]`s, none ignored, all sim-vs-Verilator on the transpiled SV; each records
+> *today's* verdict and flips loudly when a divergence is fixed or a dissolution
+> regresses).
 >
 > **Read first:** `SYNCHRONOUS_SEMANTICS.md` §Output timing. This is the **third**
 > member of the blocking/non-blocking family, after the `Out`-hold semantics and the
@@ -79,7 +114,10 @@ at all gets none — `inject_synced_reads` returns early on `in_params.is_empty(
 > passthrough gives `mid == out`; the simulator gave `1/0 2/1 3/2 …`), then fixed in
 > `classify_reads`: a read feeding a combinational `Out` in a segment that assigns no
 > register is `Immediate`. Corpus cost: **666/667**, the one failure being the test
-> that pinned the old behaviour. A first attempt keyed on the *module* ("no registers
+> that pinned the old behaviour (measured once at commit `d640526`, 2026-08-21 —
+> `git log -S"666/667"` — not a regression gate; the fix is pinned today by
+> `tests/sequential_forwarding_divergence.rs::d2_is_fixed_and_d1_still_demonstrates_the_hazard`
+> and the unit test `trailing_reads_are_immediate` in `cfg.rs`). A first attempt keyed on the *module* ("no registers
 > anywhere") broke three passing tests including a hardware-anchored one, because
 > `det_010_awaits` and `if_tick` have no data registers yet read inside control flow
 > whose *tick count* depends on the sampled value; the narrowed per-read rule excludes
@@ -97,9 +135,12 @@ needs a *clocked producer*, which is why no existing test caught it.
 
 ### Relationship to `multi_write_collapse`
 
-Same family, **complementary triggers** — neither rule subsumes the other. Verified:
-`multi_write_collapse` returns `[]` for both the D1 minimal case and `fast_counter`,
-while returning `["o"]` for the shape it targets.
+Same family, **complementary triggers** — neither rule subsumes the other. Checked
+by hand on 2026-08-21: `multi_write_collapse` returns `[]` for both the D1 minimal
+case and `fast_counter`, while returning `["o"]` for the shape it targets. **No
+unit test pins that `[]` result** — `copper-analysis/tests/analysis_semantics.rs`'s
+`multi_write_*` tests cover the collapse rule's own shapes only. (Since the
+2026-08-26 narrowing, §5.7, the D1 minimal case is a legal shape anyway.)
 
 | | `multi_write_collapse` | D1 |
 |---|---|---|
@@ -143,6 +184,15 @@ its own transpiled SV.
 | V6 | `o.write(r); tick; r = r+1;` | agree |
 | V7 | `r = r+1; o.write(s); tick; s = r;` | **DIVERGE** |
 
+> **Superseded for V1/V2/V3/V5/V7 (2026-08-26, §5.7).** These verdicts are the
+> 2026-08-21 measurement against the *unforwarded* `assign o = r` lowering. Under
+> phase B's forwarded opening-prefix emission all five **agree** — re-measured in
+> `tests/sequential_forwarding_divergence.rs::d_narrowing_battery_verdicts` and
+> `pre_tick_update_forwarding_agrees_end_to_end`, and asserted DISSOLVED by the
+> `cfg.rs` unit tests `hazard_v1_assign_then_write_dissolved`,
+> `hazard_v5_trailing_read_dissolved`, `hazard_v7_escape_across_tick_dissolved`. V4
+> and V6 still agree. What the rule retains is W4 (§4 Q1), which is not in this table.
+
 Two results here are load-bearing and neither was predicted:
 
 - **V5 vs V4** — the input read must **precede** the assignment. A read after it does
@@ -185,17 +235,19 @@ inherently wrong — see the correction below.
 Rule tried: *a register assigned in the pre-tick segment with no `In` read
 comb-reaching it on that path.* Path-sensitive, over `Cfg`, reusing
 `leading_read_reaches`. **Matched all 7 variants — and over-flagged the corpus.**
-12 of 77 clocked modules:
+12 of 77 clocked modules (measured once at commit `7bc7c90`, 2026-08-21 — `git log
+-S"12 of 77"` — not a regression gate; the current pinned set is `EXPECTED_FLAGGED`
+in the header, and the corpus pin prints today's scanned count):
 
-| module | copies | status | evidence |
-|---|---|---|---|
-| `fast_counter` | 3 | **TRUE POSITIVE** | measured divergence + hardware adjudication |
-| `add_then_write` | 1 | **TRUE POSITIVE** | the V1 fixture itself |
-| `mac_fsm` | 3 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `mac_fsm_sim_matches_transpiled_verilog` passes |
-| `if_tick_explicit` | 1 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `if_tick_sim_matches_transpiled_verilog` passes |
-| `probe_fsm` | 1 | **TRUE POSITIVE** — same defect as D1, confirmed (Q2) | a leading read on every path fixes it, exactly as it fixes V1; plain `Out` |
-| `branch_merge_explicit` | 1 | **AGREES** — measured (phase 0a) | plain `Out`, but every write is a CONSTANT; produced the constant-write clause. An earlier revision wrongly recorded this as `RegOut` |
-| `ram_prewrite` | 1 | **UNKNOWN** (plain `Out`, so the refined rule retains it) | `probe_mem_latency` is `#[ignore]`d — phase 0b stands |
+| module | copies | status (2026-08-21) | evidence | today |
+|---|---|---|---|---|
+| `fast_counter` | 3 | **TRUE POSITIVE** | measured divergence + hardware adjudication | the three copies were migrated to the post-tick sticky update (§7 3b); the witness copy in `sequential_forwarding_divergence.rs` is DISSOLVED by §5.7 and compiles with no opt-out |
+| `add_then_write` | 1 | **TRUE POSITIVE** | the V1 fixture itself | DISSOLVED 2026-08-26 (§5.7): legal, agreeing, no opt-out |
+| `mac_fsm` | 3 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `mac_fsm_sim_matches_transpiled_verilog` passes | not flagged |
+| `if_tick_explicit` | 1 | **FALSE POSITIVE** — output is `RegOut` (Q1) | `if_tick_sim_matches_transpiled_verilog` passes | not flagged |
+| `probe_fsm` | 1 | **TRUE POSITIVE** — same defect as D1, confirmed (Q2) | a leading read on every path fixes it, exactly as it fixes V1; plain `Out` | still flagged (the retained W4 class); in `EXPECTED_FLAGGED` |
+| `branch_merge_explicit` | 1 | **AGREES** — measured (phase 0a) | plain `Out`, but every write is a CONSTANT; produced the constant-write clause. An earlier revision wrongly recorded this as `RegOut` | re-measured DIVERGENT by the sweep on 2026-08-25 (§5.5) — the 0a trace was too weak to see it; in `EXPECTED_FLAGGED` |
+| `ram_prewrite` | 1 | **UNKNOWN** (plain `Out`, so the refined rule retains it) | `probe_mem_latency` is `#[ignore]`d — phase 0b stands | **narrowed out 2026-08-26** (§5.7): its write is not read-preceded, so it falls on the dissolved side; it never had a behavioral verdict and does not transpile (`tests/mem_latency_probe.rs::probe_mem_latency` remains an `#[ignore]`d diagnostic printout with no assertions) |
 
 Two observations that shape the plan:
 
@@ -283,8 +335,9 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
   **Widening D1 past the head segment: MEASURED AND REJECTED.** Extending it to
   every post-tick segment flags **36 of 120** corpus modules, ~30 of which have
   passing equivalence tests — `det_010`, `mac_pipeline`, `dual_port_ram`,
-  `bsg_dff_en`, every memory fixture. Writing a plain `Out` after a tick is the
-  ORDINARY multi-phase pattern and is correct.
+  `bsg_dff_en`, every memory fixture (measured once at commit `99290da`,
+  2026-08-25 — `git log -S"36 of 120"` — not a regression gate). Writing a plain
+  `Out` after a tick is the ORDINARY multi-phase pattern and is correct.
 
   **What the divergent shape actually is: a plain `Out` driven in TWO phases** —
   which the multi-tick lowering *already refuses* ("output port `p` is driven in
@@ -300,12 +353,19 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
   | clear moved out of the trailing segment | pulse | **DIVERGE** — not the trailing segment |
   | plain ticks, no trailing statements | pulse | **refused by the linear path** |
 
-  So the fix is `Cfg::multi_phase_out_write`, enforced in both front-ends with the
-  same `RegOut` remedy and the same `allow_pretick_alignment` opt-out. It flags 9
-  corpus modules, six of them the synthetic witnesses; the three real ones
-  (`rv32i_cpu`, `uart/system.rs::uart_tx`, `uart/system.rs::uart_rx`) were migrated
-  to `RegOut` and their self-checks are unchanged. Gate: the second exact-set test
-  in `pretick_alignment_corpus.rs`.
+  So the fix is `Cfg::multi_phase_out_write`, enforced in both front-ends
+  (`copper-macros/src/lib.rs` and `copper-codegen/src/lib.rs::transpile_target`)
+  with the same `RegOut` remedy and the same `allow_pretick_alignment` opt-out. On
+  landing it flagged 9 corpus modules, six of them the synthetic witnesses; the
+  three real ones (`examples/cpu/rv32i_cpu.rs` — since replaced by
+  `rv32i_cpu_transpilable` — and `uart/system.rs::uart_tx` / `uart_rx`) were
+  migrated to `RegOut` and their self-checks are unchanged (measured once at commit
+  `99290da`, not a regression gate). Gate:
+  `pretick_alignment_corpus.rs::multi_phase_out_write_flags_exactly_the_demonstration_modules`.
+  Note the "9" is **unverifiable history**: the pin at that same commit already
+  listed exactly {`pulse_plain`}, and that is still its whole `EXPECTED_MULTI_PHASE`
+  today, so the figure predates the witnesses' final form and cannot be
+  reconstructed from the tree.
 
   D1's own rule is UNCHANGED and still head-segment-only — deliberately. The two
   are complementary in the same way D1 and `multi_write_collapse` are.
@@ -321,17 +381,21 @@ noted it could not explain V7. That line of reasoning was looking at the wrong a
 
 ---
 
-## 5. Approaches tried — three rejected, two that landed
+## 5. Approaches tried — three rejected, and the rules that landed
 
-§5.1–5.3 are **rejected** and must not be re-tried; §5.4 and §5.5 record two more
-rejected widenings *and* the rules that eventually worked, kept together so the
-discriminator is read beside the attempts it replaced.
+§5.1–5.3 are **rejected** and must not be re-tried (§5.3 only as a *blanket*
+change — §5.7 records the narrow sub-class where it was later applied on measured
+evidence); §5.4 and §5.5 record two more rejected widenings *and* the rules that
+eventually worked, kept together so the discriminator is read beside the attempts
+it replaced; §5.6 is the derived-first rule; §5.7 is the 2026-08-26 dissolution and
+narrowing.
 
 ### 5.1 "Always-barrier" — REJECTED 2026-08-21
 
 Inject `pre_edge_barrier()` unconditionally at the loop top so alignment stops being
-incidental. Implemented behind `COPPER_ALWAYS_BARRIER` in `copper-macros`, measured,
-reverted.
+incidental. Implemented behind a `COPPER_ALWAYS_BARRIER` env flag in `copper-macros`,
+measured, reverted — the flag no longer exists in the tree (`git log
+-S"COPPER_ALWAYS_BARRIER"` finds the record, commit `7bc7c90`).
 
 - **Fixes** D1's forwarding (V1 sim `[2,3,4…]` → `[1,2,3…]`, matching SV) and leaves
   the already-correct leading-read form alone.
@@ -339,7 +403,8 @@ reverted.
   Moore output shows the **pre**-edge register value where SV's `assign count_out =
   count` shows the post-edge one. `fast_counter`'s count went `[(1,0),(2,0)…]` →
   `[(0,0),(1,0)…]` — still ≠ the independent reference, just wrong elsewhere.
-- **Corpus damage: 22 failures / 654**, and they are the modules that are currently
+- **Corpus damage: 22 failures / 654** (measured once at commit `7bc7c90`,
+  2026-08-21, not a regression gate), and they are the modules that are currently
   *correct* — `counter`, `up_down_counter`, `accumulator_en`, `slow_counter`,
   `traffic_light`, `seq6` equivalence; the `sync_2ff` anchor; poll-order
   independence; the frozen golden traces.
@@ -378,10 +443,47 @@ construction.
 > register too and had exactly the same lag (L-1). The rule is the emission context,
 > not the port type. So `RegOut`'s immunity to the *phase* question this document is
 > about is intact, and unrelated to the forwarding bug that briefly seemed to qualify
-> it. Pinned by `tests/regout_forwarding_equivalence.rs`. Every false positive was a `RegOut` module. The corrected rule keys on
-the output write, which is the same structure `multi_write_collapse` already uses.
+> it. Pinned by `tests/regout_forwarding_equivalence.rs`.
 
-### 5.4 D1 in the TRAILING segment — two widenings REJECTED, then GUARDED 2026-08-25
+Every false positive was a `RegOut` module. The corrected rule keys on the output
+write, which is the same structure `multi_write_collapse` already uses.
+
+### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
+
+Measured by hand-writing the lowering Prost uses (combinational next-value in
+coroutine order; an output write reads the *forwarded* value) and running it under
+Verilator against the simulator. The controlled pair is V1 and V4 — **identical
+designs differing only in a leading `In` read**:
+
+| | sim | current SV | Prost-style SV |
+|---|---|---|---|
+| **V1** (no leading read) | `2 3 4 5 6 7 8 9` | `1 2 3 4 5 6 7 8` ✗ | `2 3 4 5 6 7 8 9` ✓ |
+| **V4** (leading read) | `1 2 3 4 5 6 7 8` | `1 2 3 4 5 6 7 8` ✓ | `2 3 4 5 6 7 8 9` ✗ |
+
+It **fixes D1 exactly** and **breaks the currently-correct case exactly**. Symmetric
+to §5.1: always-barrier fixed the barrier case and broke Moore outputs; Prost-style
+lowering fixes the no-barrier case and breaks the barrier-protected one.
+
+Projected corpus impact (same shape, barrier-protected, currently passing): `lfsr`,
+`det_110101`, `shift_register` — 6 module copies with equivalence tests that would
+start failing. Not individually measured; the V1/V4 pair is the controlled evidence.
+
+> **THE GENERAL RESULT — this is the important part.** No single codegen lowering can
+> match the simulator, because **the simulator is not internally consistent**: two
+> structurally identical modules behave differently depending on whether one of them
+> happens to read an input. For codegen to match, it would have to replicate that
+> incidental rule — i.e. emit different hardware for the same logic based on the
+> presence of an unrelated port read. That is not a lowering anyone should write.
+>
+> So **the simulator must be made uniform first**, and only then can codegen be
+> matched to whichever uniform semantics is chosen. Fixing either side alone is now
+> measured-and-rejected in both directions (§5.1, §5.3).
+
+Note this does **not** impugn Prost: its lowering is correct *for Prost*, whose
+alignment is uniform because it has no barrier mechanism to make it incidental. The
+defect is Copper's, and it is upstream of the lowering.
+
+### 5.4 D1 in the TRAILING segment — two widenings REJECTED, then GUARDED 2026-08-25, NARROWED 2026-08-27
 
 The gap is real and measured: D1's canonical shape moved past the last tick,
 
@@ -394,7 +496,9 @@ examines head → first tick). Pinned as
 `sequential_forwarding_divergence.rs::d1_in_the_trailing_segment_is_an_unguarded_gap`.
 The trailing segment runs in the SAME cycle as the head segment — falling off the
 end of the body and re-entering it costs no clock — so it is exposed to the
-identical phase question. Two ways of covering it were implemented and measured:
+identical phase question. Two ways of covering it were implemented and measured
+(once, at commit `b853d46`, 2026-08-25 — `git log -S"newly flagged, all passing"`
+— not a regression gate):
 
 | widening | newly flagged, all passing | why it is wrong |
 |---|---|---|
@@ -438,12 +542,43 @@ during implementation). `Cfg::crosses_more_than_one_tick` counts tick nodes and 
 a folded tick-bearing loop as more than one, since it crosses an edge per iteration of
 its own.
 
-**Corpus cost: one real module.** `rv32i_cpu_pipelined`'s `program_counter`, migrated
-to `RegOut` — the same remedy its scalar sibling had already been given for the
-multi-phase rule, and the harness discards that port, so only the type and its wire
-changed. The two remaining flagged modules are the demonstration witnesses
-(`trailing_update`, `pulse_plain`), both already carrying `allow_pretick_alignment`.
-Pinned by `pretick_alignment_corpus.rs::trailing_out_write_flags_exactly_the_demonstration_modules`.
+**Corpus cost: one real module** (commit `56233ce`, 2026-08-25).
+`rv32i_cpu_pipelined`'s `program_counter`, migrated to `RegOut` — the same remedy
+its scalar sibling had already been given for the multi-phase rule, and the harness
+discards that port, so only the type and its wire changed. On landing the flagged
+demonstration witnesses were `trailing_update` and `pulse_plain`; `pulse_plain`
+left the set the same day when `written_on_all_paths` was scoped to the region
+being asked about (its trailing `dv.write(Zero)` is an unconditional constant — it
+stays guarded by `multi_phase_out_write`, which is what is actually wrong with it).
+
+#### NARROWED 2026-08-27 — the linear class is exempt (commit `8ffade7`)
+
+The phase-C decision probes of `PAIRED_IMPLEMENTATION_SCOPE.md` measured a witness
+on each side of a second discriminator, **which lowering route the trailing
+statements take**:
+
+| witness (`tests/sequential_forwarding_divergence.rs`) | shape | verdict |
+|---|---|---|
+| `linear_trailing` (`linear_trailing_probe`) | every tick a bare top-level statement — the linear lowering path | **agrees**: the linear path commits trailing updates at the right edge (the 2026-08-25 shared-map work) |
+| `trailing_update` | the last tick inside a folded `for` | **diverges** one cycle |
+| `branch_trailing` (`branch_trailing_probe`) | control extraction with a top-level last tick | **diverges** one cycle — the extraction route commits trailing updates one edge late wherever the last tick sits |
+
+So the rule's remaining refusal is a lowering limitation of the extraction route,
+and it is gated on exactly that: `Cfg::unprotected_trailing_out_write` returns `[]`
+unless **both** `crosses_more_than_one_tick` (two tick nodes, or a folded
+tick-bearing nested loop) **and** `has_nested_tick` (some tick sits inside a
+branch or loop — the source-level mirror of extraction's trigger) hold. Within the
+trailing region — nodes with a tick-free path back to the loop head — it then
+applies D1's two clauses: a write that reads a register, or a write not on every
+path (`written_on_all_paths` over the trailing entries). `linear_trailing` dropped
+its opt-out and compiles clean; it stays in the divergence file as the exemption's
+measured witness. Unit pins in `cfg.rs`: `trailing_linear_class_exempt`,
+`trailing_folded_loop_flagged`, `trailing_branch_nested_tick_flagged`. Exact-set
+pin: `pretick_alignment_corpus.rs::trailing_out_write_flags_exactly_the_demonstration_modules`,
+`EXPECTED_TRAILING` = {`trailing_update`, `branch_trailing`}, both carrying
+`allow_pretick_alignment`. The recorded follow-up is to retire the rule when phase
+C lands the corrected extraction-path trailing lowering (`PAIRED_IMPLEMENTATION_SCOPE.md`,
+Phase C).
 
 **The head rule is unchanged and still head-segment-only**, deliberately: widening #1
 proved the two regions cannot share a rule, and they are now complementary the way D1
@@ -490,10 +625,12 @@ rather than once (`pc_arm_toggle`):
 The two traces are each other shifted by exactly one cycle: a phase shift, not an
 initialisation artifact. `unprotected_pretick_out_write` returns `[]` for both.
 
-**How it was found, and why it had not been.** `tests/corpus_equivalence.rs` (phase 1
-of `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`) ran 200 cycles of seeded random
-stimulus at `branch_merge_explicit`, a fixture that had lived in the tree with only a
-*structural* check on it. The sharpest statement of the finding is that
+**How it was found, and why it had not been.** The corpus differential sweep —
+then `tests/corpus_equivalence.rs`, phase 1 of `design_docs/CORPUS_DIFFERENTIAL_SWEEP.md`;
+since 2026-08-25 (commit `6ce15d6`) generated by `build.rs` into
+`tests/corpus_generated.rs` and guarded as G-D by `tools/regression.sh` — ran 200
+cycles of seeded random stimulus at `branch_merge_explicit`, a fixture that had
+lived in the tree with only a *structural* check on it. The sharpest statement of the finding is that
 `branch_merge` and `branch_merge_explicit` transpile to **byte-identical**
 SystemVerilog (asserted by `control_extraction_structural.rs`), the async twin agrees
 with that SV for all 200 cycles, and the explicit twin leads it by one — so the
@@ -505,11 +642,17 @@ segment (`Cfg::written_on_all_paths`). §5.4 records two widenings rejected for 
 cost — 25 and 10 modules, most of them correct designs — so this one was measured the
 same way before landing:
 
-> **Corpus cost: three modules, and all three are the measured divergences.**
+> **Corpus cost: three modules, and all three are the measured divergences**
+> (measured once at commit `348ddd0`, 2026-08-25; not a regression gate — the
+> three are the constant-write entries of `EXPECTED_FLAGGED` today).
 > `branch_merge_explicit` (the corpus instance the sweep found), plus the two
 > witnesses `pc_arm_write` and `pc_arm_toggle`. **Zero false positives.** 26/26
 > examples and all 93 differential cases unaffected (the sweep's size on the day;
-> `G-D` prints the current count).
+> `G-D` prints the current count). Unit pins in `cfg.rs`:
+> `a_conditional_constant_write_is_flagged`,
+> `an_unconditional_constant_write_is_not_flagged`; sim-vs-Verilator witnesses:
+> `a_write_in_a_state_arm_leads_the_hardware_by_one_cycle`,
+> `the_state_arm_lead_is_systematic_not_a_first_cycle_artifact`.
 
 That is the discriminator §5.4 asked for, and it was hiding in plain sight: *a
 constant is idempotent across the phase shift only if it is written on every path.*
@@ -524,8 +667,8 @@ every corpus scan. A real design in this shape now gets a compile error pointing
 
 **Why this direction rather than a simulator change.** The alternative — teaching the
 executor to run the segment's two jobs in different phases (§5.1's "no single global
-phase choice satisfies both") — is a more complex simulation rule, and the standing
-decision (2026-08-25) is to **limit the design expressions instead**: keep "a value
+phase choice satisfies both") — is a more complex simulation rule, and the direction
+taken (2026-08-25) is to **limit the design expressions instead**: keep "a value
 live across a `clk.tick().await` is a register", keep one value per variable (no
 current/next distinction, as in §10.1's languages), and reject the shapes that
 diverge rather than growing the machinery that reconciles them.
@@ -565,9 +708,19 @@ V8a. The fixture was reordered to V8c's form; the shape is pinned as V8d.
 
 Rule: `Cfg::pretick_out_write_before_update`, three clauses, each with a flipping
 witness (V8c flips the read clause, V8b the update-order clause, a constant write
-the register-read clause). Enforced in the macro with the same
-`allow_pretick_alignment` opt-out; exact-set pinned as the fourth scan in
-`pretick_alignment_corpus.rs`.
+the register-read clause). Enforced in the macro (`copper-macros/src/lib.rs`) with
+the same `allow_pretick_alignment` opt-out; not run by the transpiler. Pins: unit
+tests `v8a_write_between_read_and_update_flagged`, `v8b_write_after_update_not_flagged`,
+`v8c_write_before_read_not_flagged`, `v8_constant_write_not_flagged`,
+`v8_regout_not_flagged`, `v8_unrelated_update_after_write_not_flagged` in
+`cfg.rs`; trybuild `ui/fail/write_before_update.rs` and the `v8b_publish_after_update`
+/ `v8c_publish_before_read` cases of `ui/pass/pretick_alignment_ok.rs`; the
+sim-vs-Verilator battery `v8a_write_between_leading_read_and_update_diverges_known_gap`,
+`v8b_moving_the_write_after_the_update_removes_the_divergence`,
+`v8c_moving_the_write_before_the_read_removes_the_divergence`,
+`v8d_temp_renamed_update_diverges_like_v8a_known_gap`; and the exact-set pin
+`write_before_update_flags_exactly_the_demonstration_modules` (the fourth scan in
+`pretick_alignment_corpus.rs`, `EXPECTED_WRITE_BEFORE_UPDATE` listed in the header).
 
 **The trailing clause (2026-08-27).** The identical mixed-generation hazard
 exists in the trailing segment with no read involved: trailing statements
@@ -581,7 +734,11 @@ sim-only and whose composed pipeline stream also carried the phantom extra
 cycle — migrated to the canonical registered-stage spelling
 (`write; read; tick; update`, which matches `always_ff reg <= f(in); assign out
 = reg` cycle-for-cycle standalone and composed) and their streams re-blessed to
-the true two-flop latency. Honest scope (R6): pre-tick and trailing regions;
+the true two-flop latency (the stages live in `tests/module_composition_hybrid.rs`;
+commit `b439894`). Pins for the clause: `v8t_trailing_write_before_update_flagged` /
+`v8t_trailing_write_after_update_not_flagged` in `cfg.rs`, the witness
+`v8t_trailing_stage_shape_verdict`, and the last two entries of
+`EXPECTED_WRITE_BEFORE_UPDATE`. Honest scope (R6): pre-tick and trailing regions;
 middle segments of multi-tick loops are unexamined (no measured instance);
 conditional writes carry no extra clause because none has a measured
 divergence.
@@ -609,43 +766,17 @@ write to be **read-preceded** (`leading_read_reaches`), retaining exactly the
 W4/`probe_fsm` class; the conditional/constant hold clause is untouched
 (constants are blind to forwarded emission — `pc_arm_*`'s pins stayed green
 throughout). `add_then_write`, `fast_counter` (witness), V5 and V7 dropped their
-opt-outs and compile clean on their own merits; `ram_prewrite` left the flag set
-with a recorded note (it never had a behavioral verdict and does not transpile).
-
-### 5.3 Option (c), Prost-style lowering — REJECTED 2026-08-21 (as a blanket change)
-
-Measured by hand-writing the lowering Prost uses (combinational next-value in
-coroutine order; an output write reads the *forwarded* value) and running it under
-Verilator against the simulator. The controlled pair is V1 and V4 — **identical
-designs differing only in a leading `In` read**:
-
-| | sim | current SV | Prost-style SV |
-|---|---|---|---|
-| **V1** (no leading read) | `2 3 4 5 6 7 8 9` | `1 2 3 4 5 6 7 8` ✗ | `2 3 4 5 6 7 8 9` ✓ |
-| **V4** (leading read) | `1 2 3 4 5 6 7 8` | `1 2 3 4 5 6 7 8` ✓ | `2 3 4 5 6 7 8 9` ✗ |
-
-It **fixes D1 exactly** and **breaks the currently-correct case exactly**. Symmetric
-to §5.1: always-barrier fixed the barrier case and broke Moore outputs; Prost-style
-lowering fixes the no-barrier case and breaks the barrier-protected one.
-
-Projected corpus impact (same shape, barrier-protected, currently passing): `lfsr`,
-`det_110101`, `shift_register` — 6 module copies with equivalence tests that would
-start failing. Not individually measured; the V1/V4 pair is the controlled evidence.
-
-> **THE GENERAL RESULT — this is the important part.** No single codegen lowering can
-> match the simulator, because **the simulator is not internally consistent**: two
-> structurally identical modules behave differently depending on whether one of them
-> happens to read an input. For codegen to match, it would have to replicate that
-> incidental rule — i.e. emit different hardware for the same logic based on the
-> presence of an unrelated port read. That is not a lowering anyone should write.
->
-> So **the simulator must be made uniform first**, and only then can codegen be
-> matched to whichever uniform semantics is chosen. Fixing either side alone is now
-> measured-and-rejected in both directions (§5.1, §5.3).
-
-Note this does **not** impugn Prost: its lowering is correct *for Prost*, whose
-alignment is uniform because it has no barrier mechanism to make it incidental. The
-defect is Copper's, and it is upstream of the lowering.
+opt-outs and compile clean on their own merits; `ram_prewrite` left the flagged set
+with a recorded note in `EXPECTED_FLAGGED` (it never had a behavioral verdict and
+does not transpile). The narrowing is pinned three ways: the `cfg.rs` unit tests
+`hazard_v1_assign_then_write_dissolved`, `hazard_v5_trailing_read_dissolved`,
+`hazard_v7_escape_across_tick_dissolved` (each asserts `[]`) beside
+`hazard_w4_mixed_alignment_flagged`; `ui/pass/pretick_alignment_ok.rs::forwarded_opening_drive`
+(the former ui/fail V1 case); and `EXPECTED_FLAGGED`, which gained
+`w4_mixed_alignment` and lost `add_then_write`, `fast_counter` and `ram_prewrite`
+the same day (commit `7abfd98`). The rule's implementation is the
+`register_read_hazard` conjunction in `Cfg::unprotected_pretick_out_write`:
+`!node.uses.is_disjoint(&regs) && self.leading_read_reaches(n)`.
 
 ---
 
@@ -661,9 +792,9 @@ precedent ("empirically pinned + corpus-clean + false-positive-free").
 - **R3 — Conditions derived from measurement.** Each necessary condition must be
   justified by a variant that flips when it is removed, as the V4/V5 pair justifies
   "the read must precede".
-- **R4 — Static, all-paths, compile-time.** Per the standing decision recorded for
-  the multi-write work: static checks over dynamic ones. A dynamic backstop was
-  already tried and dropped there for false-firing.
+- **R4 — Static, all-paths, compile-time.** As with the multi-write work: static
+  checks over dynamic ones. A dynamic backstop was already tried and dropped there
+  for false-firing.
 - **R5 — Actionable diagnostic.** A spanned error naming the register and pointing at
   a legal alternative (Q4), like the multi-write rule points at `RegOut`.
 - **R6 — Honest scope.** Any known false negative (e.g. multi-tick segments, Q5) is
@@ -677,8 +808,10 @@ precedent ("empirically pinned + corpus-clean + false-positive-free").
 
 ## 7. Development plan
 
-Sequenced, each phase gated on the previous. Phases 0–1 are pure measurement and
-need no sign-off; phase 3 changes `copper-macros` behaviour and does.
+Sequenced, each phase gated on the previous. Phases 0–1 are pure measurement;
+phase 3 changes `copper-macros` behaviour. **This section is the 2026-08-21 plan
+with its completion marks; where §5.4–§5.7 changed a rule afterwards, the phase is
+marked SUPERSEDED with a pointer rather than rewritten.**
 
 ### Phase 0 — Coverage prerequisites (no semantics change)
 
@@ -689,10 +822,16 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
   2026-08-21** — measured sim-vs-Verilator: it **AGREES**. Note the trace is weak
   (its outputs are write-once `Logic::One` and saturate), but it was enough to
   establish it is not divergent, and it produced the constant-write clause.
-- **0b** Resolve `ram_prewrite` / `probe_mem_latency` — un-ignore it, or record why
-  it cannot be.
+- **0b** ~~Resolve `ram_prewrite` / `probe_mem_latency` — un-ignore it, or record why
+  it cannot be.~~ **MOOT since 2026-08-26**: the §5.7 narrowing put `ram_prewrite`
+  outside the rule (its write is not read-preceded), so it no longer needs a
+  verdict to satisfy G0. `tests/mem_latency_probe.rs::probe_mem_latency` remains an
+  `#[ignore]`d diagnostic printout with no assertions; `ram_prewrite` does not
+  transpile, so the corpus sweep will cover it the moment it does.
 - **Gate G0:** every module the candidate rule flags has a behavioral verdict:
-  diverges, or agrees.
+  diverges, or agrees. **MET as of 2026-08-26** — every entry of the four pinned
+  sets has a measured verdict in `tests/sequential_forwarding_divergence.rs` or
+  the sweep.
 
 ### Phase 1 — Discrimination measurement (answers Q1, Q2) — **DONE 2026-08-21**
 
@@ -713,7 +852,15 @@ behaviour. Fix that first, or the corpus verdict stays partly unknown.
   over the CFG and re-running the corpus sweep to confirm cleanliness empirically
   rather than by inspection.
 
-### Phase 2 — Rule synthesis and offline validation — **DONE 2026-08-21**
+### Phase 2 — Rule synthesis and offline validation — **DONE 2026-08-21; SUPERSEDED by §5.7 (2026-08-26)**
+
+> **Read this phase as history.** The rule below is D1 *as landed 2026-08-21*.
+> Clause 1 was narrowed on 2026-08-26 to require the write to be **read-preceded**
+> (`leading_read_reaches`), and clause 1 gained the constant-write hold condition
+> on 2026-08-25 (§5.5). Three rows of the witness table — V1, V7, V5 — carry the
+> verdict "DIVERGE → flag"; each is now asserted **DISSOLVED** (returns `[]`) by a
+> unit test in `cfg.rs`: `hazard_v1_assign_then_write_dissolved`,
+> `hazard_v7_escape_across_tick_dissolved`, `hazard_v5_trailing_read_dissolved`.
 
 **The rule, as landed** (`Cfg::unprotected_pretick_out_write`). Flag a plain
 combinational `Out` port `P` when **both** hold in the pre-tick segment:
@@ -728,29 +875,32 @@ same way `multi_write_collapse` gets its exclusion.
 
 **Every clause has a measured witness** (R3), each a unit test in `cfg.rs`:
 
-| clause | witness | verdict |
-|---|---|---|
-| register assigned pre-tick, plain `Out` | V1 | DIVERGE → flag |
-| no in-segment read-back needed | V7 | DIVERGE → flag |
-| read must *precede* the assignment | V4 vs V5 | agree / DIVERGE |
-| post-tick assignment is safe | V6 | agree → no flag |
-| mixed alignment does **not** protect | W4 | DIVERGE → flag |
-| `RegOut` is immune | W8, W9 | agree → no flag |
-| **write must read a register** | `branch_merge_explicit` | agree → no flag |
-| same defect as `probe_fsm` | W5/W6 | DIVERGE → flag |
-| barrier-pinned corpus shape | `lfsr` | agree → no flag |
+| clause | witness | verdict (2026-08-21) | today |
+|---|---|---|---|
+| register assigned pre-tick, plain `Out` | V1 | DIVERGE → flag | DISSOLVED (`hazard_v1_assign_then_write_dissolved`) |
+| no in-segment read-back needed | V7 | DIVERGE → flag | DISSOLVED (`hazard_v7_escape_across_tick_dissolved`) |
+| read must *precede* the assignment | V4 vs V5 | agree / DIVERGE | V4 unchanged (`hazard_v4_leading_read_not_flagged`); V5 DISSOLVED (`hazard_v5_trailing_read_dissolved`) |
+| post-tick assignment is safe | V6 | agree → no flag | unchanged (`hazard_v6_post_tick_assign_not_flagged`) |
+| mixed alignment does **not** protect | W4 | DIVERGE → flag | unchanged — the retained class (`hazard_w4_mixed_alignment_flagged`) |
+| `RegOut` is immune | W8, W9 | agree → no flag | unchanged (`hazard_w8_…`, `hazard_w9_…`) |
+| **write must read a register** | `branch_merge_explicit` | agree → no flag | REVERSED by §5.5: a constant on *some* paths only is flagged (`a_conditional_constant_write_is_flagged`) |
+| same defect as `probe_fsm` | W5/W6 | DIVERGE → flag | unchanged (`hazard_probe_fsm_flagged`) |
+| barrier-pinned corpus shape | `lfsr` | agree → no flag | unchanged (`hazard_lfsr_shape_not_flagged`) |
 
 The constant-write clause was added *during* phase 2: `branch_merge_explicit` drives
 three plain `Out`s from an unprotected path and was flagged by the first cut, so it
 was measured (phase 0a, discharged) — it **agrees**, because every write is
 `Logic::One`. Flagging it would have rejected a correct design.
 
-- **Gate G2: MET.** `copper-analysis/tests/pretick_alignment_corpus.rs` scans 76
-  clocked modules across `examples/`, `src/` and `tests/`, and flags **exactly 7** —
-  the measured-divergent set, nothing else. The expectation is an *exact set*, so the
-  test fails in both directions: a newly flagged module is a regression or a real bug,
-  and a no-longer-flagged one means the divergence was fixed and several pinned tests
-  need re-blessing.
+- **Gate G2: MET.** `copper-analysis/tests/pretick_alignment_corpus.rs` scans the
+  clocked modules across `examples/`, `src/` and `tests/` and flags an exact set —
+  the measured-divergent modules, nothing else. On landing that was 76 scanned,
+  **exactly 7** flagged (measured once at commit `ccf4877`, 2026-08-21, not a
+  gate); today the pin is `EXPECTED_FLAGGED` — five modules, listed in the header —
+  and the test prints the scanned count on every run. The expectation is an *exact
+  set*, so the test fails in both directions: a newly flagged module is a
+  regression or a real bug, and a no-longer-flagged one means the divergence was
+  fixed and several pinned tests need re-blessing.
 
 ### Phase 2 (original scope, for reference)
 
@@ -790,8 +940,11 @@ was measured (phase 0a, discharged) — it **agrees**, because every write is
   the boundary 5 → 6 and breaks it. **The anchor is repaired, not downgraded.**
 - **3d DONE** — `ui/fail/pretick_alignment.rs` plus `ui/pass/pretick_alignment_ok.rs`
   covering all four accepting clauses (post-tick update, `RegOut`, leading read,
-  constant write).
-- **Gate G3: MET** — `smoke.sh` green.
+  constant write). Since 2026-08-26 the `fail` case is `mixed_alignment` (W4) and
+  the `pass` file also carries `forwarded_opening_drive` (the former V1 fail case)
+  and the V8b/V8c shapes.
+- **Gate G3: MET** — the full regression run (`tools/regression.sh`, ending in
+  `REGRESSION OK`) green.
 
 **A bug introduced and caught during this phase, worth recording.** Adding the flag
 broke three attribute parsers using `parse_args::<syn::Ident>()`, which fails outright
@@ -809,58 +962,82 @@ That is the same defect class this whole document is about, introduced while fix
   D2 is exposed. Either fix/accept D2 or downgrade that test with a recorded
   rationale (R7). **This is the step where D2 stops being deferrable.**
 - **3d** `trybuild` `ui/fail/` + `ui/pass/` cases, per the P1 pattern.
-- **Gate G3:** `cargo test --workspace` green, `smoke.sh` `SMOKE OK`.
+- **Gate G3:** `cargo test --workspace` green, `tools/regression.sh` `REGRESSION OK`.
 
 ### Phase 4 — Documentation
 
-- **4a** `SYNCHRONOUS_SEMANTICS.md` §Output timing gains this as the third member of
-  the family.
-- **4b** `paper/threats_to_validity.md` + contribution 5: report the divergence and
-  the restriction, as the multi-write case is reported.
-- **4c** Retire this doc to a status note, or move it to `OUTDATED/`.
+- **4a DONE** — `SYNCHRONOUS_SEMANTICS.md` §Output timing carries the family
+  ("The pre-tick alignment family — dissolved where the denotation defines it,
+  refused where nothing can realize it") and points back here for the record.
+- **4b OPEN** — the paper's Threats to Validity / Limitations section and
+  contribution 5: report the divergence and the restriction, as the multi-write
+  case is reported. (The earlier `paper/threats_to_validity.md` draft is gone; the
+  paper draft under `paper/` — `sigconf.tex`, untracked as of 2026-09-01 — has a
+  `Limitations` section and no Threats to Validity section yet.)
+- **4c OPEN** — retire this doc to a status note, or move it to `OUTDATED/`. Not
+  yet: the trailing rule's retirement is still gated on phase C
+  (`PAIRED_IMPLEMENTATION_SCOPE.md`), and this doc is the record of the rejected
+  fixes.
 
 ---
 
-## 8. Consequences to plan for
+## 8. Consequences to plan for — all RESOLVED (kept as the 2026-08-21 record)
 
-- **Fixing D1 exposes D2** (R7 / step 3c). These were found together because they
-  cancel; they must be resolved together or the anchor breaks.
-- **`probe_fsm` may become unexpressible.** It is a deliberate *investigation
+- ~~**Fixing D1 exposes D2** (R7 / step 3c). These were found together because they
+  cancel; they must be resolved together or the anchor breaks.~~ **Resolved
+  2026-08-21** — §7 3c: D2 fixed in `classify_reads`, the anchor
+  `tests/two_domain_hierarchy_cdc.rs` passes for the right reason.
+- ~~**`probe_fsm` may become unexpressible.** It is a deliberate *investigation
   fixture* demonstrating a divergence. If the guardrail rejects it, that fixture
   stops compiling and `probe_timing_investigation.rs` goes with it. Decide whether
   the rule needs an escape hatch for study fixtures, or whether that investigation is
-  now subsumed and can be retired.
-- **Three `fast_counter` copies** live in two examples and one test. Migrating them
+  now subsumed and can be retired.~~ **Resolved 2026-08-21** — §7 3a: the
+  `allow_pretick_alignment` opt-out; `probe_fsm` carries it, stays in
+  `EXPECTED_FLAGGED`, and `tests/probe_timing_investigation.rs::probe_fsm_sim_matches_verilog`
+  stays `#[ignore]`d as the W4-class demonstration.
+- ~~**Three `fast_counter` copies** live in two examples and one test. Migrating them
   changes `two_domain_counter.rs`'s printed timeline and its prose, which already
-  mis-describes the latency decomposition.
+  mis-describes the latency decomposition.~~ **Resolved 2026-08-21** — §7 3b:
+  migrated to the post-tick sticky update.
 
 ---
 
-## 9. Open decisions
+## 9. Open decisions — all DECIDED (kept as the 2026-08-21 record)
 
-- **Escape hatch or not?** `multi_write_collapse` has none — it points at `RegOut`.
+- ~~**Escape hatch or not?** `multi_write_collapse` has none — it points at `RegOut`.
   D1's legal form is a rewrite, not a type change, so there may be no equivalent
-  "just use this instead" for every case.
-- **D2's disposition** — its own guardrail, a codegen change, or accepted-and-
+  "just use this instead" for every case.~~ **Decided 2026-08-21: yes** —
+  `#[hardware(sequential, allow_pretick_alignment)]`, §7 3a; it silences the error,
+  not the detection.
+- ~~**D2's disposition** — its own guardrail, a codegen change, or accepted-and-
   documented? Unlike D1 there is no independent-hardware adjudication yet; getting
-  one is the prerequisite.
+  one is the prerequisite.~~ **Decided 2026-08-21: fixed in the simulator** after
+  adjudication against hand-written Verilog — §1 D2, §7 3c.
 - ~~**Option (c) is back on the table.**~~ **MEASURED AND REJECTED as a blanket
   change — see §5.3.** Prost-style lowering fixes D1 exactly and breaks the
   barrier-protected majority exactly. The reason generalises: the simulator is not
   internally consistent, so *no* single lowering can match it. Both single-sided
   fixes are now measured and rejected (§5.1 sim-only, §5.3 codegen-only). What
   remains is (a) reject the shape, (d) make it unexpressible, or a *paired* fix that
-  makes the sim uniform **and** matches codegen to it.
-- **A fourth option, from §10: make it unexpressible.** Give register locals the
+  makes the sim uniform **and** matches codegen to it. **The paired fix was
+  executed 2026-08-26** (`PAIRED_IMPLEMENTATION_SCOPE.md`, phases A/B/D; §5.7):
+  forwarded emission for the opening-prefix sub-class where §5.3's own measurement
+  showed it correct, and D1 narrowed to what no emission can match.
+- ~~**A fourth option, from §10: make it unexpressible.** Give register locals the
   current/next distinction that `Out`/`RegOut` already gives ports — a `Reg<T>`
   with explicit read/write. This is what MyHDL, Chisel, Amaranth, Spade and
   Bluespec all do, and it dissolves the problem rather than detecting it. Cost: it
   changes the surface syntax for sequential state, which is a headline ergonomic
-  claim.
-- **Is the deeper fix worth scoping separately?** §5.1's finding — that the pre-tick
+  claim.~~ **Not taken.** The 2026-08-26 dissolution (§5.7) made most of the class
+  legal with the surface syntax unchanged; what remains is refused, not retyped.
+- ~~**Is the deeper fix worth scoping separately?** §5.1's finding — that the pre-tick
   segment conflates next-state and Moore-output evaluation — describes an executor
   restructuring that would make the guardrail unnecessary. Out of scope here, but it
-  is the principled fix and should be recorded as such rather than forgotten.
+  is the principled fix and should be recorded as such rather than forgotten.~~
+  **Superseded by the cycle-dataflow model** (`CYCLE_DATAFLOW_SEMANTICS.md`,
+  `DERIVATION_TABLE.md`): the denotation is normative, the simulator is checked
+  against it, and the remaining rules are derived from it rather than from the
+  executor's phase machinery.
 
 ---
 
@@ -946,7 +1123,7 @@ the CFG, and it is the concrete thing to test first in phase 1.
 
 [Riedl, Scheipel & Baunach, **LATTE '26**] proposes coroutines as the fundamental
 abstraction of synchronous hardware — the same thesis as Copper's contribution 1,
-arrived at independently (see `paper/related_work.md`). Because it shares Copper's
+arrived at independently (see the paper's Related Work section). Because it shares Copper's
 substrate, it is the single most relevant data point here, and it answers three
 questions at once.
 
@@ -986,7 +1163,8 @@ So the two coroutine HDLs resolve the same ambiguity in opposite directions, and
 Prost's direction is the one that preserves the source's meaning. **This is why §3.2
 carries a correction and why option (c) is back on the table in §9.** It also
 reframes D1: Copper's codegen may be the side that fails to preserve coroutine
-semantics, rather than the simulator being "wrong".
+semantics, rather than the simulator being "wrong". (This is the direction §5.7
+eventually took, for the opening-prefix sub-class only.)
 
 **(c) Its guardrail philosophy is the one to adopt.** Prost states the design
 constraint for exactly this kind of check:
@@ -1023,8 +1201,8 @@ detection, item 4's multi-clock).
 `SYNCHRONOUS_SEMANTICS.md` already cites MyHDL's "restrict the synthesizable subset"
 discipline as the precedent for the multi-write guardrail, and it applies here too:
 MyHDL's converter *rejects* constructs outside its convertible subset rather than
-silently emitting something that behaves differently. The G4 finding
-(`paper/related_work.md`) is the sharp version — MyHDL's **convertible** subset is
+silently emitting something that behaves differently. The G4 finding (recorded for
+the paper's Related Work section) is the sharp version — MyHDL's **convertible** subset is
 strictly larger than its **RTL-synthesizable** subset, and its multi-`yield`
 cycle-slicing converts only to *behavioral*, non-synthesizable HDL. That is the same
 boundary Copper is negotiating, with the difference that Copper claims the

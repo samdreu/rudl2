@@ -170,7 +170,18 @@ if [ "$RUN_TEST" -eq 1 ]; then
   SWEPT=$(grep -cE "^test (fx|ex)_[a-z0-9_]+::[a-z0-9_]+_differential \.\.\. ok" "$TMP/test.log")
   SWEPT_SKIP=$(grep -cE "^test (fx|ex)_[a-z0-9_]+::[a-z0-9_]+_differential \.\.\. ignored" "$TMP/test.log")
   [ "$SWEPT" -gt 0 ] || fail "G-D: no differential cases ran"
-  echo "  G-D ok: corpus sweep ran $SWEPT differential cases ($SWEPT_SKIP ignored-with-reason)"
+  # A differential case with no Verilator is a case that compared the simulator to
+  # itself: the harness marks an ABSENT binary skippable (installed-but-broken already
+  # panics), so every one of those "ok" lines would be hollow. Passing-test stdout is
+  # captured by cargo, so the skip marker cannot be grepped from the log — probe the
+  # binary directly instead, and refuse to call the sweep satisfied without it.
+  if command -v verilator >/dev/null 2>&1; then
+    echo "  G-D ok: corpus sweep ran $SWEPT differential cases ($SWEPT_SKIP ignored-with-reason)"
+  else
+    echo "  G-D NOT SATISFIED: verilator is absent, so the $SWEPT differential cases ran" >&2
+    echo "        sim-only and prove nothing about the emitted SystemVerilog" >&2
+    PARTIAL=1
+  fi
 
   # G-E — ANCHORING. The sweep checks the simulator against the SystemVerilog the
   # transpiler emitted: two implementations of one source, which proves CONSISTENCY.

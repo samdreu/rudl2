@@ -12,8 +12,11 @@
 //! flagged module is a regression (or a real bug in that module), and a
 //! no-longer-flagged one means the hazard was fixed and the list needs updating.
 //!
-//! Scope note: the detector examines only the pre-tick segment, so the multi-tick
-//! `accum_2` class is a known false negative (plan Q5) and is deliberately absent.
+//! Scope note: the detector examines only the pre-tick segment. The multi-tick
+//! `accum_2` shape was once cited as a false negative of that scoping (plan Q5); it
+//! was then measured to AGREE with its transpiled SV and un-ignored on 2026-08-21
+//! (`tests/read_timing_equivalence.rs::accum_2_sim_matches_verilog`), so there is no
+//! known middle-segment instance — the gap is theoretical until one is measured.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -86,17 +89,21 @@ fn clocked_hardware_fns(items: &[Item], out: &mut Vec<ItemFn>) {
 /// not the *detection*, so an opted-out module cannot quietly disappear from the
 /// corpus view.
 ///
-/// * `add_then_write` / `fast_counter` in `sequential_forwarding_divergence.rs` —
-///   the pinned sim-vs-Verilator proof that the hazard is real.
-/// * `probe_fsm` — a pre-existing `#[ignore]`d divergence, measured to be the *same*
-///   defect (a leading read on every path fixes it).
-/// * `ram_prewrite` — flagged and plausible, but its only test
-///   (`probe_mem_latency`) is `#[ignore]`d, so it still has no behavioral verdict.
+/// The set today (after the 2026-08-26 narrowing to READ-PRECEDED register-reading
+/// writes and the constant-write clause — see the entries and their dated notes):
 ///
-/// The real designs that used to appear here — the three `fast_counter` copies in
-/// `examples/cdc/` and `two_domain_hierarchy_cdc.rs` — were migrated to update the
-/// sticky flag *after* the tick, the form measured to match the independent
-/// hand-written SV reference.
+/// * `probe_fsm` / `w4_mixed_alignment` — the retained class: a read reaches the
+///   write on one path only (the path-dependent region boundary).
+/// * `pc_arm_write` / `pc_arm_toggle` / `branch_merge_explicit` — the constant-write
+///   clause: a constant written on *some* paths, where the alternative is the held
+///   value, so the phase shift is observable.
+///
+/// `add_then_write` / `fast_counter` (the original D1 witnesses) and `ram_prewrite`
+/// were in this set until 2026-08-26 and left it — the history is recorded inline
+/// below. The real designs that used to appear here — the three `fast_counter`
+/// copies in `examples/cdc/` and `two_domain_hierarchy_cdc.rs` — were migrated to
+/// update the sticky flag *after* the tick, the form measured to match the
+/// independent hand-written SV reference.
 const EXPECTED_FLAGGED: &[&str] = &[
     "tests/fixtures/probe_timing_dut.rs::probe_fsm",
     // `ram_prewrite` also left the set in the phase-D narrowing: its write is not

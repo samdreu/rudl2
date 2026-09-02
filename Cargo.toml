@@ -63,6 +63,10 @@ path = "examples/sequential/pattern_detector.rs"
 [[example]]
 name = "pattern_detector_2"
 path = "examples/sequential/pattern_detector_2.rs"
+# Its `#[cfg(test)]` transition-table check (`det_010_variants_match_transition_table`)
+# was compiled but never RUN until 2026-09-01: an example's tests only execute when
+# the target opts in. `main()` is a printing demo; this is the example's real check.
+test = true
 
 [[example]]
 name = "traffic_light_fsm"

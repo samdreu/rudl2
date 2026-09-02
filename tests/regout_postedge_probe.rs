@@ -2,7 +2,7 @@
 //! is combinational (a "write v; tick; v+=1" counter reads [1,2,3,…]), while the
 //! same body driving a `RegOut` output is registered — its value is deferred one
 //! cycle to [0,1,2,…]. This pins the two output-timing behaviors the
-//! register/combinational distinction selects between (EXECUTOR_CONVENTION_EXPERIMENT.md).
+//! register/combinational distinction selects between (`design_docs/OUTDATED/EXECUTOR_CONVENTION_EXPERIMENT.md`).
 use copper_core::port::{registered_wire, wire, Out};
 use copper_core::types::Bits;
 use copper_core::{Clock, ClockDomain};

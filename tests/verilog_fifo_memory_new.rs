@@ -1,6 +1,8 @@
+mod common;
+
+use common::verilator_available;
 use copper_core::{Clock, ClockDomain, Logic, Memory};
 use copper_sim::{SimulationTrace, verify_with_verilator};
-use std::process::Command;
 
 struct FifoClk;
 impl ClockDomain for FifoClk {}
@@ -86,13 +88,10 @@ impl MemoryBackedFifo {
     }
 }
 
+/// Only a genuinely ABSENT verilator may skip; installed-but-broken panics inside
+/// `verilator_available` (a private `--version` probe used to treat both alike).
 fn has_verilator() -> bool {
-    Command::new("verilator")
-        .arg("--version")
-        .env_remove("VERILATOR_ROOT")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    verilator_available()
 }
 
 fn bit(v: bool) -> Vec<Logic> {

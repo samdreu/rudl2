@@ -2055,9 +2055,9 @@ fn structural_signal_name(arg: &ExprType, span: SourceSpan) -> Result<String, CH
 // ── Lowering context ──────────────────────────────────────────────────────────
 
 pub(crate) struct LowerCtx<'a> {
-    // NOTE: threaded through the lowering pipeline but not yet consumed here.
-    // See run-copper setup notes — candidate for a scoped "unthread hardware_fns"
-    // cleanup or a real use (submodule detection).
+    // NOTE: threaded through the lowering pipeline but not yet consumed here —
+    // submodule detection goes through `registry` instead. Either unthread it or
+    // give it a real use; kept for now so the call sites stay stable.
     #[allow(dead_code)]
     hardware_fns: &'a std::collections::HashSet<String>,
     registry: &'a ModuleRegistry,

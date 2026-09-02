@@ -1,9 +1,17 @@
 # Array-typed ports — the ABI decision
 
-**Status:** scoping only. No code written. Needs a decision before implementation.
-**Blocks:** cause D-b in `TODO` — `examples/combinational/mux.rs` and
-`examples/basejump/bsg_mux_one_hot.rs`, the last two modules in the corpus that
-fail for a shared reason.
+**Status:** DECIDED AND LANDED 2026-08-24 (`2618426`) — option B (§4B below,
+packed 2-D `[ELS-1:0][WIDTH-1:0]` with direct element select). `copper-transpile
+examples/combinational/mux.rs` emits `input logic [ELS_P-1:0][WIDTH_P-1:0] data_i`
+and `data_o = data_i[sel_i]`; `bsg_mux_one_hot` emits the same shape. Positive
+coverage is `copper-codegen/tests/array_ports.rs`, and both modules run in the
+corpus differential sweep. §7 records what landed; the rest of this document is
+the option analysis that led to B, kept as the rationale, in the tense it was
+written.
+
+**Was blocking (closed):** cause D-b — `examples/combinational/mux.rs` and
+`examples/basejump/bsg_mux_one_hot.rs`, at the time the last two modules in the
+corpus that failed for a shared reason.
 **Measured:** 2026-08-24, against Verilator 5.044.
 
 ```
@@ -11,18 +19,19 @@ mux              error: 26:12: cannot resolve type '[Bits<WIDTH_P>;ELS_P]' to a 
 bsg_mux_one_hot  error: 22:12: cannot resolve type '[Bits<WIDTH>;ELS]' to a hardware type
 ```
 
-Both simulate today and both check against independent BaseJump Verilog. What
-they lack is any transpiled path at all, so the *generated* SystemVerilog for the
-mux family has never existed, let alone been verified.
+Both simulated at the time and both checked against independent BaseJump Verilog.
+What they lacked was any transpiled path at all, so the *generated* SystemVerilog
+for the mux family had never existed, let alone been verified.
 
 ---
 
-## 1. Why this needs a decision rather than a default
+## 1. Why this needed a decision rather than a default
 
-Every other gap closed recently was a missing lowering with one obviously correct
-answer. This one is a **choice about the shape of the emitted module interface**,
-visible to anything that instantiates a Copper module, and changing it later is a
-breaking change to generated hardware rather than an internal refactor.
+Every other gap closed at the time was a missing lowering with one obviously
+correct answer. This one is a **choice about the shape of the emitted module
+interface**, visible to anything that instantiates a Copper module, and changing
+it later is a breaking change to generated hardware rather than an internal
+refactor.
 
 ---
 
@@ -49,8 +58,8 @@ idiomatic*, not *what is cheapest to build*.
 The simulator does not care: `wire::<[Bits<W>; ELS], D>` is a Rust array and
 never becomes bits. The ABI is purely an emission concern.
 
-The **testbench harness does care**, and it has already picked a convention.
-`examples/combinational/mux.rs` flattens for the Verilator port today:
+The **testbench harness does care**, and it had already picked a convention.
+`examples/combinational/mux.rs` flattens for the Verilator port (it still does):
 
 ```rust
 // Flatten [Bits<WIDTH>; ELS] → Vec<Logic> (element 0 at LSBs) for the Verilator port.
@@ -122,9 +131,9 @@ assign data_o = data_i[sel_i];
 indexed operand is an array port rather than a bit-vector (a bit-select and an
 element-select emit the same syntax but mean different things).
 *Cost:* no `Width` arithmetic at all — each dimension is independently `Concrete`
-or `Param`, which the existing `Width` already expresses. `range_str` gains an
-outer-dimension case (it is 6 lines today). The wart is that a value read from an
-array port has a shape the IR cannot otherwise name.
+or `Param`, which the existing `Width` already expresses. The emitter needs an
+outer-dimension case. The wart is that a value read from an array port has a
+shape the IR cannot otherwise name.
 
 ### C — N separate scalar ports
 
@@ -139,7 +148,7 @@ Listed for completeness; not viable.
 
 ---
 
-## 5. Recommendation
+## 5. The decision
 
 **Option B, packed 2-D.** Three reasons, in order of weight:
 
@@ -157,11 +166,11 @@ and there is a case for that (`Width` already carries a `// M2 (later): Sub`
 note), but it should be a deliberate decision about `Width`, not a side effect of
 the mux family.
 
-## 6. What "done" looks like
+## 6. What "done" was defined as
 
 - Both modules transpile and lint clean under `-Wall`.
 - `copper-codegen/tests/unsupported_constructs.rs::array_typed_port_is_unsupported`
-  fails loudly (it is written to demand promotion, not relaxation) and is
+  fails loudly (it was written to demand promotion, not relaxation) and is
   replaced by positive coverage.
 - Each module gains sim ≡ transpiled-SV on top of its existing sim ≡ BaseJump
   check, `include!`ing the example rather than copying it — the pattern used by
@@ -169,3 +178,29 @@ the mux family.
 - The one-hot module additionally exercises **constant** element indexing
   (`d[i]` over a loop) while `mux` exercises **dynamic** indexing (`d[sel]`);
   both need coverage, since only the second involves a run-time index.
+
+## 7. What landed (2026-08-24, `2618426`)
+
+Every item in §6, and where each lives:
+
+- **IR.** `CHIRType::Array { elem, len }` in `copper-core/src/chir.rs`; the VLIR
+  port carries an `outer_dim` (`copper-core/src/vlir.rs`), as does a
+  `VLIRStmt::WireAssign` for a local holding an array read, so the wire is
+  declared `[ELS-1:0][W-1:0]` rather than at the element width.
+- **Emission.** `copper-codegen/src/emit.rs` keeps `range_str` one-dimensional
+  and prepends the outer range when a port or wire has an `outer_dim` — outer
+  first, both packed. Element indexing is emitted as a direct index.
+- **Positive coverage.** `copper-codegen/tests/array_ports.rs`:
+  `an_array_port_declares_both_packed_dimensions`,
+  `an_array_port_with_symbolic_dimensions_needs_no_width_arithmetic` (the case
+  that decided the ABI), `indexing_an_array_port_is_a_direct_element_select`,
+  `a_local_holding_an_array_keeps_both_dimensions`, and
+  `a_nested_array_port_is_refused` (`[[Bits<4>; 2]; 3]` stays a clean refusal).
+  `array_typed_port_is_unsupported` is gone.
+- **Behavioural coverage.** `tests/mux_equivalence.rs` and
+  `tests/bsg_mux_one_hot_equivalence.rs` `include!` the examples and check
+  sim ≡ transpiled SV under Verilator on top of the examples' own sim ≡ BaseJump
+  checks; and both modules are in the corpus differential sweep (`mux` at the
+  widths in `build.rs`'s `PARAMS`, `bsg_mux_one_hot` at its file-scope consts),
+  driven by `RandStim for [T; N]` in `tests/common/mod.rs`, whose element-major
+  layout is the flattening the harness already used (§3).

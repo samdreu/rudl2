@@ -1,6 +1,8 @@
+mod common;
+
+use common::verilator_available;
 use copper_core::Logic;
 use copper_sim::{SimulationTrace, verify_with_verilator};
-use std::process::Command;
 
 fn u8_to_logic_vec(val: u8) -> Vec<Logic> {
     (0..8)
@@ -8,19 +10,11 @@ fn u8_to_logic_vec(val: u8) -> Vec<Logic> {
         .collect()
 }
 
-fn has_verilator() -> bool {
-    Command::new("verilator")
-        .arg("--version")
-    .env_remove("VERILATOR_ROOT")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn hierarchical_verilog_pipeline_matches_expected_trace() {
-    if !has_verilator() {
-        eprintln!("Skipping Verilator test: 'verilator' not found in PATH");
+    // Only a genuinely ABSENT verilator may skip; installed-but-broken panics inside
+    // `verilator_available` (a private `--version` probe used to treat both alike).
+    if !verilator_available() {
         return;
     }
 
