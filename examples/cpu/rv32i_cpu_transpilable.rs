@@ -47,15 +47,15 @@
 //                                    time. That is also what makes this module
 //                                    resettable, and therefore sweepable.
 //
-// The one thing that could NOT be fixed here is the memory ADDRESS WIDTH: the
+// The one thing no source spelling could fix was the memory ADDRESS WIDTH: the
 // address nets are sized to the memory (10 bits for 1024 words) and every index
-// is `Bits<32>`-derived, so the assignment truncates and Verilator's `-Wall`
-// rejects it. No source spelling avoids it — `truncate` and `part_select` are not
-// supported methods, and a `Bits<10>` local still takes a 32-bit right-hand side.
-// It needs a width cast in `vlir_lower`, or a lowering for `truncate`. Until then
-// this module transpiles but does not Verilate, which is why `build.rs` still
-// skips it — and why that SKIP entry names a codegen fix rather than a language
-// gap.
+// is `Bits<32>`-derived, so the assignment truncated and Verilator's `-Wall`
+// rejected it — `truncate` and `part_select` are not supported methods, and a
+// `Bits<10>` local still takes a 32-bit right-hand side. That one was fixed in
+// the LOWERING instead (cause Q, 2026-08-26): memory addresses now get a width
+// cast in `chir_lower`. Since then this module Verilates, and `build.rs` carries
+// it in the RESET table — making it the first CPU-scale design covered by the
+// corpus differential sweep.
 
 use copper_core::{Bits, Clock, ClockDomain, Logic, Memory};
 use copper_core::port::{wire, In, Out};

@@ -23,6 +23,7 @@ Chisel (DAC'12), PyMTL, Clash, Spade (TRETS'26), Prost (LATTE'26), RHDL (LATTE'2
 | M4 | **Correctness evidence** — designs verified, property proved, bugs found | Filament (found 4 designs producing wrong output), Kôika (proved semantics) | `equivalence.py` |
 | M5 | **Expressiveness / coverage** — how many designs, which constructs | everyone, usually as a case-study table | `equivalence.py` |
 | M6 | **Compiler performance** — elaboration/compile time | Calyx, Filament | `perf.py` |
+| M7 | **Simulation throughput** — cycles/s of the host-language simulator vs a compiled RTL simulator | Kôika (Cuttlesim vs Verilator), PyMTL, Clash; MyHDL/cocotb folklore | `simperf.py` |
 
 Two findings from the survey worth keeping in mind while writing:
 
@@ -62,6 +63,7 @@ one of these numbers is bounded:
 | `loc.py` | M1 design size | the debug `copper-transpile` |
 | `qor.py` | M2 post-synthesis area | `yosys` (`brew install yosys`) |
 | `perf.py` | M6 transpile time | the release `copper-transpile` |
+| `simperf.py` | M7 simulation throughput | Verilator + Icarus (`brew install icarus-verilog`) — both required, the metric IS the comparison |
 | `summarize.py` | rolls the CSVs into `SUMMARY.md` | — |
 
 Outputs land in `paper/stats/`: one CSV per collector plus `SUMMARY.md`.
@@ -72,9 +74,52 @@ Outputs land in `paper/stats/`: one CSV per collector plus `SUMMARY.md`.
   file; a generic-cell path length is not a frequency. Either add a liberty target
   (e.g. an open PDK) or drop the metric — do not report a unitless "levels of logic"
   number as if it were timing.
-* **Simulation throughput (cycles/s) vs Verilator.** Needs a fixed-cycle benchmark
-  harness that does not exist. The example run times are NOT this number: they are
-  dominated by Verilator compilation.
+
+## M7 methodology (the fixed-cycle benchmark harness)
+
+`simperf.py` drives `tests/sim_throughput.rs`, which for each benchmarked design
+(a small sequential datapath, an FSM, a `Memory`-backed RAM, and the RV32I CPU
+running a non-halting store/load/branch loop whose branch pattern depends on the
+loaded data) times a fixed-cycle loop in the Copper simulator AND in two
+independent simulators running the SystemVerilog transpiled from the same
+module: Verilator (the compiled-simulator ceiling) and Icarus Verilog (the
+interpreted event-driven baseline):
+
+* **Self-checking by construction.** Both sides run identical deterministic
+  stimulus and fold every cycle's post-edge outputs into a checksum; the harness
+  asserts the two checksums are EQUAL. A throughput number is only reported for
+  two simulations that provably computed the same thing — and each benchmark run
+  is thereby also a longer-horizon differential check than the corpus sweep runs.
+* **What is timed.** The cycle loop only — compilation, model construction, and
+  boot/reset are excluded on every side; stimulus generation and the checksum
+  fold are included on every side (identical trivial integer ops). Median of
+  repeated runs after a warm-up. Single-threaded everywhere; Rust release
+  profile, Verilator default + `-O2`, Icarus `iverilog -g2012`/`vvp`. The
+  Verilator testbench is a counted loop, not the unrolled per-cycle testbench
+  the equivalence checks generate — that one's compile time scales with the
+  trace and would poison the measurement. Icarus has no in-process clock a
+  testbench can read, so its number is vvp process wall-clock minus a
+  `+cycles=0` baseline run of the same binary (startup, bytecode load, and boot
+  cancel out) — meaningless at smoke-mode cycle counts, fine at 1M.
+* **4-state honesty.** The emitted SV leaves registers uninitialized; 2-state
+  Verilator zero-fills them (accidentally matching the simulator's zero inits),
+  4-state Icarus keeps them X. The harness never folds a value before it has
+  been architecturally written (reset cycles, a RAM-filling warm-up, 16
+  post-reset cycles on the CPU), so the checksum equality is real on all three —
+  an `x` in an Icarus checksum means the warm-up is wrong, not the parser.
+* **What the number means.** Inputs are driven and outputs observed every cycle
+  — the harness-in-the-loop throughput a testbench author experiences, not a
+  free-running batch number. First three-way measurement (2026-09-01): the
+  Copper simulator sits BETWEEN the two Verilog simulators — Verilator is
+  4.6–15.1x faster than Copper, and Copper is 9.5–46.8x faster than Icarus,
+  running the RV32I CPU at ~0.8M cycles/s (Verilator 12.2M, Icarus 0.03M). So
+  the honest sentence is: within roughly one order of magnitude of the compiled
+  simulator, one to two orders faster than the interpreted one — with no
+  compile step and native debugging on top. Regenerate rather than quote these
+  numbers.
+* **Rot guard.** Under a bare `cargo test` the harness runs in smoke mode (small
+  cycle count, checksum cross-check still enforced), so regression guard G-C
+  keeps it from silently not running. The CSV is refused from a debug build.
 
 ## Known findings the harness surfaced
 

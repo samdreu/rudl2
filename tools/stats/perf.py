@@ -6,8 +6,7 @@ of the transpiler is roughly an order of magnitude slower and a cold first
 invocation pays page-in cost. Reports the median of N runs.
 
 NOT measured here (do not invent these numbers):
-  * simulation throughput (cycles/s) vs Verilator — needs a fixed-cycle benchmark
-    harness that does not exist yet; see tools/stats/README.md.
+  * simulation throughput (cycles/s) vs Verilator — that is M7, tools/stats/simperf.py.
   * end-to-end synthesis time — dominated by the vendor tool, not by Copper.
 
     tools/stats/perf.py [--runs N]        # -> paper/stats/perf.csv

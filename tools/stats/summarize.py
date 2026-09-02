@@ -7,6 +7,7 @@ S = ROOT / "paper" / "stats"
 read = lambda n: list(csv.DictReader(open(S / n))) if (S / n).exists() else []
 
 loc, qor, ev, perf = read("loc.csv"), read("qor.csv"), read("evidence.csv"), read("perf.csv")
+sperf = read("simperf.csv")
 stamp = sys.argv[1] if len(sys.argv) > 1 else datetime.date.today().isoformat()
 o = [f"# Evaluation numbers (generated {stamp})",
      "", "Regenerate with `tools/stats/collect.sh`. **Do not edit by hand** — every",
@@ -81,9 +82,32 @@ if perf:
           f"* median **{statistics.median(med):.1f} ms** per module "
           f"(min {min(med):.1f}, max {max(med):.1f})",
           f"* slowest: `{slow['module']}` at {slow['median_ms']} ms", "",
-          "> **Scope.** Release binary, median of repeated runs after a warm-up. Simulation",
-          "> throughput vs Verilator is **not** measured — no fixed-cycle benchmark harness",
-          "> exists yet.", ""]
+          "> **Scope.** Release binary, median of repeated runs after a warm-up.",
+          "> Simulation throughput vs Verilator is M7 below, not this number.", ""]
+
+if sperf:
+    o += ["## M7 — simulation throughput vs Verilator and Icarus Verilog", "",
+          "| design | cycles | sim (cycles/s) | Verilator (cycles/s) | Icarus (cycles/s) | Verilator/sim | sim/Icarus |",
+          "|---|---|---|---|---|---|---|"]
+    for r in sperf:
+        iv = f"{float(r['iverilog_cycles_per_sec']):,.0f}" if r.get("iverilog_cycles_per_sec") else "—"
+        ivr = f"{r['sim_over_iverilog']}x" if r.get("sim_over_iverilog") else "—"
+        o.append(f"| `{r['design']}` | {int(r['cycles']):,} | "
+                 f"{float(r['sim_cycles_per_sec']):,.0f} | "
+                 f"{float(r['verilator_cycles_per_sec']):,.0f} | {iv} | "
+                 f"{r['verilator_over_sim']}x | {ivr} |")
+    o += ["",
+          "> **Scope.** Fixed-cycle timed loop (`tests/sim_throughput.rs`), median of",
+          "> repeated runs after a warm-up on every side; excludes compilation, model",
+          "> construction, and boot/reset. Single-threaded everywhere; Rust release",
+          "> profile, Verilator default + `-O2`, Icarus `iverilog -g2012`/`vvp` (process",
+          "> wall-clock minus a `+cycles=0` baseline run — vvp has no in-process clock).",
+          "> Identical deterministic stimulus on all sides, and the per-cycle output",
+          "> checksums are asserted EQUAL — a row only exists where all simulations",
+          "> provably computed the same thing. Both ratio columns read \"left is N×",
+          "> faster\". This is the harness-in-the-loop number a testbench author",
+          "> experiences (inputs driven and outputs observed every cycle), not a",
+          "> free-running batch number.", ""]
 
 (S / "SUMMARY.md").write_text("\n".join(o))
 print(f"-> {S/'SUMMARY.md'} ({len(o)} lines)")

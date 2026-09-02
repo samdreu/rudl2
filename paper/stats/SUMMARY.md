@@ -1,4 +1,4 @@
-# Evaluation numbers (generated 2026-08-27)
+# Evaluation numbers (generated 2026-09-01)
 
 Regenerate with `tools/stats/collect.sh`. **Do not edit by hand** — every
 number here is derived from the repo, and a hand-copied number goes stale.
@@ -72,6 +72,26 @@ Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 * median **3.9 ms** per module (min 3.0, max 1262.0)
 * slowest: `rv32i_cpu_transpilable` at 1262.0 ms
 
-> **Scope.** Release binary, median of repeated runs after a warm-up. Simulation
-> throughput vs Verilator is **not** measured — no fixed-cycle benchmark harness
-> exists yet.
+> **Scope.** Release binary, median of repeated runs after a warm-up.
+> Simulation throughput vs Verilator is M7 below, not this number.
+
+## M7 — simulation throughput vs Verilator and Icarus Verilog
+
+| design | cycles | sim (cycles/s) | Verilator (cycles/s) | Icarus (cycles/s) | Verilator/sim | sim/Icarus |
+|---|---|---|---|---|---|---|
+| `lfsr` | 1,000,000 | 4,082,835 | 42,687,080 | 429,231 | 10.5x | 9.5x |
+| `det_110101` | 1,000,000 | 8,576,029 | 39,170,882 | 183,202 | 4.6x | 46.8x |
+| `dual_port_ram` | 1,000,000 | 3,460,598 | 37,959,968 | 156,965 | 11.0x | 22.0x |
+| `rv32i_cpu_transpilable` | 1,000,000 | 810,133 | 12,194,007 | 30,303 | 15.1x | 26.7x |
+
+> **Scope.** Fixed-cycle timed loop (`tests/sim_throughput.rs`), median of
+> repeated runs after a warm-up on every side; excludes compilation, model
+> construction, and boot/reset. Single-threaded everywhere; Rust release
+> profile, Verilator default + `-O2`, Icarus `iverilog -g2012`/`vvp` (process
+> wall-clock minus a `+cycles=0` baseline run — vvp has no in-process clock).
+> Identical deterministic stimulus on all sides, and the per-cycle output
+> checksums are asserted EQUAL — a row only exists where all simulations
+> provably computed the same thing. Both ratio columns read "left is N×
+> faster". This is the harness-in-the-loop number a testbench author
+> experiences (inputs driven and outputs observed every cycle), not a
+> free-running batch number.
