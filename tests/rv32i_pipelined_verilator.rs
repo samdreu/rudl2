@@ -28,6 +28,13 @@
 mod common;
 use common::{verilator_available, verilator_command};
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // The example's `fn main` is `#[cfg(not(test))]`, so the include brings the
 // core, the assemblers, the 13 programs, and `build_memory` — the same pattern
 // `rv32i_integration.rs` uses.
@@ -164,7 +171,7 @@ fn pipelined_cpu_matches_its_verilated_self_on_all_programs() {
     )
     .expect("the pipelined CPU must transpile");
 
-    let work = std::env::temp_dir().join(format!("copper_rv32i_pl_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_rv32i_pl_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("rv32i_cpu_pipelined.sv"), &child_sv).unwrap();

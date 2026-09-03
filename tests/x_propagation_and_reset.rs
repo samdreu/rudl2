@@ -29,6 +29,13 @@ use copper_core::{Bits, Clock, ClockDomain, Logic};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct C;
 impl ClockDomain for C {}
 
@@ -321,7 +328,7 @@ fn x_cannot_be_checked_against_verilator() {
          gone; re-check whether a real X equivalence test is now possible:\n{sv}"
     );
 
-    let work = std::env::temp_dir().join(format!("copper_xgap_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_xgap_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).unwrap();
     let sv_path = work.join("held.sv");

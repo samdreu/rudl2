@@ -87,6 +87,13 @@ use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 use std::path::Path;
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct C;
 impl ClockDomain for C {}
 struct ClkFast;
@@ -236,7 +243,7 @@ fn run_sv(sv_path: &Path, top: &str, clk_port: &str, probes: &[&str], extra_init
 fn transpile_and_run(src: &str, top: &str, clk: &str, probe: &str, init: &str) -> Vec<u8> {
     let sv = copper_codegen::transpile_source(src, Some(top), &copper_codegen::EmitConfig::default())
         .expect("transpile");
-    let dir = std::env::temp_dir().join(format!("copper_fwd_src_{top}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("copper_fwd_src_{top}_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{top}.sv"));
@@ -350,7 +357,7 @@ fn independent_hardware_anchors_the_corrected_spelling() {
     }
     let sim = sim_fast_counter();
 
-    let dir = std::env::temp_dir().join(format!("copper_fwd_ref_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("copper_fwd_ref_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -395,7 +402,7 @@ fn independent_hardware_anchors_the_corrected_spelling() {
         &copper_codegen::EmitConfig::default(),
     )
     .expect("transpile corrected");
-    let dir2 = std::env::temp_dir().join(format!("copper_fwd_corr_{}", std::process::id()));
+    let dir2 = std::env::temp_dir().join(format!("copper_fwd_corr_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&dir2);
     std::fs::create_dir_all(&dir2).unwrap();
     let pc = dir2.join("fast_counter_corrected.sv");
@@ -1247,7 +1254,7 @@ fn m2_model_forwarded_lowering_matches_the_simulator_for_trailing_update() {
     }
 
     let dir = std::env::temp_dir()
-        .join(format!("copper_fwd_m2_{}", std::process::id()));
+        .join(format!("copper_fwd_m2_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("trailing_update_model.sv");
@@ -1653,7 +1660,7 @@ fn v8t_trailing_stage_shape_verdict() {
             &copper_codegen::EmitConfig::default(),
         )
         .expect("transpile");
-        let dir = std::env::temp_dir().join(format!("copper_v8t_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("copper_v8t_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("v8t_stage_publish_then_load.sv");

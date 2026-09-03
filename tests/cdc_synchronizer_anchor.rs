@@ -48,6 +48,13 @@ use common::verilator_available;
 use std::path::Path;
 use std::process::Command;
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct SrcClk;
 impl ClockDomain for SrcClk {}
 struct DstClk;
@@ -352,7 +359,7 @@ fn testbench(top: &str, d_at_edges: &[u8], expected_q: &[u8]) -> String {
 /// Verilate `sv_file` with `top`, build `tb_src` against it, run it, and report
 /// whether the self-checking testbench passed. Runs in an isolated work dir.
 fn run_verilator(sv_file: &Path, top: &str, tb_src: &str) -> Result<(), String> {
-    let work = std::env::temp_dir().join(format!("copper_sync2ff_{top}_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_sync2ff_{top}_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| format!("mkdir: {e}"))?;
 
@@ -446,7 +453,7 @@ fn transpiled_sync_2ff_matches_sim() {
     )
     .expect("transpile the concrete synchronizer");
 
-    let work = std::env::temp_dir().join(format!("copper_sync2ff_sv_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_sync2ff_sv_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::create_dir_all(&work).unwrap();
     let sv_path = work.join("sync_2ff_concrete.sv");
     std::fs::write(&sv_path, &sv).unwrap();

@@ -46,6 +46,13 @@ use common::verilator_available;
 use std::path::Path;
 use std::process::Command;
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // ── The design (real modules, for the simulator) ──────────────────────────────
 // Kept identical to `examples/cdc/two_domain_hierarchy.rs`; the transpiler reads
 // that example file from disk (see DESIGN_FILE) so the two never silently drift.
@@ -177,7 +184,7 @@ fn dual_clock_testbench(top: &str, fast_per_slow: usize, expected: &[(u8, u8)]) 
 /// Verilate `sv_file` with `top`, build against `tb_src`, run it, and return
 /// whether the self-checking testbench passed. Runs in an isolated work dir.
 fn run_dual_clock_verilator(sv_file: &str, top: &str, tb_src: &str) -> Result<bool, String> {
-    let work = std::env::temp_dir().join(format!("copper_tdh_{top}_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_tdh_{top}_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| format!("mkdir: {e}"))?;
 
@@ -232,7 +239,7 @@ fn transpiled_hierarchy_matches_sim_under_verilator() {
     let src = std::fs::read_to_string(DESIGN_FILE).expect("read example source");
     let sv = copper_codegen::transpile_source_hierarchy(&src, Some("two_domain_top"), &copper_codegen::EmitConfig::default())
         .expect("transpile hierarchy");
-    let work = std::env::temp_dir().join(format!("copper_tdh_sv_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_tdh_sv_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::create_dir_all(&work).unwrap();
     let sv_path = work.join("two_domain_top.sv");
     std::fs::write(&sv_path, &sv).unwrap();

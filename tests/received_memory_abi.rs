@@ -33,6 +33,13 @@ use copper_core::{Bits, Clock, ClockDomain, Logic, Memory};
 use copper_macros::hardware;
 use copper_sim::HardwareExecutor;
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct MainClk;
 impl ClockDomain for MainClk {}
 
@@ -174,7 +181,7 @@ fn received_memory_bus_matches_the_owned_memory_semantics() {
     )
     .expect("transpile");
 
-    let work = std::env::temp_dir().join(format!("copper_rmabi_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_rmabi_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("mem_user.sv"), &child_sv).unwrap();

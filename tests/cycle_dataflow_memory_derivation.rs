@@ -17,6 +17,13 @@
 mod common;
 use common::{verilator_available, verilator_command};
 
+/// Per-invocation nonce for temporary directories. Two tests in one binary can
+/// transpile or Verilate the same top module at the same moment, and a directory
+/// keyed on the process id alone is then shared: one test's cleanup deletes the
+/// file the other's Verilator is about to read (seen on a 96-core host,
+/// 2026-09-03). Same rule as the Verilator work dir in CLAUDE.md.
+static TMP_NONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // The R+W representative, with a same-edge collision to pin ReadFirst. Included
 // at top level (like tests/rv32i_integration.rs includes its CPU): the example
 // brings its own imports and `MainClk`, which the ROM fixture below shares. Its
@@ -37,7 +44,7 @@ fn run_sv_stimulus(
     probe: &str,
     cycles: &[&[(&str, u64)]],
 ) -> Vec<u64> {
-    let work = std::env::temp_dir().join(format!("copper_m3_{top}_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("copper_m3_{top}_{}_{}", std::process::id(), TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).unwrap();
     let sv_path = work.join(format!("{top}.sv"));

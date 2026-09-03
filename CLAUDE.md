@@ -266,6 +266,11 @@ receive/clone one.
   golden `det_010` — and a shared directory made them clobber each other's build.
   That is a false-PASS mechanism as well as a false-failure one: a test can end up
   run against another test's model. Never key that directory on anything less unique.
+  The same rule covers the **source** directory a test writes its transpiled `.sv`
+  into before Verilating it: `tests/sequential_forwarding_divergence.rs` keyed that
+  on `(top, pid)` and two tests transpiling `trailing_update` raced on a 96-core host
+  (2026-09-03), one deleting the file the other's Verilator was about to read. Every
+  test temp dir now carries a `TMP_NONCE`.
 - **When adding a `#[hardware]` mode or flag, fix every attribute parser.**
   `parse_args::<syn::Ident>()` fails outright once a flag is present, which silently
   drops those modules from corpus scans (`copper-analysis/tests/pretick_alignment_corpus.rs`
