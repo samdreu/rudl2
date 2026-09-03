@@ -27,15 +27,16 @@ module handshake (
     // is an `initial` block instead.
     // IEEE 1800-2023 9.2.2.4 forbids writing an `always_ff` variable from another
     // process, and this block counts as one; the lint enforces it by default from
-    // 5.05x. (A comment must not START with the word "verilator" — that spelling is
-    // a pragma.) The transpiler emits the same pair around its own power-on block.
+    // 5.05x and reports it at the `always_ff` write, so the pragma pair has to
+    // enclose both blocks. (A comment must not START with the word "verilator" —
+    // that spelling is a pragma.) The transpiler emits the same pair around its
+    // own flop block.
     /* verilator lint_off MULTIDRIVEN */
     initial begin
         state = TOP;
         n     = 8'd0;
         done  = 8'd0;
     end
-    /* verilator lint_on MULTIDRIVEN */
 
     always_ff @(posedge clk) begin
         case (state)
@@ -53,4 +54,5 @@ module handshake (
             default: state <= TOP;
         endcase
     end
+    /* verilator lint_on MULTIDRIVEN */
 endmodule

@@ -30,6 +30,7 @@ pub fn emit_verilog(module: &VLIRModule, config: &EmitConfig) -> String {
         out: String::new(),
         cfg: config,
         port_names: module.ports.iter().map(|p| p.name.clone()).collect(),
+        lint_multidriven: false,
     };
     e.module(module);
     e.out
@@ -43,6 +44,17 @@ struct Emitter<'a> {
     /// must not redeclare it (`logic … m_wr0_addr;` next to the port is a
     /// double declaration).
     port_names: HashSet<String>,
+    /// Set while emitting a sequential body that states a power-on value (a
+    /// register initializer or a memory preload) under the Verilator profile:
+    /// the `always_ff` block is then wrapped in a `MULTIDRIVEN` lint-off pair.
+    /// IEEE 1800-2023 §9.2.2.4 forbids writing an `always_ff` variable from any
+    /// other process, Verilator 5.05x enforces it by default (5.044 did not), and
+    /// it counts the `initial` block as that other process — reporting the
+    /// warning AT THE `always_ff` WRITE, which is why the pair must enclose the
+    /// flop block and not the initializer. A power-on value is elaboration-time
+    /// state, not a second driver; the other spelling, a declaration initializer,
+    /// trips `PROCASSINIT` under `-Wall`. Yosys and Icarus accept the bare form.
+    lint_multidriven: bool,
 }
 
 impl Emitter<'_> {
@@ -63,6 +75,7 @@ impl Emitter<'_> {
                 out: String::new(),
                 cfg: self.cfg,
                 port_names: self.port_names.clone(),
+                lint_multidriven: false,
             };
             match &m.body {
                 VLIRBody::Combinational(c) => e.comb_body(c),
@@ -184,6 +197,8 @@ impl Emitter<'_> {
     // ── Sequential body ─────────────────────────────────────────────────────
 
     fn seq_body(&mut self, s: &VLIRSeqBody) {
+        self.lint_multidriven = matches!(self.cfg.profile, ToolchainProfile::Verilator)
+            && (s.reg_decls.iter().any(|r| r.init.is_some()) || s.memories.iter().any(|m| m.init.is_some()));
         for r in &s.reg_decls {
             self.reg_decl(r);
         }
@@ -387,35 +402,19 @@ impl Emitter<'_> {
     /// references use (a declaration initializer on a variable an `always` block
     /// also writes trips Verilator's `PROCASSINIT` under `-Wall`). Blocking `=`,
     /// unguarded by the clock: elaboration-time state, not a clocked update. See
-    /// `VLIRRegDecl::init` for why the value must be stated at all.
-    ///
-    /// Under the Verilator profile the block is wrapped in a `MULTIDRIVEN`
-    /// lint-off/lint-on pair. IEEE 1800-2023 §9.2.2.4 forbids writing an
-    /// `always_ff` variable from any other process, and Verilator 5.05x
-    /// enforces it by default (5.044 did not), counting the `initial` block as
-    /// that other process. A power-on value is elaboration-time state, not a
-    /// second driver, and the alternative spelling — a declaration initializer —
-    /// trips `PROCASSINIT` under `-Wall` instead. Yosys and Icarus accept the
-    /// block as written, so the other profiles emit it bare.
+    /// `VLIRRegDecl::init` for why the value must be stated at all, and
+    /// `lint_multidriven` for the lint pragma the `always_ff` block then carries.
     fn reg_inits(&mut self, regs: &[VLIRRegDecl]) {
         let with_init: Vec<&VLIRRegDecl> = regs.iter().filter(|r| r.init.is_some()).collect();
         if with_init.is_empty() {
             return;
-        }
-        let verilator = matches!(self.cfg.profile, ToolchainProfile::Verilator);
-        if verilator {
-            self.out.push_str(&format!("{}/* verilator lint_off MULTIDRIVEN */\n", self.indent(1)));
         }
         self.out.push_str(&format!("{}initial begin\n", self.indent(1)));
         for r in with_init {
             let init = r.init.as_ref().unwrap();
             self.out.push_str(&format!("{}{} = {};\n", self.indent(2), r.name, expr_str(init)));
         }
-        self.out.push_str(&format!("{}end\n", self.indent(1)));
-        if verilator {
-            self.out.push_str(&format!("{}/* verilator lint_on MULTIDRIVEN */\n", self.indent(1)));
-        }
-        self.out.push('\n');
+        self.out.push_str(&format!("{}end\n\n", self.indent(1)));
     }
 
     // ── Submodules ──────────────────────────────────────────────────────────
@@ -476,12 +475,18 @@ impl Emitter<'_> {
     // ── always_ff ───────────────────────────────────────────────────────────
 
     fn always_ff(&mut self, ff: &VLIRAlwaysFF) {
+        if self.lint_multidriven {
+            self.out.push_str(&format!("{}/* verilator lint_off MULTIDRIVEN */\n", self.indent(1)));
+        }
         self.out
             .push_str(&format!("{}always_ff @(posedge {}) begin\n", self.indent(1), ff.clock));
         for s in &ff.stmts {
             self.ff_stmt(s, 2);
         }
         self.out.push_str(&format!("{}end\n", self.indent(1)));
+        if self.lint_multidriven {
+            self.out.push_str(&format!("{}/* verilator lint_on MULTIDRIVEN */\n", self.indent(1)));
+        }
     }
 
     fn ff_stmt(&mut self, s: &VLIRFFStmt, level: usize) {

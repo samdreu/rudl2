@@ -3366,15 +3366,15 @@ module counter (
 
     logic [7:0] count;
 
-    /* verilator lint_off MULTIDRIVEN */
     initial begin
         count = 8'd0;
     end
-    /* verilator lint_on MULTIDRIVEN */
 
+    /* verilator lint_off MULTIDRIVEN */
     always_ff @(posedge clk) begin
         count <= (count + step);
     end
+    /* verilator lint_on MULTIDRIVEN */
 
     assign out = count;
 
@@ -3527,11 +3527,9 @@ module fsm (
 
     logic [1:0] state;
 
-    /* verilator lint_off MULTIDRIVEN */
     initial begin
         state = 2'd0;
     end
-    /* verilator lint_on MULTIDRIVEN */
 
     always_comb begin
         if ((state == 2'd2)) begin
@@ -3541,6 +3539,7 @@ module fsm (
         end
     end
 
+    /* verilator lint_off MULTIDRIVEN */
     always_ff @(posedge clk) begin
         case (state)
             2'd0: begin
@@ -3554,6 +3553,7 @@ module fsm (
             end
         endcase
     end
+    /* verilator lint_on MULTIDRIVEN */
 
 endmodule
 ";
