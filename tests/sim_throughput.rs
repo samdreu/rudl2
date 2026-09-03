@@ -487,6 +487,7 @@ fn render_tb(module: &str, tb: &Tb) -> String {
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 static inline uint64_t fold(uint64_t c, uint64_t v) { return (c ^ v) * 0x100000001B3ULL; }
 static inline uint64_t xs(uint64_t& x) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; }
@@ -495,11 +496,19 @@ static inline uint64_t xs(uint64_t& x) { x ^= x << 13; x ^= x >> 7; x ^= x << 17
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
-    const char* cy = Verilated::commandArgsPlusMatch("cycles=");
-    const char* rn = Verilated::commandArgsPlusMatch("runs=");
-    if (!cy[0] || !rn[0]) { fprintf(stderr, "need +cycles=N and +runs=K\n"); return 2; }
-    uint64_t cycles = strtoull(cy + 8, 0, 10);
-    long runs = strtol(rn + 6, 0, 10);
+    // COPY each plusarg before fetching the next: commandArgsPlusMatch returns a
+    // pointer into one reused internal string, so after the second call the
+    // first pointer reads "+runs=K". Skipping a fixed 8 bytes from that landed
+    // on the terminator for a two-digit K (cycles parsed as 0, the loop never
+    // ran, and the checksum stayed at the FNV offset) and, for a one-digit K, on
+    // the previous string's leftover digits — which is why every run with fewer
+    // than nine repetitions passed by accident. Found 2026-09-03 on the first
+    // ten-repetition run. Parse after '=' rather than at a fixed offset.
+    std::string cyS = Verilated::commandArgsPlusMatch("cycles=");
+    std::string rnS = Verilated::commandArgsPlusMatch("runs=");
+    if (cyS.empty() || rnS.empty()) { fprintf(stderr, "need +cycles=N and +runs=K\n"); return 2; }
+    uint64_t cycles = strtoull(cyS.c_str() + cyS.find('=') + 1, 0, 10);
+    long runs = strtol(rnS.c_str() + rnS.find('=') + 1, 0, 10);
     for (long rep = 0; rep < runs; rep++) {
         V@MODULE@* top = new V@MODULE@();
         uint64_t csum = 0xCBF29CE484222325ULL;
@@ -514,7 +523,9 @@ int main(int argc, char** argv) {
         auto t1 = std::chrono::steady_clock::now();
         unsigned long long ns = (unsigned long long)
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        printf("RUN ns=%llu csum=%016llx\n", ns, (unsigned long long)csum);
+        // Report the cycle count the loop actually used, so the harness can
+        // refuse a run that measured something other than what it asked for.
+        printf("RUN cycles=%llu ns=%llu csum=%016llx\n", (unsigned long long)cycles, ns, (unsigned long long)csum);
         top->final();
         delete top;
     }
@@ -637,8 +648,16 @@ fn run_verilator_side(d: &Design, sv: &str, cycles: u64, reps: u32) -> Vec<(u128
     let results: Vec<(u128, u64)> = String::from_utf8_lossy(&run.stdout)
         .lines()
         .filter_map(|l| {
-            let l = l.strip_prefix("RUN ns=")?;
-            let (ns, csum) = l.split_once(" csum=")?;
+            let l = l.strip_prefix("RUN cycles=")?;
+            let (ran, rest) = l.split_once(" ns=")?;
+            let ran: u64 = ran.parse().ok()?;
+            assert_eq!(
+                ran, cycles,
+                "{}: the Verilated benchmark ran {ran} cycles, not the {cycles} requested — \
+                 its plusarg parsing is wrong, and a checksum over the wrong horizon proves nothing",
+                d.name
+            );
+            let (ns, csum) = rest.split_once(" csum=")?;
             Some((ns.parse().ok()?, u64::from_str_radix(csum, 16).ok()?))
         })
         .collect();

@@ -171,11 +171,15 @@ fn pipelined_cpu_matches_its_verilated_self_on_all_programs() {
     std::fs::write(work.join("owner_top.sv"), OWNER_SV).unwrap();
 
     // `+cycles=N` bounds the run; one `pc halted a0` line per cycle.
-    let tb = "#include \"Vowner_top.h\"\n#include \"verilated.h\"\n#include <iostream>\n\
+    let tb = "#include \"Vowner_top.h\"\n#include \"verilated.h\"\n#include <iostream>\n#include <cstring>\n\
         int main(int c, char** v) { Verilated::commandArgs(c, v);\n\
         Vowner_top* t = new Vowner_top();\n\
+        // Parse after '=' — never at a fixed offset (see tests/sim_throughput.rs on\n\
+        // commandArgsPlusMatch's reused buffer; one call here, but the same shape).\n\
         const char* cy = Verilated::commandArgsPlusMatch(\"cycles=\");\n\
-        int n = atoi(cy + 8);\n\
+        const char* eq = cy[0] ? strchr(cy, '=') : 0;\n\
+        if (!eq) { std::cerr << \"need +cycles=N\" << std::endl; return 2; }\n\
+        int n = atoi(eq + 1);\n\
         t->clk = 0; t->eval();\n\
         for (int i = 0; i < n; i++) {\n\
             t->clk = 0; t->eval(); t->clk = 1; t->eval();\n\
