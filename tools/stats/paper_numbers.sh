@@ -10,7 +10,8 @@
 # What it does, in order:
 #   1. Refuses to start unless every tool is present (rustc, cargo, python3,
 #      verilator, iverilog, yosys) and the 1-minute load average is below
-#      --max-load (default 2.0): a loaded machine produced a 2x swing in the
+#      --max-load (default: 2.0, or a sixth of the cores on a larger machine):
+#      a loaded laptop produced a 2x swing in the
 #      simulator-throughput numbers on 2026-09-01/02. `--force` overrides.
 #   2. Records the machine and tool provenance to paper/stats/machine.txt:
 #      OS, CPU model, cores, memory, frequency governor (Linux), whether the
@@ -39,7 +40,7 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || cd "$(dirname "$0")/../.." || exit 2
 unset VERILATOR_ROOT
 
-RUNS=10; CYCLES=1000000; GAP=3600; CORE=""; MAX_LOAD=2.0; WITH_REG=0; TOL=10; FORCE=0; QUICK=0
+RUNS=10; CYCLES=1000000; GAP=3600; CORE=""; MAX_LOAD=""; WITH_REG=0; TOL=10; FORCE=0; QUICK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --runs) RUNS=$2; shift 2;;
@@ -72,7 +73,13 @@ for t in rustc cargo python3 verilator iverilog yosys; do
 done
 if [ -n "$missing" ]; then echo "missing tools:$missing" >&2; exit 2; fi
 load1=$(uptime | sed -E 's/.*load averages?: *([0-9.]+).*/\1/' | tr -d ',')
-echo "load average (1 min): $load1   limit: $MAX_LOAD"
+# Idle means a free core and little contention, so the limit scales with the
+# machine: 2.0 on a laptop, a sixth of the cores on a big shared server (a
+# 96-core box at a load of 8 has 88 idle cores; the timing collectors run on
+# one, pinned). `--max-load` overrides.
+ncpu=$( (nproc 2>/dev/null || sysctl -n hw.ncpu) )
+[ -z "$MAX_LOAD" ] && MAX_LOAD=$(python3 -c "print(max(2.0, $ncpu / 6))")
+echo "load average (1 min): $load1   limit: $MAX_LOAD   (cores: $ncpu)"
 if [ $FORCE -eq 0 ] && [ "$(python3 -c "print(1 if float('$load1') > float('$MAX_LOAD') else 0)")" = "1" ]; then
   echo "machine is not idle (load $load1 > $MAX_LOAD); quit other work or pass --force" >&2; exit 2
 fi
