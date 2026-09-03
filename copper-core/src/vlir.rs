@@ -127,6 +127,16 @@ pub struct VLIRSeqBody {
 pub struct VLIRRegDecl {
     pub name: String,
     pub width: Width,
+    /// Power-on value, emitted as an `initial` assignment when the register's
+    /// Copper initializer is a literal. Without it the emitted SystemVerilog
+    /// states no start value at all: the simulator starts every register at its
+    /// declared literal and Verilator's two-state model zero-fills, so the two
+    /// agreed by accident, while a four-state simulator keeps X and a synthesizer
+    /// may treat a self-driven uninitialized register as undefined forever and
+    /// delete it (Yosys removed `sipo_block`'s phase counter and every gate that
+    /// read it, 2026-09-02). `None` for a register born inside the loop, whose
+    /// value is assigned before it is read.
+    pub init: Option<VLIRExpr>,
 }
 
 /// A memory array: `logic [width-1:0] <name> [0:depth-1];`.

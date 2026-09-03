@@ -31,6 +31,12 @@ use std::collections::{BTreeSet, HashSet};
 /// The modules whose LOWERED phase count differs from their SOURCE phase count.
 /// Every one is control-extracted; every one lowers to exactly one phase.
 const EXPECTED_DISAGREEMENTS: &[&str] = &[
+    // Added 2026-09-02 with the module: a `for` over the pattern bits with a `break`
+    // before its tick, plus a conditional trailing tick — every tick sits inside a
+    // loop or a branch, so the whole body is extracted into one `match pc`. Not a
+    // pass hiding phases from a module that used to be visible; a new module of the
+    // shape this set exists to name. tests/det_for_probe.rs pins its timing.
+    "det_for",
     "capture_after_wait",
     "det_010_awaits",
     "handshake",

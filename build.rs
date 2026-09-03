@@ -153,6 +153,7 @@ const SKIP: &[(&str, &str)] = &[
 ///
 /// A generic module missing from this table is ignored with a reason that says so.
 const PARAMS: &[(&str, &[(&str, i64)])] = &[
+    ("det_for", &[("N", 3)]),
     ("mux", &[("WIDTH_P", 8), ("ELS_P", 4), ("LG_ELS_LP", 2)]),
     ("priority_encode", &[("N", 8), ("N_LOG", 3)]),
     ("ripple_carry_adder", &[("N", 8)]),
@@ -199,6 +200,10 @@ const REFERENCE: &[(&str, &str)] = &[
     // TRANSPILER's and not the simulator's (it agreed with the sim and disagreed with
     // the emitted SV). Live since the module's SKIP row was deleted on 2026-09-01.
     ("bit_not_bits", "tests/fixtures/reference_sv/bit_not_bits.sv"),
+    // The paper's §2.1 listing. Hand-written as the explicit three-state machine a
+    // Verilog designer writes; anchors BOTH `handshake` spellings (while_wait's and
+    // wait_loop's), which tests/handshake_equivalence.rs shows are cycle-identical.
+    ("handshake", "tests/fixtures/reference_sv/handshake.sv"),
 ];
 
 const RESET: &[(&str, &str, bool)] = &[

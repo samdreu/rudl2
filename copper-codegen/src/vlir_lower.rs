@@ -266,7 +266,14 @@ fn lower_seq(s: &SHIRSeqBody, leg: &Legalizer, registered_outs: &HashSet<String>
     let mut reg_decls: Vec<VLIRRegDecl> = s
         .registers
         .iter()
-        .map(|r| VLIRRegDecl { name: leg.get(&r.name), width: width_of(&r.ty) })
+        .map(|r| VLIRRegDecl {
+            name: leg.get(&r.name),
+            width: width_of(&r.ty),
+            // The register's own width, not the literal's: a `let mut pc: u8 = 0`
+            // arrives as a 64-bit literal, and `pc = 64'd0` into `logic [7:0]`
+            // is a width-truncation lint.
+            init: r.init.as_ref().map(|l| VLIRExpr::Lit { width: width_of(&r.ty), value: l.value }),
+        })
         .collect();
 
     let submodules = s.submodules.iter().map(|m| lower_submodule(m, leg, &MemBinding::new())).collect::<LowerResult<_>>()?;
@@ -2603,6 +2610,7 @@ fn mem_pipeline_regs(
                     out.push(VLIRRegDecl {
                         name: leg.get(&read_stage(&m.name, port, stage, is_data)),
                         width: width.clone(),
+                        init: None,
                     });
                 }
             }
@@ -2620,6 +2628,7 @@ fn mem_pipeline_regs(
                     out.push(VLIRRegDecl {
                         name: leg.get(&write_stage(&m.name, port, stage, suffix)),
                         width,
+                        init: None,
                     });
                 }
             }
@@ -3357,6 +3366,10 @@ module counter (
 
     logic [7:0] count;
 
+    initial begin
+        count = 8'd0;
+    end
+
     always_ff @(posedge clk) begin
         count <= (count + step);
     end
@@ -3511,6 +3524,10 @@ module fsm (
 );
 
     logic [1:0] state;
+
+    initial begin
+        state = 2'd0;
+    end
 
     always_comb begin
         if ((state == 2'd2)) begin

@@ -8,6 +8,7 @@ read = lambda n: list(csv.DictReader(open(S / n))) if (S / n).exists() else []
 
 loc, qor, ev, perf = read("loc.csv"), read("qor.csv"), read("evidence.csv"), read("perf.csv")
 sperf = read("simperf.csv")
+ana = read("analysis.csv")
 stamp = sys.argv[1] if len(sys.argv) > 1 else datetime.date.today().isoformat()
 o = [f"# Evaluation numbers (generated {stamp})",
      "", "Regenerate with `tools/stats/collect.sh`. **Do not edit by hand** — every",
@@ -84,6 +85,20 @@ if perf:
           f"* slowest: `{slow['module']}` at {slow['median_ms']} ms", "",
           "> **Scope.** Release binary, median of repeated runs after a warm-up.",
           "> Simulation throughput vs Verilator is M7 below, not this number.", ""]
+
+if ana:
+    amed = [float(r["median_us"]) for r in ana]
+    aslow = max(ana, key=lambda r: float(r["median_us"]))
+    o += ["## M8 — attribute cost: the analysis the `#[hardware]` macro runs", "",
+          f"* {len(ana)} modules analysed",
+          f"* median **{statistics.median(amed):.0f} µs** per module "
+          f"(min {min(amed):.0f}, max {max(amed):.0f})",
+          f"* slowest: `{aslow['module']}` at {float(aslow['median_us']):.0f} µs", "",
+          "> **Scope.** Parse of the function plus the shared control-flow analysis and",
+          "> every compile-time rule, in the macro's own order, timed in a release build",
+          "> outside `rustc` (`copper-codegen/src/bin/analysis-time.rs`). Excludes the",
+          "> token rewrite and `rustc`'s compilation of the generated coroutine, which is",
+          "> compiling the design rather than attribute overhead.", ""]
 
 if sperf:
     o += ["## M7 — simulation throughput vs Verilator and Icarus Verilog", "",

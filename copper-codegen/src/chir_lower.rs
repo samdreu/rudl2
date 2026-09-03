@@ -5013,16 +5013,42 @@ fn extract_block_expr_value(
 /// tick-bearing loop (cause K's shape, which the flattener does accept), the outer
 /// loop is well-formed and the fault is somewhere inside, so reporting the outer
 /// one names a construct the author has no reason to doubt.
-fn nested_loop_error(l: &ExprLoop, span: SourceSpan) -> CHIRLowerError {
-    // Descend to the innermost loop that is actually at fault.
-    if let Some(last) = l.body.last() {
-        if let RawStmtKind::Expr(es) = &last.kind {
-            if let ExprType::Loop(inner) = &es.expr {
-                if stmts_contain_tick(&inner.body) {
-                    return nested_loop_error(inner, last.span);
-                }
-            }
+///
+/// It also walks SIDEWAYS, for the same reason. The linear path reports the first
+/// nested loop it *reaches*, which is routinely not the one at fault: a module
+/// whose body is a well-formed wait followed by a malformed one was reported at the
+/// WELL-FORMED loop, with the ordering rule — advice its author had already
+/// followed. Whether a loop is at fault is asked with
+/// `control_extract::body_ends_at_a_clock_boundary`, the same predicate the gate
+/// uses to decide what it will flatten, so the diagnosis cannot accuse a loop the
+/// gate would have accepted.
+pub(crate) fn nested_loop_error(l: &ExprLoop, span: SourceSpan) -> CHIRLowerError {
+    // A loop this pass would have flattened is not evidence of anything. Look for
+    // the loop that actually stopped it, nested inside this one.
+    if crate::control_extract::body_ends_at_a_clock_boundary(&l.body) {
+        if let Some((culprit, culprit_span)) = crate::control_extract::first_malformed_loop(&l.body) {
+            return nested_loop_error(culprit, culprit_span);
         }
+        // Nothing nested here is malformed either, so the module was declined for a
+        // construct this function cannot see. `transpile_fir` prefers
+        // `control_extract::unflattenable_reason` whenever that construct can be
+        // named, so reaching here means it could not be — say that plainly rather
+        // than blaming a loop that is correctly written.
+        return CHIRLowerError::UnsupportedConstruct {
+            description: "this module could not be flattened into an FSM, and this \
+                          nested `loop` is NOT the reason — its body ends at a clock \
+                          boundary, which is the shape the flattener accepts. The \
+                          blocker is another construct in the same body"
+                .to_string(),
+            span,
+            suggested_rewrite: Some(
+                "look for a `clk.tick().await` under a construct whose repetition is \
+                 not a state — a `for` whose range is not a constant `start..end`, a \
+                 `while` whose body does not end at the tick, or a tick inside a `let` \
+                 initializer"
+                    .to_string(),
+            ),
+        };
     }
 
     let has_statement_tick = l.body.iter().any(is_tick_stmt);

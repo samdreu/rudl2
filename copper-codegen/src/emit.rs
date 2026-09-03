@@ -190,6 +190,7 @@ impl Emitter<'_> {
         if !s.reg_decls.is_empty() {
             self.out.push('\n');
         }
+        self.reg_inits(&s.reg_decls);
 
         self.mem_decls(&s.memories);
 
@@ -379,6 +380,25 @@ impl Emitter<'_> {
 
     fn reg_decl(&mut self, r: &VLIRRegDecl) {
         self.out.push_str(&format!("{}logic {}{};\n", self.indent(1), range_str(&r.width), r.name));
+    }
+
+    /// Power-on register values, as one `initial` block per module — the same
+    /// form `mem_inits` uses for a preloaded memory, and the form the hand-written
+    /// references use (a declaration initializer on a variable an `always` block
+    /// also writes trips Verilator's `PROCASSINIT` under `-Wall`). Blocking `=`,
+    /// unguarded by the clock: elaboration-time state, not a clocked update. See
+    /// `VLIRRegDecl::init` for why the value must be stated at all.
+    fn reg_inits(&mut self, regs: &[VLIRRegDecl]) {
+        let with_init: Vec<&VLIRRegDecl> = regs.iter().filter(|r| r.init.is_some()).collect();
+        if with_init.is_empty() {
+            return;
+        }
+        self.out.push_str(&format!("{}initial begin\n", self.indent(1)));
+        for r in with_init {
+            let init = r.init.as_ref().unwrap();
+            self.out.push_str(&format!("{}{} = {};\n", self.indent(2), r.name, expr_str(init)));
+        }
+        self.out.push_str(&format!("{}end\n\n", self.indent(1)));
     }
 
     // ── Submodules ──────────────────────────────────────────────────────────

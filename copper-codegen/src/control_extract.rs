@@ -415,6 +415,37 @@ fn expand_counted_for(
     loop_body.push(exit_test());
     loop_body.push(boundary.clone());
 
+    // The hoisted tick stands in for the LAST iteration's tick, which the second
+    // exit test skipped. That is right for the two exit tests this pass wrote —
+    // they leave after the body has run — and wrong for a `break` the AUTHOR wrote
+    // inside the body: it leaves before the body's tick, and in the source that
+    // costs no cycle at all. Both kinds of `break` share one continuation (the
+    // statements after the loop), so a body that breaks gets the tick guarded on
+    // the counter having actually reached the end: true on the exit tests' path
+    // (the increment is forwarded, so `i + 1 >= end` reads correctly in the same
+    // cycle), false on the author's, which ran before the increment. Measured
+    // 2026-09-02 on a `for` pattern detector (tests/det_for_probe.rs): every
+    // mismatch cost the RTL two edges and the simulator one. A body with no
+    // `break` keeps the unconditional tick — no extra `if`, no extra state.
+    let hoisted = if stmts_break_enclosing_loop(work) {
+        expr_stmt(
+            ExprType::If(ExprIf {
+                condition: Box::new(ExprType::Binary(ExprBinary {
+                    left: Box::new(path_expr(&var, span)),
+                    op: ">=".to_string(),
+                    right: Box::new(end.clone()),
+                    span,
+                })),
+                then_block: vec![boundary.clone()],
+                else_branch: None,
+                span,
+            }),
+            span,
+        )
+    } else {
+        boundary.clone()
+    };
+
     let decl = RawStmt {
         order,
         kind: RawStmtKind::Local(LocalStmt {
@@ -438,7 +469,7 @@ fn expand_counted_for(
         text: String::new(),
         span,
     };
-    Some(vec![decl, loop_stmt, boundary])
+    Some(vec![decl, loop_stmt, hoisted])
 }
 
 /// A range bound that is a plain integer literal, for the empty-range check. A
@@ -1701,7 +1732,7 @@ fn unflattenable_in_stmts(stmts: &[RawStmt], in_loop: bool) -> Option<Unflattena
 /// clocked module in the same domain is stable across the window, so both models
 /// read the same value — it is a testbench-observable difference, which is
 /// precisely why it cannot be left in: sim ≡ SV under a testbench is the bar.
-fn body_ends_at_a_clock_boundary(body: &[RawStmt]) -> bool {
+pub(crate) fn body_ends_at_a_clock_boundary(body: &[RawStmt]) -> bool {
     match body.iter().position(is_tick_stmt) {
         Some(t) => t + 1 == body.len(),
         // No tick of its own — the segment may still end by entering another
@@ -1786,6 +1817,58 @@ fn unflattenable_in_expr(e: &ExprType, in_loop: bool) -> Option<Unflattenable> {
         }),
         ExprType::Block(b) => unflattenable_in_stmts(&b.stmts, in_loop),
         ExprType::Match(m) => m.arms.iter().find_map(|a| unflattenable_in_expr(&a.body, in_loop)),
+        _ => None,
+    }
+}
+
+/// The first nested `loop` in `stmts` whose body is NOT one segment between two
+/// ticks, with the span of the statement holding it.
+///
+/// This is the loop the gate declined, and it is frequently NOT the loop the
+/// linear path downstream reaches first — a body of `<well-formed wait>` followed
+/// by `<malformed wait>` was reported at the well-formed one, quoting the ordering
+/// rule its author had already followed. Asking
+/// [`body_ends_at_a_clock_boundary`] here, rather than re-deriving what "at fault"
+/// means, keeps the accusation and the gate in agreement by construction.
+///
+/// A well-formed loop is descended INTO rather than skipped: a malformed loop can
+/// sit inside one whose own body ends at a boundary.
+pub(crate) fn first_malformed_loop(stmts: &[RawStmt]) -> Option<(&ExprLoop, SourceSpan)> {
+    stmts.iter().find_map(|s| match &s.kind {
+        RawStmtKind::Expr(es) => first_malformed_loop_in_expr(&es.expr, s.span),
+        _ => None,
+    })
+}
+
+fn first_malformed_loop_in_expr(e: &ExprType, span: SourceSpan) -> Option<(&ExprLoop, SourceSpan)> {
+    match e {
+        ExprType::Loop(l) => {
+            if !body_ends_at_a_clock_boundary(&l.body) {
+                Some((l, span))
+            } else {
+                first_malformed_loop(&l.body)
+            }
+        }
+        // Structures the flattener descends into — keep looking.
+        ExprType::If(f) => first_malformed_loop(&f.then_block)
+            .or_else(|| f.else_branch.as_deref().and_then(|e| first_malformed_loop_in_expr(e, span))),
+        ExprType::Block(b) => first_malformed_loop(&b.stmts),
+        ExprType::Match(m) => m.arms.iter().find_map(|a| first_malformed_loop_in_expr(&a.body, span)),
+        _ => None,
+    }
+}
+
+/// The malformed nested loop inside the module's own top-level `loop`, if any.
+/// Used by `transpile_fir` to report the loop actually at fault, which only the
+/// whole body reveals — `chir_lower` sees one loop at a time and cannot look
+/// sideways at its siblings.
+pub fn first_malformed_nested_loop(fir: &FrontendModuleIR) -> Option<(&ExprLoop, SourceSpan)> {
+    let loop_idx = fir.raw_statements.iter().position(is_loop_stmt)?;
+    match &fir.raw_statements[loop_idx].kind {
+        RawStmtKind::Expr(es) => match &es.expr {
+            ExprType::Loop(l) => first_malformed_loop(&l.body),
+            _ => None,
+        },
         _ => None,
     }
 }

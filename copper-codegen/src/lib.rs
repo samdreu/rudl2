@@ -51,6 +51,20 @@ pub fn transpile_fir(
     // path downstream cannot name. Computed BEFORE the pass runs, since a declined
     // module is left untouched and there is nothing to inspect afterwards.
     let declined = control_extract::unflattenable_reason(&fir);
+    // When the reason is a MALFORMED NESTED LOOP, `unflattenable_reason` returns
+    // None on purpose, so `chir_lower::nested_loop_error` can split it three ways.
+    // But that function is handed one loop at a time and cannot look sideways: for
+    // a body of `<well-formed wait>` then `<malformed wait>` it was called on the
+    // FIRST loop and quoted the ordering rule at a loop that already obeys it.
+    // Find the loop actually at fault here, where the whole body is visible, and
+    // build the message from THAT one. Rendered eagerly because `extract_control`
+    // takes `&mut fir` next, which ends the borrow.
+    let malformed_loop = if declined.is_none() {
+        control_extract::first_malformed_nested_loop(&fir)
+            .map(|(l, sp)| format!("{}", chir_lower::nested_loop_error(l, sp)))
+    } else {
+        None
+    };
     let preloop_muts_before = preloop_mut_names(&fir);
     control_extract::extract_control(&mut fir);
     // Register state SYNTHESIZED by the FIR→FIR passes — `pc`, the
@@ -71,9 +85,12 @@ pub fn transpile_fir(
     // reported its well-formed repeating wait (line 55) for a `continue` further
     // down the body. Prefer the construct that actually stopped the flattening,
     // with its own span.
-    let chir = lower_to_chir(fir, hardware_fns, registry).map_err(|e| match &declined {
-        Some(reason) => format!("{reason}"),
-        None => format!("{e}"),
+    let chir = lower_to_chir(fir, hardware_fns, registry).map_err(|e| {
+        match (&declined, &malformed_loop) {
+            (Some(reason), _) => format!("{reason}"),
+            (None, Some(m)) => m.clone(),
+            _ => format!("{e}"),
+        }
     })?;
     let shir = lower_to_shir(&chir).map_err(|e| format!("{e}"))?;
     let vlir = lower_to_vlir(&shir).map_err(|e| format!("{e}"))?;

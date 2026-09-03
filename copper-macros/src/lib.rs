@@ -735,7 +735,7 @@ impl<'a> VisitMut for ReadRewriter<'a> {
 /// free-running module has nothing to protect. Returns an error (without
 /// modifying `f`) if any `In` parameter is used in a way that can't be
 /// rewritten — see `find_unprotectable_in_uses`.
-fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
+fn inject_synced_reads(f: &mut ItemFn, cfg: Option<&copper_analysis::Cfg>) -> Result<(), Error> {
     let in_params: HashSet<String> = in_param_names(&f.sig).into_iter().collect();
     if in_params.is_empty() {
         return Ok(());
@@ -829,7 +829,7 @@ fn inject_synced_reads(f: &mut ItemFn) -> Result<(), Error> {
     // Static edge-phase classification (item 3): computed on `f` as it stands here
     // — pristine, before any read rewrite — in the same source order the rewriter
     // reaches read leaves, so tag `i` lines up with the i-th rewritten read.
-    let timings = copper_analysis::classify_reads(f);
+    let timings = copper_analysis::classify_reads_with(f, cfg);
 
     let mut rewriter = ReadRewriter {
         in_params: &in_params,
@@ -953,7 +953,17 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             // now a hard, spanned compile error rather than an accident silently
             // masked by the single-trailing-tick construction. Checked on the
             // pristine ItemFn, before any rewrite.
-            if let Err(err) = copper_analysis::check_reachability(&input_fn) {
+            // One control-flow graph per module. Every check below is a method on
+            // it, and the register set it caches is what each of them would
+            // otherwise recompute (the liveness fixed point dominated the
+            // attribute's cost on the transpilable CPU: four rebuilds of it,
+            // measured 2026-09-03). `None` only for a body with no top-level
+            // loop, which `validate_hardware_fn` has already refused.
+            let cfg = copper_analysis::Cfg::build(&input_fn);
+            if let Err(err) = cfg
+                .as_ref()
+                .map_or(Ok(()), |c| c.check_reachability().map_err(|(s, m)| Error::new(s, m)))
+            {
                 return err.to_compile_error().into();
             }
             // A combinational `Out` written on both sides of one bare `clk.tick().await`
@@ -962,7 +972,7 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             // is observed, so the sim silently disagrees with the synthesized hardware
             // (the multi-write-around-a-tick pattern; see the shared analysis and the
             // paper's contribution 5). Reject it, pointing at `RegOut`.
-            let collapsing = copper_analysis::multi_write_collapse(&input_fn);
+            let collapsing = cfg.as_ref().map(|c| c.multi_write_collapse()).unwrap_or_default();
             if let Some(port) = collapsing.first() {
                 let span = port_param_span(&input_fn.sig, port)
                     .unwrap_or_else(|| input_fn.sig.ident.span());
@@ -997,8 +1007,8 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             let misaligned = if allow_pretick_alignment {
                 Vec::new()
             } else {
-                let mut m = copper_analysis::unprotected_pretick_out_write(&input_fn);
-                m.extend(copper_analysis::unprotected_trailing_out_write(&input_fn));
+                let mut m = cfg.as_ref().map(|c| c.unprotected_pretick_out_write()).unwrap_or_default();
+                m.extend(cfg.as_ref().map(|c| c.unprotected_trailing_out_write()).unwrap_or_default());
                 m.sort();
                 m.dedup();
                 m
@@ -1035,7 +1045,7 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             let stale = if allow_pretick_alignment {
                 Vec::new()
             } else {
-                copper_analysis::pretick_out_write_before_update(&input_fn)
+                cfg.as_ref().map(|c| c.pretick_out_write_before_update()).unwrap_or_default()
             };
             if let Some(port) = stale.first() {
                 let span = port_param_span(&input_fn.sig, port)
@@ -1068,7 +1078,7 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             let multi_phase = if allow_pretick_alignment {
                 Vec::new()
             } else {
-                copper_analysis::multi_phase_out_write(&input_fn)
+                cfg.as_ref().map(|c| c.multi_phase_out_write()).unwrap_or_default()
             };
             if let Some(port) = multi_phase.first() {
                 let span = port_param_span(&input_fn.sig, port)
@@ -1096,7 +1106,7 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             // the FSM report; `inject_synced_reads` (item 3) additionally consumes
             // the crate's `classify_reads` to bake per-read edge-phase timing into
             // the generated code. Computed on the pristine ItemFn before we rewrite.
-            let inferred_registers = copper_analysis::infer_registers(&input_fn);
+            let inferred_registers = cfg.as_ref().map(|c| c.registers()).unwrap_or_default();
             log::debug!(
                 "copper-analysis inferred registers for `{}`: {:?}",
                 input_fn.sig.ident,
@@ -1104,7 +1114,7 @@ pub fn hardware(args: TokenStream, input: TokenStream) -> TokenStream {
             );
 
             let mut f = input_fn;
-            if let Err(err) = inject_synced_reads(&mut f) {
+            if let Err(err) = inject_synced_reads(&mut f, cfg.as_ref()) {
                 return err.to_compile_error().into();
             }
             wrap_in_module(&mut f);

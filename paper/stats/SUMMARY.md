@@ -1,4 +1,4 @@
-# Evaluation numbers (generated 2026-09-01)
+# Evaluation numbers (generated 2026-09-03)
 
 Regenerate with `tools/stats/collect.sh`. **Do not edit by hand** — every
 number here is derived from the repo, and a hand-copied number goes stale.
@@ -7,12 +7,12 @@ number here is derived from the repo, and a hand-copied number goes stale.
 
 | property | count |
 |---|---|
-| example `#[hardware]` modules | 34 |
-| transpile to SystemVerilog | 34/34 |
-| covered by the differential sweep (sim vs Verilator, seeded random) | 32/34 |
-| with a dedicated equivalence test | 21/34 |
-| anchored to third-party hardware (BaseJump STL) | 7/34 |
-| **anchored AND differentially swept** | 7/34 |
+| example `#[hardware]` modules | 36 |
+| transpile to SystemVerilog | 36/36 |
+| covered by the differential sweep (sim vs Verilator, seeded random) | 34/36 |
+| with a dedicated equivalence test | 23/36 |
+| anchored to third-party hardware (BaseJump STL) | 7/36 |
+| **anchored AND differentially swept** | 7/36 |
 
 The last row is the transitive chain: the *generated* SystemVerilog is tied to
 hardware neither Copper nor its transpiler wrote.
@@ -35,10 +35,10 @@ Not swept, each with the reviewed reason from `build.rs`'s `SKIP`:
 | `bsg_dff_en` | 8 | 8 | 1.0 | 8/8 |
 | `bsg_encode_one_hot` | 15 | 11 | 1.364 | 0/0 |
 | `bsg_mux_one_hot` | 20 | 20 | 1.0 | 0/0 |
-| `sipo_block` | 32 | 36 | 0.889 | 32/30 ⚠ |
+| `sipo_block` | 37 | 36 | 1.028 | 30/30 |
 
 **3/6 synthesise to an identical cell count** as the hand-written
-BaseJump reference; mean ratio 1.053 (range 0.889–1.364).
+BaseJump reference; mean ratio 1.077 (range 1.000–1.364).
 
 > **Scope.** Yosys `synth` to generic cells, not a vendor flow — comparative,
 > not absolute silicon. A ⚠ marks a flip-flop-count difference from the
@@ -68,21 +68,33 @@ Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 
 ## M6 — transpiler performance
 
-* 34 modules lowered to SystemVerilog
-* median **3.9 ms** per module (min 3.0, max 1262.0)
-* slowest: `rv32i_cpu_transpilable` at 1262.0 ms
+* 36 modules lowered to SystemVerilog
+* median **4.2 ms** per module (min 2.9, max 1266.1)
+* slowest: `rv32i_cpu_transpilable` at 1266.1 ms
 
 > **Scope.** Release binary, median of repeated runs after a warm-up.
 > Simulation throughput vs Verilator is M7 below, not this number.
+
+## M8 — attribute cost: the analysis the `#[hardware]` macro runs
+
+* 36 modules analysed
+* median **108 µs** per module (min 37, max 382568)
+* slowest: `rv32i_cpu_transpilable` at 382568 µs
+
+> **Scope.** Parse of the function plus the shared control-flow analysis and
+> every compile-time rule, in the macro's own order, timed in a release build
+> outside `rustc` (`copper-codegen/src/bin/analysis-time.rs`). Excludes the
+> token rewrite and `rustc`'s compilation of the generated coroutine, which is
+> compiling the design rather than attribute overhead.
 
 ## M7 — simulation throughput vs Verilator and Icarus Verilog
 
 | design | cycles | sim (cycles/s) | Verilator (cycles/s) | Icarus (cycles/s) | Verilator/sim | sim/Icarus |
 |---|---|---|---|---|---|---|
-| `lfsr` | 1,000,000 | 4,082,835 | 42,687,080 | 429,231 | 10.5x | 9.5x |
-| `det_110101` | 1,000,000 | 8,576,029 | 39,170,882 | 183,202 | 4.6x | 46.8x |
-| `dual_port_ram` | 1,000,000 | 3,460,598 | 37,959,968 | 156,965 | 11.0x | 22.0x |
-| `rv32i_cpu_transpilable` | 1,000,000 | 810,133 | 12,194,007 | 30,303 | 15.1x | 26.7x |
+| `lfsr` | 1,000,000 | 4,202,252 | 43,830,093 | 434,209 | 10.4x | 9.7x |
+| `det_110101` | 1,000,000 | 8,756,500 | 43,537,178 | 186,947 | 5.0x | 46.8x |
+| `dual_port_ram` | 1,000,000 | 3,613,300 | 37,469,440 | 282,304 | 10.4x | 12.8x |
+| `rv32i_cpu_transpilable` | 1,000,000 | 1,715,096 | 14,947,907 | 30,805 | 8.7x | 55.7x |
 
 > **Scope.** Fixed-cycle timed loop (`tests/sim_throughput.rs`), median of
 > repeated runs after a warm-up on every side; excludes compilation, model

@@ -253,6 +253,12 @@ pub struct Cfg {
     /// and `branch_trailing` — branch-nested ticks — both measured divergent,
     /// 2026-08-27). Conservative direction: any nesting keeps the flag.
     has_nested_tick: bool,
+    /// The register set, computed once. The backward-liveness fixed point behind
+    /// [`Cfg::registers`] is the expensive part of every analysis on this graph
+    /// (≈375 ms on the transpilable CPU, measured 2026-09-03 against 0.8 ms to
+    /// build the graph), and five rules plus the read classifier each ask for it.
+    /// The graph is immutable once built, so the answer cannot change.
+    registers_cache: std::cell::OnceCell<Vec<String>>,
 }
 
 impl Cfg {
@@ -292,6 +298,7 @@ impl Cfg {
             exit: None,
             nested_ticking_loops: b.nested,
             has_nested_tick,
+            registers_cache: std::cell::OnceCell::new(),
         })
     }
 
@@ -316,6 +323,7 @@ impl Cfg {
             exit: Some(exit),
             nested_ticking_loops: b.nested,
             has_nested_tick: false,
+            registers_cache: std::cell::OnceCell::new(),
         }
     }
 
@@ -363,6 +371,11 @@ impl Cfg {
     /// A post-tick temp that dies within its own segment is not live at the head and
     /// is still correctly excluded (it is combinational logic in a D-input path).
     pub fn registers(&self) -> Vec<String> {
+        self.registers_cache.get_or_init(|| self.compute_registers()).clone()
+    }
+
+    /// The uncached computation behind [`Cfg::registers`].
+    fn compute_registers(&self) -> Vec<String> {
         let live_out = self.liveness();
         let mut across_boundary = BTreeSet::new();
         for (i, node) in self.nodes.iter().enumerate() {
@@ -1921,6 +1934,7 @@ impl Builder {
             // Sub-CFG of a nested loop: its interior IS extraction territory, so
             // the conservative value keeps any rule that consults it flagging.
             has_nested_tick: true,
+            registers_cache: std::cell::OnceCell::new(),
         }
     }
 
@@ -2500,16 +2514,20 @@ fn loop_body_stmts(expr: &Expr) -> &[Stmt] {
 ///   tick-bearing `while` is desugared to `loop { if !cond { break; } … }`, whose
 ///   leading `break` gives the same answer. The two front-ends agreeing about this
 ///   is the point — them disagreeing is this pipeline's recurring bug class.
-/// * `for` — assumed to run its body, so "no". A counted repetition over a constant
-///   range is the shape the fold's optimism was built for (`uart_tx`, `rv32i_cpu`,
-///   `for _ in 0..CLKS_PER_BIT { clk.tick().await; }`) and it genuinely does tick.
-///   The assumption is only wrong for an **empty** range, which needs const
-///   evaluation to see and which this crate (syntax-level, `syn`-only) cannot do.
-///   Recorded rather than silently relied on: an empty constant range would make
-///   the enclosing loop tickless and is not detected here.
+/// * `for` — the same question as `loop`: does every path through the body reach a
+///   tick before it can `break`? A counted repetition over a constant range with the
+///   tick last (`uart_tx`, `rv32i_cpu`, `for _ in 0..CLKS_PER_BIT { clk.tick().await; }`)
+///   answers "no exit without a tick", as before. A body that `break`s BEFORE its
+///   tick (`for i in 0..N { if miss { break; } clk.tick().await; }`) answers "yes":
+///   the enclosing loop then needs a boundary of its own after the `for`. Until
+///   2026-09-02 this arm was a flat `false` ("a `for` runs its body"), and a
+///   detector written that way with nothing after the `for` passed the check and
+///   hung the simulator; `tests/ui/fail/for_break_before_tick.rs` in copper-macros
+///   pins the rejection. What is still not seen: an **empty** range, which needs
+///   const evaluation and which this crate (syntax-level, `syn`-only) cannot do.
 fn may_exit_without_tick(expr: &Expr) -> bool {
     match expr {
-        Expr::ForLoop(_) => false,
+        Expr::ForLoop(f) => !ticks_before_any_break(&f.body.stmts),
         Expr::While(_) => true,
         Expr::Loop(l) => !ticks_before_any_break(&l.body.stmts),
         _ => false,
@@ -2709,6 +2727,15 @@ pub enum ReadTiming {
 /// The i-th entry is the timing of the i-th `In`-param read; the macro assigns the
 /// i-th tag to the i-th read it rewrites.
 pub fn classify_reads(f: &ItemFn) -> Vec<ReadTiming> {
+    classify_reads_with(f, Cfg::build(f).as_ref())
+}
+
+/// [`classify_reads`] on a graph the caller has already built for `f` — the
+/// `#[hardware]` macro builds one graph per module and runs every check on it,
+/// so the register set behind `combinational_segment` is computed once rather
+/// than once per rule. `None` means `f` has no top-level loop (a combinational
+/// body), exactly as [`Cfg::build`] would report.
+pub fn classify_reads_with(f: &ItemFn, cfg: Option<&Cfg>) -> Vec<ReadTiming> {
     let in_params = in_param_names(f);
     if in_params.is_empty() {
         return Vec::new();
@@ -2719,7 +2746,7 @@ pub fn classify_reads(f: &ItemFn) -> Vec<ReadTiming> {
     // pin, which is what licenses the passthrough case in `classify_expr`.
     // Registers are computed on the same `ItemFn`, so the two agree by construction.
     let comb_outputs = combinational_outputs(f);
-    let combinational_segment = Cfg::build(f).is_some_and(|c| c.registers().is_empty());
+    let combinational_segment = cfg.is_some_and(|c| c.registers().is_empty());
     let ctx = ReadCtx {
         in_params: &in_params,
         comb_outputs: &comb_outputs,

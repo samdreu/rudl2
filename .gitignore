@@ -23,3 +23,4 @@ waveforms/
 .claude/
 smoke-failure.log
 regression-failure.log
+paper/stats-quick/

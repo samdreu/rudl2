@@ -69,6 +69,20 @@ path = "examples/sequential/pattern_detector_2.rs"
 test = true
 
 [[example]]
+name = "pattern_detector_for"
+path = "examples/sequential/pattern_detector_for.rs"
+# `main()` is a self-check (simulator vs the hand model, `exit(1)` on mismatch); the
+# `#[cfg(test)]` checks add the fixed-fire-cycle pin and the N = 1 / N = 5 cases.
+test = true
+
+[[example]]
+name = "handshake"
+path = "examples/sequential/handshake.rs"
+# `main()` is a self-check (simulator vs the hand model, `exit(1)` on mismatch); the
+# `#[cfg(test)]` checks pin the `done` step cycles and the never-acknowledged case.
+test = true
+
+[[example]]
 name = "traffic_light_fsm"
 path = "examples/sequential/traffic_light_fsm.rs"
 

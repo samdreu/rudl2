@@ -32,7 +32,7 @@ use syn::ItemFn;
 
 mod cfg;
 
-pub use cfg::{classify_reads, Cfg, DerivationFacts, EdgeKind, PhaseFacts, ReadTiming};
+pub use cfg::{classify_reads, classify_reads_with, Cfg, DerivationFacts, EdgeKind, PhaseFacts, ReadTiming};
 
 /// Plain combinational `Out` ports written **between a leading `In` read and the
 /// update of a register the write reads** — the read's pre-edge barrier drags the
