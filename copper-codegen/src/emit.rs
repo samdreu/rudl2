@@ -388,17 +388,34 @@ impl Emitter<'_> {
     /// also writes trips Verilator's `PROCASSINIT` under `-Wall`). Blocking `=`,
     /// unguarded by the clock: elaboration-time state, not a clocked update. See
     /// `VLIRRegDecl::init` for why the value must be stated at all.
+    ///
+    /// Under the Verilator profile the block is wrapped in a `MULTIDRIVEN`
+    /// lint-off/lint-on pair. IEEE 1800-2023 §9.2.2.4 forbids writing an
+    /// `always_ff` variable from any other process, and Verilator 5.05x
+    /// enforces it by default (5.044 did not), counting the `initial` block as
+    /// that other process. A power-on value is elaboration-time state, not a
+    /// second driver, and the alternative spelling — a declaration initializer —
+    /// trips `PROCASSINIT` under `-Wall` instead. Yosys and Icarus accept the
+    /// block as written, so the other profiles emit it bare.
     fn reg_inits(&mut self, regs: &[VLIRRegDecl]) {
         let with_init: Vec<&VLIRRegDecl> = regs.iter().filter(|r| r.init.is_some()).collect();
         if with_init.is_empty() {
             return;
+        }
+        let verilator = matches!(self.cfg.profile, ToolchainProfile::Verilator);
+        if verilator {
+            self.out.push_str(&format!("{}/* verilator lint_off MULTIDRIVEN */\n", self.indent(1)));
         }
         self.out.push_str(&format!("{}initial begin\n", self.indent(1)));
         for r in with_init {
             let init = r.init.as_ref().unwrap();
             self.out.push_str(&format!("{}{} = {};\n", self.indent(2), r.name, expr_str(init)));
         }
-        self.out.push_str(&format!("{}end\n\n", self.indent(1)));
+        self.out.push_str(&format!("{}end\n", self.indent(1)));
+        if verilator {
+            self.out.push_str(&format!("{}/* verilator lint_on MULTIDRIVEN */\n", self.indent(1)));
+        }
+        self.out.push('\n');
     }
 
     // ── Submodules ──────────────────────────────────────────────────────────

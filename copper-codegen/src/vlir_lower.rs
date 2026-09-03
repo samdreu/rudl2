@@ -3366,9 +3366,11 @@ module counter (
 
     logic [7:0] count;
 
+    /* verilator lint_off MULTIDRIVEN */
     initial begin
         count = 8'd0;
     end
+    /* verilator lint_on MULTIDRIVEN */
 
     always_ff @(posedge clk) begin
         count <= (count + step);
@@ -3525,9 +3527,11 @@ module fsm (
 
     logic [1:0] state;
 
+    /* verilator lint_off MULTIDRIVEN */
     initial begin
         state = 2'd0;
     end
+    /* verilator lint_on MULTIDRIVEN */
 
     always_comb begin
         if ((state == 2'd2)) begin

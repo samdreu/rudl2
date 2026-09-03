@@ -41,6 +41,9 @@ def skip_table():
     return out
 
 BIN = ROOT / "target" / "debug" / "copper-transpile"
+# A fresh clone has no binary yet; build it (no-op when up to date).
+subprocess.run(["cargo", "build", "-q", "-p", "copper-codegen", "--bin", "copper-transpile"],
+               cwd=ROOT, check=True)
 
 def modules_in(path):
     """Ask the CLI, never a hand-rolled attribute scan.

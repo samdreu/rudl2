@@ -25,11 +25,17 @@ module handshake (
     // The lint pass (-Wall, fatal here) refuses a declaration initializer on a
     // variable an always block also writes (PROCASSINIT), so the power-on state
     // is an `initial` block instead.
+    // IEEE 1800-2023 9.2.2.4 forbids writing an `always_ff` variable from another
+    // process, and this block counts as one; the lint enforces it by default from
+    // 5.05x. (A comment must not START with the word "verilator" — that spelling is
+    // a pragma.) The transpiler emits the same pair around its own power-on block.
+    /* verilator lint_off MULTIDRIVEN */
     initial begin
         state = TOP;
         n     = 8'd0;
         done  = 8'd0;
     end
+    /* verilator lint_on MULTIDRIVEN */
 
     always_ff @(posedge clk) begin
         case (state)
