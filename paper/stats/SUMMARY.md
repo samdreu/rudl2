@@ -47,6 +47,21 @@ BaseJump reference; mean ratio 1.077 (range 1.000–1.364).
 
 * `bsg_gray_to_binary` — reference synth failed
 
+## M2b — post-synthesis area vs a SAME-AUTHOR reference
+
+| module | Copper cells | reference cells | ratio | FFs (Copper/ref) | source |
+|---|---|---|---|---|---|
+| `ram_read_first` | 347 | 320 | 1.084 | 136/136 | `tests/fixtures/write_first_ram_dut.rs` |
+| `bit_not_bits` | 32 | 32 | 1.0 | 0/0 | `tests/fixtures/bits_ops_dut.rs` |
+| `handshake` | 38 | 43 | 0.884 | 18/18 | `examples/sequential/handshake.rs` |
+
+> **Scope.** Each reference here is a second spelling of the module by its OWN
+> author (`build.rs`'s REFERENCE table), not third-party hardware. It answers the
+> area question — does the lowering cost more logic than a human's? — but it is
+> **not** independent evidence: never average these into the BaseJump table
+> above, and never call one an anchor.
+
+
 ## M1 — design size vs the reference
 
 | module | Copper SLOC | reference SLOC | ratio | emitted SV SLOC |
