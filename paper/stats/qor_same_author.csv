@@ -1,0 +1,4 @@
+module,status,copper_cells,ref_cells,cell_ratio,copper_ffs,ref_ffs,ff_match,copper_hist,ref_hist,note,source
+ram_read_first,ok,347,320,1.084,136,136,yes,$_ANDNOT_x4 $_AND_x57 $_DFFE_PP_x128 $_DFF_P_x8 $_MUX_x93 $_NAND_x28 $_NOR_x7 $_ORNOT_x16 $_OR_x6,$_ANDNOT_x5 $_AND_x39 $_DFFE_PP_x128 $_DFF_P_x8 $_MUX_x101 $_NAND_x19 $_NOR_x2 $_ORNOT_x10 $_OR_x8,,tests/fixtures/write_first_ram_dut.rs
+bit_not_bits,ok,32,32,1.0,0,0,yes,$_NOT_x32,$_NOT_x32,,tests/fixtures/bits_ops_dut.rs
+handshake,ok,38,43,0.884,18,18,yes,$_AND_x6 $_DFFE_PP_x16 $_DFF_P_x2 $_MUX_x2 $_NAND_x1 $_NOR_x1 $_NOT_x3 $_XNOR_x1 $_XOR_x6,$_ANDNOT_x2 $_AND_x8 $_DFFE_PP_x16 $_NAND_x1 $_NOR_x1 $_NOT_x2 $_OR_x4 $_SDFFCE_PN0P_x2 $_XNOR_x1 $_XOR_x6,,examples/sequential/handshake.rs

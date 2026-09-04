@@ -8,6 +8,7 @@ read = lambda n: list(csv.DictReader(open(S / n))) if (S / n).exists() else []
 
 loc, qor, ev, perf = read("loc.csv"), read("qor.csv"), read("evidence.csv"), read("perf.csv")
 sperf = read("simperf.csv")
+qsa = read("qor_same_author.csv")
 ana = read("analysis.csv")
 stamp = sys.argv[1] if len(sys.argv) > 1 else datetime.date.today().isoformat()
 o = [f"# Evaluation numbers (generated {stamp})",
@@ -55,6 +56,26 @@ if qor:
               "> reference, which is a finding to explain, not a failure: these designs pass",
               "> the differential equivalence check.", ""]
     for r in qor:
+        if r["status"] != "ok":
+            o.append(f"* `{r['module']}` — {r['status']}"
+                     + (f": {r['note']}" if r.get("note") else ""))
+    o.append("")
+
+if qsa:
+    ok = [r for r in qsa if r["status"] == "ok"]
+    o += ["## M2b — post-synthesis area vs a SAME-AUTHOR reference", "",
+          "| module | Copper cells | reference cells | ratio | FFs (Copper/ref) | source |",
+          "|---|---|---|---|---|---|"]
+    for r in ok:
+        flag = "" if r["ff_match"] == "yes" else " \u26a0"
+        o.append(f"| `{r['module']}` | {r['copper_cells']} | {r['ref_cells']} | "
+                 f"{r['cell_ratio']} | {r['copper_ffs']}/{r['ref_ffs']}{flag} | `{r.get('source','')}` |")
+    o += ["", "> **Scope.** Each reference here is a second spelling of the module by its OWN",
+          "> author (`build.rs`'s REFERENCE table), not third-party hardware. It answers the",
+          "> area question — does the lowering cost more logic than a human's? — but it is",
+          "> **not** independent evidence: never average these into the BaseJump table",
+          "> above, and never call one an anchor.", ""]
+    for r in qsa:
         if r["status"] != "ok":
             o.append(f"* `{r['module']}` — {r['status']}"
                      + (f": {r['note']}" if r.get("note") else ""))
