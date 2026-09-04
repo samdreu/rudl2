@@ -57,7 +57,7 @@ BaseJump reference; mean ratio 1.077 (range 1.000–1.364).
 | `bsg_encode_one_hot` | 18 | 40 | 0.45 | 25 |
 | `bsg_gray_to_binary` | 10 | 50 | 0.2 | 18 |
 | `bsg_mux_one_hot` | 16 | 22 | 0.727 | 23 |
-| `sipo_block` | 33 | 17 | 1.941 | 75 |
+| `sipo_block` | 33 | 17 | 1.941 | 78 |
 
 Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 
@@ -69,8 +69,8 @@ Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 ## M6 — transpiler performance
 
 * 36 modules lowered to SystemVerilog
-* median **4.2 ms** per module (min 2.9, max 1266.1)
-* slowest: `rv32i_cpu_transpilable` at 1266.1 ms
+* median **4.5 ms** per module (min 2.8, max 1767.4)
+* slowest: `rv32i_cpu_transpilable` at 1767.4 ms
 
 > **Scope.** Release binary, median of repeated runs after a warm-up.
 > Simulation throughput vs Verilator is M7 below, not this number.
@@ -78,8 +78,8 @@ Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 ## M8 — attribute cost: the analysis the `#[hardware]` macro runs
 
 * 36 modules analysed
-* median **108 µs** per module (min 37, max 382568)
-* slowest: `rv32i_cpu_transpilable` at 382568 µs
+* median **192 µs** per module (min 57, max 517103)
+* slowest: `rv32i_cpu_transpilable` at 517103 µs
 
 > **Scope.** Parse of the function plus the shared control-flow analysis and
 > every compile-time rule, in the macro's own order, timed in a release build
@@ -91,10 +91,10 @@ Mean Copper/reference SLOC over 7 anchored designs: **0.860**.
 
 | design | cycles | sim (cycles/s) | Verilator (cycles/s) | Icarus (cycles/s) | Verilator/sim | sim/Icarus |
 |---|---|---|---|---|---|---|
-| `lfsr` | 1,000,000 | 4,202,252 | 43,830,093 | 434,209 | 10.4x | 9.7x |
-| `det_110101` | 1,000,000 | 8,756,500 | 43,537,178 | 186,947 | 5.0x | 46.8x |
-| `dual_port_ram` | 1,000,000 | 3,613,300 | 37,469,440 | 282,304 | 10.4x | 12.8x |
-| `rv32i_cpu_transpilable` | 1,000,000 | 1,715,096 | 14,947,907 | 30,805 | 8.7x | 55.7x |
+| `lfsr` | 1,000,000 | 2,158,446 | 14,360,623 | 392,799 | 6.7x | 5.5x |
+| `det_110101` | 1,000,000 | 3,718,314 | 14,301,147 | 212,139 | 3.8x | 17.5x |
+| `dual_port_ram` | 1,000,000 | 1,697,997 | 10,866,131 | 193,706 | 6.4x | 8.8x |
+| `rv32i_cpu_transpilable` | 1,000,000 | 815,240 | 6,231,447 | 18,482 | 7.6x | 44.1x |
 
 > **Scope.** Fixed-cycle timed loop (`tests/sim_throughput.rs`), median of
 > repeated runs after a warm-up on every side; excludes compilation, model

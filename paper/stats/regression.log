@@ -1,0 +1,71 @@
+
+==== 1/4  build workspace ====
+warning: copper@0.1.0: corpus sweep: 137 generated, 10 ignored-with-reason
+warning: copper@0.1.0: anchoring: 5 module(s) checked against an independent reference, 142 cross-checked against the transpiler only
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.93s
+
+==== 2/4  copper-transpile CLI ====
+  transpiled 17 lines of SystemVerilog — OK
+
+==== 3/4  cargo test --workspace ====
+  1034 passed, 0 failed, 21 ignored across 130 test binaries
+  G-C ok: all 105 test files ran
+  G-D ok: corpus sweep ran 137 differential cases (10 ignored-with-reason)
+  G-E: 5 module(s) checked against an independent reference, 142 cross-checked against the transpiler only
+  21 ignored test(s) — deliberately not run, re-read these periodically:
+    ex_cdc_two_domain_hierarchy::two_domain_top_differential ... ignored, a `#[hardware(structural)]` parent: transpile-only by design, with
+    ex_cpu_rv32i_cpu_pipelined::rv32i_cpu_pipelined_differential ... ignored, ANCHORED OUTSIDE THIS SWEEP as of 2026-08-27: tests/rv32i_pipe
+    fx_control_extraction_dut::branch_merge_explicit_differential ... ignored, a demonstration of the pre-tick hazard since 2026-08-25: its 
+    fx_multiphase_rom_dut::mp_rom_differential ... ignored, refused by design: a plain `Out` driven from a memory read result across phases 
+    fx_out_phase_dut::out_from_reg_before_commit_differential ... ignored, ONE-CYCLE DIVERGENCE, GUARDED as of 2026-08-27: the trailing clau
+    fx_out_phase_dut::regout_trailing_single_tick_differential ... ignored, ONE-CYCLE DIVERGENCE, and the half worth knowing: reaching for `
+    fx_probe_timing_dut::probe_differential ... ignored, an `allow_pretick_alignment` witness: the module exists to DEMONSTRATE the pre-tick
+    fx_probe_timing_dut::probe_fsm_differential ... ignored, a pinned divergence (probe_fsm_sim_matches_verilog is #[ignore]d for it): a pha
+    fx_trailing_statements_dut::trailing_constant_differential ... ignored, STARTUP TRANSIENT, not a divergence in steady state: `dv` is wri
+    fx_wait_loop_dut::tick_first_waiter_differential ... ignored, refused by design: a repeating wait must be written test-first; pinned as 
+    probe_mem_latency ... ignored, DIAGNOSTIC PRINTOUT, not a check — it has no assertions, so passing means nothing. Run with --ignored --n
+    probe_fsm_sim_matches_verilog ... ignored, demonstration: a phase-gated cross-tick (mid-phase) read still diverges from the transpiler b
+    probe_registered_timing ... ignored, DIAGNOSTIC PRINTOUT, not a check — it has no assertions, so passing means nothing. Run with --ignor
+    copper-core/src/cdc.rs - cdc (line 114) ... ignored
+    copper-core/src/cdc.rs - cdc (line 134) ... ignored
+    copper-core/src/cdc.rs - cdc (line 152) ... ignored
+    copper-core/src/cdc.rs - cdc (line 168) ... ignored
+    copper-core/src/cdc.rs - cdc (line 70) ... ignored
+    copper-core/src/cdc.rs - cdc (line 89) ... ignored
+    copper-core/src/port.rs - port::Out (line 73) ... ignored
+    copper-core/src/types.rs - types::Clock<Domain>::tick (line 905) ... ignored
+
+==== 4/4  examples (Copper sim vs Verilator equivalence) ====
+  G-A ok: all 28 example files are registered
+  one_bit_comparator     PASS
+  mux                    PASS
+  ripple_carry_adder     PASS
+  rotate_right           PASS
+  priority_encode        PASS
+  shift_register         PASS
+  pattern_detector       PASS
+  pattern_detector_2     PASS
+  pattern_detector_for   PASS
+  handshake              PASS
+  traffic_light_fsm      PASS
+  pipeline_mac           PASS
+  lfsr                   PASS
+  dual_port_ram          PASS
+  rv32i_cpu_pipelined    PASS
+  rv32i_cpu_transpilable PASS
+  uart_rx                PASS
+  uart_system            PASS
+  two_domain_counter     PASS
+  two_domain_hierarchy   PASS
+  flag_crossing          PASS
+  bsg_dff_en             PASS
+  bsg_mux_one_hot        PASS
+  bsg_counter_up_down    PASS
+  bsg_encode_one_hot     PASS
+  bsg_gray_to_binary     PASS
+  bsg_adder_one_hot      PASS
+  sipo_block             PASS
+  examples: 28/28 passed
+  G-B ok: all 28 registered examples ran
+
+REGRESSION OK (812s)

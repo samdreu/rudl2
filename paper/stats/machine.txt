@@ -1,0 +1,14 @@
+generated: 2026-09-03T23:40:34Z
+commit: 8ebc2bb (dirty)
+host: recycle.cs.washington.edu
+os: Linux 6.12.0-211.49.1.el10_2.x86_64 x86_64
+cpu: Intel(R) Xeon(R) Platinum 8160M CPU @ 2.10GHz (96 logical cores)
+memory: 754 GB
+governor: unknown
+pinning: taskset -c 40
+load at start: 7.94
+runs: 10   cycles: 1000000   gap: 3600s   tolerance: 10%
+rustc: rustc 1.98.1 (48a229cea 2026-09-01)
+verilator: Verilator 5.051 devel rev v5.050-308-gc917f04c6 (mod)
+iverilog: Icarus Verilog version 14.0 (devel) (s20260301-394-g9edaf7b6a-dirty)
+yosys: Yosys 0.68+182 (git sha1 0bf55a858-dirty, Release, Clang /usr/bin/clang++ 21.1.8)
